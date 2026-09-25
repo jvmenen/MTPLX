@@ -23,8 +23,8 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
 | 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
 | 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
-| 19 | Scoring: top-K via blokmaxima, één `logsumexp` per rij | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Gebouwd (dc9c0e3e): GPU 9-14× sneller per blok, waarden bitgelijk; echte toets loopt |
-| 20 | Scoring: trunk in prefill-blokken | idem | Gebouwd (736d9480) achter `MTPLX_PROMPT_SCORE_TRUNK_CHUNK`; pariteit op testmodel bitgelijk; echte toets loopt (let op piekgeheugen ~4,7 GiB bij 8k) |
+| 19 | Scoring: top-K via blokmaxima (commit A) | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Echt getoetst: bitgelijk (243/243, verschil 0), ~10% sneller; klaar voor PR |
+| 20 | Scoring: trunk in prefill-blokken (commit B) | idem | Echt getoetst: 1,25× sneller maar FOUT (213/243, logprob-verschil 19,85, ook binnen het eerste blok); oorzaak in onderzoek, niet indienen |
 | 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
 | 22 | Chat-encode-memo per segment | idem | Kleine PR; 40-55 ms per beurt bij 77k tokens (gemeten basis) |
 | 23 | `sessionbank_put_s` publiceren; put en laatste commit van het kritieke pad halen | idem | Eerst zichtbaar maken (kleine PR), dan verplaatsen |

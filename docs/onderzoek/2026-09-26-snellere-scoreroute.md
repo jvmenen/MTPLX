@@ -55,3 +55,23 @@ B voegt op deze plak 9-14% toe; op het echte model met 40 lagen naar verwachting
 ## Echte toets
 
 Script `verify_scoring_real.py` (in de lokale werkmap `laya-nl`): per verse server de 240 classifierprompts plus Nederlandse prompts van ~2k, ~4k en ~8k tokens; latency per lengteklasse, fouten, top-1-overeenkomst, maximaal logprob-verschil en geheugen uit `/health`. Drie runs: `main`, tak met `MTPLX_PROMPT_SCORE_TRUNK_CHUNK=256` (alleen A) en tak standaard (A+B). Uitkomst volgt in een apart rapport.
+
+## Echte toets (26 september 2026, 23:35-23:43)
+
+M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX Optimized-Balance, productie-instellingen, verse server per run, 240 classifierprompts (250-840 tokens) plus Nederlandse prompts van ~2k, ~4k en ~8k tokens, K = 20.
+
+| | main | alleen A (`TRUNK_CHUNK=256`) | A+B (standaard) |
+|---|---|---|---|
+| p50 <512 tokens (n=188) | 536 ms | 473 ms | 382 ms |
+| p50 512-1023 tokens (n=52) | 630 ms | 593 ms | 420 ms |
+| ~2k tokens | 2.130 ms | 2.041 ms | 1.416 ms |
+| ~4k tokens | 4.284 ms | 4.060 ms | 2.530 ms |
+| ~8k tokens | 8.844 ms | 8.367 ms | 4.742 ms |
+| Top-1 laatste positie gelijk aan main | | **243/243** | **213/243** |
+| Top-1 alle posities | | 121.263/121.263 | 114.292/121.263 |
+| Max. logprob-verschil | | **0** | **19,85** (prompt 32, positie 161) |
+| Fouten | 0 | 0 | 0 |
+
+**Conclusie:** commit A is bitgelijk en ~10% sneller: klaar voor een PR. Commit B is 1,25× sneller bovenop A (8k: 8,4 naar 4,7 s), maar geeft op het echte model **verkeerde uitkomsten**, ook binnen het eerste blok van 256 rijen; op het kleine testmodel was hij bitgelijk. Oorzaak wordt onderzocht; B wordt niet ingediend zolang de uitkomst niet 243/243 en afrondingsniveau is.
+
+`session_bank.effective_max_bytes` was bij alle drie verse servers 17,39 GiB (voor en na), dus het plafond staat op een verse server ruim; zie vondst 8 over het wegzakken na zware beurten.
