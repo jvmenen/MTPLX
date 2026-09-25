@@ -23,8 +23,8 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
 | 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
 | 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
-| 19 | Scoring: top-K via blokmaxima (commit A) | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Echt getoetst: bitgelijk (243/243, verschil 0), ~10% sneller; klaar voor PR |
-| 20 | Scoring: trunk in prefill-blokken (commit B) | idem | Echt getoetst: 1,25× sneller maar FOUT (213/243, logprob-verschil 19,85, ook binnen het eerste blok); oorzaak in onderzoek, niet indienen |
+| 19 | Scoring: top-K via blokmaxima (commit A) | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Bitgelijk op echt model (243/243, verschil 0), mediaan 1,21× sneller; klaar voor PR |
+| 20 | Scoring: trunk in prefill-blokken (commit B) | idem | Teruggedraaid: uitkomst hangt op A3B af van blokgrootte door MoE-routering (geen codefout); hooguit opt-in met standaard 256 |
 | 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
 | 22 | Chat-encode-memo per segment | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Gebouwd (6b3bbf54): tokeniseren bij 78K van 51,9 naar 2,3 ms, exact; volledige suite en TTFT op echte server nog meten, daarna PR |
 | 23 | `sessionbank_put_s` publiceren; put en laatste commit van het kritieke pad halen | idem | Eerst zichtbaar maken (kleine PR), dan verplaatsen |
@@ -33,6 +33,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 26 | Jinja-template-render kost ~40 ms bij 78K tokens en domineert nu de chat-encode | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Incrementeel renderen onderzoeken (grotere wijziging) |
 | 27 | Memo-sleutel merkt een ter plekke gewijzigde woordenschat niet op | idem | `len(tokenizer)` aan de sleutel toevoegen vóór de PR |
 | 28 | Werkgeheugen W in rust onbekend; als W ≥ 9 GiB is dat het echte probleem | [bankplafond](2026-09-26-bankplafond.md) | `/v1/mtplx/snapshot` → `mem.generation_working_bytes` uitlezen tijdens gewoon gebruik door Bink en Fleur |
+| 29 | MoE-routering op A3B is niet batch-invariant: router-logits verschillen 1-2 bf16-stappen met het aantal rijen en de 8e/9e expert liggen vaak gelijk, dus scores hangen ~0,2 nats/token af van de blokindeling | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Melden bij de maker (issue); verkennen of een deterministische tie-break of vaste router-rekenindeling kan; relevant voor reproduceerbaarheid van classificaties |
 
 ## Afgehandeld
 

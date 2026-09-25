@@ -75,3 +75,27 @@ M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX Optimized-Balance, productie-instellingen, v
 **Conclusie:** commit A is bitgelijk en ~10% sneller: klaar voor een PR. Commit B is 1,25× sneller bovenop A (8k: 8,4 naar 4,7 s), maar geeft op het echte model **verkeerde uitkomsten**, ook binnen het eerste blok van 256 rijen; op het kleine testmodel was hij bitgelijk. Oorzaak wordt onderzocht; B wordt niet ingediend zolang de uitkomst niet 243/243 en afrondingsniveau is.
 
 `session_bank.effective_max_bytes` was bij alle drie verse servers 17,39 GiB (voor en na), dus het plafond staat op een verse server ruim; zie vondst 8 over het wegzakken na zware beurten.
+
+## Oorzaak van de afwijking bij commit B, en besluit (27 september 2026)
+
+Commit B bevatte geen codefout. Op Qwen3.6-35B-A3B verandert de uitkomst zodra het model de prompt in blokken van een andere grootte verwerkt, en dat effect is veel groter dan afronding.
+
+- **Patroon:** elke prompt langer dan 256 tokens wijkt af vanaf ~positie 4; prompts van ≤256 tokens (3 stuks) zijn bitgelijk. Rij i hangt dus af van hoeveel rijen er in dezelfde forward zitten, ook binnen de eerste 256.
+- **Reproductie op de server** (prompt 32, 507 tokens, blokgroottes 1/128/256/320/512/2048): 256 tegen 320 wijkt af vanaf positie 1 (max 19,8, gemiddeld 0,365 nats); 128 tegen 256 max 19,0; token voor token (1) tegen 256 max 10,5; 320 tegen 2048 en 512 tegen 2048 gelijk tot rij 320 (zelfde eerste forward).
+- **Per laag gemeten:** de attentie-uitvoer van laag 0 en de MoE-invoer zijn bitgelijk, maar de router-logits verschillen 1-2 bf16-stappen (tot 0,125): de matmul geeft net andere uitkomsten afhankelijk van het aantal rijen. Het verschil tussen de 8e en 9e gekozen expert is zelf vaak maar 1-2 bf16-stappen (mediaan 0,03-0,06, vaak exact gelijk). Daardoor kiezen al in laag 0 12 van de 128 rijen een andere expertset, oplopend tot 40-77 van de 128 per laag in lagen 14-39. Zo wordt afrondingsruis een echt verschil in uitkomst.
+- **Ruis op 25 prompts (9.909 posities):**
+
+| Vergelijking | Top-1 gelijk | Gem. verschil | Max. verschil |
+|---|---|---|---|
+| 256 tegen 128 | 93,5% | 0,20 nats | 7,45 |
+| 256 tegen 2048 | 93,5% | 0,21 nats | 9,52 |
+| 128 tegen 2048 | 93,0% | 0,22 nats | 9,52 |
+
+  De gemiddelde logprob per prompt verschuift nauwelijks (−4,72 tegen −4,69): ruis, geen bias.
+- **Uitgesloten:** verkeerde norm-variant, de losse lm_head, de blokgrootte-override, cache-offsets op het eerste blok. Het kleine testmodel was bitgelijk omdat zijn router zulke bijna-gelijke keuzes niet heeft.
+
+**Besluit:** commit B teruggedraaid (`8a72563b`); de tak bevat nu alleen commit A. Geen bredere indeling kan 243/243 op afrondingsniveau halen tegen de 256-referentie, en eerdere scores zijn allemaal met 256 berekend.
+
+**Hernieuwde toets (verse server, teruggedraaide tak):** tegen `main` 243/243 top-1 op de laatste positie, 121.263/121.263 over alle posities, maximaal verschil 0. Latency p50: <512 tokens 432 ms (main 536), 512-1023 521 ms (630), ~2k 1,82 s (2,13), ~4k 3,66 s (4,28), ~8k 7,55 s (8,84); mediane versnelling 1,21× (de eerdere run gaf 1,10×, dus deels variatie tussen runs). 539 tests geslaagd, 1 overgeslagen.
+
+**Betekenis breder dan deze tak:** dezelfde ruis zit al in `main`. Scores op dit model hangen ~0,2 nats per token af van de blokindeling; ook token-voor-token verwerken wijkt tot 10,5 nats af van 256-rijen. Dat verklaart de kansverschillen tot 0,2 tussen prompt-scoring en eerste-token-logprobs bij onze classifier (andere rekenindeling). Voor KL-metingen op A3B is dit de ondergrens van de ruis, tenzij de prompt altijd in dezelfde indeling wordt verwerkt. De 1,25× van commit B kan alleen als opt-in met standaard 256; scores met een andere indeling zijn dan niet vergelijkbaar met eerdere.
