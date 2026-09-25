@@ -6,9 +6,9 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 
 | # | Vondst | Bron | Volgende stap |
 |---|---|---|---|
-| 1 | Eerste-token-logprobs werkt in unit-tests, maar is niet getoetst met echte gewichten | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Testserver op de tak starten, vergelijken met prompt-scoring op de 240 testberichten (oordeel, kansverschil, p50/p90) |
-| 2 | Uitschieters van ~1,5 s op korte generaties; hypotheses: blank retries, wachten op het lock, achtergrondonderhoud, GPU niet resident | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md), [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Meten met en zonder `seed` / logprobs; tellen hoe vaak het eerste token leeg is |
-| 3 | `/v1/completions` gebruikt de session bank nooit (`cache_bypass` altijd waar) | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Opgelost achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (tak `feat/prefix-reuse-block`); live toetsen |
+| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Live getoetst: 228/240 gelijk aan prompt-scoring, 14% sneller; klaar voor een upstream-PR (CHANGELOG-regel, volledige suite, build) |
+| 2 | Uitschieters van ~1,5 s op korte generaties | [live-test](2026-09-26-live-test-classifier.md) | Weg met logprobs (p90 590 ms), past bij blank retries; nog apart bewijzen door zonder logprobs met en zonder `seed` te meten |
+| 3 | `/v1/completions` gebruikt de session bank niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md), [live-test](2026-09-26-live-test-classifier.md) | Werkt achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (G3: 276 tokens hergebruikt, 37% sneller); geheugengebruik meten |
 | 4 | Hergebruik alleen in stappen van 512 tokens; 128 instellen via env en CLI werkte niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Oorzaak gevonden (drempel opgehoogd tot blokgrootte, GDN-grensraster, korte prompts zonder grenzen); vlag `--ram-session-prefix-min-match-tokens 128` gebouwd; live toetsen en geheugengebruik per grens meten |
 | 5 | Chatroute zonder voorgevuld `Antwoord:` is minder nauwkeurig (0,58 tegen 0,68) | idem | Kijken of de chatroute een voorgevuld assistent-antwoord ondersteunt, of een ander promptpatroon dat hetzelfde doet |
 | 6 | `score_prompt_logprobs` bouwt per blok een volledige float32-log-softmax (~250 MB) | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Top-K op bf16 met één `logsumexp` per rij; meten wat het scheelt |
@@ -17,10 +17,13 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 9 | Eén verzoek tegelijk (`decode_batch_max = 1`) | idem | Uitzoeken of batching met MTP samen kan, en wat het oplevert voor meerdere agents |
 | 10 | Negen tests in `tests/test_public_cli.py` falen op een schone `main` in deze omgeving | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Oorzaak bekijken (lokale modelcache?); eventueel melden bij de maker |
 | 11 | Health meldt `ssd_prefix_miss` terwijl de echte oorzaak in het werkgeheugen ligt | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Echte afwijsreden rapporteren; kandidaat voor een kleine upstream-PR |
-| 12 | `common_prefix_len` is een Python-lus, meerdere keren per verzoek per entry | idem | Numpy-vergelijking, één keer per verzoek omzetten; meten |
-| 13 | Gedupliceerde env-lezers met letterlijke standaarden en een magische `max(512, …)` | idem | Opruimen naar één bron per instelling (deels gedaan in `runtime_options`) |
+| 12 | `common_prefix_len` is een Python-lus | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Gedaan op `refactor/prefix-helpers` (tot 3,4x sneller); vierde kopie in `openai._common_prefix_len` nog omzetten |
+| 13 | Gedupliceerde env-lezers en magische 512 | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Grotendeels gedaan; resterend: cold-tier-constanten, `parse_args`-512, bank-limieten, losse bool-parsers |
 | 14 | `restore_or_prefill_prompt_state`, `_restore_near_prefix_prompt_state` en `near_prefix_candidates` zijn honderden regels | idem | Opsplitsen per herstelroute; aparte opschoon-PR |
-| 15 | Eerste-token-logprobs en kort prefix-hergebruik zitten op twee takken | beide rapporten | Samenvoegen op een testtak en live meten: kansen, p50/p90, `cached_tokens`, geheugen |
+| 15 | Beide takken samengevoegd en live getest | [live-test](2026-09-26-live-test-classifier.md) | Klaar; zie 16 en 17 |
+| 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
+| 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
+| 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
 
 ## Afgehandeld
 
