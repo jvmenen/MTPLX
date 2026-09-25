@@ -8,6 +8,7 @@ Deze map hoort bij de fork `jvmenen/MTPLX` en staat op de tak `onderzoek`, los v
 |---|---|---|
 | 2026-09-25 | [metingen-classifier](2026-09-25-metingen-classifier.md) | Waar de tijd per classificatie heen gaat, hergebruik van het promptbegin, promptvolgorde |
 | 2026-09-25 | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Logprobs voor het eerste gegenereerde token op `/v1/completions` en `/v1/chat/completions` (tak `feat/first-token-logprobs`) |
+| 2026-09-26 | [bankplafond](2026-09-26-bankplafond.md) | Waarom het plafond van de session bank wegzakt en een voorzichtige fix (tak `fix/bank-ceiling-peak-decay`) |
 | 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren (tak `feat/chat-encode-segment-memo`) |
 | 2026-09-26 | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Top-K zonder volledige log-softmax en trunk in prefill-blokken (tak `feat/faster-prompt-scoring`) |
 | 2026-09-26 | [optimalisaties](2026-09-26-optimalisaties.md) | Gerangschikte optimalisaties met effect, snelle winsten en wat niet de moeite is |
@@ -29,5 +30,5 @@ Zie [VONDSTEN.md](VONDSTEN.md): een lopende lijst met vondsten waar we nog naar 
 | `test/classifier-live` | Beide featuretakken samengevoegd voor de live test | Lokaal |
 | `feat/faster-prompt-scoring` | Snellere scoreroute | A bitgelijk en getoetst; B fout op echt model, in onderzoek |
 | `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Lokaal gecommit (6b3bbf54) |
-| `fix/bank-ceiling-peak-decay` | Plafond gespreksgeheugen niet vast op 1 GiB | In onderzoek |
+| `fix/bank-ceiling-peak-decay` | Plafond gespreksgeheugen, piekreserve laat afnemen | Lokaal gecommit (fb1cd817), standaard uit, hardwareverificatie open |
 | `onderzoek` | Deze documentatie | Lopend |

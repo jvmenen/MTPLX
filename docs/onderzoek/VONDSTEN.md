@@ -12,7 +12,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 5 | Chatroute zonder voorgevuld `Antwoord:` is minder nauwkeurig (0,58 tegen 0,68) | idem | Kijken of de chatroute een voorgevuld assistent-antwoord ondersteunt, of een ander promptpatroon dat hetzelfde doet |
 | 6 | `score_prompt_logprobs` bouwt per blok een volledige float32-log-softmax | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Opgelost in 19 |
 | 7 | `_run_generation` (~650 regels) en de completions-handler (~500 regels) zijn lastig leesbaar | idem | Kandidaat voor een aparte opschoon-PR: antwoordopbouw en streamlus uitlichten |
-| 8 | Plafond van de session bank zakt naar 1 GiB door een piekreserve die nooit daalt | [metingen-classifier](2026-09-25-metingen-classifier.md) | Nagaan of de reserve na verloop van tijd mag afnemen (piek resetten na een rustige periode) |
+| 8 | Plafond van de session bank zakt weg | [bankplafond](2026-09-26-bankplafond.md) | Deels weerlegd: reserve kost ~7 GiB, 1 GiB vraagt ook een groot werkgeheugen. Fix gebouwd achter `MTPLX_SESSION_BANK_SPIKE_BURSTS` (fb1cd817, standaard uit); hardwareverificatie volgens rapport. Handmatige omweg: cache leegmaken via de beheerroute reset de piek |
 | 9 | Eén verzoek tegelijk (`decode_batch_max = 1`) | idem | Uitzoeken of batching met MTP samen kan, en wat het oplevert voor meerdere agents |
 | 10 | 19 tests falen op een schone `main` in deze omgeving (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`) | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Oorzaak bekijken (lokale modelcache?); eventueel melden bij de maker |
 | 11 | Health meldt `ssd_prefix_miss` terwijl de echte oorzaak in het werkgeheugen ligt | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Echte afwijsreden rapporteren; kandidaat voor een kleine upstream-PR |
@@ -32,6 +32,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 25 | Vaste overhead van ~50 ms per verzoek onverklaard | idem | Client-kloktijd vs `prompt_eval_time_s`/`server_elapsed_s`; py-spy (sudo) |
 | 26 | Jinja-template-render kost ~40 ms bij 78K tokens en domineert nu de chat-encode | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Incrementeel renderen onderzoeken (grotere wijziging) |
 | 27 | Memo-sleutel merkt een ter plekke gewijzigde woordenschat niet op | idem | `len(tokenizer)` aan de sleutel toevoegen vóór de PR |
+| 28 | Werkgeheugen W in rust onbekend; als W ≥ 9 GiB is dat het echte probleem | [bankplafond](2026-09-26-bankplafond.md) | `/v1/mtplx/snapshot` → `mem.generation_working_bytes` uitlezen tijdens gewoon gebruik door Bink en Fleur |
 
 ## Afgehandeld
 
