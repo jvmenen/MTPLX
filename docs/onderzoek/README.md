@@ -90,7 +90,7 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Gepusht (fb1cd817), standaard uit; eerst werkgeheugen meten |
 | `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Gepusht (fe32206c), live getoetst; besluit over PR open (vondst 31) |
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
-| `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht (3916836e); op de echte server gecontroleerd (26 sep), PR-akkoord open |
-| `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig), PR-akkoord open |
+| `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht; PR [#534](https://github.com/youssofal/MTPLX/pull/534) ingediend |
+| `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig); geen PR, blijft staan als bewijs |
 | `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
