@@ -73,7 +73,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [opschonen-prefix-helpers](2026-09-26-opschonen-prefix-helpers.md) | Snellere prefixvergelijking, één lezer per instelling |
 | 2026-09-26 | [optimalisaties](2026-09-26-optimalisaties.md) | Gerangschikte optimalisaties met effect, snelle winsten en wat niet de moeite is |
 | 2026-09-26 | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Top-K zonder volledige log-softmax (bitgelijk, 1,2× sneller); waarom bredere blokken fout gaan (MoE-routering) |
-| 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren |
+| 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren; servermeting en afronding voor de PR |
 | 2026-09-26 | [bankplafond](2026-09-26-bankplafond.md) | Waarom het plafond van de session bank wegzakt en een voorzichtige fix |
 
 ## Takken
@@ -85,7 +85,7 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
 | `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
-| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht (6b3bbf54); meting op echte server open |
+| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht (9dd094d8), bijgewerkt op main 1de2b1c0, gemeten op de echte server; PR-tekst klaar, wacht op akkoord |
 | `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Gepusht (fb1cd817), standaard uit; eerst werkgeheugen meten |
 | `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Gepusht (fe32206c), live getoetst; besluit over PR open (vondst 31) |
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
