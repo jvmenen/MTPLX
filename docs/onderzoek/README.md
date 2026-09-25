@@ -21,7 +21,7 @@ Zie [VONDSTEN.md](VONDSTEN.md): een lopende lijst met vondsten waar we nog naar 
 
 | Tak | Inhoud | Status |
 |---|---|---|
-| `feat/first-token-logprobs` | Eerste-token-logprobs, 27 tests | Lokaal gecommit (3c3f3aaf), live getoetst |
+| `feat/first-token-logprobs` | Eerste-token-logprobs, 27 tests | PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
 | `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Lokaal gecommit (fe32206c), live getoetst |
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling | Lokaal gecommit (d32c77b2, 412e1571) |
 | `test/classifier-live` | Beide featuretakken samengevoegd voor de live test | Lokaal |

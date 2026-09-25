@@ -6,7 +6,6 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 
 | # | Vondst | Bron | Volgende stap |
 |---|---|---|---|
-| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Klaar voor PR: CHANGELOG, API-docs, build, fresh-venv-smoke groen; volledige suite ~9.400 geslaagd, 19 mislukt (alle 19 ook op schone `main`); tak gepusht naar de fork (c1962f4e); PR naar upstream wacht op akkoord Jeroen |
 | 2 | Uitschieters van ~1,5 s op korte generaties | [live-test](2026-09-26-live-test-classifier.md) | Weg met logprobs (p90 590 ms), past bij blank retries; nog apart bewijzen door zonder logprobs met en zonder `seed` te meten |
 | 3 | `/v1/completions` gebruikt de session bank niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md), [live-test](2026-09-26-live-test-classifier.md) | Werkt achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (G3: 276 tokens hergebruikt, 37% sneller); geheugengebruik meten |
 | 4 | Hergebruik alleen in stappen van 512 tokens; 128 instellen via env en CLI werkte niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Oorzaak gevonden (drempel opgehoogd tot blokgrootte, GDN-grensraster, korte prompts zonder grenzen); vlag `--ram-session-prefix-min-match-tokens 128` gebouwd; live toetsen en geheugengebruik per grens meten |
@@ -38,3 +37,4 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 |---|---|---|
 | 2026-09-25 | Vraag en labels vooraan in de prompt voor hergebruik | Slechter op beide modellen (Balance 0,70 tegen 0,72; AUROC 0,92 tegen 0,96); huidige volgorde blijft |
 | 2026-09-25 | Alleen de laatste positie teruggeven bij prompt-scoring | Levert niets op: top-1 of top-20 en de JSON-grootte maken geen meetbaar verschil |
+| 2026-09-26 | Eerste-token-logprobs (vondst 1) | PR ingediend: https://github.com/youssofal/MTPLX/pull/530 |
