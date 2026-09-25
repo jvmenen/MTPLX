@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.token_prefix import common_prefix_len
 
 from .codec import (
     ColdEncodeInterrupted,
@@ -284,14 +285,6 @@ def token_hash(token_ids: tuple[int, ...]) -> str:
     for token in token_ids:
         h.update(int(token).to_bytes(8, byteorder="little", signed=True))
     return h.hexdigest()
-
-
-def common_prefix_len(left: tuple[int, ...], right: tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:

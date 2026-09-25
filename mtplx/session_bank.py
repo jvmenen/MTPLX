@@ -30,6 +30,7 @@ from .cache_state import (
 )
 from .cache_bank.codec import ColdEncodeInterrupted
 from .runtime import MTPLXRuntime
+from .token_prefix import common_prefix_len
 from .runtime_options import (
     DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
     block_prefix_restore_enabled,
@@ -312,14 +313,6 @@ def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
     for token in token_ids:
         h.update(int(token).to_bytes(8, byteorder="little", signed=True))
     return h.hexdigest()
-
-
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
