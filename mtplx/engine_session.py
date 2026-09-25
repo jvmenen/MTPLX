@@ -23,7 +23,6 @@ from typing import Any, Iterator, Mapping
 
 from .session_bank import (
     CacheMissReason,
-    DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
     DEFAULT_IDLE_TTL_S,
     DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_BYTES,
@@ -32,7 +31,10 @@ from .session_bank import (
     SessionBank,
     block_aligned_prefix_len,
 )
-from .runtime_options import block_prefix_restore_enabled
+from .runtime_options import (
+    block_prefix_min_match_tokens,
+    block_prefix_restore_enabled,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -596,7 +598,6 @@ _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 8.0
 _DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
 _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
 _DEFAULT_PREFIX_BLOCK_SIZE = DEFAULT_PREFIX_BLOCK_SIZE
-_DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
 
 
 _DEFAULT_POSTCOMMIT_ARRIVAL_WAIT_S = 0.6
@@ -862,11 +863,7 @@ def _prefix_block_size() -> int:
 
 
 def _block_prefix_min_match_tokens() -> int:
-    return _env_int(
-        "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
-        _DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
-        minimum=1,
-    )
+    return block_prefix_min_match_tokens()
 
 
 @dataclass

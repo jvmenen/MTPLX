@@ -4,6 +4,17 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Short shared prompt prefixes can be reused.** `--ram-session-prefix-min-match-tokens N` (config `ram_session_prefix_min_match_tokens`) sets the shortest prompt prefix the RAM SessionBank restores across requests (default unchanged at 512). On hybrid models a restore needs a recurrent snapshot at or below the shared prefix, so the setting also records one where a prompt stops sharing tokens with the banked entries (`MTPLX_SESSION_SHARED_PREFIX_EDGE`) and banks prompts with at least N new tokens (`MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX`). A classifier or a shared system prompt of a few hundred tokens followed by a varying tail was never reused before. Not yet measured on hardware.
+- **`/v1/completions` can use the SessionBank** with `MTPLX_COMPLETIONS_SESSION_BANK=1`: restore by token prefix and bank the final state, as an anonymous chat request does, under its own session and policy fingerprint. Off by default.
+
+### Fixed
+
+- `MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS` below the block size (256) was silently raised to the block size by the RAM restore lane.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

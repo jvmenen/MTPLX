@@ -10117,6 +10117,11 @@ def cmd_serve_public(args: Any) -> int:
     ssd_min_prefix = getattr(args, "ssd_session_cache_min_prefix_tokens", None)
     if ssd_min_prefix is not None:
         cmd.extend(["--ssd-session-cache-min-prefix-tokens", str(ssd_min_prefix)])
+    ram_prefix_min_match = getattr(args, "ram_session_prefix_min_match_tokens", None)
+    if ram_prefix_min_match is not None:
+        cmd.extend(
+            ["--ram-session-prefix-min-match-tokens", str(ram_prefix_min_match)]
+        )
     adaptive_policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if adaptive_policy != "none":
         cmd.extend(["--adaptive-policy", adaptive_policy])
@@ -11973,6 +11978,14 @@ def _batching_command_suffix(args: Any) -> str:
                     shlex.quote(str(ssd_min_prefix)),
                 ]
             )
+    ram_prefix_min_match = getattr(args, "ram_session_prefix_min_match_tokens", None)
+    if ram_prefix_min_match is not None:
+        parts.extend(
+            [
+                "--ram-session-prefix-min-match-tokens",
+                shlex.quote(str(ram_prefix_min_match)),
+            ]
+        )
     paged_kv_quantization = str(getattr(args, "paged_kv_quantization", "off") or "off")
     if paged_kv_quantization != "off":
         parts.extend(["--paged-kv-quantization", shlex.quote(paged_kv_quantization)])
@@ -13412,6 +13425,7 @@ def _with_batching_args(target: Any, source: Any) -> Any:
         ("ssd_session_cache_dir", None),
         ("ssd_session_cache_max_size", None),
         ("ssd_session_cache_min_prefix_tokens", 512),
+        ("ram_session_prefix_min_match_tokens", None),
     ):
         setattr(target, attr, getattr(source, attr, default))
     return target
@@ -16161,6 +16175,7 @@ def cmd_config_public(args: Any) -> int:
         "prefill_chunk_tokens",
         "ssd_session_cache_min_prefix_tokens",
         "ram_session_cache_max_entries",
+        "ram_session_prefix_min_match_tokens",
         "context_window",
         "top_k",
     }:
