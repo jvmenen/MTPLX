@@ -8,6 +8,7 @@ Deze map hoort bij de fork `jvmenen/MTPLX` en staat op de tak `onderzoek`, los v
 |---|---|---|
 | 2026-09-25 | [metingen-classifier](2026-09-25-metingen-classifier.md) | Waar de tijd per classificatie heen gaat, hergebruik van het promptbegin, promptvolgorde |
 | 2026-09-25 | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Logprobs voor het eerste gegenereerde token op `/v1/completions` en `/v1/chat/completions` (tak `feat/first-token-logprobs`) |
+| 2026-09-26 | [optimalisaties](2026-09-26-optimalisaties.md) | Gerangschikte optimalisaties met effect, snelle winsten en wat niet de moeite is |
 | 2026-09-26 | [live-test-classifier](2026-09-26-live-test-classifier.md) | Live test van beide takken samen op 240 berichten: snelheid, kwaliteit, hergebruik |
 | 2026-09-26 | [opschonen-prefix-helpers](2026-09-26-opschonen-prefix-helpers.md) | Snellere prefixvergelijking, één lezer per instelling (tak `refactor/prefix-helpers`) |
 | 2026-09-25 | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Waarom een kort gedeeld promptbegin niet wordt hergebruikt en hoe 128 instelbaar wordt; completions in de session bank (tak `feat/prefix-reuse-block`) |

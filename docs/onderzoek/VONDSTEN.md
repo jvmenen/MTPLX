@@ -6,7 +6,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 
 | # | Vondst | Bron | Volgende stap |
 |---|---|---|---|
-| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Live getoetst: 228/240 gelijk aan prompt-scoring, 14% sneller; klaar voor een upstream-PR (CHANGELOG-regel, volledige suite, build) |
+| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Afgerond op `feat/first-token-logprobs`: CHANGELOG en API-docs toegevoegd, build en fresh-venv-smoke groen; volledige suite loopt; daarna PR |
 | 2 | Uitschieters van ~1,5 s op korte generaties | [live-test](2026-09-26-live-test-classifier.md) | Weg met logprobs (p90 590 ms), past bij blank retries; nog apart bewijzen door zonder logprobs met en zonder `seed` te meten |
 | 3 | `/v1/completions` gebruikt de session bank niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md), [live-test](2026-09-26-live-test-classifier.md) | Werkt achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (G3: 276 tokens hergebruikt, 37% sneller); geheugengebruik meten |
 | 4 | Hergebruik alleen in stappen van 512 tokens; 128 instellen via env en CLI werkte niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Oorzaak gevonden (drempel opgehoogd tot blokgrootte, GDN-grensraster, korte prompts zonder grenzen); vlag `--ram-session-prefix-min-match-tokens 128` gebouwd; live toetsen en geheugengebruik per grens meten |
@@ -24,6 +24,13 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
 | 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
 | 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
+| 19 | Scoring: top-K via blokmaxima op bf16 en één `logsumexp` per rij (vervangt twee tensors van 254 MB per blok) | [optimalisaties](2026-09-26-optimalisaties.md) | Kleine PR met pariteitstest; meten bij 300/512/550 tokens (sluit aan op 6) |
+| 20 | Scoring: trunk in blokken van 2048 i.p.v. 256, lm_head per 256 rijen | idem | Kleine PR; ~50-75 ms per bespaarde forward |
+| 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
+| 22 | Chat-encode-memo per segment | idem | Kleine PR; 40-55 ms per beurt bij 77k tokens (gemeten basis) |
+| 23 | `sessionbank_put_s` publiceren; put en laatste commit van het kritieke pad halen | idem | Eerst zichtbaar maken (kleine PR), dan verplaatsen |
+| 24 | Laatste pending-commit overslaan voor `anon-completions` | idem | Kleine PR; ~10-20 ms per classificatie |
+| 25 | Vaste overhead van ~50 ms per verzoek onverklaard | idem | Client-kloktijd vs `prompt_eval_time_s`/`server_elapsed_s`; py-spy (sudo) |
 
 ## Afgehandeld
 
