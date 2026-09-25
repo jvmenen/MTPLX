@@ -19382,6 +19382,17 @@ def _engine_busy_signal(state: "ServerState") -> bool:
     return False
 
 
+def _close_spike_burst(state: ServerState) -> None:
+    """A request burst is over: the session bank remembers its spike.
+
+    A no-op unless MTPLX_SESSION_BANK_SPIKE_BURSTS is set (see
+    engine_session._session_bank_recent_spikes).
+    """
+    close = getattr(getattr(state, "sessions", None), "close_spike_burst", None)
+    if callable(close):
+        close()
+
+
 # Sustained-critical prefill abort (#393): this many consecutive guard ticks
 # (~30 s at the 10 s interval) at CRITICAL with the engine busy. One tick is
 # routinely survivable — the trim frees bank/retrieval weight and the
@@ -19565,8 +19576,13 @@ async def _memory_pressure_loop(
     guard = _MemoryPressureGuard()
     abort_streak = 0
     system_level = 1
+    engine_busy = False
     while True:
         try:
+            was_busy = engine_busy
+            engine_busy = await asyncio.to_thread(_engine_busy_signal, state)
+            if was_busy and not engine_busy:
+                _close_spike_burst(state)
             level = await asyncio.to_thread(_memory_pressure_level)
             level_source = "macos"
             allocator_level, allocator_fraction = _allocator_pressure_level(state)

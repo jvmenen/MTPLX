@@ -442,3 +442,106 @@ def test_describe_plan_names_the_machine_bound() -> None:
 def test_detect_total_ram_reports_this_machine() -> None:
     detected = detect_total_ram_bytes()
     assert detected is not None and detected > 8 * GIB
+
+
+# ---------------------------------------------------------------------------
+# the reserve remembers recent bursts, not the lifetime high-water
+
+
+def _production_64g_plan():
+    # The 2.11.3 report: 64 GB M5 Pro, Qwen3.6-35B-A3B 4-bit (~27.6 GiB of
+    # weights) under a 48 GiB Metal limit; the bank's idle max resolves to
+    # the 18.7 GB `max_bytes` that /health showed.
+    return plan_memory(
+        total_ram_bytes=64 * GIB,
+        model_weights_bytes=int(27.6 * GIB),
+        usable_bytes_override=48 * GIB,
+        usable_bytes_explicit=True,
+        model_max_context=FLAGSHIP_MAX_CONTEXT,
+    )
+
+
+def _ceiling(plan, spike: int, working: int) -> int:
+    from mtplx.memory_plan import transient_reserve_bytes
+
+    active = plan.model_weights_bytes + working
+    reserve = transient_reserve_bytes(
+        active + spike,
+        active,
+        play_bytes=plan.usable_bytes - plan.model_weights_bytes,
+    )
+    return bank_dynamic_ceiling(plan, working, transient_bytes=reserve)
+
+
+def test_production_plan_after_a_deep_turn_is_bounded_by_the_cap() -> None:
+    plan = _production_64g_plan()
+    assert plan.bank_idle_max_bytes == 18_683_107_738
+    # A lifetime spike at the play/2 cap (~10.2 GiB) costs the idle bank
+    # 7.2 GiB against the static 3 GiB reserve (9.2 vs 16.4 GiB at 1 GiB of
+    # working set), but on its own it does not reach the floor: that takes
+    # a live working set of about 9.2 GiB on top.
+    assert _ceiling(plan, 16 * GIB, 1 * GIB) == 9_878_424_781
+    assert _ceiling(plan, 0, 1 * GIB) == 17_609_365_914
+    assert _ceiling(plan, 16 * GIB, int(9.1 * GIB)) > BANK_FLOOR_BYTES
+    assert _ceiling(plan, 16 * GIB, int(9.3 * GIB)) == BANK_FLOOR_BYTES
+
+
+def test_recent_spikes_keep_a_deep_burst_for_the_window_then_let_go() -> None:
+    from mtplx.memory_plan import RecentSpikes
+
+    plan = _production_64g_plan()
+    active = plan.model_weights_bytes + 2 * GIB
+    spikes = RecentSpikes(bursts=4)
+    deep = spikes.observe(active + 12 * GIB, active)
+    spikes.close_burst()
+    assert deep == 12 * GIB
+    idle_after_deep = _ceiling(plan, deep, 1 * GIB)
+    for _ in range(4):
+        # Short turns: MLX's peak restarted at the close, so each burst
+        # measures only its own small spike, yet the deep one is held.
+        assert spikes.observe(active + 1 * GIB, active) == 12 * GIB
+        spikes.close_burst()
+    # The fourth short burst's close pushed the deep one out of the window.
+    released = spikes.observe(active + 1 * GIB, active)
+    assert released == 1 * GIB
+    assert _ceiling(plan, released, 1 * GIB) > idle_after_deep
+    # A second deep turn re-arms the reserve at once, mid-burst.
+    assert spikes.observe(active + 11 * GIB, active) == 11 * GIB
+
+
+def test_recent_spikes_never_shrink_within_an_open_burst() -> None:
+    from mtplx.memory_plan import RecentSpikes
+
+    spikes = RecentSpikes(bursts=2)
+    # The bank demoting entries during the burst lowers active and raises
+    # the reading; a later reading with a higher active never lowers it.
+    assert spikes.observe(40 * GIB, 34 * GIB) == 6 * GIB
+    assert spikes.observe(40 * GIB, 31 * GIB) == 9 * GIB
+    assert spikes.observe(40 * GIB, 38 * GIB) == 9 * GIB
+
+
+def test_recent_spikes_after_a_peak_reset_fall_back_to_the_static_floor() -> None:
+    from mtplx.memory_plan import (
+        RUNTIME_TRANSIENTS_BYTES,
+        RecentSpikes,
+        transient_reserve_bytes,
+    )
+
+    spikes = RecentSpikes(bursts=1)
+    spikes.close_burst()
+    # Right after mx.reset_peak_memory() the peak reads below active.
+    spike = spikes.observe(0, 30 * GIB)
+    assert spike == 0
+    assert transient_reserve_bytes(30 * GIB + spike, 30 * GIB) == (
+        RUNTIME_TRANSIENTS_BYTES
+    )
+
+
+def test_recent_spikes_keep_the_play_cap() -> None:
+    from mtplx.memory_plan import RecentSpikes, transient_reserve_bytes
+
+    spikes = RecentSpikes(bursts=8)
+    spike = spikes.observe(60 * GIB, 30 * GIB)
+    assert transient_reserve_bytes(
+        30 * GIB + spike, 30 * GIB, play_bytes=18 * GIB
+    ) == 9 * GIB

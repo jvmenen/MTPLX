@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -729,6 +730,34 @@ def transient_reserve_bytes(
     if play_bytes is not None and int(play_bytes) > 0:
         cap = min(cap, max(RUNTIME_TRANSIENTS_BYTES, int(play_bytes) // 2))
     return max(RUNTIME_TRANSIENTS_BYTES, min(cap, spike))
+
+
+class RecentSpikes:
+    """The largest allocation spike of the last few request bursts.
+
+    Fed the lifetime high-water, ``transient_reserve_bytes`` keeps one deep
+    turn's spike for the whole serve, and ``peak - active`` only grows as
+    the bank demotes entries after that turn (active falls, the peak
+    stays), so the reserve settles at its cap. This measures the spike per
+    burst instead: the server closes a burst when the engine goes idle and
+    restarts MLX's peak counter, so every burst starts from zero. The
+    largest spike of the last ``bursts`` bursts stays reserved, so a deep
+    prefill still guards the next one until that many bursts have passed
+    without one.
+    """
+
+    def __init__(self, bursts: int) -> None:
+        self._closed: deque[int] = deque(maxlen=max(1, int(bursts)))
+        self._open = 0
+
+    def observe(self, peak_bytes: int, active_bytes: int) -> int:
+        """Record a reading of the open burst; return the spike to reserve."""
+        self._open = max(self._open, int(peak_bytes) - int(active_bytes))
+        return max([self._open, *self._closed])
+
+    def close_burst(self) -> None:
+        self._closed.append(self._open)
+        self._open = 0
 
 
 def bank_dynamic_ceiling(

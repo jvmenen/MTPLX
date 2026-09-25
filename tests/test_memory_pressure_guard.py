@@ -405,3 +405,29 @@ def test_bank_shrink_protect_active_never_evicts_the_live_session():
     evicted = bank.shrink_to_bytes(0, reason="memory_pressure_critical")
     assert evicted == 2
     assert bank.total_nbytes == 0
+
+
+def test_spike_burst_closes_only_on_the_busy_to_idle_edge(monkeypatch):
+    closes = []
+    busy_by_tick = iter([True, True, False, False, False])
+    monkeypatch.setattr(srv, "_memory_pressure_level", lambda: 1)
+    monkeypatch.setattr(
+        srv, "_engine_busy_signal", lambda state: next(busy_by_tick, False)
+    )
+    state = make_state(FakeBank(total=0, max_bytes=8 << 30))
+    state.sessions.close_spike_burst = lambda: closes.append(1)
+
+    async def five_ticks():
+        task = asyncio.ensure_future(
+            srv._memory_pressure_loop(state, interval_s=0.01)
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(five_ticks())
+    # One burst, one close: idle ticks after the edge are not bursts.
+    assert closes == [1]

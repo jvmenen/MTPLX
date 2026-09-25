@@ -4,6 +4,33 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_SESSION_BANK_SPIKE_BURSTS=N` lets the session bank's spike
+  reserve forget a deep turn** (opt-in, default off). The dynamic bank
+  ceiling reserves the allocation spike this process has seen, read as
+  MLX's lifetime peak minus current active memory. After one deep prefill
+  that reading never comes down, and it grows as the bank demotes entries
+  (active falls, the peak stays), so it settles at its cap of half the
+  post-weights memory for the rest of the serve. With `N` set, the memory
+  guard closes a burst when the engine goes idle, remembers that burst's
+  spike and restarts MLX's peak counter; the reserve is the largest spike
+  of the last `N` bursts, never below the static 3 GiB and never above the
+  existing cap. A deep turn therefore still guards the next `N` bursts,
+  and a new deep prefill re-arms it within the burst. Opt-in because the
+  reset changes every `peak_memory_bytes` reading to "since the engine was
+  last idle", and because after `N` quiet bursts the first new deep
+  prefill meets a fuller bank, the situation behind the 2026-08-29 banner
+  receipts. Analysed, not measured: for a 64 GB Mac with a 48 GiB Metal
+  limit and 27.6 GiB of weights (bank idle max 17.4 GiB), the capped
+  reserve of 10.2 GiB holds the idle ceiling at 10.2 GiB minus the working
+  set instead of 17.4 GiB minus it; the 1 GiB floor seen on such a Mac also
+  needs a working set of 9.2 GiB or more at that moment, which this change
+  does not affect. Unit tests cover the burst window, the caps and the
+  guard's busy-to-idle edge; nothing was measured on hardware.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
