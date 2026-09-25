@@ -4,6 +4,22 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`sessionbank_put_s` in the request stats.** The generation-final
+  session-bank put of the serial lane runs on the model-owner thread before
+  the response's terminal frame, but its wall time appeared nowhere:
+  `elapsed_s` is taken before the put, and only the batched lanes published
+  their puts (`ar_batch_row_bank_put_s`,
+  `mtp_batch_prompt_boundary_bank_put_s`). The serial lane now stamps
+  `sessionbank_put_s` (seconds, rounded to 6 digits) in `mtplx_stats` and in
+  the metrics row behind `/v1/mtplx/snapshot`, next to
+  `sessionbank_snapshot_bytes`. The key is present only when that put ran,
+  so responses without a bank commit keep their exact envelope. Timing only;
+  no behavior change (unit tests with a stub bank, no model run).
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
