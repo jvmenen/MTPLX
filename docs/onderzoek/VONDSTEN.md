@@ -26,10 +26,12 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 19 | Scoring: top-K via blokmaxima (commit A) | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Echt getoetst: bitgelijk (243/243, verschil 0), ~10% sneller; klaar voor PR |
 | 20 | Scoring: trunk in prefill-blokken (commit B) | idem | Echt getoetst: 1,25× sneller maar FOUT (213/243, logprob-verschil 19,85, ook binnen het eerste blok); oorzaak in onderzoek, niet indienen |
 | 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
-| 22 | Chat-encode-memo per segment | idem | Kleine PR; 40-55 ms per beurt bij 77k tokens (gemeten basis) |
+| 22 | Chat-encode-memo per segment | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Gebouwd (6b3bbf54): tokeniseren bij 78K van 51,9 naar 2,3 ms, exact; volledige suite en TTFT op echte server nog meten, daarna PR |
 | 23 | `sessionbank_put_s` publiceren; put en laatste commit van het kritieke pad halen | idem | Eerst zichtbaar maken (kleine PR), dan verplaatsen |
 | 24 | Laatste pending-commit overslaan voor `anon-completions` | idem | Kleine PR; ~10-20 ms per classificatie |
 | 25 | Vaste overhead van ~50 ms per verzoek onverklaard | idem | Client-kloktijd vs `prompt_eval_time_s`/`server_elapsed_s`; py-spy (sudo) |
+| 26 | Jinja-template-render kost ~40 ms bij 78K tokens en domineert nu de chat-encode | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Incrementeel renderen onderzoeken (grotere wijziging) |
+| 27 | Memo-sleutel merkt een ter plekke gewijzigde woordenschat niet op | idem | `len(tokenizer)` aan de sleutel toevoegen vóór de PR |
 
 ## Afgehandeld
 
