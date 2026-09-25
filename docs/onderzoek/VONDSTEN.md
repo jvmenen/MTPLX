@@ -10,7 +10,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 3 | `/v1/completions` gebruikt de session bank niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md), [live-test](2026-09-26-live-test-classifier.md) | Werkt achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (G3: 276 tokens hergebruikt, 37% sneller); geheugengebruik meten |
 | 4 | Hergebruik alleen in stappen van 512 tokens; 128 instellen via env en CLI werkte niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Oorzaak gevonden (drempel opgehoogd tot blokgrootte, GDN-grensraster, korte prompts zonder grenzen); vlag `--ram-session-prefix-min-match-tokens 128` gebouwd; live toetsen en geheugengebruik per grens meten |
 | 5 | Chatroute zonder voorgevuld `Antwoord:` is minder nauwkeurig (0,58 tegen 0,68) | idem | Kijken of de chatroute een voorgevuld assistent-antwoord ondersteunt, of een ander promptpatroon dat hetzelfde doet |
-| 6 | `score_prompt_logprobs` bouwt per blok een volledige float32-log-softmax (~250 MB) | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Top-K op bf16 met één `logsumexp` per rij; meten wat het scheelt |
+| 6 | `score_prompt_logprobs` bouwt per blok een volledige float32-log-softmax | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Opgelost in 19 |
 | 7 | `_run_generation` (~650 regels) en de completions-handler (~500 regels) zijn lastig leesbaar | idem | Kandidaat voor een aparte opschoon-PR: antwoordopbouw en streamlus uitlichten |
 | 8 | Plafond van de session bank zakt naar 1 GiB door een piekreserve die nooit daalt | [metingen-classifier](2026-09-25-metingen-classifier.md) | Nagaan of de reserve na verloop van tijd mag afnemen (piek resetten na een rustige periode) |
 | 9 | Eén verzoek tegelijk (`decode_batch_max = 1`) | idem | Uitzoeken of batching met MTP samen kan, en wat het oplevert voor meerdere agents |
@@ -23,8 +23,8 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
 | 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
 | 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
-| 19 | Scoring: top-K via blokmaxima op bf16 en één `logsumexp` per rij (vervangt twee tensors van 254 MB per blok) | [optimalisaties](2026-09-26-optimalisaties.md) | Kleine PR met pariteitstest; meten bij 300/512/550 tokens (sluit aan op 6) |
-| 20 | Scoring: trunk in blokken van 2048 i.p.v. 256, lm_head per 256 rijen | idem | Kleine PR; ~50-75 ms per bespaarde forward |
+| 19 | Scoring: top-K via blokmaxima, één `logsumexp` per rij | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Gebouwd (dc9c0e3e): GPU 9-14× sneller per blok, waarden bitgelijk; echte toets loopt |
+| 20 | Scoring: trunk in prefill-blokken | idem | Gebouwd (736d9480) achter `MTPLX_PROMPT_SCORE_TRUNK_CHUNK`; pariteit op testmodel bitgelijk; echte toets loopt (let op piekgeheugen ~4,7 GiB bij 8k) |
 | 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
 | 22 | Chat-encode-memo per segment | idem | Kleine PR; 40-55 ms per beurt bij 77k tokens (gemeten basis) |
 | 23 | `sessionbank_put_s` publiceren; put en laatste commit van het kritieke pad halen | idem | Eerst zichtbaar maken (kleine PR), dan verplaatsen |
