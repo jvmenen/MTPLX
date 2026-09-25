@@ -27,7 +27,6 @@ from .session_bank import (
     DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
-    DEFAULT_PREFIX_BLOCK_SIZE,
     SessionBank,
     block_aligned_prefix_len,
 )
@@ -35,6 +34,9 @@ from .token_prefix import common_prefix_len
 from .runtime_options import (
     block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
+    near_prefix_max_token_gap,
+    near_prefix_min_match_tokens,
+    prefix_block_size,
 )
 
 
@@ -588,9 +590,6 @@ def is_background_request(
 
 
 _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 8.0
-_DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
-_DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
-_DEFAULT_PREFIX_BLOCK_SIZE = DEFAULT_PREFIX_BLOCK_SIZE
 
 
 _DEFAULT_POSTCOMMIT_ARRIVAL_WAIT_S = 0.6
@@ -809,31 +808,12 @@ def _postcommit_wait_timeout_s() -> float:
     return value
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(int(minimum), value)
-
-
 def _near_prefix_max_token_gap() -> int:
-    return _env_int(
-        "MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP",
-        _DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
-        minimum=0,
-    )
+    return near_prefix_max_token_gap()
 
 
 def _near_prefix_min_match_tokens() -> int:
-    return _env_int(
-        "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS",
-        _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
-        minimum=1,
-    )
+    return near_prefix_min_match_tokens()
 
 
 def _block_prefix_restore_enabled() -> bool:
@@ -848,11 +828,7 @@ def _block_prefix_restore_enabled() -> bool:
 
 
 def _prefix_block_size() -> int:
-    return _env_int(
-        "MTPLX_SESSION_PREFIX_BLOCK_SIZE",
-        _DEFAULT_PREFIX_BLOCK_SIZE,
-        minimum=1,
-    )
+    return prefix_block_size()
 
 
 def _block_prefix_min_match_tokens() -> int:

@@ -14,6 +14,7 @@ All notable user-facing changes to MTPLX. The format is based on
 ### Fixed
 
 - `MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS` below the block size (256) was silently raised to the block size by the RAM restore lane.
+- The prefill admission guard estimated block-prefix reuse with the default threshold (512) and block size (256), ignoring `MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS` (and `--ram-session-prefix-min-match-tokens`) and `MTPLX_SESSION_PREFIX_BLOCK_SIZE`, which the restore itself honours. With a lowered threshold it treated a restorable short shared prefix as a full miss; with a raised one it counted reuse the restore would refuse. Unchanged when neither variable is set.
 
 ## [2.12.0] - 2026-09-23
 

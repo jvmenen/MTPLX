@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.runtime_options import (
+    DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+    DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
+)
 from mtplx.token_prefix import common_prefix_len
 
 from .codec import (
@@ -1043,8 +1047,8 @@ class SessionBankColdTier:
         mtp_history_policy: str | None = None,
         draft_head_identity: str | None = None,
         policy_fingerprint: str | None = None,
-        max_token_gap: int = 8,
-        min_matched_tokens: int = 64,
+        max_token_gap: int = DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+        min_matched_tokens: int = DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
         block_size: int = DEFAULT_BLOCK_SIZE,
         block_min_matched_tokens: int = DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
         allow_block_prefix: bool = True,

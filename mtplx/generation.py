@@ -116,8 +116,12 @@ from .runtime_options import (
     block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
     env_bool,
+    near_prefix_max_token_gap,
+    near_prefix_min_match_tokens,
+    prefix_block_size,
     qwen4_opdiet_enabled,
     shared_prefix_edge_enabled,
+    store_on_prefill_min_suffix,
 )
 from .route_tape import RouteTape, counter_deltas
 
@@ -4569,14 +4573,14 @@ def _restore_near_prefix_prompt_state(
     candidates = getattr(session_bank, "near_prefix_candidates", None)
     if not callable(candidates):
         return None
-    max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
-    min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    max_gap = near_prefix_max_token_gap()
+    min_match = near_prefix_min_match_tokens()
     block_prefix_enabled = (
         block_prefix_restore_enabled()
         if allow_block_prefix is None
         else bool(allow_block_prefix)
     )
-    block_size = max(1, _env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", 256))
+    block_size = prefix_block_size()
     block_min_match = block_prefix_min_match_tokens()
     candidates_seen = 0
     _prefix_restore_fn = getattr(session_bank, "restore_entry_prefix_cache", None)
@@ -5582,11 +5586,7 @@ def _store_on_prefill_env_enabled() -> bool:
 
 
 def _store_on_prefill_min_suffix() -> int:
-    raw = os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX", "1024")
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return 1024
+    return store_on_prefill_min_suffix()
 
 
 def _shared_prefix_edge(session_bank: Any, prompt_ids: list[int]) -> int | None:

@@ -366,6 +366,32 @@ BLOCK_PREFIX_MIN_MATCH_ENV = "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS"
 SHARED_PREFIX_EDGE_ENV = "MTPLX_SESSION_SHARED_PREFIX_EDGE"
 STORE_ON_PREFILL_MIN_SUFFIX_ENV = "MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX"
 DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX = 1024
+#: Token block a block-prefix restore rewinds to (the last full block under
+#: the shared prefix).
+PREFIX_BLOCK_SIZE_ENV = "MTPLX_SESSION_PREFIX_BLOCK_SIZE"
+DEFAULT_PREFIX_BLOCK_SIZE = 256
+#: Near-prefix lane: a stored prefix may run this many tokens past the
+#: shared prefix (tokenizer-boundary drift at the end of a transcript) ...
+NEAR_PREFIX_MAX_TOKEN_GAP_ENV = "MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP"
+DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
+#: ... provided the prompt shares at least this many tokens with it.
+NEAR_PREFIX_MIN_MATCH_ENV = "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS"
+DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
+
+
+def _env_int_at_least(name: str, default: int, *, minimum: int) -> int:
+    """``name`` as an int, floored at ``minimum``.
+
+    Unset, empty or unparsable yields ``default``.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(minimum, int(str(raw).strip()))
+    except ValueError:
+        return default
 
 
 def block_prefix_min_match_tokens() -> int:
@@ -376,13 +402,43 @@ def block_prefix_min_match_tokens() -> int:
     by. Unset, empty or unparsable yields the default; the floor is 1.
     """
 
-    raw = os.environ.get(BLOCK_PREFIX_MIN_MATCH_ENV)
-    if raw is None or not str(raw).strip():
-        return DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
-    try:
-        return max(1, int(str(raw).strip()))
-    except ValueError:
-        return DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
+    return _env_int_at_least(
+        BLOCK_PREFIX_MIN_MATCH_ENV, DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS, minimum=1
+    )
+
+
+def prefix_block_size() -> int:
+    """The single parse of ``MTPLX_SESSION_PREFIX_BLOCK_SIZE`` (floor 1)."""
+
+    return _env_int_at_least(PREFIX_BLOCK_SIZE_ENV, DEFAULT_PREFIX_BLOCK_SIZE, minimum=1)
+
+
+def near_prefix_max_token_gap() -> int:
+    """The single parse of ``MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP`` (floor 0)."""
+
+    return _env_int_at_least(
+        NEAR_PREFIX_MAX_TOKEN_GAP_ENV, DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP, minimum=0
+    )
+
+
+def near_prefix_min_match_tokens() -> int:
+    """The single parse of ``MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS`` (floor 1)."""
+
+    return _env_int_at_least(
+        NEAR_PREFIX_MIN_MATCH_ENV, DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS, minimum=1
+    )
+
+
+def store_on_prefill_min_suffix() -> int:
+    """The single parse of ``MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX`` (floor 1).
+
+    A prefill banks its prompt state only when at least this many tokens
+    were newly prefilled.
+    """
+
+    return _env_int_at_least(
+        STORE_ON_PREFILL_MIN_SUFFIX_ENV, DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX, minimum=1
+    )
 
 
 def shared_prefix_edge_enabled() -> bool:
