@@ -175,10 +175,12 @@ from mtplx.profiles import (
 from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     apply_session_prefix_min_match_env,
+    block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
     canonicalize_flag_tokens,
     env_bool,
     normalize_paged_kv_quantization,
+    prefix_block_size,
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
@@ -21751,18 +21753,15 @@ _PREFILL_ADMISSION_PRESSURE_FRACTION = 0.97
 def _block_restorable_prefix_tokens(matched_tokens: int) -> int:
     """Tokens a block-prefix restore serves from a ``matched_tokens`` common
     prefix: rewound to the block edge, zero under the restore floor. Mirrors
-    the block path of ``SessionBank.near_prefix_candidates`` (conservative
-    for kvcache-v2 entries, which restore at any token)."""
-    from mtplx.session_bank import (
-        DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
-        DEFAULT_PREFIX_BLOCK_SIZE,
-        block_aligned_prefix_len,
-    )
+    the block path of ``SessionBank.near_prefix_candidates`` with the block
+    size and threshold the decode loop passes it (conservative for
+    kvcache-v2 entries, which restore at any token)."""
+    from mtplx.session_bank import block_aligned_prefix_len
 
     aligned = block_aligned_prefix_len(
-        max(0, int(matched_tokens)), block_size=DEFAULT_PREFIX_BLOCK_SIZE
+        max(0, int(matched_tokens)), block_size=prefix_block_size()
     )
-    if aligned < DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS:
+    if aligned < block_prefix_min_match_tokens():
         return 0
     return int(aligned)
 
@@ -25444,6 +25443,16 @@ def _completions_session_bank_kwargs(state: Any) -> dict[str, Any]:
     }
 
 
+#: Shortest prompt whose prefix state is committed to the bank before decode
+#: (tool-free requests with the SSD tier on). 512 matches the cold tier's
+#: default minimum prefix (``DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS``) and the
+#: default block-prefix restore threshold, so a short prompt does not pay a
+#: pre-decode snapshot copy the SSD tier would not store and a follow-up
+#: could not block-restore from by default. A lower
+#: ``--ssd-session-cache-min-prefix-tokens`` does not lower it.
+_PROMPT_PREFIX_COMMIT_MIN_TOKENS = 512
+
+
 def _commit_prompt_prefix_for_request(
     state: Any,
     *,
@@ -25456,8 +25465,11 @@ def _commit_prompt_prefix_for_request(
         return False
     tier = getattr(state, "session_bank_cold_tier", None)
     if tier is not None and bool(getattr(tier, "enabled", False)):
-        min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
-        return len(prompt_ids) >= max(512, min_prefix_tokens)
+        min_prefix_tokens = int(
+            getattr(tier, "min_prefix_tokens", _PROMPT_PREFIX_COMMIT_MIN_TOKENS)
+            or _PROMPT_PREFIX_COMMIT_MIN_TOKENS
+        )
+        return len(prompt_ids) >= max(_PROMPT_PREFIX_COMMIT_MIN_TOKENS, min_prefix_tokens)
     # Without the SSD tier a copying store skips this commit for plain chat:
     # it would snapshot views the answer's first decode write then copies.
     # The one-copy store banks the prompt as a lease plus one recurrent anchor
@@ -25466,7 +25478,7 @@ def _commit_prompt_prefix_for_request(
     # diverges where the assistant turn starts). Skipping it left every
     # follow-up at the first turn's prompt, re-reading one more answer each
     # turn (#291, with --ssd-session-cache off).
-    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
+    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= _PROMPT_PREFIX_COMMIT_MIN_TOKENS
 
 
 def _anonymous_coding_agent_tool_request(
