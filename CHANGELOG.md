@@ -10,6 +10,25 @@ All notable user-facing changes to MTPLX. The format is based on
 
 - **Chat requests no longer build the whole vocabulary to check for Gemma 4.** `is_gemma4_tokenizer` runs on every chat encode and, for any tokenizer that is not Gemma 4, fell through to `tokenizer.get_vocab()`, which builds a dict of every token on each call: ~47 ms for the 248k-token Qwen3.6 tokenizer. The marker tokens are now looked up one by one through the `tokenizers` backend (`token_to_id`, ~15 us); `get_vocab()` stays the fallback for tokenizers without a fast backend. Detection is unchanged (checked on the Gemma 4 and Qwen3.6 pack tokenizers) and the encoded ids are identical. CPU only, Qwen3.6-35B-A3B Optimized Balance tokenizer, M5 Pro, 2026-09-26, median of 7: `_encode_messages` 52.7 -> 0.1 ms for a 46-token chat, 60.0 -> 6.9 ms at 10K tokens and 129.0 -> 61.3 ms at 80K. On a running server (turbo, fan mode default, 1de2b1c0 plus this change) the time from request arrival to the start of generation for a 396-token chat fell from 51 to 2 ms and the client time for `max_tokens: 1` from 503 to 448 ms (10 requests). Host tests in `tests/test_gemma4_tokenizer_probe.py`.
 
+- **Prompt scoring picks its top-K without a full-vocabulary log-softmax.**
+  `/v1/completions` with `echo`, `logprobs` and `max_tokens: 0` used to
+  build a float32 log-softmax over all 248,320 logits of every row and
+  partition all of it. It now takes one float32 logsumexp per row, finds
+  the top-K ids by the largest value per 64-logit block (only the K best
+  blocks can hold the top K), and subtracts the logsumexp only at those ids
+  and at the scored token. The logprobs are bitwise the same values; the
+  ids are the same except where the K-th value is an exact tie, and exact
+  ties now list by ascending token id instead of an unspecified order.
+  Measured on synthetic tensors only (256 x 248,320 random bf16 logits, one
+  scoring chunk, M5 Pro): 47 ms -> 3.4 to 5.2 ms per chunk on the GPU for
+  K 1 to 128, and 420 ms -> 150 to 170 ms on the CPU. On the real model
+  (M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo,
+  depth 2, fan mode default, logprobs 20, fresh server per run, 2026-09-26)
+  against 2.12.0 over 240 prompts of 250-840 tokens plus ~2k, ~4k and ~8k
+  token prompts: every scored position bitwise equal (121,263 of 121,263,
+  largest logprob difference 0), p50 432 ms vs 536 ms below 512 tokens,
+  521 ms vs 630 ms at 512-1,023 tokens, 7.55 s vs 8.84 s at ~8k tokens.
+
 ### Fixed
 
 - **A well-formed bare tool call after tool results is no longer retried as orphan tool markup.** A call whose arguments strip to one short token (`count_lines` with `part=2`, a single path) left nothing but that token once the tags were removed, so the tool-fed retry re-ran the turn with an extra nudge message. Under scoped reasoning history that message re-renders every earlier assistant turn, so the retry prompt diverged at token 663 and re-prefilled the new tool result, or the whole history. The retry now stands down when the tool parser finds a call, as the reasoning-only and stalled-promise repairs already do. Unseeded requests only, which includes every `/v1/messages` request. Measured on Apple M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX-Optimized-Balance, profile turbo, fan mode default, 2026-09-26, base 1de2b1c0: a streamed agent loop alternating ~17K-token and short tool results from 10K to 77K tokens, `max_tokens` 1024, TTFT on turns with a long tool result 30.0/32.9/67.6/86.6 s -> 11.3/15.0/17.9/19.8 s, short turns 3.2-25.0 s -> 0.2-0.4 s; one generation per turn instead of two or three. `MTPLX_TOOL_FED_RETRY_PARSED_CALL_GUARD=0` restores the old behaviour.
