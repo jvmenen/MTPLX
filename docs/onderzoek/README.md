@@ -78,16 +78,16 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 
 ## Takken
 
-Alleen de takken met "gepusht" of een PR staan in de fork op GitHub; de rest bestaat alleen lokaal op de Mac in `~/Dev/MTPLX` en de worktrees `~/Dev/MTPLX-<onderwerp>` (zie vondst 32).
+Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lokaal werken ze in `~/Dev/MTPLX` en de worktrees `~/Dev/MTPLX-<onderwerp>`.
 
 | Tak | Inhoud | Status |
 |---|---|---|
 | `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
 | `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
-| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Alleen lokaal (6b3bbf54); meting op echte server open |
-| `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Alleen lokaal (fb1cd817), standaard uit; eerst werkgeheugen meten |
-| `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Alleen lokaal (fe32206c), live getoetst; besluit over PR open (vondst 31) |
-| `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Alleen lokaal (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
-| `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Alleen lokaal, alleen voor metingen |
+| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht (6b3bbf54); meting op echte server open |
+| `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Gepusht (fb1cd817), standaard uit; eerst werkgeheugen meten |
+| `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Gepusht (fe32206c), live getoetst; besluit over PR open (vondst 31) |
+| `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
+| `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
