@@ -65,3 +65,33 @@ De agent van de eerste-token-logprobs noemde blank retries als sterkste spoor (4
 - `common_prefix_len` (`session_bank.py:317`) is een Python-lus die per entry meerdere keren per verzoek draait; één keer per verzoek omzetten en een numpy-vergelijking scheelt tijd.
 - De echte afwijsreden in het werkgeheugen rapporteren in plaats van `ssd_prefix_miss`.
 - De twee bijna identieke `_run_generation_dispatched`-aanroepen in de chat-handler (~33120-33200) kunnen een gedeelde kwargs-helper krijgen, zoals completions nu heeft.
+
+## Echte afwijsreden uit het werkgeheugen (26 september 2026, vondst 11)
+
+Tak `fix/prefix-miss-reason`, commit `3916836e`, gebaseerd op `origin/main` 1de2b1c0 (2.12.0), gepusht naar de fork. Worktree `~/Dev/MTPLX-afwijsreden`. **Alleen code gelezen en unit-tests, niet gemeten op een echte server of een echt model.**
+
+### Oorzaak
+
+- `ssd_prefix_miss` wordt gezet door de SSD-laag (`cache_bank/cold_tier.py:1039` en `:1137`). `SessionBank._restore_cold` neemt die over in `last_miss_reason` (`session_bank.py:2687` op main) en overschrijft zo de reden uit het werkgeheugen.
+- `near_prefix_candidates` slaat entries over zonder reden (`session_bank.py:1400-1416` op main): gedeeld begin onder `block_min_match` (= max(blokgrootte, drempel)), een hybride entry zonder GDN-grenzen waarvan het herstelpunt naar een blokrand zakt, of een uitgeschakelde bloklaan. De diagnose zegt dan alleen `prefix_divergence_at_token` (`:1560-1565`).
+- `_restore_near_prefix_prompt_state` wijst kandidaten af (`boundary_not_better`, `identity_mismatch`, `missing_committed_mtp_history`, `restore_failed`, ...), maar die namen gingen alleen naar stderr met `MTPLX_DEBUG_PREFIX_DIVERGENCE` (`generation.py:4612-4735` op main).
+
+### Wijziging
+
+- `session_bank.py:329` `block_prefix_skip_reason()`: `below_block_min_match:<N>` (met de drempel die echt gold, dus ook de stille ophoging naar 256), `no_gdn_boundaries`, `block_prefix_disabled` of `prefix_divergence_at_token`. Aanroepen op `:1425` en `:1444`; terugval op de generieke reden op `:1601`.
+- `session_bank.py:2214`: `/health` toont `session_bank.last_ram_miss_reason`, afgeleid van `last_prefix_diagnostic["ram_miss_reason"]`.
+- `generation.py:4533` `_note_near_prefix_miss()` en `:4644` `_near_reject()`: de eerste afwijzing (beste kandidaat) wordt bewaard en bij een mislukte laan in de diagnose gezet (`:4985`).
+- `last_miss_reason` houdt zijn betekenis (`ssd_prefix_miss` blijft staan als de SSD echt mist). Geen rekengedrag of keuze van kandidaten veranderd, geen nieuwe schakelaars.
+- CHANGELOG: regel onder `## [Unreleased]` (Fixed).
+
+### Tests
+
+- Nieuw `tests/test_ram_miss_reason.py`, 17 tests, alle groen: per reden de juiste melding, `ssd_prefix_miss` naast de bewaarde werkgeheugenreden, beste kandidaat wint, diagnose ongemoeid zonder kandidaten.
+- Volledige suite: 9.380 geslaagd, 67 overgeslagen, 19 mislukt: precies de nulmeting (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`).
+- Ruff: geen nieuwe meldingen (`session_bank.py` 28 en `generation.py` 72, gelijk aan main; nieuw testbestand schoon). `python -m build` en `scripts/fresh_venv_smoke.sh` geslaagd.
+
+### Open
+
+- Op de echte server controleren dat `/health` na een kort gedeeld begin `last_ram_miss_reason: below_block_min_match:512` toont naast `last_miss_reason: ssd_prefix_miss`, en na een verzoek met een hybride entry zonder grenzen `boundary_not_better:0` of `no_gdn_boundaries`.
+- Niet opgelost: afwijzingen van een exacte entry in `restore()` zelf (`model_mismatch`, `template_mismatch`, ...) worden nog steeds door de SSD-reden overschreven, en de per-verzoek `cache_miss_reason` in het antwoord toont nog alleen `last_miss_reason`.
+- PR alleen na akkoord van Jeroen; tekst klaar in `pr-prefix-miss-reason.md`.

@@ -47,3 +47,57 @@ Uitgangspunten voor de schattingen: model 20 GB (4-bit), woordenschat 248.320, h
 ## Open
 
 De vaste overhead van ~50 ms per verzoek is niet toegewezen. Eerste stap: kloktijd bij de client vergelijken met `mtplx_stats.prompt_eval_time_s` en `server_elapsed_s`; daarna één `py-spy`-opname (vraagt sudo) buiten een GPU-meting.
+
+## Tijd van de laatste session-bank-put zichtbaar (26 september 2026, vondst 23 stap 1)
+
+Tak `feat/sessionbank-put-timing` (worktree `~/Dev/MTPLX-putstijd`), gebaseerd op `origin/main` 1de2b1c0. Commit dbb4bfea, gepusht naar de fork.
+
+### Wat er verandert
+
+- `mtplx/server/openai.py:26250-26265` (`_run_generation`): `perf_counter()` rond de laatste `session_bank.put` na een beurt; de duur komt als `stats["sessionbank_put_s"]` (afgerond op 6 cijfers, zelfde idioom als de batchlanes) naast `sessionbank_snapshot_bytes`.
+- `mtplx/server/openai.py:20688`: `sessionbank_put_s` in `PUBLIC_MTPLX_STATS_KEYS`, dus zichtbaar in `mtplx_stats` van chat, messages en completions.
+- `mtplx/server/openai.py:26339`: dezelfde sleutel in de lijst die naar de metrics-envelope wordt gekopieerd, dus ook in `state.last_metrics` en daarmee in `/v1/mtplx/snapshot` (`latest`, `recent`, openai.py:18507-18508).
+- De sleutel staat er alleen als die put gedraaid heeft (het "quiet envelope"-idioom van de maker); antwoorden zonder bankcommit blijven byte-gelijk, de goldens veranderen niet.
+- Geen gedragswijziging: de put zelf, de volgorde en de foutafhandeling blijven gelijk. `timing_out` is bewust niet meegegeven: de uitsplitsing (trunk-snapshot, entry-build, cold-enqueue) vraagt een extra publiek veld en de controle `_callable_accepts_keyword` voor testdubbels (zoals openai.py:23215-23216). Dat is een logische vervolgstap als `sessionbank_put_s` groot blijkt.
+
+### Waarom de kost onzichtbaar was (alleen code gelezen)
+
+- `elapsed_s` wordt genomen op openai.py:26197, vóór de put (26251). Dus ook `request_elapsed_s`, `end_to_end_tok_s` en het dashboard missen deze tijd.
+- De batchlanes publiceren hun puts al wel: `ar_batch_prompt_boundary_bank_put_s` (openai.py:4627), `ar_batch_row_bank_put_s` (4679) en `mtp_batch_prompt_boundary_bank_put_s` (24742). De seriële lane, die het standaardverkeer bedient, deed dat niet.
+- Niet in de meting: de MTP-historie-snapshot in `_generation_final_bank_metadata` (openai.py:26245-26249; `snapshot_cache` op regel 23029) die vlak vóór de put draait. Die zit ook op het kritieke pad.
+
+### Tests (gemeten in deze omgeving, testmodel/stubs, geen echt model)
+
+- Nieuw `tests/test_sessionbank_put_timing.py` (2 tests): met een stubbank waarvan de put 20 ms duurt, staat `sessionbank_put_s` als float van minstens 20 ms in de requeststats, in `_public_mtplx_stats` en in de laatste metrics-rij; zonder final state (geen put) ontbreekt de sleutel overal. De eerste test faalt zonder de wijziging.
+- Goldens (`test_request_observability_golden.py`) en `test_api_benchmark_contracts.py`: 44 geslaagd, ongewijzigd.
+- Volledige suite: ongeveer 9.365 geslaagd, 67 overgeslagen, 19 mislukt; precies de nulmeting (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`), geen nieuwe. Gerichte set (nieuwe test, goldens, contracten, `test_no_mlx_imports`, `test_runtime_kpis`): 68 geslaagd.
+- Ruff over `mtplx` en `tests`: 2665 meldingen, gelijk aan `main`.
+- `python -m build` en `scripts/fresh_venv_smoke.sh`: geslaagd.
+
+### Te meten op de echte server (nog niet gedaan)
+
+- `sessionbank_put_s` per beurt op Qwen3.6-35B-A3B (Balance) bij oplopende contextlengte (2k, 8k, 32k) en bij agentbeurten met tools, verse server per variant; naast `ttft_s`, `elapsed_s` en de klantgemeten totale tijd, zodat zichtbaar wordt, welk deel van de staart de put is.
+- Of `MTPLX_SESSION_LAZY_SNAPSHOT` (standaard aan, session_bank.py:88) de put al goedkoop maakt; zo ja, dan is stap 2 weinig waard.
+- Classifierverkeer (`anon-completions`): hoe vaak de put daar draait en wat hij kost.
+
+### Stap 2: de put van het kritieke pad halen (niet gebouwd, alleen code gelezen)
+
+Waar hij nu staat:
+
+- `_run_generation` draait via `_run_generation_dispatched` (openai.py:25352) als foreground-werk op de model-owner-thread (`_submit_foreground_model_work`, 3921; aanroep 25568).
+- De modellock wordt genomen op 25927 en vrijgegeven op 26193; de put op 26251 draait dus zonder `state.lock`, maar nog binnen dezelfde foreground-taak. Het eindframe van de stream (finish_reason, usage, `[DONE]`) en de volgende foreground-taak wachten erop.
+
+Wat nodig zou zijn:
+
+1. **Hergebruik van het bestaande postcommit-pad.** `_store_generation_final_history_snapshot` (openai.py:23095) doet dezelfde commit als idle-postcommit: lock niet-blokkerend (23180), dezelfde `_generation_final_bank_values`/`_metadata`, put met `timing_out` (23215-23217). `_schedule_idle_postcommit_snapshot` (23310) zet het werk op de idle-lane (`_submit_idle_postcommit_model_work`, 4997) en registreert een pending postcommit op de sessie (23644), waar het volgende verzoek van dezelfde sessie begrensd op wacht (32578, 33412).
+2. **Lockvolgorde.** De bank heeft geen eigen lock (geen threading in `session_bank.py`; `_entries` wordt direct gemuteerd op 1169 en `_evict_if_needed` op 1172). Veiligheid komt nu uit de serialisatie op de owner-thread. Een uitgestelde put moet dus op de owner-thread blijven en eerst `state.lock` nemen, dan pas de bank aanraken, in dezelfde volgorde als de foreground (lock op 25927, daarna restore en generatie). Nooit bank vóór lock, en niet blokkerend wachten op de lock vanuit de idle-lane (patroon 23180: bij bezet overslaan en loggen).
+3. **Levensduur van de cache.** De put leest `final_state.final_trunk_cache` en de MTP-cache. Tot de taak draait moeten die buffers vastgehouden worden; het volgende verzoek mag ze niet via donatie overschrijven. Met lazy snapshots is dit al een bekend risico (settle-job, session_bank.py:2220-2320; kopie bij eerste schrijfactie 66 ms/GB volgens het commentaar op 94-102).
+
+Risico's:
+
+- **Cachemisser op de volgende beurt.** Komt de volgende beurt van dezelfde sessie vóór de postcommit, dan moet hij wachten (pending-postcommit) of koud prefillen. Voor agentsessies met korte pauzes kan dat de winst opeten of omkeren.
+- **Geheugen.** Een GB-grote cache blijft langer vastgehouden; onder aanhoudend verkeer kan de idle-lane uitgehongerd raken (zie het commentaar over newest-wins-coalescing bij de cold-enqueue, session_bank.py:2362-2368).
+- **Stats verschuiven.** `sessionbank_snapshot_bytes` en `sessionbank_skipped_oversized_snapshot` zijn bij het antwoord nog niet bekend; ze verhuizen naar `session_postcommit_snapshot`.
+- **Retries.** Paden die al `commit_final_state_to_bank=False` meegeven (openai.py:33683 e.v.) moeten consistent blijven.
+
+Inschatting: pas doen als de meting op het echte model laat zien dat `sessionbank_put_s` een merkbaar deel van de staart is (orde honderden milliseconden). Met lazy snapshots en uitgestelde cold-tier-serialisatie (session_bank.py:2353-2380) is de put waarschijnlijk al grotendeels goedkoop; wat overblijft, is de entry-build en de dispatch, plus de MTP-historie-snapshot vlak ervoor, die buiten deze meting valt. Als hij wel groot is: achter een schakelaar (bijvoorbeeld `MTPLX_DEFER_FINAL_BANK_COMMIT`, standaard uit) het bestaande postcommit-pad gebruiken, niet een nieuw pad bouwen.
