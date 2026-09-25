@@ -25491,6 +25491,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "decode_partitioned_paged_calls",
     "sessionbank_snapshot_bytes",
     "sessionbank_skipped_oversized_snapshot",
+    "sessionbank_put_s",
     "hardware_acceleration_eligible",
     "hardware_acceleration_confirmed",
     "prefill_route",
@@ -31756,6 +31757,7 @@ def _run_generation(
                 final_state,
                 token_count=len(bank_token_ids),
             )
+            put_started = time.perf_counter()
             session_bank.put(
                 runtime=state.runtime,
                 token_ids=bank_token_ids,
@@ -31768,6 +31770,9 @@ def _run_generation(
                 **bank_values,
                 **bank_metadata,
             )
+            # Wall time of this put: it runs on the model-owner thread before
+            # the terminal frame, so it delays the response and the next job.
+            stats["sessionbank_put_s"] = round(time.perf_counter() - put_started, 6)
             stats["sessionbank_snapshot_bytes"] = int(
                 getattr(session_bank, "last_put_nbytes", 0) or 0
             )
@@ -31841,6 +31846,7 @@ def _run_generation(
             "partitioned_paged_calls_by_phase",
             "prefill_partitioned_paged_calls",
             "decode_partitioned_paged_calls",
+            "sessionbank_put_s",
         ):
             if key in stats:
                 envelope[key] = stats[key]
