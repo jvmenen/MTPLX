@@ -74,7 +74,7 @@ Tak `feat/sessionbank-put-timing` (worktree `~/Dev/MTPLX-putstijd`), gebaseerd o
 - Ruff over `mtplx` en `tests`: 2665 meldingen, gelijk aan `main`.
 - `python -m build` en `scripts/fresh_venv_smoke.sh`: geslaagd.
 
-### Te meten op de echte server (nog niet gedaan)
+### Te meten op de echte server (gedaan, zie de controle hieronder)
 
 - `sessionbank_put_s` per beurt op Qwen3.6-35B-A3B (Balance) bij oplopende contextlengte (2k, 8k, 32k) en bij agentbeurten met tools, verse server per variant; naast `ttft_s`, `elapsed_s` en de klantgemeten totale tijd, zodat zichtbaar wordt, welk deel van de staart de put is.
 - Of `MTPLX_SESSION_LAZY_SNAPSHOT` (standaard aan, session_bank.py:88) de put al goedkoop maakt; zo ja, dan is stap 2 weinig waard.
@@ -101,3 +101,23 @@ Risico's:
 - **Retries.** Paden die al `commit_final_state_to_bank=False` meegeven (openai.py:33683 e.v.) moeten consistent blijven.
 
 Inschatting: pas doen als de meting op het echte model laat zien dat `sessionbank_put_s` een merkbaar deel van de staart is (orde honderden milliseconden). Met lazy snapshots en uitgestelde cold-tier-serialisatie (session_bank.py:2353-2380) is de put waarschijnlijk al grotendeels goedkoop; wat overblijft, is de entry-build en de dispatch, plus de MTP-historie-snapshot vlak ervoor, die buiten deze meting valt. Als hij wel groot is: achter een schakelaar (bijvoorbeeld `MTPLX_DEFER_FINAL_BANK_COMMIT`, standaard uit) het bestaande postcommit-pad gebruiken, niet een nieuw pad bouwen.
+
+### Controle op de echte server (26 september 2026)
+
+Gemeten op Apple M5 Pro, 64 GB, Qwen3.6-35B-A3B Balance, profiel turbo (productie-instellingen), verse server vanuit de worktree, commit `dbb4bfea`. Zelfgemaakte neutrale tekst, zonder redeneren, `temperature` 0. Drie herhalingen per punt, mediaan. Een groeiend gesprek: elke beurt voegt tekst toe aan het vorige gesprek, dus de 8k- en 32k-beurt hergebruiken het begin.
+
+| Punt | Prompt (tokens) | Hergebruikt | `sessionbank_put_s` | `ttft_s` | `elapsed_s` | Client (s) | Snapshot |
+|---|---|---|---|---|---|---|---|
+| Chat ~2k | 1.715 | 0 | 0,46 ms | 0,94 | 1,46 | 1,54 | 233 MB |
+| Chat ~8k | 8.156 | 1.650 | 1,28 ms | 3,23 | 3,49 | 3,57 | 636 MB |
+| Chat ~32k | 34.242 | 8.091 | 4,42 ms | 16,34 | 16,68 | 16,86 | 1,29 GB |
+| Agent, beurt met toolaanroep | 2.012 | 0 | 0,49 ms | 1,05 | 1,26 | 1,35 | 240 MB |
+| Agent, beurt na toolresultaat | 2.073 | 2.041 | 0,67 ms | 0,15 | 0,39 | 0,46 | 241 MB |
+| Classificatie `/v1/completions`, `max_tokens` 1 | 384 | 0 | ontbreekt | 0,27 | 0,26 | 1,06 | 0 |
+| Classificatie via prompt-scoring (`echo`, `max_tokens` 0) | 385 | n.v.t. | ontbreekt | n.v.t. | n.v.t. | 0,44 | n.v.t. |
+
+- **Veld zichtbaar (geslaagd).** `sessionbank_put_s` staat in `mtplx_stats` van elk chatantwoord en met dezelfde waarde in `/v1/mtplx/snapshot` → `latest`. Een eerdere reeks die doorschoot naar 10k en 44k tokens gaf 1,4 en 4,8 ms: hetzelfde beeld.
+- **Classificatie.** `max_tokens` 1 met `logprobs` geeft op deze tak HTTP 400 (eerste-token-logprobs zitten in PR #530, niet op main); daarom gemeten zonder `logprobs` en via prompt-scoring. `/v1/completions` gebruikt op main de bank niet (`session_prefill_store.skip_reason: no_bank`), dus er is geen put en de sleutel ontbreekt, zoals bedoeld.
+- **Conclusie.** De put kost 0,5 tot 4,4 ms, ongeveer 0,03% van de beurt bij 32k en hooguit 0,2% bij een korte agentbeurt. De lazy snapshot en de uitgestelde cold-tier-serialisatie maken hem al goedkoop. **Stap 2 (de put van het kritieke pad halen) is de moeite niet**; het verschil tussen client- en `elapsed_s` (70 tot 180 ms) zit ergens anders.
+- **Bijvangst.** Bij `/v1/completions` met `max_tokens` 1 is de clienttijd ~1,06 s tegen `elapsed_s` 0,26 s: ongeveer 0,8 s buiten de gemeten tijd. Past bij vondst 2 en 25; niet verder onderzocht.
+- De server is daarna gestopt; poort 8000 is vrij.

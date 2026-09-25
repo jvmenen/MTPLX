@@ -95,3 +95,19 @@ Tak `fix/prefix-miss-reason`, commit `3916836e`, gebaseerd op `origin/main` 1de2
 - Op de echte server controleren dat `/health` na een kort gedeeld begin `last_ram_miss_reason: below_block_min_match:512` toont naast `last_miss_reason: ssd_prefix_miss`, en na een verzoek met een hybride entry zonder grenzen `boundary_not_better:0` of `no_gdn_boundaries`.
 - Niet opgelost: afwijzingen van een exacte entry in `restore()` zelf (`model_mismatch`, `template_mismatch`, ...) worden nog steeds door de SSD-reden overschreven, en de per-verzoek `cache_miss_reason` in het antwoord toont nog alleen `last_miss_reason`.
 - PR alleen na akkoord van Jeroen; tekst klaar in `pr-prefix-miss-reason.md`.
+
+### Controle op de echte server (26 september 2026)
+
+Gemeten op Apple M5 Pro, 64 GB, Qwen3.6-35B-A3B Balance, profiel turbo (productie-instellingen), verse server vanuit de worktree, commit `3916836e`. Chatverzoeken met zelfgemaakte neutrale tekst, `max_tokens` 8, zonder redeneren.
+
+- **Kort gedeeld begin (geslaagd).** Eerste verzoek 313 tokens, tweede 628 tokens met 296 gedeelde tokens. Het tweede verzoek hergebruikt niets (`cached_tokens` 0). `/health` → `session_bank`:
+  ```json
+  {"last_miss_reason": "ssd_prefix_miss", "last_ram_miss_reason": "below_block_min_match:512",
+   "last_prefix_diagnostic": {"prompt_len": 628, "session_id": "anon-ee650f476bbd8b35", "stored_prefix_len": 315,
+     "common_prefix_tokens": 296, "nearest_boundary_tokens": 256, "near_prefix_gap": 19,
+     "ram_miss_reason": "below_block_min_match:512", "miss_reason": "prefix_divergence_at_token"}}
+  ```
+  Bij het allereerste verzoek staat er terecht `last_ram_miss_reason: new_session`.
+- **Tweede reden (niet op te wekken).** Met een gedeeld begin boven 512 tokens (538 en 649 gedeeld) werd telkens hergebruikt (`block_prefix_boundary_clone`, 512 en 601 tokens uit het werkgeheugen); `last_ram_miss_reason` is dan `null`. Een hybride entry zonder grenzen kwam in deze korte proef niet voor, dus `no_gdn_boundaries` en `boundary_not_better` zijn alleen door de unit-tests gedekt.
+- **Bijvangst (bestaand gedrag, ook op main).** Na een geslaagd hergebruik blijft `last_miss_reason` op `ssd_prefix_miss` van het vorige verzoek staan, terwijl `last_ram_miss_reason` wel naar `null` gaat. De nieuwe waarde is dus het betrouwbaarste signaal van de laatste beurt.
+- De server is daarna gestopt; poort 8000 is vrij.

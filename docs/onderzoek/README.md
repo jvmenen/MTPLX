@@ -86,11 +86,11 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
 | `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
-| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht (9dd094d8), bijgewerkt op main 1de2b1c0, gemeten op de echte server; PR-tekst klaar, wacht op akkoord |
+| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht; PR [#533](https://github.com/youssofal/MTPLX/pull/533) ingediend |
 | `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Gepusht (fb1cd817), standaard uit; eerst werkgeheugen meten |
 | `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Gepusht (fe32206c), live getoetst; besluit over PR open (vondst 31) |
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
-| `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht (3916836e); servercontrole en PR-akkoord open |
-| `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); meting op de echte server en PR-akkoord open |
+| `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht (3916836e); op de echte server gecontroleerd (26 sep), PR-akkoord open |
+| `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig), PR-akkoord open |
 | `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
