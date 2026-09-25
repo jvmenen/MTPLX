@@ -6,7 +6,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 
 | # | Vondst | Bron | Volgende stap |
 |---|---|---|---|
-| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Afgerond op `feat/first-token-logprobs`: CHANGELOG en API-docs toegevoegd, build en fresh-venv-smoke groen; volledige suite loopt; daarna PR |
+| 1 | Eerste-token-logprobs | [live-test](2026-09-26-live-test-classifier.md) | Klaar voor PR: CHANGELOG, API-docs, build, fresh-venv-smoke groen; volledige suite ~9.400 geslaagd, 19 mislukt (alle 19 ook op schone `main`); tak gepusht naar de fork (c1962f4e); PR naar upstream wacht op akkoord Jeroen |
 | 2 | Uitschieters van ~1,5 s op korte generaties | [live-test](2026-09-26-live-test-classifier.md) | Weg met logprobs (p90 590 ms), past bij blank retries; nog apart bewijzen door zonder logprobs met en zonder `seed` te meten |
 | 3 | `/v1/completions` gebruikt de session bank niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md), [live-test](2026-09-26-live-test-classifier.md) | Werkt achter `MTPLX_COMPLETIONS_SESSION_BANK=1` (G3: 276 tokens hergebruikt, 37% sneller); geheugengebruik meten |
 | 4 | Hergebruik alleen in stappen van 512 tokens; 128 instellen via env en CLI werkte niet | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Oorzaak gevonden (drempel opgehoogd tot blokgrootte, GDN-grensraster, korte prompts zonder grenzen); vlag `--ram-session-prefix-min-match-tokens 128` gebouwd; live toetsen en geheugengebruik per grens meten |
@@ -15,7 +15,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 7 | `_run_generation` (~650 regels) en de completions-handler (~500 regels) zijn lastig leesbaar | idem | Kandidaat voor een aparte opschoon-PR: antwoordopbouw en streamlus uitlichten |
 | 8 | Plafond van de session bank zakt naar 1 GiB door een piekreserve die nooit daalt | [metingen-classifier](2026-09-25-metingen-classifier.md) | Nagaan of de reserve na verloop van tijd mag afnemen (piek resetten na een rustige periode) |
 | 9 | Eén verzoek tegelijk (`decode_batch_max = 1`) | idem | Uitzoeken of batching met MTP samen kan, en wat het oplevert voor meerdere agents |
-| 10 | Negen tests in `tests/test_public_cli.py` falen op een schone `main` in deze omgeving | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Oorzaak bekijken (lokale modelcache?); eventueel melden bij de maker |
+| 10 | 19 tests falen op een schone `main` in deze omgeving (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`) | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Oorzaak bekijken (lokale modelcache?); eventueel melden bij de maker |
 | 11 | Health meldt `ssd_prefix_miss` terwijl de echte oorzaak in het werkgeheugen ligt | [prefix-hergebruik](2026-09-25-prefix-hergebruik.md) | Echte afwijsreden rapporteren; kandidaat voor een kleine upstream-PR |
 | 12 | `common_prefix_len` is een Python-lus | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Gedaan op `refactor/prefix-helpers` (tot 3,4x sneller); vierde kopie in `openai._common_prefix_len` nog omzetten |
 | 13 | Gedupliceerde env-lezers en magische 512 | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Grotendeels gedaan; resterend: cold-tier-constanten, `parse_args`-512, bank-limieten, losse bool-parsers |
