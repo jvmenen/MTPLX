@@ -23,7 +23,6 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 16 | Vraag en labels vooraan (nodig voor hergebruik) kost rangschikkingskwaliteit (AUROC ~0,93 tegen 0,965) | [live-test](2026-09-26-live-test-classifier.md) | Andere promptpatronen proberen die hergebruik en een goede rangschikking combineren; per vraag toetsen |
 | 17 | G2 hergebruikte niets, G3 met hetzelfde begin wel | idem | Uitzoeken hoe het dominante gedeelde begin wordt gekozen bij gemengde prompts |
 | 18 | `engine_session` hoogt de drempel nog op tot de blokgrootte, `session_bank` niet meer | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Nagaan of dat bedoeld is |
-| 19 | Scoring: top-K via blokmaxima (commit A) | [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) | Schone PR-tak `feat/prompt-scoring-topk` (ce31ad08) gepusht: tests, build, smoke groen; PR wacht op akkoord Jeroen |
 | 20 | Scoring: trunk in prefill-blokken (commit B) | idem | Teruggedraaid: uitkomst hangt op A3B af van blokgrootte door MoE-routering (geen codefout); hooguit opt-in met standaard 256 |
 | 21 | GDN-grenzen vastleggen binnen de forward voor A3B (nu alleen qwen4_exp) | idem | Grotere klus; ~50-80 ms per warme agentbeurt |
 | 22 | Chat-encode-memo per segment | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Gebouwd (6b3bbf54): tokeniseren bij 78K van 51,9 naar 2,3 ms, exact; volledige suite en TTFT op echte server nog meten, daarna PR |
@@ -42,3 +41,4 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 2026-09-25 | Vraag en labels vooraan in de prompt voor hergebruik | Slechter op beide modellen (Balance 0,70 tegen 0,72; AUROC 0,92 tegen 0,96); huidige volgorde blijft |
 | 2026-09-25 | Alleen de laatste positie teruggeven bij prompt-scoring | Levert niets op: top-1 of top-20 en de JSON-grootte maken geen meetbaar verschil |
 | 2026-09-26 | Eerste-token-logprobs (vondst 1) | PR ingediend: https://github.com/youssofal/MTPLX/pull/530 |
+| 2026-09-26 | Scoring: top-K via blokmaxima (vondst 19) | PR ingediend: https://github.com/youssofal/MTPLX/pull/532 |

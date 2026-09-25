@@ -73,7 +73,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | Tak | Inhoud | Status |
 |---|---|---|
 | `feat/first-token-logprobs` | Eerste-token-logprobs | PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
-| `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht (ce31ad08), op het echte model bitgelijk en 1,2× sneller; PR wacht op akkoord |
+| `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Lokaal; vervangen door `feat/prompt-scoring-topk` |
 | `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Lokaal gecommit (6b3bbf54); meting op echte server open |
 | `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Lokaal gecommit (fb1cd817), standaard uit; eerst werkgeheugen meten |
