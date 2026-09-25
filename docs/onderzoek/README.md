@@ -7,9 +7,15 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 ## Waar te beginnen
 
 1. **[VONDSTEN.md](VONDSTEN.md)**: de lopende werklijst. Open punten met bron en volgende stap; afgehandelde punten onderaan. Kies hier je werk.
-2. **De tabel "Takken in de fork"** hieronder: welke tak welke stand heeft.
+2. **De tabel "Takken"** hieronder: welke tak welke stand heeft.
 3. **Het rapport** dat bij je onderwerp hoort (tabel "Rapporten"), voor de achtergrond en eerdere metingen.
 4. **Achtergrond in één keer**: [metingen-classifier](2026-09-25-metingen-classifier.md) (waar de tijd heen gaat) en [snellere-scoreroute](2026-09-26-snellere-scoreroute.md) (de les over MoE-routering en blokgroottes).
+
+## Over de codebase
+
+- MTPLX wordt grotendeels door AI-agents geschreven onder regie van de maker (Youssof): 30 tot 90 commits per dag, commits met auteur "Claude Code" en "Codex", een map `mistakes/` met lessen voor agents. Verwacht zeer grote bestanden (`server/openai.py` ~39k regels, `generation.py` ~16k), functies van honderden regels, veel env-knoppen, en uitgebreid commentaar met metingen ("receipts").
+- Gevolg voor ons: houd PR's klein en gericht (grote herstructureringen lopen snel achter op `main`), werk takken vlak voor een PR bij, en lees code met agents en file:line-verwijzingen.
+- De maker stuurt op metingen: onderbouw elke wijziging met cijfers van het gedrag dat verandert.
 
 ## Spelregels
 
@@ -39,7 +45,9 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
   - stoppen: `mtplx stop --port 8000`, wachten tot `pgrep -f mtplx.server.openai` leeg is;
   - starten vanuit de worktree: `env PYTHONPATH=<worktree> nohup ~/Dev/MTPLX/.venv/bin/python -P -m mtplx.server.openai ${=ARGS} > log 2>&1 &` met `ARGS=$(cat ~/Dev/laya-nl/mtplx-originele-args.txt)` (de productie-instellingen). In zsh `${=ARGS}` gebruiken, anders komen alle argumenten als één argument binnen. Alleen de venv-python kent `mtplx`.
   - na afloop weer stoppen en poort 8000 vrij laten.
+- **Het platform herstart MTPLX als iemand een ander model vraagt.** Alle gebruikers in het Bink-platform (agents, chat-titels, nachtelijke review) moeten daarom hetzelfde model vragen (Balance); anders wisselt de server heen en weer, en elke wissel kost minuten. Een gestopte productieserver wordt gestart door wie hem het eerst nodig heeft, met het model dat die vraagt.
 - **Meet op een verse server per variant**: de MLX-piekmeting daalt nooit, en caches vertekenen anders de vergelijking.
+- **Geheugen meten:** `/health` toont alleen `session_bank.effective_max_bytes`; actief geheugen, piek en werkgeheugen staan in `/v1/mtplx/snapshot` onder `mem.*`.
 - **Meetmateriaal** (lokaal, niet in de fork): `~/Dev/laya-nl/` met `data/scoring-prompts.jsonl` (240 classifierprompts), `verify_scoring_real.py` (scoreroute oud tegen nieuw), `test_live_classifier.py` en `resultaten/`.
 
 ### Pull requests naar het origineel
@@ -68,16 +76,18 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren |
 | 2026-09-26 | [bankplafond](2026-09-26-bankplafond.md) | Waarom het plafond van de session bank wegzakt en een voorzichtige fix |
 
-## Takken in de fork
+## Takken
+
+Alleen de takken met "gepusht" of een PR staan in de fork op GitHub; de rest bestaat alleen lokaal op de Mac in `~/Dev/MTPLX` en de worktrees `~/Dev/MTPLX-<onderwerp>` (zie vondst 32).
 
 | Tak | Inhoud | Status |
 |---|---|---|
-| `feat/first-token-logprobs` | Eerste-token-logprobs | PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
-| `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
-| `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Lokaal; vervangen door `feat/prompt-scoring-topk` |
-| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Lokaal gecommit (6b3bbf54); meting op echte server open |
-| `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Lokaal gecommit (fb1cd817), standaard uit; eerst werkgeheugen meten |
-| `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Lokaal gecommit (fe32206c), live getoetst |
-| `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Lokaal gecommit (d32c77b2, 412e1571) |
-| `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Lokaal, alleen voor metingen |
-| `onderzoek` | Deze documentatie | Lopend |
+| `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
+| `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
+| `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
+| `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Alleen lokaal (6b3bbf54); meting op echte server open |
+| `fix/bank-ceiling-peak-decay` | Piekreserve van het bankplafond laat afnemen | Alleen lokaal (fb1cd817), standaard uit; eerst werkgeheugen meten |
+| `feat/prefix-reuse-block` | Hergebruik van een promptbegin korter dan 512 tokens, completions in de session bank | Alleen lokaal (fe32206c), live getoetst; besluit over PR open (vondst 31) |
+| `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Alleen lokaal (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
+| `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Alleen lokaal, alleen voor metingen |
+| `onderzoek` | Deze documentatie | Gepusht, lopend |
