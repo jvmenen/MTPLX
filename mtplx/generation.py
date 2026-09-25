@@ -113,9 +113,11 @@ from .sampling import (
 )
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import (
+    block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
     env_bool,
     qwen4_opdiet_enabled,
+    shared_prefix_edge_enabled,
 )
 from .route_tape import RouteTape, counter_deltas
 
@@ -1506,9 +1508,7 @@ def _bank_may_preempt_first_span(session_bank, prompt_ids, span) -> bool:
     probe = getattr(session_bank, "shares_ram_prefix", None)
     if not callable(probe):
         return False
-    block_min_match = max(
-        1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512)
-    )
+    block_min_match = block_prefix_min_match_tokens()
     span_end = int(span[1]) if span is not None else block_min_match
     try:
         return bool(
@@ -4577,10 +4577,7 @@ def _restore_near_prefix_prompt_state(
         else bool(allow_block_prefix)
     )
     block_size = max(1, _env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", 256))
-    block_min_match = max(
-        block_size,
-        _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512),
-    )
+    block_min_match = block_prefix_min_match_tokens()
     candidates_seen = 0
     _prefix_restore_fn = getattr(session_bank, "restore_entry_prefix_cache", None)
     _prefix_restore_supports_served = callable(
@@ -5592,6 +5589,31 @@ def _store_on_prefill_min_suffix() -> int:
         return 1024
 
 
+def _shared_prefix_edge(session_bank: Any, prompt_ids: list[int]) -> int | None:
+    """Where this prompt stops sharing tokens with the banked entries.
+
+    A hybrid model restores a shared prefix only from a recurrent snapshot
+    at or below it, and the prefill records those snapshots on a fixed grid
+    near the prompt end, so a short fixed preamble followed by a varying
+    tail (a classifier, a shared system prompt) never gets one. Passing this
+    length as the prefill's stable edge records one exactly there, and the
+    next prompt with the same preamble restores from it.
+
+    None when the switch is off or no entry shares the block-prefix
+    minimum. The caller's own stable edge, when it has one, takes precedence.
+    """
+
+    if not shared_prefix_edge_enabled():
+        return None
+    probe = getattr(session_bank, "dominant_shared_prefix_tokens", None)
+    if not callable(probe):
+        return None
+    shared = int(probe(prompt_ids, min_tokens=block_prefix_min_match_tokens()))
+    if shared <= 0 or shared >= len(prompt_ids):
+        return None
+    return shared
+
+
 def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any) -> None:
     """Env-gated diagnostic: report where the prompt diverges from each bank entry.
 
@@ -6136,6 +6158,8 @@ def restore_or_prefill_prompt_state(
         # The bank only ever sees the content-keyed view of a vision prompt;
         # for text prompts the two views are the same list.
         bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
+        if stable_prefix_len is None and vision_splice is None:
+            stable_prefix_len = _shared_prefix_edge(session_bank, prompt_ids)
         exact_prefix_len = 0
         try:
             longest_prefix = getattr(session_bank, "longest_prefix", None)

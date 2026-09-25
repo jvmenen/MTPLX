@@ -147,8 +147,10 @@ from mtplx.profiles import (
 )
 from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
+    apply_session_prefix_min_match_env,
     block_prefix_restore_enabled,
     canonicalize_flag_tokens,
+    env_bool,
     normalize_paged_kv_quantization,
     resolve_api_key,
 )
@@ -20283,6 +20285,50 @@ def _session_keep_live_refs_for_request(
     )
 
 
+#: One bank session for every /v1/completions request. A raw completion
+#: carries no conversation identity, and the per-session retention cap then
+#: bounds what completions traffic can hold in the bank.
+COMPLETIONS_SESSION_ID = "anon-completions"
+#: Keeps completions entries and chat entries apart: each endpoint restores
+#: only what it stored itself.
+COMPLETIONS_POLICY_FINGERPRINT = "endpoint=completions"
+
+
+def _completions_session_bank_enabled() -> bool:
+    """``MTPLX_COMPLETIONS_SESSION_BANK``, default OFF.
+
+    Chat requests restore shared prompt prefixes from the session bank and
+    bank their final state; /v1/completions generations did neither and
+    prefilled every prompt cold.
+    """
+
+    return env_bool("MTPLX_COMPLETIONS_SESSION_BANK", default=False)
+
+
+def _completions_session_bank_kwargs(state: Any) -> dict[str, Any]:
+    """Session-bank arguments for a /v1/completions generation, or none.
+
+    The same restore and commit the chat path gets for a request without a
+    client session: restore by token prefix, bank the final state. Snapshot
+    only (no live lease), like every anonymous session, so one-off prompts
+    cannot pin their paged-KV buffers.
+    """
+
+    if not _completions_session_bank_enabled():
+        return {}
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is None:
+        return {}
+    return {
+        "session_id": COMPLETIONS_SESSION_ID,
+        "session_bank": bank,
+        "session_template_hash": getattr(state, "template_hash", None),
+        "session_draft_head_identity": getattr(state, "draft_head_identity", None),
+        "session_policy_fingerprint": COMPLETIONS_POLICY_FINGERPRINT,
+        "session_keep_live_ref": False,
+    }
+
+
 def _commit_prompt_prefix_for_request(
     state: Any,
     *,
@@ -37161,6 +37207,9 @@ def create_app(state: ServerState) -> FastAPI:
                 completions_cross_yield
             )
         stop_sequences = _normalize_stop_sequences(request.stop)
+        completions_bank_kwargs = _completions_session_bank_kwargs(state)
+        if completions_bank_kwargs:
+            request_observability["request_session_source"] = "completions_bank"
         model = state.model_id
         response_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -37240,6 +37289,7 @@ def create_app(state: ServerState) -> FastAPI:
                             prompt_ids,
                             batch_key="completion.stream",
                             response_id=response_id,
+                            **completions_bank_kwargs,
                             max_tokens=request.max_tokens,
                             temperature=sampler_temperature,
                             top_p=sampler_top_p,
@@ -37578,6 +37628,7 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_ids,
                     batch_key="completion",
                     response_id=response_id,
+                    **completions_bank_kwargs,
                     max_tokens=request.max_tokens,
                     temperature=sampler_temperature,
                     top_p=sampler_top_p,
@@ -38380,6 +38431,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum committed prefix length before writing to the SSD SessionBank cache.",
     )
     parser.add_argument(
+        "--ram-session-prefix-min-match-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Shortest shared prompt prefix the RAM SessionBank reuses across "
+            "requests (default 512). Setting it also records recurrent state "
+            "where a prompt stops sharing tokens with banked entries and banks "
+            "prompts with at least this many new tokens, which hybrid models "
+            "need to reuse a short shared prefix."
+        ),
+    )
+    parser.add_argument(
         "--paged-kv-quantization",
         "--paged-kv-quant",
         "--kv-quant",
@@ -39011,6 +39074,9 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
+    apply_session_prefix_min_match_env(
+        getattr(args, "ram_session_prefix_min_match_tokens", None)
+    )
     set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
     _start_aime_parent_watchdog_from_env()
     try:

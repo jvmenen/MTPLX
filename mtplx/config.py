@@ -47,6 +47,7 @@ CONFIG_VALUE_KEYS = (
     "ram_session_cache_max_size",
     "ram_session_cache_per_session_max_size",
     "ram_session_block_prefix_restore",
+    "ram_session_prefix_min_match_tokens",
     "context_window",
     "reasoning",
     "reasoning_effort",
@@ -88,6 +89,7 @@ class UserConfig:
     ram_session_cache_max_size: str | None = None
     ram_session_cache_per_session_max_size: str | None = None
     ram_session_block_prefix_restore: bool | None = None
+    ram_session_prefix_min_match_tokens: int | None = None
     context_window: int | None = None
     reasoning: str | None = None
     reasoning_effort: str | None = None
@@ -205,6 +207,7 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
         ram_session_cache_max_size=read("ram_session_cache_max_size", _str_or_none),
         ram_session_cache_per_session_max_size=read("ram_session_cache_per_session_max_size", _str_or_none),
         ram_session_block_prefix_restore=read("ram_session_block_prefix_restore", _bool_or_none),
+        ram_session_prefix_min_match_tokens=read("ram_session_prefix_min_match_tokens", _int_or_none),
         context_window=read("context_window", _int_or_none),
         reasoning=read("reasoning", _str_or_none),
         reasoning_effort=read("reasoning_effort", _str_or_none),
@@ -335,6 +338,7 @@ _RUNTIME_DEFAULTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "ram_session_cache_max_size": ("ram_session_cache_max_size", ("ram-session-cache-max-size",)),
     "ram_session_cache_per_session_max_size": ("ram_session_cache_per_session_max_size", ("ram-session-cache-per-session-max-size",)),
     "ram_session_block_prefix_restore": ("ram_session_block_prefix_restore", ("ram-session-block-prefix-restore",)),
+    "ram_session_prefix_min_match_tokens": ("ram_session_prefix_min_match_tokens", ("ram-session-prefix-min-match-tokens",)),
     "context_window": ("context_window", ("context-window",)),
     "reasoning": ("reasoning", ("reasoning",)),
     "reasoning_effort": ("reasoning_effort", ("reasoning-effort",)),

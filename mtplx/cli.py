@@ -842,6 +842,17 @@ def _add_ssd_session_cache_args(parser: argparse.ArgumentParser) -> None:
         default=512,
         help="Minimum committed prefix length before writing SSD SessionBank snapshots.",
     )
+    parser.add_argument(
+        "--ram-session-prefix-min-match-tokens",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Shortest shared prompt prefix the RAM SessionBank reuses across "
+            "requests (default 512). Also records recurrent state where a "
+            "prompt stops sharing tokens with banked entries, which hybrid "
+            "models need to reuse a short shared prefix."
+        ),
+    )
 
 
 def _add_paged_kv_quant_args(parser: argparse.ArgumentParser) -> None:
