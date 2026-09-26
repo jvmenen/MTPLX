@@ -139,9 +139,9 @@ def batch_invariant_prefill_refusal(model: Any) -> str | None:
     classes; any other quantized projection (e.g. Prism's
     ``HadamardQuantizedLinear``) keeps its row-count-dependent kernels, and
     a SwitchGLU with few experts stays row dependent despite the padding.
-    Half a lane would let the prefill-sized scoring trunk and the dropped
-    tail grid change results, so the caller installs nothing when this
-    returns a reason.
+    Half a lane would let the prefill-sized scoring trunk, the dropped tail
+    grid and the in-forward GDN boundaries change results, so the caller
+    installs nothing when this returns a reason.
 
     A dense model (no ``SwitchGLU``) is refused with ``dense_model`` unless
     MTPLX_BATCH_INVARIANT_PREFILL_DENSE is set: without routing the lane
