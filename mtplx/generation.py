@@ -8311,6 +8311,7 @@ def generate_ar(
             trace_metadata=trace_metadata,
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
+            first_token_logprobs_top_k=first_token_logprobs_top_k,
         )
     counter_start = _runtime_counter_snapshot(rt)
     first_logprobs: FirstTokenLogprobs | None = None
@@ -9607,6 +9608,7 @@ def generate_mtpk(
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
             requested_speculative_depth=requested_block_size,
+            first_token_logprobs_top_k=first_token_logprobs_top_k,
         )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")

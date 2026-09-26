@@ -25201,7 +25201,6 @@ def _logprobs_top_k_limit() -> int:
 
 
 def _reject_unservable_first_token_logprobs(
-    state: ServerState,
     *,
     top_k: int,
     max_tokens: int | None,
@@ -25247,11 +25246,6 @@ def _reject_unservable_first_token_logprobs(
         raise HTTPException(
             status_code=400,
             detail="logprobs cannot be combined with stop sequences; omit stop",
-        )
-    if _bank_backend_id(state) == GEMMA4_BACKEND:
-        raise HTTPException(
-            status_code=400,
-            detail="logprobs are not supported on the gemma4_assistant backend",
         )
 
 
@@ -32412,7 +32406,6 @@ def create_app(state: ServerState) -> FastAPI:
         first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
         if first_token_logprobs_top_k is not None:
             _reject_unservable_first_token_logprobs(
-                state,
                 top_k=first_token_logprobs_top_k,
                 max_tokens=_request_max_tokens(request),
                 stream=bool(request.stream),
@@ -37356,7 +37349,6 @@ def create_app(state: ServerState) -> FastAPI:
             )
         if requested_logprobs is not None:
             _reject_unservable_first_token_logprobs(
-                state,
                 top_k=requested_logprobs,
                 max_tokens=request.max_tokens,
                 stream=bool(request.stream),
