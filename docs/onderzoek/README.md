@@ -82,6 +82,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [instellingen-36-37-39](2026-09-26-instellingen-36-37-39.md) | KV in q8, kostgestuurde draft-diepte, grenzen afwerpen en de bankknop op de integratietak gemeten: geen van vier in de eindconfig |
 | 2026-09-26 | [chatroute-scoped](2026-09-26-chatroute-scoped.md) | Waarom chat-prefill trager is (extra forward voor de GDN-grens) en per beurt encoderen in scoped modus |
 | 2026-09-26 | [compiled-verify-6bit](2026-09-26-compiled-verify-6bit.md) | Waarom verify op het 6-bit Balance-model eager loopt (voorzichtigheid, geen fout) en wat compiled oplevert: +1 tot +3% decode, bij lange context niet bitgelijk; niet in de eindconfig |
+| 2026-09-26 | [eindbenchmark](2026-09-26-eindbenchmark.md) | 2.11.3 tegen de integratietak (en schone 2.12.0) op het echte model: agentgesprek −64%, scoreroute −17% bitgelijk, eerste-token-logprobs −37% zonder completions-bank, decode +6% van upstream; toewijzing per fix |
 
 ## Takken
 
@@ -106,5 +107,5 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `fix/messages-ttft` | Kale goedgevormde toolaanroep niet meer als orphan markup herhalen (vondst 35) | Gepusht (2f38106b); op de echte server gemeten; PR-besluit open (vondst 43) |
 | `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie` |
-| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd |
+| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd. Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
