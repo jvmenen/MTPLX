@@ -38,13 +38,28 @@ def is_gemma4_tokenizer(tokenizer: Any) -> bool:
             and str(getattr(tokenizer, "eoc_token", "")) == "<channel|>"
         ):
             return True
-        vocab = tokenizer.get_vocab()
-        return all(
-            token in vocab
-            for token in ("<|think|>", "<|channel>", "<channel|>", "<|turn>", "<turn|>")
+        return _vocab_contains_all(
+            tokenizer, ("<|think|>", "<|channel>", "<channel|>", "<|turn>", "<turn|>")
         )
     except Exception:
         return False
+
+
+def _vocab_contains_all(tokenizer: Any, tokens: tuple[str, ...]) -> bool:
+    """Vocabulary membership without materializing the vocabulary.
+
+    ``get_vocab()`` on a fast tokenizer builds a dict of every token on each
+    call (~47 ms for the 248k-token Qwen3.6 tokenizer, once per chat
+    request). The ``tokenizers`` backend answers per token in microseconds;
+    ``get_vocab()`` stays the fallback for tokenizers without one.
+    """
+    for candidate in (tokenizer, getattr(tokenizer, "_tokenizer", None)):
+        backend = getattr(candidate, "backend_tokenizer", None)
+        token_to_id = getattr(backend, "token_to_id", None)
+        if callable(token_to_id):
+            return all(token_to_id(token) is not None for token in tokens)
+    vocab = tokenizer.get_vocab()
+    return all(token in vocab for token in tokens)
 
 
 def encode_without_added_special_tokens(tokenizer: Any, text: str) -> list[int]:
