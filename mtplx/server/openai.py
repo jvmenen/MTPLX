@@ -30276,6 +30276,11 @@ _AGENT_THINKING_BUDGET_BY_EFFORT = {
 }
 
 
+def _thinking_guard_covers_chat() -> bool:
+    """``MTPLX_THINKING_GUARD_SCOPE``: "agent" (default) or "all" (plus chat)."""
+    return os.environ.get("MTPLX_THINKING_GUARD_SCOPE", "agent").strip().lower() == "all"
+
+
 def _thinking_guard_config_for_request(
     state: ServerState,
     *,
@@ -30292,9 +30297,13 @@ def _thinking_guard_config_for_request(
 
     Scope when enabled: requests that declare tools AND have thinking
     enabled (the OpenCode/agent tool loop) — plain chat and no-think
-    requests never get a guard. The guard is a surfaced budget (telemetry
-    key thinking_guard); below the budget decode is bit-exact. Mechanism
-    and the 2026-07-20 chess-marathon forensics: mtplx/thinking_guard.py.
+    requests never get a guard. ``MTPLX_THINKING_GUARD_SCOPE=all`` widens
+    the opt-in to plain chat with thinking enabled (xhigh chat marathons
+    and single-token collapses inside ``<think>`` have the same shape as
+    the agent-lane ones); no-think requests still never get a guard. The
+    guard is a surfaced budget (telemetry key thinking_guard); below the
+    budget decode is bit-exact. Mechanism and the 2026-07-20 chess-marathon
+    forensics: mtplx/thinking_guard.py.
     """
     obs = request_observability or {}
     if not bool(obs.get("request_enable_thinking")):
@@ -30303,7 +30312,7 @@ def _thinking_guard_config_for_request(
         tool_count = int(obs.get("request_tool_count") or 0)
     except (TypeError, ValueError):
         tool_count = 0
-    if tool_count <= 0:
+    if tool_count <= 0 and not _thinking_guard_covers_chat():
         return None
     raw = (
         str(getattr(state.args, "agent_thinking_budget", "off") or "off")

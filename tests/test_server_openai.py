@@ -13758,6 +13758,40 @@ def test_thinking_guard_never_touches_plain_chat_even_opted_in(monkeypatch):
     assert no_tools is None and no_thinking is None
 
 
+
+def test_thinking_guard_scope_all_covers_plain_chat_with_thinking(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": True, "request_tool_count": 0},
+    )
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 2048
+
+
+def test_thinking_guard_scope_all_still_skips_no_think(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": False, "request_tool_count": 0},
+    )
+    assert config is None
+
+
+def test_thinking_guard_scope_all_is_still_opt_in(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": True, "request_tool_count": 0},
+    )
+    assert config is None
+
 # --- parallel_tool_calls wiring ---------------------------------------------
 
 
