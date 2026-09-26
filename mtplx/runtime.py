@@ -869,7 +869,15 @@ def load(
         )
 
         if batch_invariant_prefill_enabled():
+            from .gdn_inforward_boundaries import install_gdn_inforward_boundaries
+
             invariant_report = install_batch_invariant_prefill(model)
+            # Only on the invariant lane: there a wider forward rounds like
+            # the ladder's narrower ones, so recording boundaries inside it
+            # leaves every result unchanged.
+            invariant_report["gdn_inforward_layers"] = (
+                install_gdn_inforward_boundaries(model)
+            )
             logger.info("[batch-invariant-prefill] %s", invariant_report)
         # Must run after MTP injection and after load-coverage validation.
         from .proj_fusion import (
