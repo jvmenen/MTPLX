@@ -86,6 +86,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [compiled-verify-6bit](2026-09-26-compiled-verify-6bit.md) | Waarom verify op het 6-bit Balance-model eager loopt (voorzichtigheid, geen fout) en wat compiled oplevert: +1 tot +3% decode, bij lange context niet bitgelijk; niet in de eindconfig |
 | 2026-09-26 | [eindbenchmark](2026-09-26-eindbenchmark.md) | 2.11.3 tegen de integratietak (en schone 2.12.0) op het echte model: agentgesprek −64%, scoreroute −17% bitgelijk, eerste-token-logprobs −37% zonder completions-bank, decode +6% van upstream; toewijzing per fix |
 | 2026-09-26 | [batch-invariante-router](2026-09-26-batch-invariante-router.md) | Waarom prefill-rijen op A3B afhangen van de blokgrootte (split-K, expert- en SDPA-kernels in MLX, SDPA via `attention_split` onder turbo) en een schakelaar die dat oplost: scoring bitgelijk voor elke blokgrootte vanaf 9 rijen, 1,28× sneller, geen merkbare kosten buiten scoring; aanbevolen voor de eindconfig |
+| 2026-09-26 | [voorrang](2026-09-26-voorrang.md) | Voorrang voor korte verzoeken in de seriële wachtrij (schakelaar, standaard uit); gemeten zonder effect op platformverkeer, omdat de classifier buiten de rij loopt en korte titels HTTP 503 krijgen (voorlopig, her-runs open) |
 
 ## Takken
 
@@ -112,4 +113,5 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie`; PR-besluit open (vondst 50) |
 | `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd (vondst 48). Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
 | `perf/batch-invariant-router` | Batch-invariante prefill (vondst 29), commit B en staartgrenzen alleen met de schakelaar | Gepusht (1ce69614); op de echte server gemeten (26 sep); aanbevolen voor de eindconfig en `perf/integratie`, PR-besluit open |
+| `perf/short-request-priority` | Voorrang voor korte verzoeken in de seriële wachtrij (vondst 54) | Gepusht (67211d39), standaard uit; eerste meting zonder effect op platformverkeer, her-runs open; geen PR |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
