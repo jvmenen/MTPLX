@@ -26163,9 +26163,17 @@ def _run_generation(
         if streaming_response is None
         else bool(streaming_response)
     )
-    # A logprobs request asks for the distribution, not for visible text: a
+    # A blank retry only helps when a fresh seed can change the output. A
+    # greedy decode ignores the seed, so each retry replays the identical
+    # generation (a blank 1-token completion cost four full prefills). A
+    # logprobs request asks for the distribution, not for visible text: a
     # whitespace or stop first token is a valid answer, never a blank to retry.
-    retries_allowed = not response_is_streaming and first_token_logprobs_top_k is None
+    retry_can_change_output = float(sampler.temperature) > 0.0
+    retries_allowed = (
+        retry_can_change_output
+        and not response_is_streaming
+        and first_token_logprobs_top_k is None
+    )
     max_attempts = 1 + blank_retry_budget if retries_allowed else 1
     last: dict[str, Any] | None = None
     trace_preview = (
@@ -26187,6 +26195,8 @@ def _run_generation(
         **(request_observability or {}),
     }
     for attempt in range(max_attempts):
+        # Usage and TTFT describe the returned attempt, not discarded ones.
+        token_times.clear()
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
         smart_fan_lease: str | None = None
