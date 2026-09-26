@@ -130,6 +130,12 @@ class ModelWorkScheduler:
     quiet window; continuous latency-critical work is allowed to defer
     background durability — foreground load already makes absolute
     eventuality impossible.
+
+    Inside the foreground band, items submitted with
+    ``submit_priority_foreground`` (short requests: chat titles, one-token
+    completions) run before plain foreground items, between items and
+    never mid-item. ``priority_max_streak`` bounds how many priority items
+    may pass a waiting plain item in a row, so long requests cannot starve.
     """
 
     # Capability marker for server wiring: submit_idle_persistence exists.
@@ -141,6 +147,7 @@ class ModelWorkScheduler:
         name: str = "mtplx-model",
         idle_grace_s: float | None = None,
         persistence_quiet_grace_s: float = 0.25,
+        priority_max_streak: int | None = None,
     ) -> None:
         self.name = str(name)
         if idle_grace_s is None:
@@ -163,8 +170,14 @@ class ModelWorkScheduler:
                 idle_grace_s = 0.3
         self.idle_grace_s = max(0.0, float(idle_grace_s))
         self.persistence_quiet_grace_s = max(0.0, float(persistence_quiet_grace_s))
+        if priority_max_streak is None:
+            priority_max_streak = _env_int("MTPLX_SCHEDULER_PRIORITY_MAX_STREAK", 4)
+        self.priority_max_streak = max(1, int(priority_max_streak))
         self._condition = Condition()
         self._foreground: deque[_WorkItem] = deque()
+        self._priority: deque[_WorkItem] = deque()
+        self._priority_streak = 0
+        self._priority_passed = 0
         self._idle: deque[_WorkItem] = deque()
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
@@ -237,7 +250,7 @@ class ModelWorkScheduler:
 
     def foreground_pending(self) -> int:
         with self._condition:
-            return len(self._foreground)
+            return len(self._foreground) + len(self._priority)
 
     def persistence_pending(self) -> int:
         """Queued (not running) durability items. Cheap: for the server's
@@ -272,7 +285,7 @@ class ModelWorkScheduler:
 
     def foreground_pending_or_active(self) -> bool:
         with self._condition:
-            return bool(self._foreground) or self._active_kind == "foreground"
+            return self._foreground_queued_locked() or self._active_kind == "foreground"
 
     def any_pending_or_active(self) -> bool:
         """True while the owner thread is executing or has queued work of any
@@ -280,7 +293,7 @@ class ModelWorkScheduler:
         signal for the smart-fan stale-lease reconciler."""
         with self._condition:
             return (
-                bool(self._foreground)
+                self._foreground_queued_locked()
                 or bool(self._idle)
                 or bool(self._persistence)
                 or self._active_kind is not None
@@ -414,7 +427,10 @@ class ModelWorkScheduler:
             )
             return {
                 "idle_keepalive": self._keepalive_state_locked(time.monotonic()),
-                "foreground_pending": len(self._foreground),
+                "foreground_pending": len(self._foreground) + len(self._priority),
+                "priority_pending": len(self._priority),
+                "priority_passed": self._priority_passed,
+                "priority_max_streak": self.priority_max_streak,
                 "idle_pending": len(self._idle),
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
@@ -494,6 +510,28 @@ class ModelWorkScheduler:
             earliest_start_s=time.monotonic(),
         )
 
+    def submit_priority_foreground(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        batch_key: str | None = None,
+        **kwargs: Any,
+    ) -> Future:
+        """Foreground work that runs before queued plain foreground items.
+
+        Admission only: a running item is never interrupted, and after
+        ``priority_max_streak`` consecutive passes the oldest plain item
+        runs first (anti-starvation)."""
+        return self._submit(
+            "foreground",
+            fn,
+            args=args,
+            kwargs=kwargs,
+            batch_key=batch_key,
+            earliest_start_s=time.monotonic(),
+            priority=True,
+        )
+
     def foreground_busy(self) -> bool:
         """True while a foreground item is queued or running.
 
@@ -503,7 +541,7 @@ class ModelWorkScheduler:
         flight. Cheap enough to poll per tensor / per blob write.
         """
         with self._condition:
-            return bool(self._foreground) or self._active_kind == "foreground"
+            return self._foreground_queued_locked() or self._active_kind == "foreground"
 
     def submit_idle_postcommit(
         self,
@@ -567,7 +605,12 @@ class ModelWorkScheduler:
                 # pthread_exit (#303 — see _release_mlx_thread_state).
                 self._park_on_exit = True
             if cancel_futures:
-                for queue in (self._foreground, self._idle, self._persistence):
+                for queue in (
+                    self._priority,
+                    self._foreground,
+                    self._idle,
+                    self._persistence,
+                ):
                     while queue:
                         item = queue.popleft()
                         item.future.cancel()
@@ -585,6 +628,7 @@ class ModelWorkScheduler:
         batch_key: str | None,
         earliest_start_s: float,
         coalesce_key: str | None = None,
+        priority: bool = False,
     ) -> Future:
         future: Future = Future()
         with self._condition:
@@ -620,7 +664,7 @@ class ModelWorkScheduler:
                 # Any armed idle-pump slot must not survive into that
                 # window (issue #290 valve; tail-gap fence intact).
                 self._persistence_pump_budget = 0
-                self._foreground.append(item)
+                (self._priority if priority else self._foreground).append(item)
             elif kind == "idle_persistence":
                 self._persistence.append(item)
             else:
@@ -720,18 +764,37 @@ class ModelWorkScheduler:
                 # GB-scale snapshot views) across the entire idle period.
                 del item
 
+    def _foreground_queued_locked(self) -> bool:
+        return bool(self._foreground) or bool(self._priority)
+
+    def _pop_foreground_locked(self) -> _WorkItem:
+        """Priority items first, but at most ``priority_max_streak`` in a row
+        while a plain foreground item waits; then the oldest plain item."""
+        if not self._priority:
+            self._priority_streak = 0
+            return self._foreground.popleft()
+        if not self._foreground:
+            self._priority_streak = 0
+            return self._priority.popleft()
+        if self._priority_streak < self.priority_max_streak:
+            self._priority_streak += 1
+            self._priority_passed += 1
+            return self._priority.popleft()
+        self._priority_streak = 0
+        return self._foreground.popleft()
+
     def _take_next(self) -> _WorkItem | _KeepaliveTurn | None:
         with self._condition:
             while True:
                 if (
                     self._shutdown
-                    and not self._foreground
+                    and not self._foreground_queued_locked()
                     and not self._idle
                     and not self._persistence
                 ):
                     return None
-                if self._foreground:
-                    return self._foreground.popleft()
+                if self._foreground_queued_locked():
+                    return self._pop_foreground_locked()
                 now = time.monotonic()
                 wait_until: float | None = None
                 if self._idle:
@@ -785,6 +848,13 @@ class ModelWorkScheduler:
                     self._condition.wait(timeout=max(0.0, wait_until - now))
                     continue
                 self._condition.wait()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
 
 
 def _sample_summary(samples: deque[float]) -> dict[str, float | int | None]:

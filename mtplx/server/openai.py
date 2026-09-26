@@ -3934,6 +3934,36 @@ def _submit_foreground_model_work(
     return executor.submit(fn, *args, **kwargs)
 
 
+def _submit_priority_foreground_model_work(
+    state: Any,
+    fn: Callable[..., Any],
+    *,
+    batch_key: str | None = None,
+) -> Any:
+    """Foreground submit that runs ahead of queued plain foreground work."""
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "submit_priority_foreground"):
+        return scheduler.submit_priority_foreground(fn, batch_key=batch_key)
+    return _submit_foreground_model_work(state, fn, batch_key=batch_key)
+
+
+def _is_short_request(prompt_ids: list[int], max_tokens: int | None) -> bool:
+    """Short-request priority (off by default): a small output budget on a
+    short prompt, such as chat titles or one-token completions.
+
+    MTPLX_SHORT_REQUEST_PRIORITY=1 enables it; the limits are
+    MTPLX_SHORT_REQUEST_MAX_TOKENS (64) and
+    MTPLX_SHORT_REQUEST_MAX_PROMPT_TOKENS (4096). Only the admission order
+    between whole requests changes, never a running generation."""
+    if not _env_bool_setting("MTPLX_SHORT_REQUEST_PRIORITY", default=False):
+        return False
+    if max_tokens is None:
+        return False
+    max_output = _env_int("MTPLX_SHORT_REQUEST_MAX_TOKENS", 64)
+    max_prompt = _env_int("MTPLX_SHORT_REQUEST_MAX_PROMPT_TOKENS", 4096)
+    return int(max_tokens) <= max_output and len(prompt_ids) <= max_prompt
+
+
 def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
     mode = str(getattr(args, "ssd_session_cache", "off") or "off").strip().lower()
     if mode == "off":
@@ -25564,11 +25594,11 @@ def _run_generation_dispatched(
             and scheduler.is_owner_thread()
         ):
             return submitted_run()
-        return _submit_foreground_model_work(
-            state,
-            submitted_run,
-            batch_key=batch_key,
-        ).result()
+        submit = _submit_foreground_model_work
+        if _is_short_request(prompt_ids, kwargs.get("max_tokens")):
+            request_observability_for_lane["short_request_priority"] = True
+            submit = _submit_priority_foreground_model_work
+        return submit(state, submitted_run, batch_key=batch_key).result()
     finally:
         # Settles hyper tickets whose work item never started (cancelled
         # futures / submit failures); a no-op for started tickets and for
