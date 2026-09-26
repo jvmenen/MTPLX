@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A blank greedy response is no longer regenerated three more times.** A non-streaming request without a seed whose text was blank after `strip()` (for example `\n\n` as the only token) was retried up to `--blank-retry-attempts` (default 3) times with fresh seeds. At `temperature: 0` the seed has no effect, so every retry replayed the same generation: a `/v1/completions` call with `max_tokens: 1` whose greedy token was `\n\n` ran four full prefills. Blank retries now run only when the target sampler samples (`temperature > 0`); sampled requests keep the retry. `usage.completion_tokens` and `ttft_s` now describe the returned attempt: discarded attempts used to add their tokens, so that 1-token completion reported 4. Measured on an M5 Pro 64 GB with Qwen3.6-35B-A3B Optimized Balance, profile turbo, fan mode default, 2026-09-26, on 1de2b1c0 plus this change, 10 requests of 384 prompt tokens after warm-up: client time median 1061 -> 265 ms (p90 1076 -> 274 ms), `server_attempts` 4 -> 1, `usage.completion_tokens` 4 -> 1, same text; the same request with a `seed` took 272 ms before and 283 ms after. Host tests in `tests/test_blank_retry_greedy.py`.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

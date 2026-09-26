@@ -25872,7 +25872,15 @@ def _run_generation(
         if streaming_response is None
         else bool(streaming_response)
     )
-    max_attempts = 1 if response_is_streaming else 1 + blank_retry_budget
+    # A blank retry only helps when a fresh seed can change the output. A
+    # greedy decode ignores the seed, so each retry replays the identical
+    # generation (a blank 1-token completion cost four full prefills).
+    retry_can_change_output = float(sampler.temperature) > 0.0
+    max_attempts = (
+        1 + blank_retry_budget
+        if retry_can_change_output and not response_is_streaming
+        else 1
+    )
     last: dict[str, Any] | None = None
     trace_preview = (
         str((request_observability or {}).get("request_last_user_preview") or "")
@@ -25893,6 +25901,8 @@ def _run_generation(
         **(request_observability or {}),
     }
     for attempt in range(max_attempts):
+        # Usage and TTFT describe the returned attempt, not discarded ones.
+        token_times.clear()
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
         smart_fan_lease: str | None = None
