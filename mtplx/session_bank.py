@@ -30,8 +30,12 @@ from .cache_state import (
 )
 from .cache_bank.codec import ColdEncodeInterrupted
 from .runtime import MTPLXRuntime
+from .token_prefix import common_prefix_len
 from .runtime_options import (
     DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
+    DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+    DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
+    DEFAULT_PREFIX_BLOCK_SIZE,
     block_prefix_restore_enabled,
 )
 
@@ -115,15 +119,6 @@ def _snapshot_settle_enabled() -> bool:
     """
     raw = str(os.environ.get("MTPLX_SESSION_SNAPSHOT_SETTLE", "0")).strip().lower()
     return raw not in {"0", "false", "off", "no"}
-
-
-def _near_prefix_tiny_gap_limit() -> int:
-    """Token gap treated as tokenizer-boundary drift (long-shipped tolerance)."""
-    raw = os.environ.get("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP")
-    try:
-        return max(0, int(str(raw).strip())) if raw is not None else 8
-    except (TypeError, ValueError):
-        return 8
 
 
 def _boundary_true_restore_enabled() -> bool:
@@ -248,7 +243,6 @@ DEFAULT_MAX_ENTRIES = 24
 DEFAULT_MAX_BYTES = 24 * GIB
 DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
-DEFAULT_PREFIX_BLOCK_SIZE = 256
 DEFAULT_ACTIVE_SESSION_PIN_TTL_S = 600.0
 DEFAULT_PER_SESSION_MAX_ENTRIES = 3
 
@@ -312,14 +306,6 @@ def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
     for token in token_ids:
         h.update(int(token).to_bytes(8, byteorder="little", signed=True))
     return h.hexdigest()
-
-
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
@@ -1376,8 +1362,8 @@ class SessionBank:
         self,
         token_ids: list[int] | tuple[int, ...],
         *,
-        max_token_gap: int = 8,
-        min_matched_tokens: int = 64,
+        max_token_gap: int = DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+        min_matched_tokens: int = DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
         block_size: int = DEFAULT_PREFIX_BLOCK_SIZE,
         block_min_matched_tokens: int = DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
         allow_block_prefix: bool = True,
