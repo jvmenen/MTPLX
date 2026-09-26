@@ -80,6 +80,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [falende-tests](2026-09-26-falende-tests.md) | Waarom 19 tests falen op een schone `main` (gebruikersconfig, geheugen) en de isolatiefix |
 | 2026-09-26 | [messages-ttft](2026-09-26-messages-ttft.md) | Waarom agentbeurten via `/v1/messages` 26-45 s tot het eerste token duren (valse herhaalpoging na een kale toolaanroep) en de fix |
 | 2026-09-26 | [instellingen-36-37-39](2026-09-26-instellingen-36-37-39.md) | KV in q8, kostgestuurde draft-diepte, grenzen afwerpen en de bankknop op de integratietak gemeten: geen van vier in de eindconfig |
+| 2026-09-26 | [chatroute-scoped](2026-09-26-chatroute-scoped.md) | Waarom chat-prefill trager is (extra forward voor de GDN-grens) en per beurt encoderen in scoped modus |
 | 2026-09-26 | [compiled-verify-6bit](2026-09-26-compiled-verify-6bit.md) | Waarom verify op het 6-bit Balance-model eager loopt (voorzichtigheid, geen fout) en wat compiled oplevert: +1 tot +3% decode, bij lange context niet bitgelijk; niet in de eindconfig |
 
 ## Takken
@@ -104,4 +105,6 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `onderzoek-completions-overhead` | Werktak van het overhead-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `fix/messages-ttft` | Kale goedgevormde toolaanroep niet meer als orphan markup herhalen (vondst 35) | Gepusht (2f38106b); op de echte server gemeten; PR-besluit open (vondst 43) |
 | `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
+| `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie` |
+| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
