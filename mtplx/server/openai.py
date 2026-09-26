@@ -14682,6 +14682,64 @@ def _chat_segment_vocab_size(tokenizer: Any) -> str | None:
         return None
 
 
+_CHAT_TURN_OPEN = "<|im_start|>"
+
+
+def _encode_rendered_chat_turns(
+    tokenizer: Any,
+    rendered: str,
+    template_observability: dict[str, Any] | None,
+) -> list[int]:
+    """Encode a render without generation seams turn by turn.
+
+    Scoped reasoning history renders plain chat without seams, so the whole
+    transcript was tokenized in one call every request and the segment memo
+    never applied. Cutting before each ``<|im_start|>`` gives the single-call
+    ids exactly: an atomic added token is split out before normalization and
+    pre-tokenization, so no merge crosses it.
+    """
+    if not _chat_turn_segments_enabled(tokenizer):
+        return _encode_rendered_chat_text(tokenizer, rendered)
+    return _encode_rendered_chat_text_segmented(
+        tokenizer,
+        rendered,
+        _chat_turn_boundaries(rendered),
+        template_observability=template_observability,
+    )
+
+
+def _chat_turn_boundaries(rendered: str) -> list[int]:
+    boundaries: list[int] = []
+    at = rendered.find(_CHAT_TURN_OPEN, 1)
+    while at > 0:
+        boundaries.append(at)
+        at = rendered.find(_CHAT_TURN_OPEN, at + 1)
+    return boundaries
+
+
+def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
+    """Env MTPLX_CHAT_TURN_SEGMENTS=off disables; only useful with the memo."""
+    if not _env_bool_setting("MTPLX_CHAT_TURN_SEGMENTS", default=True):
+        return False
+    return GLOBAL_CHAT_SEGMENT_MEMO.enabled() and _chat_turn_open_is_atomic(tokenizer)
+
+
+def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:
+    """True when ``<|im_start|>`` is an added token the tokenizer never
+    normalizes or strips around, so encoding stops and restarts at it."""
+    try:
+        added = tokenizer.added_tokens_decoder.values()
+    except AttributeError:
+        return False
+    return any(
+        getattr(token, "content", None) == _CHAT_TURN_OPEN
+        and getattr(token, "normalized", True) is False
+        and getattr(token, "lstrip", True) is False
+        and getattr(token, "rstrip", True) is False
+        for token in added
+    )
+
+
 def _encode_generation_compatible_tool_history(
     tokenizer: Any,
     normalized: list[dict[str, Any]],
@@ -15187,7 +15245,9 @@ def _encode_messages_uncached(
             template_observability=template_observability,
         )
         if rendered is not None:
-            return _encode_rendered_chat_text(tokenizer, rendered)
+            return _encode_rendered_chat_turns(
+                tokenizer, rendered, template_observability
+            )
     if (
         template_observability is not None
         and template_observability.get("tool_result_continuation_hint_injected") is True
@@ -15217,7 +15277,9 @@ def _encode_messages_uncached(
         # Seam-less thinking render (single-turn / no assistant history):
         # identical bytes to the template call below — encode the render the
         # unified branch already produced instead of rendering twice.
-        return _encode_rendered_chat_text(tokenizer, seam_rendered)
+        return _encode_rendered_chat_turns(
+            tokenizer, seam_rendered, template_observability
+        )
     template_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,

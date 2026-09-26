@@ -47,6 +47,7 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Changed
 
+- **Plain chat reuses the segment memo under scoped reasoning history.** With scoped history a chat without tools renders no generation seams, so the whole transcript was tokenized in one call every request and the per-segment encode memo never applied. Such renders are now encoded turn by turn, cut before each `<|im_start|>`: an atomic added token (not normalized, no strip) is split out before normalization and pre-tokenization, so the ids are exactly the single-call ids, and only the new turns are tokenized. Applies only when the memo is on and the tokenizer has such a token; `MTPLX_CHAT_TURN_SEGMENTS=off` restores the single call. Measured on CPU only (M5 Pro, Qwen3.6-35B-A3B tokenizer and chat template, scoped history, growing chat of 10K to 80K tokens, median of 7, 2026-09-26): `_encode_messages` at 80K from 66 ms to 1.3 ms for a short follow-up and from 67 ms to 7 ms after a 7K-token turn; token ids identical on 8,088 generated conversations (unicode, empty messages, reasoning, system prompts, literal markers).
 - **Prompt scoring picks its top-K without a full-vocabulary log-softmax.**
   `/v1/completions` with `echo`, `logprobs` and `max_tokens: 0` used to
   build a float32 log-softmax over all 248,320 logits of every row and
