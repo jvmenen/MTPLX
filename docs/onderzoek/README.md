@@ -84,6 +84,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [chatroute-scoped](2026-09-26-chatroute-scoped.md) | Waarom chat-prefill trager is (extra forward voor de GDN-grens) en per beurt encoderen in scoped modus |
 | 2026-09-26 | [compiled-verify-6bit](2026-09-26-compiled-verify-6bit.md) | Waarom verify op het 6-bit Balance-model eager loopt (voorzichtigheid, geen fout) en wat compiled oplevert: +1 tot +3% decode, bij lange context niet bitgelijk; niet in de eindconfig |
 | 2026-09-26 | [eindbenchmark](2026-09-26-eindbenchmark.md) | 2.11.3 tegen de integratietak (en schone 2.12.0) op het echte model: agentgesprek −64%, scoreroute −17% bitgelijk, eerste-token-logprobs −37% zonder completions-bank, decode +6% van upstream; toewijzing per fix |
+| 2026-09-26 | [batch-invariante-router](2026-09-26-batch-invariante-router.md) | Waarom prefill-rijen op A3B afhangen van de blokgrootte (split-K, expert- en SDPA-kernels in MLX) en een schakelaar die dat oplost; gepauzeerd met tussenstand |
 
 ## Takken
 
@@ -109,4 +110,5 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie`; PR-besluit open (vondst 50) |
 | `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd (vondst 48). Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
+| `perf/batch-invariant-router` | Batch-invariante prefill (vondst 29), commit B en staartgrenzen alleen met de schakelaar | Gepusht (2c1e653f); gepauzeerd, zie [batch-invariante-router](2026-09-26-batch-invariante-router.md) |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
