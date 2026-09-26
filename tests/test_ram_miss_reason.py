@@ -72,14 +72,18 @@ def test_shared_prefix_below_the_block_minimum_names_the_threshold():
     assert bank.last_prefix_diagnostic["common_prefix_tokens"] == 220
 
 
-def test_threshold_is_reported_after_the_silent_raise_to_the_block_size():
-    # MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS=128 is raised to the block
-    # size (256); the reason shows the minimum that actually applied.
+def test_threshold_below_the_block_size_applies_as_given():
+    # A MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS below the block size (256)
+    # is no longer raised to it: 128 serves the 220-token shared start, and a
+    # miss names the minimum that actually applied.
     bank = _bank()
     _put(bank, SHARED + list(range(80)))
 
-    assert _candidates(bank, SHARED + [7] * 100, block_min_matched_tokens=128) == []
-    assert _ram_reason(bank) == "below_block_min_match:256"
+    assert _candidates(bank, SHARED + [7] * 100, block_min_matched_tokens=240) == []
+    assert _ram_reason(bank) == "below_block_min_match:240"
+
+    hits = _candidates(bank, SHARED + [7] * 100, block_min_matched_tokens=128)
+    assert [matched for _entry, matched in hits] == [220]
 
 
 def test_hybrid_entry_without_gdn_boundaries_is_named():
