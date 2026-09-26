@@ -17904,11 +17904,16 @@ def _health_degradation_payload(state: Any) -> dict[str, Any]:
     except Exception:
         demotions = "unknown"
 
+    # The invariant prefill lane: its install report, or why it stays off
+    # (e.g. a quantized projection class the lane cannot cover).
+    from mtplx.batch_invariant_prefill import batch_invariant_prefill_status
+
     return {
         "compiled_verify": compiled_verify,
         "profile_env_overridden": profile_env_overridden,
         "nax": nax,
         "demotions": demotions,
+        "batch_invariant_prefill": batch_invariant_prefill_status(),
     }
 
 

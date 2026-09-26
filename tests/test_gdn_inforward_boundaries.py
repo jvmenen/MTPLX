@@ -40,7 +40,7 @@ SWITCH = "MTPLX_GDN_BOUNDARY_INFORWARD"
 needs_metal = pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
 
 
-def _tiny_model() -> qwen3_5_moe.Model:
+def _tiny_model(experts: int = 32, top_k: int = 4) -> qwen3_5_moe.Model:
     text = {
         "model_type": "qwen3_5_moe_text",
         "hidden_size": 128,
@@ -55,8 +55,8 @@ def _tiny_model() -> qwen3_5_moe.Model:
         "linear_value_head_dim": 64,
         # 32 experts, top 4: with 8 experts MLX picks another expert kernel
         # below 33 tokens even on the lane, which A3B (256 experts) never does.
-        "num_experts": 32,
-        "num_experts_per_tok": 4,
+        "num_experts": experts,
+        "num_experts_per_tok": top_k,
         "moe_intermediate_size": 64,
         "shared_expert_intermediate_size": 64,
         "intermediate_size": 64,
@@ -119,6 +119,7 @@ def lane(monkeypatch):
     monkeypatch.setattr(base, "scaled_dot_product_attention", base.scaled_dot_product_attention)
     monkeypatch.setitem(bip._STOCK_SDPA, "sdpa", None)
     monkeypatch.setitem(bip._STATE, "installed", False)
+    monkeypatch.setitem(bip._STATE, "refusal", None)
     # Small numbers so a 160-token prompt has a real ladder: chunks of 96,
     # rungs of 8 on an 8-token grid, the nearest boundary 3 tokens before the
     # end, and a restore floor low enough to keep the cold tail grid.
@@ -250,8 +251,48 @@ def test_without_the_invariant_lane_there_are_no_hooks(lane, monkeypatch):
 def test_the_runtime_installs_the_hooks_only_with_the_lane():
     source = Path(generation.__file__).with_name("runtime.py").read_text()
     lane_block = source.split("if batch_invariant_prefill_enabled():", 1)[1].split("logger.info", 1)[0]
-    assert "install_gdn_inforward_boundaries(model)" in lane_block
+    assert "_install_batch_invariant_lane(model)" in lane_block
+    helper = source.split("def _install_batch_invariant_lane(", 1)[1].split("\ndef ", 1)[0]
+    refused, installed = helper.split("return\n", 1)
+    assert "install_gdn_inforward_boundaries(model)" not in refused
+    assert "install_gdn_inforward_boundaries(model)" in installed
     assert source.count("install_gdn_inforward_boundaries(") == 1
+
+
+def test_the_runtime_installs_lane_and_hooks_on_the_a3b_layout(lane):
+    from mtplx import runtime
+
+    model = _tiny_model()
+    runtime._install_batch_invariant_lane(model)
+    assert bip.batch_invariant_prefill_installed() is True
+    assert isinstance(model.language_model.model.layers[0].linear_attn, gib._BoundaryCaptureMixin)
+    assert generation._resolve_inforward_boundary_hooks(_Runtime(model)) is not None
+    status = bip.batch_invariant_prefill_status()
+    assert status["installed"] is True
+    assert status["gdn_inforward_layers"] == 3
+    assert status["switch_glus"] == 4
+
+
+def test_a_refused_model_gets_neither_lane_nor_hooks(lane, monkeypatch):
+    from mtplx import runtime
+
+    # 8 experts, top 2: the SwitchGLU padding is not row invariant there.
+    model = _tiny_model(experts=8, top_k=2)
+    before = [type(module) for _name, module in model.named_modules()]
+    runtime._install_batch_invariant_lane(model)
+    assert [type(module) for _name, module in model.named_modules()] == before
+    assert bip.batch_invariant_prefill_installed() is False
+    assert not hasattr(model, "boundary_capture_scope")
+    assert bip.batch_invariant_prefill_status() == {
+        "installed": False,
+        "reason": "switch_glu_experts:8",
+    }
+    # The chunk layout stays the ladder's, as without the switch.
+    prompt = _prompt(231, seed=11)
+    rt, *_rest = _warm(model, prompt, 60, inforward=True, monkeypatch=monkeypatch)
+    plan = generation._prefill_spans_with_tail_grid(170, tail_interval=8, chunk_size=96)
+    assert rt.forwards == [end - start for start, end in plan] + [1]
+    assert "prefill_inforward_boundary_captures" not in rt.diagnostic_counters
 
 
 def test_zero_restores_the_ladder(lane, monkeypatch):

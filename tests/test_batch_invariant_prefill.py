@@ -7,6 +7,8 @@ where the stock kernels are known to differ (router 256 x 2048 in 8 bit).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 from mlx import nn
@@ -245,6 +247,7 @@ def test_install_swaps_classes_without_touching_parameters(monkeypatch):
     monkeypatch.setattr(base, "scaled_dot_product_attention", stock_sdpa)
     monkeypatch.setitem(bip._STOCK_SDPA, "sdpa", None)
     monkeypatch.setitem(bip._STATE, "installed", False)
+    monkeypatch.setitem(bip._STATE, "refusal", None)
 
     class Tiny(nn.Module):
         def __init__(self):
@@ -289,3 +292,88 @@ def test_cold_tail_grid_is_dropped_below_the_restore_floor_only_with_the_lane(
     monkeypatch.delenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", raising=False)
     monkeypatch.setitem(bip._STATE, "installed", installed)
     assert generation._cold_prefill_tail_interval(tokens) == expected
+
+
+# ---------------------------------------------------------------------------
+# Admission: the lane installs only where it covers every projection
+# ---------------------------------------------------------------------------
+
+
+class _Trunk(nn.Module):
+    """A3B's projection classes: affine linears, a quantized embedding, a
+    bf16 linear (vision tower) and a SwitchGLU with many experts."""
+
+    def __init__(self, experts: int = 256):
+        super().__init__()
+        self.embed = nn.QuantizedEmbedding(64, 256, group_size=64, bits=4)
+        self.router = _router(bits=8)
+        self.vision = nn.Linear(8, 8)
+        self.experts = _switch_glu(experts=experts)
+
+
+@pytest.mark.parametrize("experts", [16, 32, 256])
+def test_admission_accepts_the_a3b_layout(experts):
+    assert bip.batch_invariant_prefill_refusal(_Trunk(experts)) is None
+
+
+@pytest.mark.parametrize("experts", [4, 8])
+def test_admission_refuses_a_switch_glu_with_few_experts(experts):
+    assert bip.batch_invariant_prefill_refusal(_Trunk(experts)) == f"switch_glu_experts:{experts}"
+
+
+def test_admission_refuses_a_projection_class_the_lane_cannot_swap():
+    from mtplx.models.prism_hadamard_qwen35 import HadamardQuantizedLinear
+
+    model = _Trunk()
+    model.o_proj = HadamardQuantizedLinear(256, 64, block=0)
+    assert (
+        bip.batch_invariant_prefill_refusal(model)
+        == "unsupported_linear:HadamardQuantizedLinear"
+    )
+
+
+def test_admission_refuses_a_non_affine_quantized_linear():
+    model = _Trunk()
+    model.o_proj = nn.QuantizedLinear(256, 64, group_size=32, bits=4, mode="mxfp4")
+    assert (
+        bip.batch_invariant_prefill_refusal(model)
+        == "unsupported_linear:QuantizedLinear[mxfp4]"
+    )
+
+
+def test_admission_refuses_expert_projections_outside_a_stock_switch_glu():
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    model = _Trunk()
+    model.packed = QuantizedSwitchLinear(256, 64, 8, group_size=64, bits=4)
+    assert (
+        bip.batch_invariant_prefill_refusal(model)
+        == "unsupported_linear:QuantizedSwitchLinear"
+    )
+
+
+def test_status_names_why_the_lane_is_off(monkeypatch):
+    monkeypatch.setitem(bip._STATE, "installed", False)
+    monkeypatch.setitem(bip._STATE, "refusal", None)
+    monkeypatch.delenv("MTPLX_BATCH_INVARIANT_PREFILL", raising=False)
+    assert bip.batch_invariant_prefill_status() == {"installed": False, "reason": "disabled"}
+    monkeypatch.setenv("MTPLX_BATCH_INVARIANT_PREFILL", "1")
+    # Switched on but never reached the install (e.g. the Gemma 4 pair loader).
+    assert bip.batch_invariant_prefill_status() == {"installed": False, "reason": "not_reached"}
+    bip.refuse_batch_invariant_prefill("unsupported_linear:HadamardQuantizedLinear")
+    assert bip.batch_invariant_prefill_status() == {
+        "installed": False,
+        "reason": "unsupported_linear:HadamardQuantizedLinear",
+    }
+
+
+def test_health_degradation_payload_carries_the_lane_status(monkeypatch):
+    from mtplx.server import openai
+
+    monkeypatch.setitem(bip._STATE, "installed", False)
+    monkeypatch.setitem(bip._STATE, "refusal", "switch_glu_experts:8")
+    payload = openai._health_degradation_payload(SimpleNamespace())
+    assert payload["batch_invariant_prefill"] == {
+        "installed": False,
+        "reason": "switch_glu_experts:8",
+    }

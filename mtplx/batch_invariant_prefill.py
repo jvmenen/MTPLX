@@ -46,7 +46,7 @@ from typing import Any
 
 import mlx.core as mx
 from mlx import nn
-from mlx_lm.models.switch_layers import SwitchGLU
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 
 from .attention_context import current_attention_phase
 
@@ -62,7 +62,11 @@ _MIN_ROWS_PER_EXPERT = 4
 _MIN_FUSED_QUERY_ROWS = 9
 _FUSED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128, 192, 256})
 _STOCK_SDPA: dict[str, Any] = {"sdpa": None}
-_STATE = {"installed": False}
+# SwitchGLU padding keeps expert rows invariant from 16 experts up (16/32/256
+# measured); with 8 experts, top-2, MLX picks another expert kernel below 33
+# tokens even after padding (M5 Pro, MLX 0.32.2, synthetic tensors).
+_MIN_INVARIANT_EXPERTS = 16
+_STATE: dict[str, Any] = {"installed": False, "report": {}, "refusal": None}
 _STOCK_KERNELS: ContextVar[bool] = ContextVar(
     "mtplx_batch_invariant_stock_kernels", default=False
 )
@@ -80,6 +84,62 @@ def batch_invariant_prefill_installed() -> bool:
     callers may choose forward widths freely without changing results."""
 
     return _STATE["installed"]
+
+
+def batch_invariant_prefill_status() -> dict[str, Any]:
+    """The lane's state for /health: the install report, or why it is off."""
+
+    if _STATE["installed"]:
+        return {"installed": True, **_STATE["report"]}
+    if _STATE["refusal"] is not None:
+        return {"installed": False, "reason": _STATE["refusal"]}
+    reason = "not_reached" if batch_invariant_prefill_enabled() else "disabled"
+    return {"installed": False, "reason": reason}
+
+
+def _uncovered_module_reason(module: Any, under_switch_glu: bool) -> str | None:
+    if type(module) is SwitchGLU:
+        experts = int(module.gate_proj["weight"].shape[0])
+        if experts < _MIN_INVARIANT_EXPERTS:
+            return f"switch_glu_experts:{experts}"
+        return None
+    if "scales" not in module:
+        return None  # not a quantized projection
+    if type(module) is nn.QuantizedLinear:
+        if module.mode == "affine":
+            return None
+        return f"unsupported_linear:QuantizedLinear[{module.mode}]"
+    if hasattr(module, "as_linear") or (
+        under_switch_glu and type(module) is QuantizedSwitchLinear
+    ):
+        return None  # embedding lookup, or an expert projection of a SwitchGLU
+    return f"unsupported_linear:{type(module).__name__}"
+
+
+def batch_invariant_prefill_refusal(model: Any) -> str | None:
+    """Why the lane cannot make ``model``'s prefill rows invariant, or None.
+
+    The lane only swaps affine ``nn.QuantizedLinear`` and stock ``SwitchGLU``
+    classes; any other quantized projection (e.g. Prism's
+    ``HadamardQuantizedLinear``) keeps its row-count-dependent kernels, and
+    a SwitchGLU with few experts stays row dependent despite the padding.
+    Half a lane plus the in-forward GDN boundaries would change results, so
+    the caller installs nothing when this returns a reason."""
+
+    modules = model.named_modules()
+    switch_glus = {name for name, module in modules if type(module) is SwitchGLU}
+    for name, module in modules:
+        under_switch_glu = name.rpartition(".")[0] in switch_glus
+        reason = _uncovered_module_reason(module, under_switch_glu)
+        if reason is not None:
+            return reason
+    return None
+
+
+def refuse_batch_invariant_prefill(reason: str) -> None:
+    """Record why this process runs its prefill on the stock kernels."""
+
+    _STATE["refusal"] = reason
 
 
 @contextmanager
@@ -288,4 +348,5 @@ def install_batch_invariant_prefill(model: Any) -> dict[str, int]:
             _swap_class(module, BatchInvariantSwitchGLU)
             report["switch_glus"] += 1
     _STATE["installed"] = True
+    _STATE["report"] = report
     return report
