@@ -6,6 +6,8 @@ Tak `perf/batch-invariant-router` (vanaf lokale `perf/integratie` 54c4ca5f), wor
 
 **Aanbeveling: de schakelaar `MTPLX_BATCH_INVARIANT_PREFILL=1` hoort in de eindconfig**, samen met de standaard trunk van de scoreroute (prefill-blok). Hij voldoet aan de beslisregel: buiten scoring geen merkbare kosten meer (alles binnen 3% van A), scoring en lange prefill merkbaar sneller, kwaliteit gelijkwaardig. De tak hoort in `perf/integratie`. Voor een PR naar het origineel is hij nog te breed (vier onderwerpen, één haak in een mlx-lm-module); eerst het besluit over de eindconfig en de modeltest van vondst 47.
 
+**Tests:** volledige suite op `1ce69614` met `MTPLX_CONFIG=/nonexistent`: 9663 geslaagd, 67 overgeslagen, 0 mislukt (log `suite-tak.log`). Ruff: geen nieuwe meldingen (`generation.py` 72 zoals de basis; `batch_invariant_prefill.py` en de tests schoon). Nieuwe tests: `test_stock_prefill_kernels_scope_keeps_the_stock_route_in_prefill`, `test_final_token_prefill_phase_is_prefill_on_stock_kernels`, `test_lm_head_slices_run_in_the_prefill_phase`; de installatietest controleert ook de haak in `mlx_lm.models.base`.
+
 ### Servermetingen na de fixes (gemeten)
 
 M5 Pro 64 GB, macOS 26.6.2, MLX 0.32.2, Qwen3.6-35B-A3B Optimized-Balance, profiel turbo met de productie-argumenten, fanmodus default, commit `1ce69614`, 26 september 12:50-13:27. Verse server per variant, eigen SSD-cachemap; `requests_completed` na elke variant gelijk aan wat de scripts stuurden (773, 773, 244, 245, 245, 245, 773, 773). Scripts `runall.zsh` en `analyse.py`; ruwe uitvoer in `res/`, `logs/`, `analyse-middag.txt` en `~/Dev/laya-nl/eindbench/resultaten/router-*.json`. De ochtendresultaten staan in `res-ochtend/` en `logs-ochtend/`.
