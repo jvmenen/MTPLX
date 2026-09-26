@@ -11,6 +11,28 @@ All notable user-facing changes to MTPLX. The format is based on
 - **Logprobs for the first generated token.** `/v1/completions` accepts `logprobs: K` with `max_tokens: 1` (and `echo` off) and returns OpenAI-shaped `choices[0].logprobs` (`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`, plus `token_ids`); `/v1/chat/completions` accepts `logprobs: true` with `top_logprobs: K` and returns `choices[0].logprobs.content`. Values are the raw model distribution of the row that produced the token, before temperature, penalties, grammar masks and steering, and a full-prompt SessionBank hit uses the restored logits. Scope is deliberately the first token only: `max_tokens` other than 1, `stream`, a non-empty `stop`, `K` above `MTPLX_PROMPT_LOGPROBS_MAX` (default 128) and backends that cannot serve it return 400, and the MTP batch lane refuses these requests while the live AR batch lane routes them solo. Blank retries are skipped for logprobs requests, since the distribution is the answer. This lets a classifier read the next-token distribution through the normal generation path instead of cold prompt scoring. Measured on an M5 Pro (64 GB), Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo, depth 2, fan mode default, temperature 0, 240 prompts of 250-840 tokens (median 475), 2026-09-26: same top label as echo prompt scoring on 228/240 prompts, p50 486 ms against 562 ms, p90 590 ms against 667 ms. The Anthropic `/v1/messages` route does not expose logprobs.
 - **Short shared prompt prefixes can be reused.** `--ram-session-prefix-min-match-tokens N` (config `ram_session_prefix_min_match_tokens`) sets the shortest prompt prefix the RAM SessionBank restores across requests (default unchanged at 512). On hybrid models a restore needs a recurrent snapshot at or below the shared prefix, so the setting also records one where a prompt stops sharing tokens with the banked entries (`MTPLX_SESSION_SHARED_PREFIX_EDGE`) and banks prompts with at least N new tokens (`MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX`). A classifier or a shared system prompt of a few hundred tokens followed by a varying tail was never reused before. Not yet measured on hardware.
 - **`/v1/completions` can use the SessionBank** with `MTPLX_COMPLETIONS_SESSION_BANK=1`: restore by token prefix and bank the final state, as an anonymous chat request does, under its own session and policy fingerprint. Off by default.
+- **`MTPLX_SESSION_BANK_SPIKE_BURSTS=N` lets the session bank's spike
+  reserve forget a deep turn** (opt-in, default off). The dynamic bank
+  ceiling reserves the allocation spike this process has seen, read as
+  MLX's lifetime peak minus current active memory. After one deep prefill
+  that reading never comes down, and it grows as the bank demotes entries
+  (active falls, the peak stays), so it settles at its cap of half the
+  post-weights memory for the rest of the serve. With `N` set, the memory
+  guard closes a burst when the engine goes idle, remembers that burst's
+  spike and restarts MLX's peak counter; the reserve is the largest spike
+  of the last `N` bursts, never below the static 3 GiB and never above the
+  existing cap. A deep turn therefore still guards the next `N` bursts,
+  and a new deep prefill re-arms it within the burst. Opt-in because the
+  reset changes every `peak_memory_bytes` reading to "since the engine was
+  last idle", and because after `N` quiet bursts the first new deep
+  prefill meets a fuller bank, the situation behind the 2026-08-29 banner
+  receipts. Analysed, not measured: for a 64 GB Mac with a 48 GiB Metal
+  limit and 27.6 GiB of weights (bank idle max 17.4 GiB), the capped
+  reserve of 10.2 GiB holds the idle ceiling at 10.2 GiB minus the working
+  set instead of 17.4 GiB minus it; the 1 GiB floor seen on such a Mac also
+  needs a working set of 9.2 GiB or more at that moment, which this change
+  does not affect. Unit tests cover the burst window, the caps and the
+  guard's busy-to-idle edge; nothing was measured on hardware.
 
 ### Changed
 

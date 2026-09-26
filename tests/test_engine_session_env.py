@@ -393,3 +393,79 @@ def test_manager_never_expires_sessions_when_ttl_is_off(monkeypatch):
     session = es.EngineSession("s-481b", idle_ttl_s=es.session_bank_idle_ttl_s())
     assert session.is_stale(now_s=session.last_access_s + 61.0)
     assert not session.is_stale(now_s=session.last_access_s + 59.0)
+
+
+@pytest.mark.parametrize("raw", [None, "", "0", "-3", "soon"])
+def test_spike_bursts_off_keeps_the_lifetime_peak(monkeypatch, raw):
+    if raw is None:
+        monkeypatch.delenv("MTPLX_SESSION_BANK_SPIKE_BURSTS", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_SESSION_BANK_SPIKE_BURSTS", raw)
+    assert _engine_session()._session_bank_recent_spikes() is None
+
+
+def _manager_with_fake_allocator(monkeypatch, allocator):
+    import mlx.core as mx
+
+    from mtplx.memory_plan import GIB, plan_memory
+
+    for name in ("get_active_memory", "get_peak_memory", "reset_peak_memory"):
+        monkeypatch.setattr(mx, name, getattr(allocator, name))
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
+    plan = plan_memory(
+        total_ram_bytes=64 * GIB,
+        model_weights_bytes=int(27.6 * GIB),
+        usable_bytes_override=48 * GIB,
+        usable_bytes_explicit=True,
+        model_max_context=262_144,
+    )
+    return _engine_session().EngineSessionManager(
+        model_weights_bytes=plan.model_weights_bytes, memory_plan=plan
+    )
+
+
+class _FakeAllocator:
+    def __init__(self, active, peak):
+        self.active = active
+        self.peak = peak
+
+    def get_active_memory(self):
+        return self.active
+
+    def get_peak_memory(self):
+        return self.peak
+
+    def reset_peak_memory(self):
+        self.peak = 0
+
+
+def test_spike_bursts_let_the_bank_ceiling_recover_after_quiet_bursts(
+    monkeypatch,
+):
+    from mtplx.memory_plan import GIB
+
+    monkeypatch.setenv("MTPLX_SESSION_BANK_SPIKE_BURSTS", "2")
+    weights = int(27.6 * GIB)
+    allocator = _FakeAllocator(active=weights + GIB, peak=weights + 14 * GIB)
+    manager = _manager_with_fake_allocator(monkeypatch, allocator)
+    after_deep = manager.bank.effective_max_bytes()
+    manager.close_spike_burst()
+    assert allocator.peak == 0
+    for _ in range(2):
+        allocator.peak = allocator.active + GIB // 2
+        assert manager.bank.effective_max_bytes() == after_deep
+        manager.close_spike_burst()
+    assert manager.bank.effective_max_bytes() > after_deep
+
+
+def test_spike_bursts_off_never_resets_the_peak(monkeypatch):
+    from mtplx.memory_plan import GIB
+
+    monkeypatch.delenv("MTPLX_SESSION_BANK_SPIKE_BURSTS", raising=False)
+    weights = int(27.6 * GIB)
+    allocator = _FakeAllocator(active=weights + GIB, peak=weights + 14 * GIB)
+    manager = _manager_with_fake_allocator(monkeypatch, allocator)
+    after_deep = manager.bank.effective_max_bytes()
+    manager.close_spike_burst()
+    assert allocator.peak == weights + 14 * GIB
+    assert manager.bank.effective_max_bytes() == after_deep
