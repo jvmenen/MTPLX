@@ -83,7 +83,9 @@ Gemeten, niet geschat. Apple M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX-Optimized-Balan
 - De memo raakte op de server zoals bedoeld: per verzoek alle eerdere segmenten als hit, één miss (het nieuwe toolresultaat).
 - Offline (alleen CPU, dezelfde argumenten als de server) splitst het zich zo: tokeniseren bij 82K van 57,8 naar 5,8 ms (lange beurt) of 0,1 ms (korte beurt); de rest van de encode (~43 ms) is de Jinja-render (vondst 26).
 - **TTFT van lange beurten is geen goede maat**: de prefill werd over opeenvolgende runs 10 tot 20% trager (warmte; prefill bij 82K 9,5 s in de eerste run, 11,3 s in de zesde). De omgekeerde volgorde in het laatste paar bevestigt dat het volgorde is en geen effect van de tak; de wijziging raakt de GPU-prefill niet.
-- `/v1/messages`: de encode vóór de prefill daalt op dezelfde manier (bij 77K ~109 naar 50-85 ms), maar die route doet na elke generatie nog een tweede, niet-gesegmenteerde encode in de streamworker (postcommit met `allow_committed_reasoning`, ~110 ms bij 77K), die gelijk blijft. Zie ook vondst 35 over de TTFT op deze route.
+- `/v1/messages`: de encode vóór de prefill daalt op dezelfde manier (bij 77K ~109 naar 50-85 ms). Daarnaast zag de meet-hook per verzoek een tweede encode in de streamworker (~110 ms bij 77K), die gelijk bleef.
+
+  **Correctie (26 september 2026, [messages-ttft](2026-09-26-messages-ttft.md)):** die tweede encode is geen postcommit, maar de herhaalprompt van de herstelpoging na een lege of "orphan" tooluitvoer (`maybe_retry_degenerate_tool_fed_empty_completion`: de berichten plus een extra user-bericht, `allow_committed_reasoning=True`). De tokenaantallen zijn exact na te rekenen en de encode valt midden in het verzoek. Hij verdwijnt met de fix voor vondst 35.
 
 **Exactheid:** over alle runs (6 agentruns, 4 chatruns, samen 300 verzoeken plus opwarmverzoeken) waren gegenereerde tekst, redenering, toolaanroepen, `completion_tokens`, `prompt_tokens` en `cached_tokens` per verzoek identiek tussen main en de tak.
 

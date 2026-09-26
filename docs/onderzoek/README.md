@@ -78,6 +78,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [deepseek-optimalisaties](2026-09-26-deepseek-optimalisaties.md) | Welke optimalisaties uit DeepSeek V4.1 op MTPLX en Qwen3.6 toepasbaar zijn |
 | 2026-09-26 | [completions-overhead](2026-09-26-completions-overhead.md) | Waar ~0,8 s buiten `elapsed_s` blijft (blank retries) en de ~50 ms per chatverzoek (Gemma-vocabulairecontrole); twee fixes |
 | 2026-09-26 | [falende-tests](2026-09-26-falende-tests.md) | Waarom 19 tests falen op een schone `main` (gebruikersconfig, geheugen) en de isolatiefix |
+| 2026-09-26 | [messages-ttft](2026-09-26-messages-ttft.md) | Waarom agentbeurten via `/v1/messages` 26-45 s tot het eerste token duren (valse herhaalpoging na een kale toolaanroep) en de fix |
 
 ## Takken
 
@@ -99,4 +100,6 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `fix/completions-overhead` | Geen blank retries bij gretig decoderen; `usage` telt alleen de teruggegeven poging | Gepusht (b921b9a6); op de echte server gemeten; PR-besluit open (vondst 42) |
 | `fix/gemma4-probe-vocab` | Gemma-4-controle zonder `get_vocab()` (~47 ms per chatverzoek) | Gepusht (2a1057c7); op de echte server gemeten; PR-besluit open (vondst 42) |
 | `onderzoek-completions-overhead` | Werktak van het overhead-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
+| `fix/messages-ttft` | Kale goedgevormde toolaanroep niet meer als orphan markup herhalen (vondst 35) | Gepusht (2f38106b); op de echte server gemeten; PR-besluit open (vondst 43) |
+| `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
