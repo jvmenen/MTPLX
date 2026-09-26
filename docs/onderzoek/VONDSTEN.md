@@ -13,7 +13,6 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 | 7 | `_run_generation` (~650 regels) en de completions-handler (~500 regels) zijn lastig leesbaar | idem | Kandidaat voor een aparte opschoon-PR: antwoordopbouw en streamlus uitlichten |
 | 8 | Plafond van de session bank zakt weg | [bankplafond](2026-09-26-bankplafond.md) | Deels weerlegd: reserve kost ~7 GiB, 1 GiB vraagt ook een groot werkgeheugen. Fix gebouwd achter `MTPLX_SESSION_BANK_SPIKE_BURSTS` (fb1cd817, standaard uit); hardwareverificatie volgens rapport. Handmatige omweg: cache leegmaken via de beheerroute reset de piek |
 | 9 | Eén verzoek tegelijk (`decode_batch_max = 1`) | idem | Uitzoeken of batching met MTP samen kan, en wat het oplevert voor meerdere agents |
-| 10 | 19 tests falen op een schone `main` in deze omgeving (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`) | [eerste-token-logprobs](2026-09-25-eerste-token-logprobs.md) | Oorzaak bekijken (lokale modelcache?); eventueel melden bij de maker |
 | 12 | `common_prefix_len` is een Python-lus | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Gedaan op `refactor/prefix-helpers` (tot 3,4× sneller); vierde kopie in `openai._common_prefix_len` nog omzetten |
 | 13 | Gedupliceerde env-lezers en magische 512 | [opschonen](2026-09-26-opschonen-prefix-helpers.md) | Grotendeels gedaan; resterend: cold-tier-constanten, `parse_args`-512, bank-limieten, losse bool-parsers |
 | 14 | `restore_or_prefill_prompt_state`, `_restore_near_prefix_prompt_state` en `near_prefix_candidates` zijn honderden regels | idem | Opsplitsen per herstelroute; aparte opschoon-PR |
@@ -41,6 +40,7 @@ Lopende lijst. Per vondst: waar het vandaan komt en wat de volgende stap is. Afg
 
 | Datum | Vondst | Uitkomst |
 |---|---|---|
+| 2026-09-26 | 19 falende tests op een schone `main` (vondst 10) | Geen fout in MTPLX: 18 tests lazen de echte `~/.mtplx/config.toml` (`model`, `model_dir`), 1 Laguna-test faalt onder 85,3 GiB geheugen. Fix alleen in tests op `fix/test-isolation` (0e1b6b91, gepusht): suite 9382 geslaagd, 0 mislukt. De forge-tests lieten `Fixture-MTPLX-Speed-N`- en `Qwen-Qwen3.5-9B-MTPLX-Speed-N`-mappen achter in `~/.mtplx/models`; die kunnen weg (besluit Jeroen). PR alleen na akkoord. Zie [falende-tests](2026-09-26-falende-tests.md) |
 | 2026-09-25 | Vraag en labels vooraan in de prompt voor hergebruik | Slechter op beide modellen (Balance 0,70 tegen 0,72; AUROC 0,92 tegen 0,96); huidige volgorde blijft |
 | 2026-09-25 | Alleen de laatste positie teruggeven bij prompt-scoring | Levert niets op: top-1 of top-20 en de JSON-grootte maken geen meetbaar verschil |
 | 2026-09-26 | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Op de echte server gecontroleerd (`below_block_min_match:512` naast `ssd_prefix_miss`); PR ingediend: https://github.com/youssofal/MTPLX/pull/534. Niet in de PR: afwijzingen binnen `restore()` (`model_mismatch`, `template_mismatch`) en `cache_miss_reason` per verzoek |

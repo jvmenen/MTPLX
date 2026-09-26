@@ -33,7 +33,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 - **Eén onderwerp per tak**, gebaseerd op `origin/main`, elk in een eigen worktree (`~/Dev/MTPLX-<onderwerp>`), zodat agents elkaar niet in de weg zitten. Nooit werken in een worktree van een andere agent.
 - **Standaardgedrag niet veranderen** zonder dat het bewezen beter is; nieuw gedrag eerst achter een schakelaar (env of config, in de stijl van de bestaande knoppen).
 - **Clean Code:** kleine functies met duidelijke namen, minimale diffs in de grote bestanden (`openai.py` ~39k regels, `generation.py` ~16k), geen ongevraagd herformatteren.
-- **Tests:** nieuwe tests bij elke wijziging; de relevante bestaande tests draaien en vergelijken met de nulmeting. Op een schone `main` falen in deze omgeving al 19 tests (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`): meld alleen afwijkingen daarvan. Ruff mag geen nieuwe meldingen geven (vergelijk het aantal met `main`).
+- **Tests:** nieuwe tests bij elke wijziging; de relevante bestaande tests draaien en vergelijken met de nulmeting. Op een schone `main` falen in deze omgeving 19 tests (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`) door onze `~/.mtplx/config.toml` en 64 GB geheugen (zie [falende-tests](2026-09-26-falende-tests.md)): meld alleen afwijkingen daarvan. Draai tests met `MTPLX_CONFIG=/nonexistent` in de env; zonder die variabele schrijven de forge-tests mappen in de echte `~/.mtplx/models`. Op een tak met `fix/test-isolation` erin is dat niet meer nodig. Ruff mag geen nieuwe meldingen geven (vergelijk het aantal met `main`).
 - **Python:** venv `~/Dev/MTPLX/.venv` (editable, dev- en server-extras). In een andere worktree: `PYTHONPATH=<worktree>` zetten en controleren met `python -c "import mtplx; print(mtplx.__file__)"`.
 
 ### Het echte model en de server (belangrijk)
@@ -76,6 +76,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren; servermeting en afronding voor de PR |
 | 2026-09-26 | [bankplafond](2026-09-26-bankplafond.md) | Waarom het plafond van de session bank wegzakt en een voorzichtige fix |
 | 2026-09-26 | [deepseek-optimalisaties](2026-09-26-deepseek-optimalisaties.md) | Welke optimalisaties uit DeepSeek V4.1 op MTPLX en Qwen3.6 toepasbaar zijn |
+| 2026-09-26 | [falende-tests](2026-09-26-falende-tests.md) | Waarom 19 tests falen op een schone `main` (gebruikersconfig, geheugen) en de isolatiefix |
 
 ## Takken
 
@@ -92,5 +93,6 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
 | `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht; PR [#534](https://github.com/youssofal/MTPLX/pull/534) ingediend |
 | `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig); geen PR, blijft staan als bewijs |
+| `fix/test-isolation` | Tests lezen de gebruikersconfig niet meer; Laguna-routetest los van het geheugen (vondst 10) | Gepusht (0e1b6b91); PR-tekst klaar, PR alleen na akkoord |
 | `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
