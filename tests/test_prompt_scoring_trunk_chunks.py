@@ -256,3 +256,33 @@ def test_runtime_without_a_separate_head_keeps_256_row_forwards():
     )
 
     assert model.widths == [256, 256, 88]
+
+
+def test_lm_head_slices_run_in_the_prefill_phase(monkeypatch):
+    from mtplx.attention_context import current_attention_phase
+
+    phases: list[str] = []
+
+    class _Model:
+        def make_cache(self):
+            return []
+
+        def __call__(self, inputs, cache=None, return_hidden=False, **_kwargs):
+            hidden = mx.zeros((1, inputs.shape[1], 4))
+            return (None, hidden) if return_hidden else hidden
+
+        def logits_from_post_norm(self, rows):
+            phases.append(current_attention_phase())
+            return mx.zeros((1, rows.shape[1], 8))
+
+    rt = MTPLXRuntime(
+        model=_Model(),
+        tokenizer=None,
+        model_path=None,
+        mtp_enabled=True,
+        contract=MTPContract(),
+    )
+
+    score_prompt_logprobs(rt, [i % 8 for i in range(300)], top_k=2, trunk_chunk_size=2048)
+
+    assert phases == ["prefill", "prefill"]

@@ -103,6 +103,33 @@ def test_linear_keeps_stock_route_outside_prefill():
 
 
 @needs_metal
+def test_stock_prefill_kernels_scope_keeps_the_stock_route_in_prefill():
+    router = _router()
+    stock = router(_rows(1))
+    glu = _switch_glu()
+    x = _rows(1, width=256)[None]
+    routes = _routes(1)[None]
+    stock_glu = glu(x, routes)
+    router.__class__ = bip.BatchInvariantQuantizedLinear
+    glu.__class__ = bip.BatchInvariantSwitchGLU
+    with attention_phase("prefill"), bip.stock_prefill_kernels():
+        assert mx.array_equal(router(_rows(1)), stock).item()
+        assert mx.array_equal(glu(x, routes), stock_glu).item()
+    with attention_phase("prefill"):
+        assert bip._in_prefill() is True
+
+
+def test_final_token_prefill_phase_is_prefill_on_stock_kernels():
+    from mtplx import generation
+    from mtplx.attention_context import current_attention_phase
+
+    with generation._final_token_prefill_phase():
+        assert current_attention_phase() == "prefill"
+        assert bip._in_prefill() is False
+    assert bip._in_prefill() is False
+
+
+@needs_metal
 def test_linear_is_row_invariant_in_prefill_and_keeps_leading_dims():
     router = _router()
     router.__class__ = bip.BatchInvariantQuantizedLinear
@@ -211,7 +238,11 @@ def test_attention_keeps_stock_route_outside_prefill_and_for_array_masks(monkeyp
 
 
 def test_install_swaps_classes_without_touching_parameters(monkeypatch):
+    from mlx_lm.models import base
+
+    stock_sdpa = base.scaled_dot_product_attention
     monkeypatch.setattr(qwen3_next, "scaled_dot_product_attention", qwen3_next.scaled_dot_product_attention)
+    monkeypatch.setattr(base, "scaled_dot_product_attention", stock_sdpa)
     monkeypatch.setitem(bip._STOCK_SDPA, "sdpa", None)
     monkeypatch.setitem(bip._STATE, "installed", False)
 
@@ -238,6 +269,9 @@ def test_install_swaps_classes_without_touching_parameters(monkeypatch):
     assert type(model.dense) is nn.Linear
     assert type(model.experts) is bip.BatchInvariantSwitchGLU
     assert qwen3_next.scaled_dot_product_attention is bip.batch_invariant_sdpa
+    # MTPLX's own attention routes (attention_split) import it from base.
+    assert base.scaled_dot_product_attention is bip.batch_invariant_sdpa
+    assert bip._STOCK_SDPA["sdpa"] is stock_sdpa
     assert bip.batch_invariant_prefill_installed() is True
     assert bip.install_batch_invariant_prefill(model)["attention_hooked"] == 0
 

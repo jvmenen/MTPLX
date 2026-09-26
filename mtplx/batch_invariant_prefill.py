@@ -30,11 +30,18 @@ causal kernel (zero query rows in front below 9 rows). All three reuse stock
 kernels; padding costs work only on forwards narrower than the minimums. The
 GDN layers needed nothing. The switch is read once at construction, like the
 other MoE knobs.
+
+The lone final prompt token runs on the stock kernels (``stock_prefill_kernels``):
+padding one row to 128 expert tokens costs more than the prompt's own prefill
+on short prompts, and no caller compares that row against a wider forward.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import mlx.core as mx
@@ -56,6 +63,9 @@ _MIN_FUSED_QUERY_ROWS = 9
 _FUSED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128, 192, 256})
 _STOCK_SDPA: dict[str, Any] = {"sdpa": None}
 _STATE = {"installed": False}
+_STOCK_KERNELS: ContextVar[bool] = ContextVar(
+    "mtplx_batch_invariant_stock_kernels", default=False
+)
 
 
 def batch_invariant_prefill_enabled() -> bool:
@@ -72,8 +82,21 @@ def batch_invariant_prefill_installed() -> bool:
     return _STATE["installed"]
 
 
+@contextmanager
+def stock_prefill_kernels() -> Iterator[None]:
+    """Run the enclosed prefill forward on the stock kernels, for forwards
+    whose rows no wider forward is ever compared against (the lone final
+    prompt token)."""
+
+    token = _STOCK_KERNELS.set(True)
+    try:
+        yield
+    finally:
+        _STOCK_KERNELS.reset(token)
+
+
 def _in_prefill() -> bool:
-    return current_attention_phase() == "prefill"
+    return current_attention_phase() == "prefill" and not _STOCK_KERNELS.get()
 
 
 def _pad_rows(rows: mx.array, target: int) -> mx.array:
@@ -224,12 +247,17 @@ def batch_invariant_sdpa(
 
 
 def _install_attention_route() -> bool:
-    from mlx_lm.models import qwen3_next
+    """Hook mlx-lm's SDPA where Qwen3-Next attention finds it: the module
+    global of ``qwen3_next`` (stock forward) and ``base`` (MTPLX's attention
+    routes, e.g. ``attention_split``, import it from there per call)."""
+
+    from mlx_lm.models import base, qwen3_next
 
     if qwen3_next.scaled_dot_product_attention is batch_invariant_sdpa:
         return False
-    _STOCK_SDPA["sdpa"] = qwen3_next.scaled_dot_product_attention
+    _STOCK_SDPA["sdpa"] = base.scaled_dot_product_attention
     qwen3_next.scaled_dot_product_attention = batch_invariant_sdpa
+    base.scaled_dot_product_attention = batch_invariant_sdpa
     return True
 
 
