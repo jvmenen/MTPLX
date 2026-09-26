@@ -46,6 +46,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
   - starten vanuit de worktree: `env PYTHONPATH=<worktree> nohup ~/Dev/MTPLX/.venv/bin/python -P -m mtplx.server.openai ${=ARGS} > log 2>&1 &` met `ARGS=$(cat ~/Dev/laya-nl/mtplx-originele-args.txt)` (de productie-instellingen). In zsh `${=ARGS}` gebruiken, anders komen alle argumenten als één argument binnen. Alleen de venv-python kent `mtplx`.
   - na afloop weer stoppen en poort 8000 vrij laten.
 - **Het platform herstart MTPLX als iemand een ander model vraagt.** Alle gebruikers in het Bink-platform (agents, chat-titels, nachtelijke review) moeten daarom hetzelfde model vragen (Balance); anders wisselt de server heen en weer, en elke wissel kost minuten. Een gestopte productieserver wordt gestart door wie hem het eerst nodig heeft, met het model dat die vraagt.
+- **Het Bink-platform kan tijdens een meting eigen verzoeken naar de testserver op poort 8000 sturen** (gezien in [messages-ttft](2026-09-26-messages-ttft.md)). Controleer na elke werklast `requests_completed` in `/health` tegen het verwachte aantal en herhaal een verstoorde run.
 - **Meet op een verse server per variant**: de MLX-piekmeting daalt nooit, en caches vertekenen anders de vergelijking.
 - **Geheugen meten:** `/health` toont alleen `session_bank.effective_max_bytes`; actief geheugen, piek en werkgeheugen staan in `/v1/mtplx/snapshot` onder `mem.*`.
 - **Meetmateriaal** (lokaal, niet in de fork): `~/Dev/laya-nl/` met `data/scoring-prompts.jsonl` (240 classifierprompts), `verify_scoring_real.py` (scoreroute oud tegen nieuw), `test_live_classifier.py` en `resultaten/`.
@@ -106,6 +107,6 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `onderzoek-completions-overhead` | Werktak van het overhead-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `fix/messages-ttft` | Kale goedgevormde toolaanroep niet meer als orphan markup herhalen (vondst 35) | Gepusht (2f38106b); op de echte server gemeten; PR-besluit open (vondst 43) |
 | `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
-| `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie` |
-| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd. Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
+| `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie`; PR-besluit open (vondst 50) |
+| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd (vondst 48). Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
