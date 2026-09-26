@@ -603,25 +603,30 @@ def _export_derived_model_geometry(config: dict[str, Any] | None) -> int | None:
 
 
 def _install_batch_invariant_lane(model: Any) -> None:
-    """Install the invariant prefill lane, or nothing when the lane cannot
-    cover every projection of ``model``."""
+    """Install the invariant prefill lane and the in-forward GDN boundaries,
+    or neither when the lane cannot cover every projection of ``model``."""
 
     from .batch_invariant_prefill import (
         batch_invariant_prefill_refusal,
         install_batch_invariant_prefill,
         refuse_batch_invariant_prefill,
     )
+    from .gdn_inforward_boundaries import install_gdn_inforward_boundaries
 
     refusal = batch_invariant_prefill_refusal(model)
     if refusal is not None:
         refuse_batch_invariant_prefill(refusal)
         logger.warning(
             "[batch-invariant-prefill] not installed (%s): prefill keeps the "
-            "stock kernels",
+            "stock kernels and the GDN boundary ladder",
             refusal,
         )
         return
     invariant_report = install_batch_invariant_prefill(model)
+    # Only on the invariant lane: there a wider forward rounds like the
+    # ladder's narrower ones, so recording boundaries inside it leaves every
+    # result unchanged.
+    invariant_report["gdn_inforward_layers"] = install_gdn_inforward_boundaries(model)
     logger.info("[batch-invariant-prefill] %s", invariant_report)
 
 
