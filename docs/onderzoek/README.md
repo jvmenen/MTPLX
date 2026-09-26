@@ -76,6 +76,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [chat-encode-memo](2026-09-26-chat-encode-memo.md) | Alleen nieuwe gespreksstukken tokeniseren; servermeting en afronding voor de PR |
 | 2026-09-26 | [bankplafond](2026-09-26-bankplafond.md) | Waarom het plafond van de session bank wegzakt en een voorzichtige fix |
 | 2026-09-26 | [deepseek-optimalisaties](2026-09-26-deepseek-optimalisaties.md) | Welke optimalisaties uit DeepSeek V4.1 op MTPLX en Qwen3.6 toepasbaar zijn |
+| 2026-09-26 | [completions-overhead](2026-09-26-completions-overhead.md) | Waar ~0,8 s buiten `elapsed_s` blijft (blank retries) en de ~50 ms per chatverzoek (Gemma-vocabulairecontrole); twee fixes |
 | 2026-09-26 | [falende-tests](2026-09-26-falende-tests.md) | Waarom 19 tests falen op een schone `main` (gebruikersconfig, geheugen) en de isolatiefix |
 
 ## Takken
@@ -95,4 +96,7 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig); geen PR, blijft staan als bewijs |
 | `fix/test-isolation` | Tests lezen de gebruikersconfig niet meer; Laguna-routetest los van het geheugen (vondst 10) | Gepusht (0e1b6b91); PR [#535](https://github.com/youssofal/MTPLX/pull/535) ingediend |
 | `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
+| `fix/completions-overhead` | Geen blank retries bij gretig decoderen; `usage` telt alleen de teruggegeven poging | Gepusht (b921b9a6); op de echte server gemeten; PR-besluit open (vondst 42) |
+| `fix/gemma4-probe-vocab` | Gemma-4-controle zonder `get_vocab()` (~47 ms per chatverzoek) | Gepusht (2a1057c7); op de echte server gemeten; PR-besluit open (vondst 42) |
+| `onderzoek-completions-overhead` | Werktak van het overhead-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
