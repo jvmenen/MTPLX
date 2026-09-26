@@ -7308,6 +7308,45 @@ def _tool_fed_degenerate_completion_reason(text: str) -> str | None:
     return None
 
 
+
+def _tool_fed_retry_parsed_call_guard_enabled() -> bool:
+    """MTPLX_TOOL_FED_RETRY_PARSED_CALL_GUARD: on (default) | 0/off.
+
+    Kill switch for the parsed-call exemption in the tool-fed retry below."""
+    raw = os.environ.get("MTPLX_TOOL_FED_RETRY_PARSED_CALL_GUARD", "1")
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _tool_fed_retry_is_parsed_call(
+    state: Any,
+    text: str,
+    *,
+    retry_reason: str,
+    thinking_enabled: bool,
+    tool_specs: Any,
+) -> bool:
+    """True when an "orphan markup" verdict is really a well-formed call.
+
+    A bare call whose arguments strip to one short token (``count_lines``
+    with ``part=2``, ``read`` with one path) leaves nothing but ``2`` once
+    the tags are removed, so _looks_like_tool_control_payload_only calls it
+    residue. The retry then re-renders the whole transcript with a nudge
+    turn, which moves the scoped-reasoning boundary and re-prefills the
+    history (measured 2026-09-26, Qwen3.6-35B-A3B: +10 to +65 s TTFT per
+    tool turn). If the tool parser accepts the text, it is a call.
+    """
+    if retry_reason != "orphan_tool_control_markup":
+        return False
+    if not _tool_fed_retry_parsed_call_guard_enabled():
+        return False
+    reasoning_text, content_text = _tool_extraction_text_parts(
+        state, text, thinking_enabled=thinking_enabled
+    )
+    extraction = omlx_extract_tool_calls_with_thinking(
+        reasoning_text, content_text, state.runtime.tokenizer, tool_specs
+    )
+    return bool(extraction.tool_calls)
+
 def _initial_orphan_tool_control_state(text: str) -> str:
     """Classify the beginning of streamed text for dangling tool-control residue."""
 
@@ -33724,6 +33763,14 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     retry_reason = _tool_fed_degenerate_completion_reason(first_text)
                     if retry_reason is None:
+                        return generated
+                    if _tool_fed_retry_is_parsed_call(
+                        state,
+                        first_text,
+                        retry_reason=retry_reason,
+                        thinking_enabled=thinking_enabled,
+                        tool_specs=tool_specs,
+                    ):
                         return generated
                     first_stats = dict(generated.get("stats") or {})
                     repair_messages = list(messages_for_generation)
