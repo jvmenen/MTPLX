@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A well-formed bare tool call after tool results is no longer retried as orphan tool markup.** A call whose arguments strip to one short token (`count_lines` with `part=2`, a single path) left nothing but that token once the tags were removed, so the tool-fed retry re-ran the turn with an extra nudge message. Under scoped reasoning history that message re-renders every earlier assistant turn, so the retry prompt diverged at token 663 and re-prefilled the new tool result, or the whole history. The retry now stands down when the tool parser finds a call, as the reasoning-only and stalled-promise repairs already do. Unseeded requests only, which includes every `/v1/messages` request. Measured on Apple M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX-Optimized-Balance, profile turbo, fan mode default, 2026-09-26, base 1de2b1c0: a streamed agent loop alternating ~17K-token and short tool results from 10K to 77K tokens, `max_tokens` 1024, TTFT on turns with a long tool result 30.0/32.9/67.6/86.6 s -> 11.3/15.0/17.9/19.8 s, short turns 3.2-25.0 s -> 0.2-0.4 s; one generation per turn instead of two or three. `MTPLX_TOOL_FED_RETRY_PARSED_CALL_GUARD=0` restores the old behaviour.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
