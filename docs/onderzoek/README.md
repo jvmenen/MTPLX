@@ -79,6 +79,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [completions-overhead](2026-09-26-completions-overhead.md) | Waar ~0,8 s buiten `elapsed_s` blijft (blank retries) en de ~50 ms per chatverzoek (Gemma-vocabulairecontrole); twee fixes |
 | 2026-09-26 | [falende-tests](2026-09-26-falende-tests.md) | Waarom 19 tests falen op een schone `main` (gebruikersconfig, geheugen) en de isolatiefix |
 | 2026-09-26 | [messages-ttft](2026-09-26-messages-ttft.md) | Waarom agentbeurten via `/v1/messages` 26-45 s tot het eerste token duren (valse herhaalpoging na een kale toolaanroep) en de fix |
+| 2026-09-26 | [instellingen-36-37-39](2026-09-26-instellingen-36-37-39.md) | KV in q8, kostgestuurde draft-diepte, grenzen afwerpen en de bankknop op de integratietak gemeten: geen van vier in de eindconfig |
 
 ## Takken
 
