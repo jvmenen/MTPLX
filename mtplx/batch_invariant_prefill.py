@@ -34,6 +34,12 @@ other MoE knobs.
 The lone final prompt token runs on the stock kernels (``stock_prefill_kernels``):
 padding one row to 128 expert tokens costs more than the prompt's own prefill
 on short prompts, and no caller compares that row against a wider forward.
+
+Only MoE models get the lane by default. On a dense model (no ``SwitchGLU``)
+there is no routing to stabilize and the padding only costs: on Qwen3.5-9B
+~4% on prompt scoring and ~15% on greedy time to first token, against a ~21%
+scoring gain on Qwen3.6-35B-A3B. MTPLX_BATCH_INVARIANT_PREFILL_DENSE=1 admits
+dense models anyway, for callers that need invariant rows there.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from .attention_context import current_attention_phase
 
 BATCH_INVARIANT_PREFILL_ENV = "MTPLX_BATCH_INVARIANT_PREFILL"
+BATCH_INVARIANT_PREFILL_DENSE_ENV = "MTPLX_BATCH_INVARIANT_PREFILL_DENSE"
 
 # Two batches of more than 32 rows each: MLX's batched NAX qmm then uses the
 # same 64-row tiles and no split-K at every row count.
@@ -72,11 +79,20 @@ _STOCK_KERNELS: ContextVar[bool] = ContextVar(
 )
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def batch_invariant_prefill_enabled() -> bool:
     """Whether construction installs the batch-invariant prefill lane."""
 
-    value = os.environ.get(BATCH_INVARIANT_PREFILL_ENV, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return _env_flag(BATCH_INVARIANT_PREFILL_ENV)
+
+
+def batch_invariant_prefill_dense_enabled() -> bool:
+    """Whether the lane may also install on a dense model (no ``SwitchGLU``)."""
+
+    return _env_flag(BATCH_INVARIANT_PREFILL_DENSE_ENV)
 
 
 def batch_invariant_prefill_installed() -> bool:
@@ -124,7 +140,12 @@ def batch_invariant_prefill_refusal(model: Any) -> str | None:
     ``HadamardQuantizedLinear``) keeps its row-count-dependent kernels, and
     a SwitchGLU with few experts stays row dependent despite the padding.
     Half a lane plus the in-forward GDN boundaries would change results, so
-    the caller installs nothing when this returns a reason."""
+    the caller installs nothing when this returns a reason.
+
+    A dense model (no ``SwitchGLU``) is refused with ``dense_model`` unless
+    MTPLX_BATCH_INVARIANT_PREFILL_DENSE is set: without routing the lane
+    only costs prefill time. Coverage reasons come first, so a model the lane
+    cannot cover keeps that reason even with the override."""
 
     modules = model.named_modules()
     switch_glus = {name for name, module in modules if type(module) is SwitchGLU}
@@ -133,6 +154,8 @@ def batch_invariant_prefill_refusal(model: Any) -> str | None:
         reason = _uncovered_module_reason(module, under_switch_glu)
         if reason is not None:
             return reason
+    if not switch_glus and not batch_invariant_prefill_dense_enabled():
+        return "dense_model"
     return None
 
 

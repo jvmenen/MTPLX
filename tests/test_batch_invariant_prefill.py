@@ -352,6 +352,70 @@ def test_admission_refuses_expert_projections_outside_a_stock_switch_glu():
     )
 
 
+class _DenseTrunk(nn.Module):
+    """Qwen3.5-9B's projection classes: affine linears and a quantized
+    embedding, no SwitchGLU."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.QuantizedEmbedding(64, 256, group_size=64, bits=4)
+        self.q_proj = _router(bits=4)
+        self.mlp = _router(bits=4)
+
+
+def test_admission_refuses_a_dense_model(monkeypatch):
+    monkeypatch.delenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, raising=False)
+    assert bip.batch_invariant_prefill_refusal(_DenseTrunk()) == "dense_model"
+
+
+@pytest.mark.parametrize("value", ["0", "", "off"])
+def test_admission_keeps_the_a3b_layout_whatever_the_dense_switch(monkeypatch, value):
+    monkeypatch.setenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, value)
+    assert bip.batch_invariant_prefill_refusal(_Trunk()) is None
+
+
+def test_dense_switch_admits_a_dense_model(monkeypatch):
+    monkeypatch.setenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, "1")
+    assert bip.batch_invariant_prefill_refusal(_DenseTrunk()) is None
+
+
+def test_dense_switch_keeps_coverage_refusals(monkeypatch):
+    from mtplx.models.prism_hadamard_qwen35 import HadamardQuantizedLinear
+
+    model = _DenseTrunk()
+    model.o_proj = HadamardQuantizedLinear(256, 64, block=0)
+    expected = "unsupported_linear:HadamardQuantizedLinear"
+    monkeypatch.delenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, raising=False)
+    # Bonsai keeps its coverage reason, with and without the dense switch.
+    assert bip.batch_invariant_prefill_refusal(model) == expected
+    monkeypatch.setenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, "1")
+    assert bip.batch_invariant_prefill_refusal(model) == expected
+
+
+def test_runtime_installs_nothing_on_a_dense_model(monkeypatch):
+    from mtplx import runtime
+    from mtplx.server import openai
+
+    stock_sdpa = qwen3_next.scaled_dot_product_attention
+    monkeypatch.setattr(qwen3_next, "scaled_dot_product_attention", stock_sdpa)
+    monkeypatch.setitem(bip._STOCK_SDPA, "sdpa", None)
+    monkeypatch.setitem(bip._STATE, "installed", False)
+    monkeypatch.setitem(bip._STATE, "refusal", None)
+    monkeypatch.setenv(bip.BATCH_INVARIANT_PREFILL_ENV, "1")
+    monkeypatch.delenv(bip.BATCH_INVARIANT_PREFILL_DENSE_ENV, raising=False)
+
+    model = _DenseTrunk()
+    before = [type(module) for _name, module in model.named_modules()]
+    runtime._install_batch_invariant_lane(model)
+    assert [type(module) for _name, module in model.named_modules()] == before
+    assert qwen3_next.scaled_dot_product_attention is stock_sdpa
+    assert bip.batch_invariant_prefill_installed() is False
+    expected = {"installed": False, "reason": "dense_model"}
+    assert bip.batch_invariant_prefill_status() == expected
+    payload = openai._health_degradation_payload(SimpleNamespace())
+    assert payload["batch_invariant_prefill"] == expected
+
+
 def test_status_names_why_the_lane_is_off(monkeypatch):
     monkeypatch.setitem(bip._STATE, "installed", False)
     monkeypatch.setitem(bip._STATE, "refusal", None)
