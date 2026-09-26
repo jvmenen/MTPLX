@@ -5042,6 +5042,27 @@ def _gdn_boundary_tail_interval() -> int:
         return 256
 
 
+def _cold_prefill_tail_interval(prompt_tokens: int) -> int:
+    """Tail boundary grid for a cold prefill of ``prompt_tokens``.
+
+    With the batch-invariant prefill lane, a prompt below the block-restore
+    floor (512 by default, also the SSD cache minimum) gets no tail grid: the
+    forward the grid cuts off costs ~0.1-0.15 s on A3B (all experts read
+    again) and only serves a near-prefix restore of a short prompt. Without
+    the lane the cut is kept, because removing it changes the chunk layout
+    and so the MoE routing and the scores.
+    """
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    if (
+        batch_invariant_prefill_installed()
+        and int(prompt_tokens) < block_prefix_min_match_tokens()
+    ):
+        return 0
+    return _gdn_boundary_tail_interval()
+
+
 def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
     from .cache_state import _is_trimmable
 
@@ -7597,7 +7618,7 @@ def _prefill(
             len(body),
             capture_boundaries=capture_boundaries,
             inforward=_inforward_hooks is not None,
-            tail_interval=_gdn_boundary_tail_interval(),
+            tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
             mandatory_edges=_cold_edges,
         )
         for start, end in spans:
@@ -7743,7 +7764,7 @@ def _prefill_committed_mtp_history_streaming(
         len(body),
         capture_boundaries=capture_boundaries,
         inforward=_inforward_hooks is not None,
-        tail_interval=_gdn_boundary_tail_interval(),
+        tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
         mandatory_edges=_cold_edges,
         chunk_size=prefill_chunk_size,
     )

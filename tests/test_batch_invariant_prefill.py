@@ -241,3 +241,17 @@ def test_install_swaps_classes_without_touching_parameters(monkeypatch):
     assert bip.batch_invariant_prefill_installed() is True
     assert bip.install_batch_invariant_prefill(model)["attention_hooked"] == 0
 
+
+@pytest.mark.parametrize(
+    "installed,tokens,expected",
+    [(False, 395, 256), (True, 395, 0), (True, 511, 0), (True, 512, 256), (True, 4000, 256)],
+)
+def test_cold_tail_grid_is_dropped_below_the_restore_floor_only_with_the_lane(
+    monkeypatch, installed, tokens, expected
+):
+    from mtplx import generation
+
+    monkeypatch.delenv("MTPLX_GDN_BOUNDARY_TAIL_INTERVAL", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", raising=False)
+    monkeypatch.setitem(bip._STATE, "installed", installed)
+    assert generation._cold_prefill_tail_interval(tokens) == expected
