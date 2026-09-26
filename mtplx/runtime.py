@@ -863,6 +863,14 @@ def load(
         if moe_pack_gate_up_enabled():
             pack_report = configure_moe_packed_projections(model)
             logger.info("[moe-pack] %s", pack_report)
+        from .batch_invariant_prefill import (
+            batch_invariant_prefill_enabled,
+            install_batch_invariant_prefill,
+        )
+
+        if batch_invariant_prefill_enabled():
+            invariant_report = install_batch_invariant_prefill(model)
+            logger.info("[batch-invariant-prefill] %s", invariant_report)
         # Must run after MTP injection and after load-coverage validation.
         from .proj_fusion import (
             configure_fused_projections,
