@@ -9,6 +9,8 @@ All notable user-facing changes to MTPLX. The format is based on
 ### Added
 
 - **Logprobs for the first generated token.** `/v1/completions` accepts `logprobs: K` with `max_tokens: 1` (and `echo` off) and returns OpenAI-shaped `choices[0].logprobs` (`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`, plus `token_ids`); `/v1/chat/completions` accepts `logprobs: true` with `top_logprobs: K` and returns `choices[0].logprobs.content`. Values are the raw model distribution of the row that produced the token, before temperature, penalties, grammar masks and steering, and a full-prompt SessionBank hit uses the restored logits. Scope is deliberately the first token only: `max_tokens` other than 1, `stream`, a non-empty `stop`, `K` above `MTPLX_PROMPT_LOGPROBS_MAX` (default 128) and backends that cannot serve it return 400, and the MTP batch lane refuses these requests while the live AR batch lane routes them solo. Blank retries are skipped for logprobs requests, since the distribution is the answer. This lets a classifier read the next-token distribution through the normal generation path instead of cold prompt scoring. Measured on an M5 Pro (64 GB), Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo, depth 2, fan mode default, temperature 0, 240 prompts of 250-840 tokens (median 475), 2026-09-26: same top label as echo prompt scoring on 228/240 prompts, p50 486 ms against 562 ms, p90 590 ms against 667 ms. The Anthropic `/v1/messages` route does not expose logprobs.
+- **Short shared prompt prefixes can be reused.** `--ram-session-prefix-min-match-tokens N` (config `ram_session_prefix_min_match_tokens`) sets the shortest prompt prefix the RAM SessionBank restores across requests (default unchanged at 512). On hybrid models a restore needs a recurrent snapshot at or below the shared prefix, so the setting also records one where a prompt stops sharing tokens with the banked entries (`MTPLX_SESSION_SHARED_PREFIX_EDGE`) and banks prompts with at least N new tokens (`MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX`). A classifier or a shared system prompt of a few hundred tokens followed by a varying tail was never reused before. Not yet measured on hardware.
+- **`/v1/completions` can use the SessionBank** with `MTPLX_COMPLETIONS_SESSION_BANK=1`: restore by token prefix and bank the final state, as an anonymous chat request does, under its own session and policy fingerprint. Off by default.
 
 ### Changed
 
@@ -70,6 +72,8 @@ All notable user-facing changes to MTPLX. The format is based on
 ### Fixed
 
 - **The session bank names why RAM could not serve a shared prompt start.** When the near/block-prefix lane passed over every stored entry, the request fell through to the SSD lookup and `/health` only showed its `ssd_prefix_miss`, which hid the RAM-lane cause. The prefix diagnostic now carries `ram_miss_reason` (also shown as `session_bank.last_ram_miss_reason`): `below_block_min_match:<N>` with the minimum that actually applied, `no_gdn_boundaries` for a hybrid entry stored without boundary records, `block_prefix_disabled`, or the near-prefix lane's own refusal of the best candidate (`boundary_not_better:<N>`, `identity_mismatch`, `missing_committed_mtp_history`, ...). `last_miss_reason` keeps its meaning; restore behavior is unchanged. Host unit tests only (`tests/test_ram_miss_reason.py`), no model run.
+
+- `MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS` below the block size (256) was silently raised to the block size by the RAM restore lane.
 
 ## [2.12.0] - 2026-09-23
 

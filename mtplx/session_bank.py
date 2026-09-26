@@ -30,7 +30,10 @@ from .cache_state import (
 )
 from .cache_bank.codec import ColdEncodeInterrupted
 from .runtime import MTPLXRuntime
-from .runtime_options import block_prefix_restore_enabled
+from .runtime_options import (
+    DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
+    block_prefix_restore_enabled,
+)
 
 
 def _policy_uses_committed_history(policy: str | None) -> bool:
@@ -246,7 +249,6 @@ DEFAULT_MAX_BYTES = 24 * GIB
 DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
 DEFAULT_PREFIX_BLOCK_SIZE = 256
-DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
 DEFAULT_ACTIVE_SESSION_PIN_TTL_S = 600.0
 DEFAULT_PER_SESSION_MAX_ENTRIES = 3
 
@@ -1329,6 +1331,35 @@ class SessionBank:
                 best = matched
         return best
 
+    def dominant_shared_prefix_tokens(
+        self, token_ids: list[int] | tuple[int, ...], *, min_tokens: int
+    ) -> int:
+        """The shared-prefix length most RAM entries agree on, or 0.
+
+        Only entries sharing at least ``min_tokens`` with ``token_ids``
+        count. Requests built from one fixed preamble (a classifier's
+        instructions, a shared system prompt) share exactly the preamble
+        with most entries and a few tokens more with some, where their
+        variable parts happen to start alike. The most common length is the
+        preamble; ties go to the shorter length, which serves more requests.
+        One compare per entry, no cold-tier scan, no lookup side effects.
+        """
+
+        n = max(1, int(min_tokens))
+        if len(token_ids) < n:
+            return 0
+        tokens = tuple(int(token) for token in token_ids)
+        head = tokens[:n]
+        counts: dict[int, int] = {}
+        for prefix in self._entries:
+            if len(prefix) < n or prefix[:n] != head:
+                continue
+            shared = common_prefix_len(tokens, prefix)
+            counts[shared] = counts.get(shared, 0) + 1
+        if not counts:
+            return 0
+        return min(counts, key=lambda length: (-counts[length], length))
+
     def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> SessionBankEntry | None:
         tokens = tuple(int(token) for token in token_ids)
         best: SessionBankEntry | None = None
@@ -1370,7 +1401,11 @@ class SessionBank:
         gap_limit = max(0, int(max_token_gap))
         min_match = max(1, int(min_matched_tokens))
         block = max(1, int(block_size))
-        block_min_match = max(block, int(block_min_matched_tokens))
+        # The threshold is the caller's, not floored at the block size: an
+        # entry that restores at any token (pure attention, or recurrent
+        # boundaries) can serve a 128-token shared prefix, and a legacy
+        # hybrid entry is still quantized to block edges below.
+        block_min_match = max(1, int(block_min_matched_tokens))
         matches: list[tuple[SessionBankEntry, int]] = []
         best_diag: dict[str, Any] | None = None
         self._purge_expired()

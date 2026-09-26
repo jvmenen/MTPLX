@@ -359,6 +359,88 @@ def block_prefix_restore_enabled() -> bool:
     return env_bool("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", default=True)
 
 
+#: Shortest prompt prefix a request must share with a banked entry before
+#: the session bank restores from it (the block-prefix lane).
+DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
+BLOCK_PREFIX_MIN_MATCH_ENV = "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS"
+SHARED_PREFIX_EDGE_ENV = "MTPLX_SESSION_SHARED_PREFIX_EDGE"
+STORE_ON_PREFILL_MIN_SUFFIX_ENV = "MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX"
+DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX = 1024
+
+
+def block_prefix_min_match_tokens() -> int:
+    """The single parse of ``MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS``.
+
+    Read by the decode loop, the session bank and the engine session, so a
+    restore is judged by the same threshold the bank filtered candidates
+    by. Unset, empty or unparsable yields the default; the floor is 1.
+    """
+
+    raw = os.environ.get(BLOCK_PREFIX_MIN_MATCH_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
+    try:
+        return max(1, int(str(raw).strip()))
+    except ValueError:
+        return DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
+
+
+def shared_prefix_edge_enabled() -> bool:
+    """``MTPLX_SESSION_SHARED_PREFIX_EDGE``, default OFF.
+
+    When on, a prefill that shares a prompt prefix with banked entries
+    records recurrent state exactly where that shared prefix ends (see
+    ``generation._shared_prefix_edge``).
+    """
+
+    return env_bool(SHARED_PREFIX_EDGE_ENV, default=False)
+
+
+def session_prefix_min_match_env(tokens: int) -> dict[str, str]:
+    """The env that ``--ram-session-prefix-min-match-tokens N`` stands for.
+
+    Lowering the match threshold alone does not make a short shared prefix
+    reusable on a hybrid (linear-attention) model: a restore needs a
+    recurrent snapshot at or below the shared prefix, and short prompts are
+    banked without one. So the one setting also turns on the shared-prefix
+    edge and banks every prompt whose newly prefilled part is at least
+    ``tokens`` long.
+    """
+
+    tokens = max(1, int(tokens))
+    return {
+        BLOCK_PREFIX_MIN_MATCH_ENV: str(tokens),
+        SHARED_PREFIX_EDGE_ENV: "1",
+        STORE_ON_PREFILL_MIN_SUFFIX_ENV: str(
+            min(DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX, tokens)
+        ),
+    }
+
+
+def apply_session_prefix_min_match_env(
+    tokens: int | None, env: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Write :func:`session_prefix_min_match_env` into ``env`` (default
+    ``os.environ``) and return what was written.
+
+    The threshold follows the setting; the two implied variables keep a
+    value the operator already exported, so each can still be tuned or
+    switched off on its own.
+    """
+
+    if tokens is None:
+        return {}
+    target = os.environ if env is None else env
+    written: dict[str, str] = {}
+    for name, value in session_prefix_min_match_env(tokens).items():
+        already_set = bool(str(target.get(name) or "").strip())
+        if name != BLOCK_PREFIX_MIN_MATCH_ENV and already_set:
+            continue
+        target[name] = value
+        written[name] = value
+    return written
+
+
 def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = False) -> str | None:
     if value is None:
         if allow_none:
