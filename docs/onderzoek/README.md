@@ -97,7 +97,7 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | Tak | Inhoud | Status |
 |---|---|---|
 | `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
-| `feat/first-token-logprobs-gemma4` | Eerste-token-logprobs ook op het Gemma-4-paar (op `feat/first-token-logprobs`) | Gepusht (4f7b3cbb), 8 tests; nog niet op de server getoetst (`runall.zsh --alleen gemma-logprobs`); daarna besluit: #530 bijwerken of vervolg-PR ([modeltest](2026-09-26-modeltest.md)) |
+| `feat/first-token-logprobs-gemma4` | Eerste-token-logprobs ook op het Gemma-4-paar (op `feat/first-token-logprobs`) | Gepusht (4f7b3cbb), 8 tests; op de server getoetst 26 sep: werkt en is deterministisch. Besluit Jeroen: #530 bijwerken of vervolg-PR ([modeltest](2026-09-26-modeltest.md)) |
 | `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
 | `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht; PR [#533](https://github.com/youssofal/MTPLX/pull/533) ingediend |

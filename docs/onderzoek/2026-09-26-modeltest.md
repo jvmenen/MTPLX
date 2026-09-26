@@ -6,9 +6,9 @@ De integratietak was alleen op Qwen3.6-35B-A3B gemeten ([eindbenchmark](2026-09-
 
 | Model | Oordeel script | Na analyse |
 |---|---|---|
-| Qwen3.5-9B Optimized-Speed (`q9b`) | afwijkend | Werkt; agentgesprek −70%, scoreroute −13%, MLX-piek −1,5 GiB. Gretige teksten 5/12 gelijk aan main: vrijwel zeker de invariante prefill (andere afronding in de prefill), uitsluitsel met één extra meting |
+| Qwen3.5-9B Optimized-Speed (`q9b`) | afwijkend | Werkt; agentgesprek −70%, scoreroute −13%, MLX-piek −1,5 GiB. Gretige teksten 5/12 gelijk aan main: dat komt door de invariante prefill (andere afronding in de prefill), bevestigd met een extra meting zonder lane (12/12 gelijk aan main) |
 | Ternary-Bonsai-2-27B Optimized-Speed (`bonsai`) | OK | Gretige en agentteksten gelijk aan main, scoreroute 59/60 dezelfde oordelen. Met de lane-gate (`49c4a6ee`) krijgt Bonsai de lane niet meer |
-| Gemma 4 Optimized-Speed (`gemma`) | kapot | Geen regressie: chat, agent en decode gelijk aan main. Beide classificatieroutes werken op Gemma 4 ook op main niet: de scoreroute geeft HTTP 500 (upstream), eerste-token-logprobs weigert PR #530 bewust met 400. Gemma-steun gebouwd op een aparte tak |
+| Gemma 4 Optimized-Speed (`gemma`) | kapot | Geen regressie: chat, agent en decode gelijk aan main. Beide classificatieroutes werken op Gemma 4 ook op main niet: de scoreroute geeft HTTP 500 (upstream), eerste-token-logprobs weigert PR #530 bewust met 400. Gemma-steun gebouwd op een aparte tak en op de server getoetst: werkt en is deterministisch |
 
 ## Opzet
 
@@ -100,9 +100,23 @@ Gelijkheid main tegen int: gretig 12/12, agent 6/6. Beide classificatieroutes ni
 - `generate_ar` en `generate_mtpk` geven de K door; de backend-weigering in `_reject_unservable_first_token_logprobs` is weg (de parameter `state` daarmee ook).
 - CHANGELOG-regel van #530 aangepast; `docs/api.md` noemde de backendgrens niet.
 - Tests: `tests/test_first_token_logprobs_gemma4.py`, 8 tests met een Gemma-target zonder model (zelfde patroon als `test_tail_gemma4_stream_holdback.py`): waarden en top-K gelijk aan een numpy-log-softmax van de promptrij, alleen het eerste token, niets zonder verzoek, en beide ingangen geven de K door. Zonder de fix falen de tests die logprobs vragen. Met `MTPLX_CONFIG=/nonexistent` groen: dit bestand plus `test_first_token_logprobs_api`, `test_tail_gemma4_stream_holdback`, `test_generation_sustained`, `test_api_benchmark_contracts` en beide `test_gemma4_*` (148 geslaagd, 1 overgeslagen), `test_server_openai` 394 geslaagd. Ruff: 510 meldingen in de drie bronbestanden, gelijk aan de basis; testbestand schoon.
-- **Nog niet op de server getoetst.** Toets: `zsh ./runall.zsh --alleen gemma-logprobs` in `~/Dev/laya-nl/modeltest` (2 runs, `gemma-ftl-1/2`, zonder lane; `analyse.py` geeft een conclusieregel). De scoreroute blijft daar 500 geven.
+- **Op de server getoetst** (26 september 17:16 tot 17:25, `runall.zsh --alleen gemma-logprobs`, log `runall-gemma-logprobs.log`): 2 runs (`gemma-ftl-1/2`) op `4f7b3cbb`, zonder lane, verse server per run, beide compleet en onverstoord (84 verzoeken, `requests_completed` +83: de ene 500 is de scoreroute).
 
-**Moet #530 bijgewerkt worden?** Niet nodig: #530 is correct en weigert Gemma netjes. Na een geslaagde servertoets kan `4f7b3cbb` op de PR-tak (fast-forward van `feat/first-token-logprobs`) of als vervolg-PR; besluit Jeroen.
+| meting | main (run 1) | ftl-1 | ftl-2 |
+|---|---|---|---|
+| eerste-token p50 ms | n.b. (400) | 1297 | 1308 |
+| eerste-token p90 ms | | 1472 | 1481 |
+| eerste-token nauwkeurigheid | | 0,767 | 0,767 |
+| gretig TTFT s | 0,365 | 0,367 | 0,365 |
+| decode tok/s (256) | 22,6 | 23,1 | 22,9 |
+| agent totaal s | 73,4 | 75,2 | 72,6 |
+| MLX-piek GiB | 29,32 | 29,32 | 29,32 |
+
+- **Uitkomst: werkt en is deterministisch.** Eerste-token-logprobs geven op alle 60 prompts een antwoord zonder fouten; ftl-1 en ftl-2 hebben 60/60 dezelfde oordelen met exact dezelfde kansen. Gretige teksten 12/12 en agentteksten 6/6 gelijk aan main: de fix raakt de gewone generatie niet. Snelheid en geheugen gelijk aan main.
+- **Nauwkeurigheid 0,767** op dezelfde 60 prompts (q9b 0,667, Bonsai 0,717). Mediaan 60% van de labels staat in de top-20 van het eerste token; de rest krijgt geen kans. Dezelfde `<bos>`-correctie als hierboven.
+- **Scoreroute blijft 500** (vondst 57, `forward_ar` ontbreekt op `Gemma4AssistantRuntime`); per run één verzoek, daarna slaat `meet.py` de route over. Dat geeft 2 van de 3 tracebacks per run; de derde is die bij het stoppen (bevinding 2).
+
+**Moet #530 bijgewerkt worden?** Niet nodig: #530 is correct en weigert Gemma netjes. Nu de servertoets geslaagd is, kan `4f7b3cbb` op de PR-tak (fast-forward van `feat/first-token-logprobs`) of als vervolg-PR; besluit Jeroen.
 
 ## Bevinding 2: tracebacks en niet-200's op alle modellen
 
@@ -121,15 +135,30 @@ De laatste traceback komt pas bij `mtplx stop` (tijdens `meet.py` telde `runall.
 - **Eerste token gelijk, afwijking later.** In alle 7 afwijkende teksten zijn het eerste token en de eerste 56 tot 387 tekens gelijk; daarna een andere, even plausibele woordkeus (bijvoorbeeld `*   Topic:` tegen `*   **Topic:**`, "lighthouse stories" tegen "stories about lighthouses"). Binnen elke variant zijn de teksten bitgelijk.
 - **De prefill rekent anders.** De scoreroute (alleen prefill) geeft op int op 51 van de 60 prompts andere kansen dan main (maximaal 0,033), bij dezelfde oordelen. Op A3B was de top-K-fix (#532) bitgelijk ([eindbenchmark](2026-09-26-eindbenchmark.md)); de enige andere wijziging in de prefill is de lane: `QuantizedLinear` als batchmatmul van minstens 33 rijen, SDPA altijd gefuseerd, en de in-forward GDN-grenzen. Decode en verify houden de stock-kernels (`batch_invariant_prefill.py`, docstring).
 - **Mechanisme.** Een andere afronding in de prefill geeft een iets andere KV-cache; een gretige keuze tussen twee bijna gelijke tokens valt dan na enkele tientallen tokens anders uit. Zelfde patroon als op A3B (8/24 gelijk met de lane, [batch-invariante-router](2026-09-26-batch-invariante-router.md)), hier zonder MoE-routering: de 9B is dicht.
-- **Andere fixes.** Op A3B waren alle overige fixes samen ("kaal") voor decode en chat bitgelijk aan 2.12.0. Voor de 9B is dat niet apart gemeten; daarom de extra meting.
+- **Andere fixes.** Op A3B waren alle overige fixes samen ("kaal") voor decode en chat bitgelijk aan 2.12.0. Voor de 9B bevestigt de extra meting hieronder dat.
 
-**Extra meting (klaar, niet gedraaid):** q9b op de integratietak met de lane expliciet uit, 2 runs:
+**Extra meting: q9b zonder lane** (26 september 17:25 tot 17:28, `runall.zsh --alleen q9b-zonder-lane`, log `runall-q9b-zonder-lane.log`). Integratietak op `49c4a6ee` met `MTPLX_BATCH_INVARIANT_PREFILL=0` (`intnl`), 2 runs op een verse server, beide compleet en onverstoord (145 verzoeken, `requests_completed` +145, geen niet-200), lane niet geïnstalleerd.
 
-```zsh
-cd ~/Dev/laya-nl/modeltest && zsh ./runall.zsh --alleen q9b-zonder-lane > runall-q9b-zonder-lane.log 2>&1; tail -30 runall-q9b-zonder-lane.log
-```
+| vergelijking | gretig | agent | scoreroute (oordelen, exacte kansen, maximaal verschil) |
+|---|---|---|---|
+| intnl-1 tegen intnl-2 | 12/12 | 6/6 | 60/60, 60/60, 0 |
+| main tegen intnl (beide runs) | 12/12 | 1/6 | 60/60, 60/60, 0 |
+| int tegen intnl | 5/12 | 6/6 | 60/60, 9/60, 0,033 |
 
-Nieuw in `runall.zsh` (`--alleen`), `serve.zsh` (varianten `intnl` en `ftl`), `modellen.zsh` en `analyse.py` (secties "Extra" achter de samenvatting, met conclusieregel). Uitsluitsel: gretig main/intnl 12/12 en scoreroute exact gelijk betekent dat de lane het verschil geeft; anders verandert een andere fix de rekenpaden en volgt bisecten. Duur ongeveer 5 minuten, poort 8000, akkoord Jeroen nodig.
+**Uitsluitsel:** zonder lane is de integratietak voor gretige teksten en scoreroute bitgelijk aan main. Het verschil tussen int en main komt dus alleen door de invariante prefill, niet door een andere fix. De agentteksten wijken af van main door de messages-ttft-fix (vondst 43) en zijn met en zonder lane gelijk. Eerste-token-logprobs: int tegen intnl 60/60 dezelfde oordelen, 7/60 exact dezelfde kansen (maximaal 0,041).
+
+**Wat de lane op de 9B kost** (indicatief: intnl is een half uur later gemeten, niet afgewisseld met main en int):
+
+| meting | main | int (lane) | intnl (zonder lane) |
+|---|---|---|---|
+| gretig TTFT s | 0,257 | 0,243 | 0,210 |
+| scoreroute p50 ms | 502 | 436 | 419 |
+| eerste-token p50 ms | n.b. | 399 | 382 |
+| agent totaal s | 22,8 | 6,8 | 6,8 |
+| decode tok/s (256) | 65,4 | 64,1 | 64,7 |
+| MLX-piek GiB | 11,56 | 10,02 | 10,06 |
+
+De winst tegen main komt op de 9B uit de andere fixes; de lane zelf kost hier ongeveer 4% op scoreroute en eerste-token en ongeveer 15% op de gretige TTFT, bij gelijk geheugen. Op A3B was de lane juist sneller (scoring 1,28×, vondst 29), omdat daar de MoE-routering meetelt. De lane geeft op de 9B wel batch-invariantie; of die de prijs waard is, hangt af van gelijktijdige classificatie op dat model. Het Bink-platform draait A3B.
 
 **Kwaliteit** (voorlopig, alleen de afwijkplaatsen bekeken, niet de hele teksten): andere, maar even plausibele formuleringen; nauwkeurigheid van de classificatie gelijk (0,667).
 
@@ -141,7 +170,7 @@ Gevolg (verwacht, niet gemeten): Bonsai rekent de prefill op int weer als op mai
 
 ## Vervolg
 
-- Extra meting q9b zonder lane (commando hierboven), daarna oordeel q9b definitief.
-- Servertoets Gemma-eerste-token (`--alleen gemma-logprobs`), daarna besluit over #530.
+- Oordeel q9b definitief: werkt, het tekstverschil komt door de invariante prefill (extra meting, 12/12 gelijk aan main zonder lane). Kwaliteit van de zeven afwijkende teksten nog volledig lezen.
+- Gemma-eerste-token werkt op de server en is deterministisch: besluit Jeroen over `4f7b3cbb` (op #530 of als vervolg-PR).
 - Eventueel Bonsai op `49c4a6ee` opnieuw meten (int met `MTPLX_BATCH_INVARIANT_PREFILL=1`, gate weigert) om de winst zonder lane te kennen.
 - Voor de PR's van vondst 42 (gemma4-probe), 43 (messages-ttft) en 50 (scoped chat): op de drie modellen geen regressie gezien; Gemma-chat en -agent zijn bitgelijk aan main, de agentwinst van messages-ttft is op q9b −70%.
