@@ -25622,11 +25622,15 @@ async def _prompt_scoring_response(
         state.begin_foreground()
         state.lock.acquire()
         try:
-            return score_prompt_logprobs(
-                state.runtime,
-                list(prompt_ids),
-                top_k=int(top_k),
-            )
+            # The trunk runs at the prefill chunk a generation would use.
+            with prefill_chunk_size_override(
+                getattr(state.args, "prefill_chunk_tokens", None)
+            ):
+                return score_prompt_logprobs(
+                    state.runtime,
+                    list(prompt_ids),
+                    top_k=int(top_k),
+                )
         finally:
             state.lock.release()
             state.end_foreground()

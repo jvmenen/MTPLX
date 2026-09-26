@@ -240,3 +240,4 @@ def test_install_swaps_classes_without_touching_parameters(monkeypatch):
     assert qwen3_next.scaled_dot_product_attention is bip.batch_invariant_sdpa
     assert bip.batch_invariant_prefill_installed() is True
     assert bip.install_batch_invariant_prefill(model)["attention_hooked"] == 0
+

@@ -8288,22 +8288,99 @@ def _sorted_top_k(ids: np.ndarray, logprobs: np.ndarray) -> tuple[np.ndarray, np
     )
 
 
+_PROMPT_SCORE_LEGACY_TRUNK_ROWS = 256
+
+
+def _prompt_score_trunk_chunk_size() -> int:
+    """Rows per trunk forward when scoring a prompt.
+
+    ``MTPLX_PROMPT_SCORE_TRUNK_CHUNK`` names a width. Otherwise the normal
+    prefill chunk (live setting, else profile) when the batch-invariant
+    prefill lane is installed, because only then is the result independent
+    of the width; else 256, the layout through 2.12.0: on MoE models such as
+    Qwen3.6-35B-A3B another width changes the routing and the scores."""
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    override = _env_int("MTPLX_PROMPT_SCORE_TRUNK_CHUNK", 0)
+    if override > 0:
+        return override
+    if batch_invariant_prefill_installed():
+        return _prefill_chunk_size()
+    return _PROMPT_SCORE_LEGACY_TRUNK_ROWS
+
+
+def _post_norm_logits_head(rt: MTPLXRuntime) -> Callable[[Any], Any] | None:
+    """The target lm_head over post-norm hidden rows, or None when this
+    runtime cannot run its trunk without logits (logits then come from the
+    forward itself)."""
+
+    if not rt.mtp_enabled:
+        return None
+    text_model = getattr(rt.model, "language_model", rt.model)
+    return getattr(text_model, "logits_from_post_norm", None)
+
+
+def _prompt_logit_slices(
+    rt: MTPLXRuntime,
+    prompt_array: mx.array,
+    cache: Any,
+    *,
+    logits_rows: int,
+    trunk_rows: int,
+):
+    """Yield ``(start, logits[rows, vocab])`` over the prompt, never more
+    than ``logits_rows`` rows of logits at a time.
+
+    With a separate lm_head the trunk runs ``trunk_rows`` rows per forward
+    (the prefill shape) and the head runs per ``logits_rows`` slice of its
+    hidden rows; without one each forward is one ``logits_rows`` slice.
+    """
+
+    logits_head = _post_norm_logits_head(rt)
+    if logits_head is None:
+        trunk_rows = logits_rows
+    for trunk_start in range(0, int(prompt_array.shape[1]), trunk_rows):
+        trunk = prompt_array[:, trunk_start : trunk_start + trunk_rows]
+        if logits_head is None:
+            with attention_phase("prefill"):
+                logits, _hidden = _forward_ar_optional_hidden(
+                    rt, trunk, cache=cache, hidden_variant=None, emit_logits=True
+                )
+            yield trunk_start, logits[0]
+            continue
+        with attention_phase("prefill"):
+            _logits, hidden = rt.forward_ar(
+                trunk,
+                cache=cache,
+                return_hidden=True,
+                hidden_variant="post_norm",
+                emit_logits=False,
+            )
+        for offset in range(0, int(trunk.shape[1]), logits_rows):
+            rows = hidden[:, offset : offset + logits_rows, :]
+            yield trunk_start + offset, logits_head(rows)[0]
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
     top_k: int,
     chunk_size: int = 256,
+    trunk_chunk_size: int | None = None,
 ) -> dict[str, Any]:
     """Teacher-forced prompt scoring: per-position next-token top-K logprobs.
 
     One prefill-shaped pass over the prompt, chunked so at most
     ``chunk_size x vocab`` logits are resident at once — the full-prompt
     logits tensor was the 32k memory-balloon root cause and must never come
-    back. Position ``i`` of the result describes the model's distribution
-    AFTER prefix ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the
-    alignment Ivan's kl_capture consumes and llama.cpp's echo+logprobs
-    emits. Zero decode-hot-path cost: nothing here touches generation.
+    back. The trunk runs in forwards of ``trunk_chunk_size`` rows (default:
+    ``_prompt_score_trunk_chunk_size``) where the runtime can apply its
+    lm_head separately; otherwise in forwards of ``chunk_size``. Position
+    ``i`` of the result describes the model's distribution AFTER prefix
+    ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the alignment
+    Ivan's kl_capture consumes and llama.cpp's echo+logprobs emits. Zero decode-hot-path cost: nothing here touches generation.
     """
 
     import numpy as np
@@ -8317,19 +8394,17 @@ def score_prompt_logprobs(
     prompt_array = mx.array([prompt_ids])
     token_logprobs: list[float | None] = []
     top_entries: list[list[tuple[int, float]]] = []
+    if trunk_chunk_size is None:
+        trunk_chunk_size = _prompt_score_trunk_chunk_size()
     started = time.perf_counter()
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        chunk = prompt_array[:, start:end]
-        with attention_phase("prefill"):
-            logits, _hidden = _forward_ar_optional_hidden(
-                rt,
-                chunk,
-                cache=cache,
-                hidden_variant=None,
-                emit_logits=True,
-            )
-        rows_logits = logits[0]
+    for start, rows_logits in _prompt_logit_slices(
+        rt,
+        prompt_array,
+        cache,
+        logits_rows=chunk_size,
+        trunk_rows=max(1, int(trunk_chunk_size)),
+    ):
+        end = start + int(rows_logits.shape[0])
         row_lse = _row_logsumexp_f32(rows_logits)
         k = min(top_k, int(rows_logits.shape[-1]))
         top_idx = _exact_top_k_ids(rows_logits, k)
@@ -8365,7 +8440,7 @@ def score_prompt_logprobs(
             )
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
-        del logits, rows_logits, row_lse, top_idx, top_vals
+        del rows_logits, row_lse, top_idx, top_vals
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,
