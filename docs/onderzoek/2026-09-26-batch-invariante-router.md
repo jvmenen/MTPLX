@@ -64,7 +64,7 @@ Het verschil in de laatste kolom is het gemiddelde van beide rondes. De TTFT-kos
 
 ### Wat nog open is
 
-- Vondst 21 (in-forward-grenzen voor A3B) is met de schakelaar zinvol geworden: het zou de ~100 ms voor prompts vanaf 512 tokens met bank wegnemen, zonder uitkomstrisico.
+- Vondst 21 (in-forward-grenzen voor A3B) is met de schakelaar zinvol geworden: het zou de ~100 ms voor prompts vanaf 512 tokens met bank wegnemen, zonder uitkomstrisico. Inmiddels gebouwd en gemeten: zie [gdn-inforward-a3b](2026-09-26-gdn-inforward-a3b.md).
 - Paged caches: de vllm-paged-route in `attention_split` gaat buiten de haak om. In deze metingen liep prefill steeds op een contiguous cache; een prefill op een gepagede cache is niet getoetst.
 - Forwards van 2 tot 8 rijen worden nog aangevuld (kosten ~70 ms, alleen bij korte suffixen); bij een KV-capaciteit vanaf 8192 kiest `attention_split` daar bovendien eigen kernels.
 - `gather_qmm` boven 4096 tokens per forward (zie boven) is een MLX-fout die buiten deze tak valt.
