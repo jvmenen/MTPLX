@@ -2784,6 +2784,7 @@ def generate_gemma4_ar(
     session_draft_head_identity: str | None = None,
     session_policy_fingerprint: str | None = None,
     capture_final_state: bool = False,
+    first_token_logprobs_top_k: int | None = None,
 ):
     """Generate with the Gemma target only, using the local target adapter."""
 
@@ -2798,6 +2799,7 @@ def generate_gemma4_ar(
         _repetition_stop_config,
         _sample_from_logits,
         _trim_repeated_suffix,
+        first_token_logprobs,
     )
 
     del trace_label, trace_metadata
@@ -2884,9 +2886,14 @@ def generate_gemma4_ar(
         token_callback=token_callback,
     )
 
+    first_logprobs = None
     for step in range(int(max_tokens)):
         token, _dist = _sample_from_logits(logits[0], sampler, rng)
         token = int(token)
+        if first_token_logprobs_top_k is not None and not tokens:
+            first_logprobs = first_token_logprobs(
+                logits[0], token_id=token, top_k=first_token_logprobs_top_k
+            )
         tokens.append(token)
         pending_token_needs_commit = True
         events.append({"step": int(step), "token": token})
@@ -3011,6 +3018,7 @@ def generate_gemma4_ar(
         text=_decode_tokens(runtime.tokenizer, _strip_terminal_stop(tokens, stop_ids)),
         stats=stats,
         final_state=final_state,
+        first_token_logprobs=first_logprobs,
     )
 
 
@@ -3037,6 +3045,7 @@ def generate_gemma4_assistant(
     prefill_callback: Any | None = None,
     repetition_stop: bool = False,
     requested_speculative_depth: int | None = None,
+    first_token_logprobs_top_k: int | None = None,
 ):
     """Generate with the external Gemma assistant using target-prefix exactness."""
 
@@ -3051,6 +3060,7 @@ def generate_gemma4_assistant(
         _repetition_stop_config,
         _sample_from_logits,
         _trim_repeated_suffix,
+        first_token_logprobs,
     )
 
     del trace_label, trace_metadata
@@ -3157,6 +3167,15 @@ def generate_gemma4_assistant(
     interval_100: dict[int, dict[str, Any]] = {}
 
     primary, _dist = _sample_from_logits(prompt_state.logits[0], sampler, rng)
+    first_logprobs = (
+        first_token_logprobs(
+            prompt_state.logits[0],
+            token_id=int(primary),
+            top_k=first_token_logprobs_top_k,
+        )
+        if first_token_logprobs_top_k is not None and int(max_tokens) > 0
+        else None
+    )
     hidden = prompt_state.hidden
     shared_kv_states = prompt_state.shared_kv_states
     kv_offset = int(prompt_state.kv_offset)
@@ -3512,4 +3531,5 @@ def generate_gemma4_assistant(
         text=_decode_tokens(runtime.tokenizer, _strip_terminal_stop(tokens, stop_ids)),
         stats=stats,
         final_state=final_state,
+        first_token_logprobs=first_logprobs,
     )
