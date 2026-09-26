@@ -2,9 +2,9 @@
 
 Tak `perf/batch-invariant-router` (vanaf lokale `perf/integratie` 54c4ca5f), worktree `~/Dev/MTPLX-router`, gepusht naar de fork. Drie commits: `35c161f7` (schakelaar), `6a151a33` (commit B terug, alleen met schakelaar), `2c1e653f` (geen staartgrenzen onder de bankdrempel, alleen met schakelaar). Meetscripts en ruwe resultaten lokaal in `~/Dev/laya-nl/router-invariant/` (niet in de fork).
 
-## Tussenstand (gepauzeerd)
+## Tussenstand
 
-Het werk is op 26 september rond 09:05 gepauzeerd (laptop mee). De meetreeks is halverwege gestopt; de server op poort 8000 is uit.
+Het werk is op 26 september rond 09:05 gepauzeerd (laptop mee) en dezelfde dag hervat; zie "Hervat: stappen 2 tot en met 4" hieronder. De stukken tot en met "Nog niet gemeten" beschrijven de stand van de ochtend.
 
 ### Diagnose (gemeten, echt model in een eigen proces, geen server actief)
 
@@ -84,6 +84,26 @@ Varianten A (uit), B (aan, trunk standaard = prefill-blok), C (aan, `MTPLX_PROMP
 
 De TTFT-kosten komen (verwacht, niet apart gemeten) van de losse forward van het laatste prompttoken (`generation.py:7648` in de basis): die heeft 1 rij en wordt in de prefill-fase aangevuld tot 66/128/9 rijen. Eén meting per variant; een herhaling ontbreekt.
 
+### Hervat: stappen 2 tot en met 4 (gemeten, echt model in een eigen proces, turbo-env, geen server actief)
+
+Commit `1ce69614` op de tak. De scripts passen nu het turbo-profiel en het modelcontract toe zoals de server (`apply_profile_env`), omdat de ochtendmetingen in het eigen proces zonder die env liepen.
+
+**Restbron 2 verklaard (synthetische 2k/4k/8k-prompts), en restbron 1 bleek dezelfde oorzaak.** Onder het turbo-profiel loopt de volledige attentie via `mtplx/attention_split.py` (`split_call`), die `scaled_dot_product_attention` per aanroep uit `mlx_lm.models.base` importeert. De haak zat alleen op `qwen3_next.scaled_dot_product_attention`, dus in de server draaide de attentie nooit via de gedwongen fused kernel: blokken van 1024 rijen of meer kregen de fused kernel, kleinere de niet-fused route. Gevonden met `diag6.py` (per component gelijke invoer, andere uitvoer: alleen laag 3, de eerste volledige attentielaag) en `diag7.py`/`diag8.py` (de haak werd nul keer aangeroepen; stack via `attention_split.py:618`). De staartrijen van de classifierprompts (restbron 1) hadden dezelfde oorzaak: het staartblok van C (bijv. 11 rijen) liep door de niet-fused route. De lm_head buiten de prefill-fase was daar niet de oorzaak: B en C snijden de lm_head allebei per 256 rijen vanaf 0.
+
+Oplossing: de haak ook op `mlx_lm.models.base.scaled_dot_product_attention` (`batch_invariant_prefill.py`, `_install_attention_route`). De andere MTPLX-routes in `split_call` (GQA-packed, NAX-flash) grijpen alleen bij 2 tot 8 queryrijen en een KV-capaciteit vanaf 8192; de paged route alleen bij een gepagede cache. Die vallen buiten de invariantie (minder dan 9 rijen of gepagede cache).
+
+**Stap 2, losse forward van het laatste prompttoken:** draait nu op de stock-kernels (`stock_prefill_kernels`, via `_final_token_prefill_phase` op de vijf plekken in `generation.py` waar één token los door het model gaat). Andere smalle forwards (2 tot 8 rijen) worden nog steeds aangevuld.
+
+**Stap 3:** de lm_head van de scoreroute draait binnen `attention_phase("prefill")`; test `test_lm_head_slices_run_in_the_prefill_phase`.
+
+**Toets (`diag5.py`, `diag9.py`):**
+
+- Scoreroute trunk 9, 17, 64, 100, 256, 331 en 1000 tegen 2048: **bitgelijk op alle posities** (ook de eerste 9), op de tekst van 2600 tokens en prompt 32 (507 tokens).
+- Trunk 256 tegen 2048: bitgelijk op file-38, -80, -105, -230 (de eerdere staartafwijkingen) en op synthetic-2000, -4000 en -8000.
+- Trunk 8192 tegen 2048 op synthetic-8000 (7987 tokens): wijkt overal af, tot 9,8 nats. Oorzaak buiten de schakelaar: zie hieronder.
+
+**Nieuwe vondst: `gather_qmm` in MLX 0.32.2 rekent fout bij forwards van meer dan 4096 tokens** (gemeten op synthetische tensors met de A3B-vormen, `synth7.py`, 6 bit, 256 experts, top-8). De stock `SwitchGLU` geeft in één forward van 4097, 4100, 7500 of 7987 tokens andere rijen dan in blokken van 2048 (32 tot 7946 rijen, verschil tot 6,0 bij waarden rond 1,5: geen afronding maar foute uitkomsten); bij 6000 en 7000 tokens niet. In het echte model wijkt de uitvoer van de routed experts in laag 0 dan op alle 7987 rijen af bij gelijke invoer en gelijke routering. De server gebruikt onder turbo prefill-blokken van 2048 (`MTPLX_PREFILL_CHUNK_SIZE_*`), dus dit raakt de huidige configuratie niet; wel elke instelling met blokken boven 4096 tokens.
+
 ### Nog niet gemeten
 
 - Vondst 40 met de schakelaar (varianten D en E: completions-bank met en zonder staartgrenzen): gestart, afgebroken.
@@ -92,10 +112,7 @@ De TTFT-kosten komen (verwacht, niet apart gemeten) van de losse forward van het
 
 ### Hervatten: volgende stappen
 
-1. Lees dit rapport en `~/Dev/laya-nl/router-invariant/` (scripts `diag*.py`, `serve.zsh`, `runall.zsh`, `quality.py`, `qcompare.py`, `synth*.py`, `sdpa_test.py`; resultaten in `res/`, serverlogs in `logs/`). Worktree `~/Dev/MTPLX-router`, tak `perf/batch-invariant-router` (2c1e653f), schoon.
-2. Losse forward van 1 rij goedkoop maken: forwards van weinig rijen die altijd los lopen (het laatste prompttoken) niet aanvullen, of kleinere minimums meten. Doel: TTFT en eerste-token-logprobs terug naar het niveau van A zonder de invariantie voor blokken ≥ 9 rijen te verliezen. Opnieuw `diag3.py` draaien (in-process, alleen zonder draaiende server).
-3. lm_head in commit B binnen `attention_phase("prefill")` aanroepen (`generation.py:8383`), test toevoegen.
-4. Synthetische prompts B tegen C uitzoeken (zie restbron 2): in het eigen proces `score_prompt_logprobs` met `trunk_chunk_size` 256 tegen 2048 op de synthetische tekst van `verify_scoring_real.py`, en in de serverlog de prefill-blokgrootte nagaan.
-5. Servermetingen opnieuw: `runall.zsh` (varianten A, B, C, D, E, F, A2, B2; ~8 min per variant, alleen met toestemming van Jeroen; poort 8000 na afloop vrij). Doel: B tegen C 243/243 en maximaal verschil 0; vondst 40 (D tegen E: gelijke oordelen, tijdwinst); spreiding A/A2.
-6. Kwaliteitsoordeel over de gretige teksten (Claude Opus 5.5) en de NLL/classificatie van de tweede ronde.
-7. Daarna volledige suite (`MTPLX_CONFIG=/nonexistent`, vergelijken met de nulmeting), ruff, commit en `git push fork perf/batch-invariant-router`; docs bijwerken (VONDSTEN 29, 40, 21 en de README-tabellen).
+1. Gedaan (26 sep): rapport en scripts gelezen; stappen 2, 3 en 4 gebouwd en in het eigen proces getoetst (commit `1ce69614`, zie "Hervat: stappen 2 tot en met 4"). Nieuwe scripts: `diag5.py` tot en met `diag9.py`, `synth7.py`; `common.py` herkent een server nu alleen aan `python ... -m mtplx.server.openai` (een ander agentproces met die tekst in zijn opdrachtregel stopte de metingen).
+2. Servermetingen opnieuw met `runall.zsh` (A, B, C, D, E, F, A2, B2; verse server per variant, poort 8000 na afloop vrij). Doel: B tegen C 243/243 en maximaal verschil 0; TTFT en eerste-token-logprobs van B binnen ~3% van A; vondst 40 (D tegen E); spreiding A/A2 en B/B2.
+3. Kwaliteitsoordeel over de gretige teksten (Claude Opus 5.5) en de NLL/classificatie van de tweede ronde.
+4. Volledige suite (`MTPLX_CONFIG=/nonexistent`, vergelijken met de nulmeting), ruff, commit en push; docs bijwerken (VONDSTEN 29, 40, 21, de README-tabellen, nieuwe vondst over `gather_qmm` boven 4096 tokens).
