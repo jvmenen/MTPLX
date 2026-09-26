@@ -88,6 +88,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [batch-invariante-router](2026-09-26-batch-invariante-router.md) | Waarom prefill-rijen op A3B afhangen van de blokgrootte (split-K, expert- en SDPA-kernels in MLX, SDPA via `attention_split` onder turbo) en een schakelaar die dat oplost: scoring bitgelijk voor elke blokgrootte vanaf 9 rijen, 1,28× sneller, geen merkbare kosten buiten scoring; aanbevolen voor de eindconfig |
 | 2026-09-26 | [gdn-inforward-a3b](2026-09-26-gdn-inforward-a3b.md) | GDN-grenzen binnen de forward voor A3B (vondst 21), alleen met de invariante prefill: bitgelijk aan de ladder, eerste-token-logprobs met bank vanaf 512 tokens −21%, één forward minder |
 | 2026-09-26 | [voorrang](2026-09-26-voorrang.md) | Voorrang voor korte verzoeken in de seriële wachtrij (schakelaar, standaard uit); gemeten zonder effect op platformverkeer, omdat de classifier buiten de rij loopt en korte titels HTTP 503 krijgen (voorlopig, her-runs open) |
+| 2026-09-26 | [modeltest](2026-09-26-modeltest.md) | Integratietak op Qwen3.5-9B, Ternary-Bonsai-2-27B en Gemma 4 tegen 2.12.0: Bonsai OK; 9B werkt (agent −70%) maar andere gretige teksten door de invariante prefill (extra meting klaar); Gemma zonder regressie, classificatieroutes ook op main niet beschikbaar; Gemma-steun voor eerste-token-logprobs gebouwd |
 
 ## Takken
 
@@ -96,6 +97,7 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | Tak | Inhoud | Status |
 |---|---|---|
 | `feat/first-token-logprobs` | Eerste-token-logprobs | Gepusht; PR [#530](https://github.com/youssofal/MTPLX/pull/530) ingediend |
+| `feat/first-token-logprobs-gemma4` | Eerste-token-logprobs ook op het Gemma-4-paar (op `feat/first-token-logprobs`) | Gepusht (4f7b3cbb), 8 tests; nog niet op de server getoetst (`runall.zsh --alleen gemma-logprobs`); daarna besluit: #530 bijwerken of vervolg-PR ([modeltest](2026-09-26-modeltest.md)) |
 | `feat/prompt-scoring-topk` | Schone PR-tak: alleen de snellere top-K van de scoreroute | Gepusht; PR [#532](https://github.com/youssofal/MTPLX/pull/532) ingediend |
 | `feat/faster-prompt-scoring` | Werktak scoreroute (A, B en het terugdraaien van B) | Alleen lokaal; vervangen door `feat/prompt-scoring-topk`, mag weg |
 | `feat/chat-encode-segment-memo` | Chat-encode-memo per segment | Gepusht; PR [#533](https://github.com/youssofal/MTPLX/pull/533) ingediend |
@@ -112,8 +114,9 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `fix/messages-ttft` | Kale goedgevormde toolaanroep niet meer als orphan markup herhalen (vondst 35) | Gepusht (2f38106b); op de echte server gemeten; PR-besluit open (vondst 43) |
 | `onderzoek-messages-ttft` | Werktak van het messages-onderzoek, gelijk aan `main` 1de2b1c0 | Alleen lokaal, mag weg |
 | `perf/chat-scoped-segments` | Scoped chat per beurt encoderen (vondst 34) | Gepusht (54c4ca5f); in `perf/integratie`; PR-besluit open (vondst 50) |
-| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, 54c4ca5f); pushen werd geweigerd (vondst 48). Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)) |
+| `perf/integratie` | Alle fixes samen voor de eindbenchmark | Alleen lokaal (`~/Dev/MTPLX-integratie`, nu 49c4a6ee na fast-forward naar `perf/invariant-lane-gate`); pushen werd geweigerd (vondst 48). Eindbenchmark gedraaid (26 sep, [eindbenchmark](2026-09-26-eindbenchmark.md)); modeltest op 198e7194 ([modeltest](2026-09-26-modeltest.md)) |
 | `perf/batch-invariant-router` | Batch-invariante prefill (vondst 29), commit B en staartgrenzen alleen met de schakelaar | Gepusht (1ce69614); op de echte server gemeten (26 sep); aanbevolen voor de eindconfig en `perf/integratie`, PR-besluit open |
 | `perf/a3b-inforward-boundaries` | In-forward GDN-grenzen voor A3B (vondst 21), op `perf/batch-invariant-router` | Gepusht (198e7194); op de echte server gemeten (26 sep, bitgelijk, −21% vanaf 512 tokens met bank); in `perf/integratie` (fast-forward); PR-besluit samen met vondst 29 |
+| `perf/invariant-lane-gate` | Lane alleen installeren als hij elke projectie dekt (weigert o.a. Bonsai: `unsupported_linear:HadamardQuantizedLinear`); reden in `/health` | Gepusht (49c4a6ee); in `perf/integratie` (fast-forward); niet op de server gemeten ([modeltest](2026-09-26-modeltest.md)) |
 | `perf/short-request-priority` | Voorrang voor korte verzoeken in de seriële wachtrij (vondst 54) | Gepusht (67211d39), standaard uit; eerste meting zonder effect op platformverkeer, her-runs open; geen PR |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
