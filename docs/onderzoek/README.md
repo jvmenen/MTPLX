@@ -93,6 +93,6 @@ Alle takken behalve `feat/faster-prompt-scoring` staan in de fork op GitHub; lok
 | `refactor/prefix-helpers` | Snellere prefixvergelijking, één lezer per instelling (op `feat/prefix-reuse-block`) | Gepusht (d32c77b2, 412e1571); besluit over PR open (vondst 31) |
 | `fix/prefix-miss-reason` | Echte afwijsreden uit het werkgeheugen in `/health` (vondst 11) | Gepusht; PR [#534](https://github.com/youssofal/MTPLX/pull/534) ingediend |
 | `feat/sessionbank-put-timing` | `sessionbank_put_s` in de stats (vondst 23, stap 1) | Gepusht (dbb4bfea); op de echte server gemeten (put 0,5-4,4 ms, stap 2 niet nodig); geen PR, blijft staan als bewijs |
-| `fix/test-isolation` | Tests lezen de gebruikersconfig niet meer; Laguna-routetest los van het geheugen (vondst 10) | Gepusht (0e1b6b91); PR-tekst klaar, PR alleen na akkoord |
+| `fix/test-isolation` | Tests lezen de gebruikersconfig niet meer; Laguna-routetest los van het geheugen (vondst 10) | Gepusht (0e1b6b91); PR [#535](https://github.com/youssofal/MTPLX/pull/535) ingediend |
 | `test/classifier-live` | Eerste-token-logprobs en prefix-hergebruik samengevoegd voor de live test | Gepusht, alleen voor metingen |
 | `onderzoek` | Deze documentatie | Gepusht, lopend |
