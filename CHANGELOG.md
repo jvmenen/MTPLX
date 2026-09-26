@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Chat requests no longer build the whole vocabulary to check for Gemma 4.** `is_gemma4_tokenizer` runs on every chat encode and, for any tokenizer that is not Gemma 4, fell through to `tokenizer.get_vocab()`, which builds a dict of every token on each call: ~47 ms for the 248k-token Qwen3.6 tokenizer. The marker tokens are now looked up one by one through the `tokenizers` backend (`token_to_id`, ~15 us); `get_vocab()` stays the fallback for tokenizers without a fast backend. Detection is unchanged (checked on the Gemma 4 and Qwen3.6 pack tokenizers) and the encoded ids are identical. CPU only, Qwen3.6-35B-A3B Optimized Balance tokenizer, M5 Pro, 2026-09-26, median of 7: `_encode_messages` 52.7 -> 0.1 ms for a 46-token chat, 60.0 -> 6.9 ms at 10K tokens and 129.0 -> 61.3 ms at 80K. On a running server (turbo, fan mode default, 1de2b1c0 plus this change) the time from request arrival to the start of generation for a 396-token chat fell from 51 to 2 ms and the client time for `max_tokens: 1` from 503 to 448 ms (10 requests). Host tests in `tests/test_gemma4_tokenizer_probe.py`.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
