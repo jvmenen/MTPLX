@@ -26,6 +26,7 @@ class FakeAddedToken:
     normalized: bool = False
     lstrip: bool = False
     rstrip: bool = False
+    single_word: bool = False
 
 
 class TurnTokenizer:
@@ -100,6 +101,7 @@ def test_turns_are_encoded_separately_and_memoized(memo):
         FakeAddedToken("<|im_start|>", normalized=True),
         FakeAddedToken("<|im_start|>", lstrip=True),
         FakeAddedToken("<|im_start|>", rstrip=True),
+        FakeAddedToken("<|im_start|>", single_word=True),
         FakeAddedToken("<|im_end|>"),
     ],
 )
@@ -109,6 +111,41 @@ def test_non_atomic_turn_marker_keeps_the_single_call(memo, turn_open):
     oa._encode_rendered_chat_turns(tok, RENDER, obs)
     assert tok.encode_calls == 1
     assert "chat_segment_memo" not in obs
+
+
+def test_whole_word_turn_marker_keeps_single_call_ids(memo):
+    """A ``single_word`` marker glued to a word is plain text in the single
+    call; cutting before it would turn it into the special token."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"[UNK]": 0}
+    for word in ["abc", "hi", "<", "|", "im_start", ">", "\n"]:
+        vocab[word] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w+|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_special_tokens(
+        [
+            tokenizers.AddedToken(
+                "<|im_start|>", single_word=True, normalized=False, special=True
+            )
+        ]
+    )
+    tok = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    )
+    render = "<|im_start|>\nhi\n<|im_start|>\nabc<|im_start|>\nhi\n"
+    single_call = oa._encode_rendered_chat_text(tok, render)
+    cut = oa._encode_rendered_chat_text_segmented(
+        tok, render, oa._chat_turn_boundaries(render)
+    )
+    assert cut != single_call  # the glued marker only matches after a cut
+
+    assert not oa._chat_turn_open_is_atomic(tok)
+    assert oa._encode_rendered_chat_turns(tok, render, {}) == single_call
 
 
 def test_atomic_check_reads_through_a_wrapper():

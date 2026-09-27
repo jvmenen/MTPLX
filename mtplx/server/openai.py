@@ -14721,7 +14721,13 @@ def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
 
 def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:
     """True when ``<|im_start|>`` is an added token the tokenizer never
-    normalizes or strips around, so encoding stops and restarts at it."""
+    normalizes or strips around, so encoding stops and restarts at it.
+
+    It must also match anywhere, not only as a whole word: a ``single_word``
+    marker glued to a word (``abc<|im_start|>`` in a message) stays plain
+    text in the single-call encode, but the cut before it would make it the
+    start of a segment, where it does match.
+    """
     try:
         added = tokenizer.added_tokens_decoder.values()
     except AttributeError:
@@ -14731,6 +14737,7 @@ def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:
         and getattr(token, "normalized", True) is False
         and getattr(token, "lstrip", True) is False
         and getattr(token, "rstrip", True) is False
+        and getattr(token, "single_word", True) is False
         for token in added
     )
 
