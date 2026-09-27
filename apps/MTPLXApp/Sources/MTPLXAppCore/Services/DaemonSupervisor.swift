@@ -228,25 +228,25 @@ public final class DaemonSupervisor: @unchecked Sendable {
         logStore: BoundedLogStore = BoundedLogStore(),
         restartPolicy: DaemonRestartPolicy = .default,
         startFailureReportURL: URL? = nil,
-        restartSleeper: @escaping @Sendable (TimeInterval) async -> Void = DaemonSupervisor.defaultRestartSleeper,
-        initialHealthProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = DaemonSupervisor.defaultHealthProbe,
-        healthWaitProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = DaemonSupervisor.defaultHealthProbe,
+        restartSleeper: (@Sendable (TimeInterval) async -> Void)? = nil,
+        initialHealthProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
+        healthWaitProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
         // Test seam immediately before the atomic lifecycle reservation.
-        beforeProcessReservation: @escaping @Sendable () async -> Void = {},
+        beforeProcessReservation: (@Sendable () async -> Void)? = nil,
         // Test seam for the narrow period after ownership is published but
         // before Process.run() assigns a PID. Production uses the no-op.
-        beforeProcessRun: @escaping @Sendable () async -> Void = {},
+        beforeProcessRun: (@Sendable () async -> Void)? = nil,
         // Test seam after Process.run() but before the first liveness check.
-        beforePostRunLivenessCheck: @escaping @Sendable () async -> Void = {},
+        beforePostRunLivenessCheck: (@Sendable () async -> Void)? = nil,
         // Test seam after automatic restart state is published but before it
         // starts the next owned launch. Production uses the no-op.
-        beforeAutomaticRestartStart: @escaping @Sendable () async -> Void = {},
+        beforeAutomaticRestartStart: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before Stop resolves the current process
         // family. Production uses the no-op.
-        beforeStopProcessFamilyResolution: @escaping @Sendable () async -> Void = {},
+        beforeStopProcessFamilyResolution: (@Sendable () async -> Void)? = nil,
         // Test seam after the full process family is snapshotted for Stop,
         // before any signal is sent. Production uses the no-op.
-        beforeStopProcessFamilySignal: @escaping @Sendable () async -> Void = {},
+        beforeStopProcessFamilySignal: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before a Process termination handler acquires
         // supervisor state. Production uses the no-op.
         beforeTerminationHandling: @escaping @Sendable (Process) -> Void = { _ in }
@@ -254,19 +254,20 @@ public final class DaemonSupervisor: @unchecked Sendable {
         self.logStore = logStore
         self.restartPolicy = restartPolicy
         self.startFailureReportURL = startFailureReportURL
-        self.restartSleeper = restartSleeper
-        self.initialHealthProbe = initialHealthProbe
-        self.healthWaitProbe = healthWaitProbe
-        self.beforeProcessReservation = beforeProcessReservation
-        self.beforeProcessRun = beforeProcessRun
-        self.beforePostRunLivenessCheck = beforePostRunLivenessCheck
-        self.beforeAutomaticRestartStart = beforeAutomaticRestartStart
-        self.beforeStopProcessFamilyResolution = beforeStopProcessFamilyResolution
-        self.beforeStopProcessFamilySignal = beforeStopProcessFamilySignal
+        self.restartSleeper = restartSleeper ?? DaemonSupervisor.defaultRestartSleeper
+        self.initialHealthProbe = initialHealthProbe ?? DaemonSupervisor.defaultHealthProbe
+        self.healthWaitProbe = healthWaitProbe ?? DaemonSupervisor.defaultHealthProbe
+        self.beforeProcessReservation = beforeProcessReservation ?? DaemonSupervisor.noSeam
+        self.beforeProcessRun = beforeProcessRun ?? DaemonSupervisor.noSeam
+        self.beforePostRunLivenessCheck = beforePostRunLivenessCheck ?? DaemonSupervisor.noSeam
+        self.beforeAutomaticRestartStart = beforeAutomaticRestartStart ?? DaemonSupervisor.noSeam
+        self.beforeStopProcessFamilyResolution = beforeStopProcessFamilyResolution ?? DaemonSupervisor.noSeam
+        self.beforeStopProcessFamilySignal = beforeStopProcessFamilySignal ?? DaemonSupervisor.noSeam
         self.beforeTerminationHandling = beforeTerminationHandling
     }
 
-    // The production defaults of `init` are named functions on purpose.
+    // The async parameters of `init` default to `nil` and the production
+    // functions are chosen inside `init`, on purpose.
     //
     // A default argument of a public function is compiled into every module
     // that calls it. When the default was an `async` closure literal, each
@@ -281,9 +282,16 @@ public final class DaemonSupervisor: @unchecked Sendable {
     // runtime aborted in `swift_task_dealloc` ("freed pointer was not the last
     // allocation"), found by a watchpoint on that header. Which pair the
     // linker kept changed when 666f16e7 added a parameter ahead of these and
-    // renumbered the default arguments, which is why a cancelled start began
-    // to abort the debug test run there. One definition in this module cannot
-    // be mismatched.
+    // renumbered the default arguments.
+    //
+    // Naming a function as the default (4fba12ca) was not enough: converting
+    // it to a closure value still emits an "implicit closure in default
+    // argument N" thunk in every calling module, with the same direct-call
+    // versus function-pointer split. Adding the #528 test file changed the
+    // link order, and the debug test run died with SIGSEGV in
+    // `swift_task_alloc` inside that thunk for `initialHealthProbe`. A `nil`
+    // default compiles to no code at all, and the conversion below happens
+    // once, in this module.
     public static func defaultHealthProbe(_ baseURL: URL, _ apiKey: String?) async -> HealthPayload? {
         try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
     }
@@ -292,6 +300,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
         guard delay > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
+
+    private static func noSeam() async {}
 
     public var logs: BoundedLogStore {
         logStore
