@@ -129,6 +129,28 @@ def _paged_partials_kernel(*, has_window: bool = False):
     )
 
 
+def unnormalized_partials_dtype(query_dtype: Any) -> Any:
+    """Storage dtype for a two-pass kernel's UNNORMALIZED partial numerators.
+
+    Pass one stores ``sum_j exp(s_j - m_block) * v_j`` per block, before the
+    division by the block's exp-sum, so its magnitude is up to (rows walked by
+    the block) x max|v|. fp16 overflows that at 65504: 16 equal rows of 8192
+    store inf, and when another block's max is ~200 higher the reducer's
+    ``exp(m_block - m_global) * partial`` is ``0 * inf`` = NaN in every output
+    element (issue #526 analysis; tests/test_quant_partials_fp16_526.py
+    replays it). bfloat16 shares float32's exponent range, so no walk over
+    finite values can overflow it; it stays bit-for-bit what it was, and so
+    does the partial buffer's size, which is of the order of the KV walk
+    itself (27B verify at 32k: 24 heads x 4 rows x 512 blocks x 256 dims =
+    25 MB written and read back in bf16, against a 64 MB q8 walk). The
+    reducer below accumulates in float32 and casts only the normalized
+    output, so a float32 partial needs no change there: MLX types the
+    ``partials`` pointer from the input array.
+    """
+
+    return mx.float32 if query_dtype == mx.float16 else query_dtype
+
+
 @lru_cache(maxsize=1)
 def _paged_reduce_kernel():
     if not mx.metal.is_available():

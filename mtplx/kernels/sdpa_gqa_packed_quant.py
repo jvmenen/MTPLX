@@ -29,6 +29,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from .sdpa_2pass_paged import unnormalized_partials_dtype
 from .sdpa_gqa_packed import (  # shared, proven pieces
     _bail,
     _blocks_for_capacity,
@@ -352,14 +353,16 @@ def _quant_partials_kernel():
 
         for (int j = 0; j < QL; ++j) {
             const int o_offset = q_head_idx * QL + j;
-            device InT* p = partials
+            // PartT, not InT: the numerator is not yet divided by sum_exp
+            // (see sdpa_2pass_paged.unnormalized_partials_dtype).
+            device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
                 const float4 ob = (j < 4) ? obank[i] : obank2[i];
                 const float val = (j % 4 == 0) ? ob.x
                     : (j % 4 == 1) ? ob.y : (j % 4 == 2) ? ob.z : ob.w;
-                p[i] = static_cast<InT>(val);
+                p[i] = static_cast<PartT>(val);
             }
             if (simd_lid == 0) {
                 const float se = (j < 4) ? sum_exp[j] : sum_exp2[j - 4];
@@ -491,6 +494,7 @@ def sdpa_gqa_packed_tail_quant(
 
     partial_shape = (bsz, hq, q_len, blocks, d)
     stats_shape = (bsz, hq, q_len, blocks)
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = kernel(
         inputs=[
             queries,
@@ -506,6 +510,7 @@ def sdpa_gqa_packed_tail_quant(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", d),
             ("V", d),
             ("GQA_F", gqa_factor),
@@ -515,7 +520,7 @@ def sdpa_gqa_packed_tail_quant(
         grid=(hk * 32, gqa_factor, blocks),
         threadgroup=(32, gqa_factor, 1),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(
