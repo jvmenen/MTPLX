@@ -19464,6 +19464,27 @@ def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
         pass
 
 
+class _AllocatorReadingError(RuntimeError):
+    """MLX's allocator account could not be read (MLX unavailable, or its
+    active-memory accessor raised). The guard cannot price the engine's own
+    line without it, so the step that needed it is reported degraded."""
+
+
+def _allocator_reading_failure(stats: Mapping[str, Any]) -> str | None:
+    """Why ``_mlx_memory_stats_live()`` gave no allocator account, or None.
+
+    A reading that fails is not a reading of zero: the review of 23a94abf
+    found a failed read treated as zero active memory, which skipped the
+    admission (None) and the per-chunk check's engine line, with
+    ``guard_degraded`` false."""
+
+    if not stats.get("ok", False):
+        return str(stats.get("error") or "the MLX allocator reading failed")
+    if stats.get("active_memory_bytes") is None:
+        return "MLX's active-memory accessor gave no value"
+    return None
+
+
 def _note_guard_health(
     state: Any, *, where: str, error: BaseException | None
 ) -> None:
@@ -19522,13 +19543,20 @@ def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
     try:
         bank = getattr(getattr(state, "sessions", None), "bank", None)
         if bank is not None:
+            # The failing request's own conversation is still in flight here;
+            # its entries are what its retry restores from (the pressure trim
+            # spares them for the same reason).
             receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
                 int(bank.effective_max_bytes()) // 2,
                 reason="allocation_failure",
+                protect_session_ids=_in_flight_session_ids(state),
             )
             receipt["bank_bytes_after"] = int(bank.total_nbytes)
+        _note_guard_health(state, where="allocation_failure_shed", error=None)
     except Exception as exc:
         receipt["bank_error"] = repr(exc)
+        receipt["guard_degraded"] = True
+        _note_guard_health(state, where="allocation_failure_shed", error=exc)
     try:
         import mlx.core as _mx
 
@@ -19831,11 +19859,43 @@ class _PrefillSystemGuard:
     Any of them stops the request with a 507 before the chunk. An unreadable
     machine skips the Mac's lines, ``--allow-swap`` skips all of them, and
     the trip belongs to this request only.
+
+    Once the prefill's forwards are done, the check reserves only what the
+    request still allocates (``after_prefill_reserve_bytes``: the repage's
+    paged copy and decode start's copies beyond the rows the prefill left),
+    never a forward again (the review of 23a94abf: Gemma 4's check after its
+    one forward reserved that forward a second time, 79.45 GiB beside the
+    38.5 GiB it left resident, and refused a 24K prompt that had fit). The
+    generation's prefill progress says when the forwards are done
+    (``note_prefill_progress``). A backend that runs its own prefill as one
+    forward reports that only after its post-forward check, so there the
+    forward's rows are the witness (``forward_rows_bytes``): the check
+    counts the forward done once what the request holds (MLX's active
+    memory less the bank's and its queued jobs') has grown by the restore's
+    copy plus half the rows that forward leaves.
     """
 
-    def __init__(self, state: Any, *, chunk_reserve_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        state: Any,
+        *,
+        chunk_reserve_bytes: int = 0,
+        after_prefill_reserve_bytes: int | None = None,
+        forward_rows_bytes: int | None = None,
+        restore_bytes: int = 0,
+    ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        self.after_prefill_reserve_bytes = (
+            self.chunk_reserve_bytes
+            if after_prefill_reserve_bytes is None
+            else max(0, int(after_prefill_reserve_bytes))
+        )
+        self.forward_rows_bytes = (
+            None if forward_rows_bytes is None else max(0, int(forward_rows_bytes))
+        )
+        self.restore_bytes = max(0, int(restore_bytes))
+        self.prefill_done_by: str | None = None
         self.window = _SystemReadingWindow()
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
@@ -19844,6 +19904,36 @@ class _PrefillSystemGuard:
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
         self.limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
         self.allow_swap = bool(getattr(state, "allow_swap", False))
+        self.base_held: int | None = None
+        if self.forward_rows_bytes and not self.allow_swap:
+            stats = _mlx_memory_stats_live()
+            if _allocator_reading_failure(stats) is None:
+                self.base_held = self._request_held(stats)
+
+    def _request_held(self, stats: Mapping[str, Any]) -> int:
+        """MLX's active memory less what the bank and its queued jobs hold:
+        a bank trim during the forward must not read as the forward undone."""
+
+        bank = getattr(getattr(self.state, "sessions", None), "bank", None)
+        held = 0
+        if bank is not None:
+            held = int(getattr(bank, "total_nbytes", 0) or 0) + int(
+                getattr(bank, "queued_persistence_bytes", 0) or 0
+            )
+        return int(stats.get("active_memory_bytes") or 0) - held
+
+    def note_prefill_progress(self, payload: Mapping[str, Any]) -> None:
+        """The generation's prefill progress: its last chunk, or its end."""
+
+        try:
+            phase = payload.get("phase")
+            total = int(payload.get("tokens_total") or 0)
+            done = int(payload.get("tokens_done") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total):
+            if self.prefill_done_by is None:
+                self.prefill_done_by = "prefill_progress"
 
     def __call__(self) -> bool:
         if self.tripped is not None:
@@ -19860,8 +19950,28 @@ class _PrefillSystemGuard:
         self.checks += 1
         reserve = self.chunk_reserve_bytes
         stats = _mlx_memory_stats_live()
-        active = int(stats.get("active_memory_bytes") or 0)
-        pool = int(stats.get("cache_memory_bytes") or 0)
+        failure = _allocator_reading_failure(stats)
+        # Without the allocator's account the engine line cannot run; the
+        # Mac's lines below still do, and the gap is reported, never passed
+        # as a healthy check.
+        _note_guard_health(
+            self.state,
+            where="prefill_system_check",
+            error=None if failure is None else _AllocatorReadingError(failure),
+        )
+        active = 0 if failure is not None else int(stats.get("active_memory_bytes") or 0)
+        pool = 0 if failure is not None else int(stats.get("cache_memory_bytes") or 0)
+        if (
+            self.prefill_done_by is None
+            and self.forward_rows_bytes
+            and self.base_held is not None
+            and failure is None
+        ):
+            grown = self._request_held(stats) - self.base_held
+            if grown >= self.restore_bytes + self.forward_rows_bytes // 2:
+                self.prefill_done_by = "forward_rows_resident"
+        if self.prefill_done_by is not None:
+            reserve = self.after_prefill_reserve_bytes
         reason = None
         engine = None
         fields: dict[str, Any] = {}
@@ -19891,6 +20001,8 @@ class _PrefillSystemGuard:
             "action": "prefill_system_abort",
             "reason": reason,
             "chunk_reserve_bytes": int(reserve),
+            "reserve_after_prefill": self.prefill_done_by is not None,
+            "prefill_done_by": self.prefill_done_by,
             "engine_bytes": engine,
             "limit_bytes": int(self.limit) or None,
             **fields,
@@ -19946,6 +20058,56 @@ def _prefill_chunk_reserve_bytes(
         state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
     )
     return _admission_chunk_bytes(geometry, rows, scratch)
+
+
+def _prefill_after_forward_plan(
+    state: Any,
+    *,
+    prompt_tokens: int,
+    chunk_tokens: int | None,
+    priced: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What the per-chunk check reserves once the prefill's forwards are
+    done, and, for a backend that runs its own prefill as one forward, the
+    rows that forward leaves (``_PrefillSystemGuard``'s witness).
+
+    From the admission's bill when there is one: the larger of the repage
+    and decode start, less the rows the prefill leaves (its restore copy and
+    the rows it writes). Without one, a full-width copy of the prompt, and
+    its paged copy when the layout repages: more than any bill charges."""
+
+    runtime = getattr(state, "runtime", None)
+    prompt_tokens = max(1, int(prompt_tokens))
+    widths = _admission_prefill_widths(runtime, prompt_tokens, chunk_tokens)
+    own_one_forward = widths[0] is None and callable(
+        getattr(runtime, "prefill_forward_widths", None)
+    )
+    if isinstance(priced, Mapping) and priced.get("live_prefill_bytes") is not None:
+        left = int(priced["live_prefill_bytes"])
+        after = max(
+            0,
+            max(
+                int(priced.get("repage_bytes") or 0),
+                int(priced.get("decode_start_bytes") or 0),
+            )
+            - left,
+        )
+        restore = int(priced.get("restore_copy_bytes") or 0)
+        rows = max(0, left - restore)
+    else:
+        from mtplx.generation import prefill_cache_layout
+
+        geometry = _admission_geometry(state)
+        rows = prompt_tokens * int(geometry.live_bytes_per_token)
+        restore = 0
+        after = rows
+        if prefill_cache_layout(runtime, prompt_tokens) == "contiguous_then_repage":
+            after += prompt_tokens * int(geometry.paged_bytes_per_token)
+    return {
+        "after_prefill_reserve_bytes": int(after),
+        "forward_rows_bytes": int(rows) if own_one_forward else None,
+        "restore_bytes": int(restore) if own_one_forward else 0,
+    }
 
 
 def _prefill_system_abort_exception(
@@ -20280,6 +20442,10 @@ class _AdmissionGeometry:
     # a cache holds it dequantized, and decode keeps a working copy beside
     # the pages (the q8 bf16 mirror, the q4 head-major bank).
     kv_quantization: str = "off"
+    # (query heads, KV heads, key head dim, value head dim) of the attention
+    # layers: what the quantized-KV kernels' routes are decided on. None
+    # when the config does not say, which prices the route that builds most.
+    attention_shape: tuple[int, int, int, int] | None = None
 
     @property
     def resident_width(self) -> int:
@@ -20324,7 +20490,25 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
         aux_bytes_per_token=aux,
         kv_quantization=str(getattr(plan, "kv_quantization", "off") or "off"),
+        attention_shape=_attention_shape(runtime),
     )
+
+
+def _attention_shape(runtime: Any) -> tuple[int, int, int, int] | None:
+    """(query heads, KV heads, key dim, value dim) from the text config."""
+
+    args = _runtime_text_args(runtime)
+    try:
+        heads = int(getattr(args, "num_attention_heads", 0) or 0)
+        kv_heads = int(getattr(args, "num_key_value_heads", 0) or 0) or heads
+        head_dim = int(getattr(args, "head_dim", 0) or 0)
+        if not head_dim and heads:
+            head_dim = int(getattr(args, "hidden_size", 0) or 0) // heads
+    except (TypeError, ValueError):
+        return None
+    if heads <= 0 or kv_heads <= 0 or head_dim <= 0:
+        return None
+    return (heads, kv_heads, head_dim, head_dim)
 
 
 def _runtime_text_args(runtime: Any) -> Any:
@@ -20589,6 +20773,7 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
     if not isinstance(cache, (list, tuple)):
         return None
     capacities: list[int] = []
+    working: list[int] = []
     block_size = 0
     for layer in cache:
         if getattr(layer, "allocated_blocks", None) is None:
@@ -20598,6 +20783,10 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
             block_size = int(layer.block_size)
         except (AttributeError, TypeError, ValueError):
             continue
+        # Decode's working copy beside quantized pages (the q4 bank, the q8
+        # mirror): a lease extends the one it already holds.
+        rows_fn = getattr(layer, "kv_quant_working_rows", None)
+        working.append(int(rows_fn()) if callable(rows_fn) else 0)
     if not capacities:
         return {"paged": False}
     return {
@@ -20605,6 +20794,126 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
         "capacity_tokens": min(capacities),
         "paged_layers": len(capacities),
         "block_size": block_size,
+        "working_rows": min(working) if working else 0,
+    }
+
+
+def _admission_quant_working(
+    geometry: _AdmissionGeometry,
+    *,
+    bits: int,
+    prompt_tokens: int,
+    reused_tokens: int,
+    out_rows: int,
+    leased_paged: bool,
+    repages: bool,
+    capacity_tokens: int,
+    existing_rows: int,
+    block_size: int,
+    prefill_chunk_tokens: int | None,
+    verify_tokens: int,
+) -> tuple[int, dict[str, Any]]:
+    """What decode's working copy beside quantized pages adds for this
+    request, priced the way the cache builds it (the review of 23a94abf: the
+    whole prefix was charged whether the copy already existed or would never
+    be built; a 150K lease with its q4 bank was charged 2.75 GiB again, and
+    a one-token q8 extension on the kernel route 9.16 GiB of mirror).
+
+    The route latches at the request's first call on the quantized pages
+    (``cache_state.kv_quant_decode_route``): a lease's suffix prefill, from
+    the reused prefix; a repaged prompt's decode, from the prompt's end; a
+    prompt paged from the start, at its first chunk. q4 builds its
+    head-major bank only on the kernel route and keeps it across requests.
+    q8 builds its bf16 mirror on every call the kernel does not take (the
+    dequant route, or a call wider than the kernel's query rows: a suffix
+    prefill chunk, a verify burst), and a request that latches the kernel
+    releases the mirror it found. Growth follows the cache's own rule
+    (``kv_quant_working_copy_peak_rows``), so a copy that already holds the
+    request's reach adds nothing.
+    """
+
+    from mtplx.cache_state import (
+        kv_quant_decode_route,
+        kv_quant_kernel_q_len,
+        kv_quant_working_copy_peak_rows,
+    )
+
+    P = max(0, int(prompt_tokens))
+    R = min(P, max(0, int(reused_tokens)))
+    M = P - R
+    aux_w = max(0, int(geometry.aux_bytes_per_token))
+    if bits == 8:
+        width = max(0, int(geometry.live_bytes_per_token) - aux_w)
+    else:
+        width = max(0, int(geometry.paged_bytes_per_token) - aux_w)
+    verify = max(1, int(verify_tokens))
+    chunk = max(1, int(prefill_chunk_tokens)) if prefill_chunk_tokens else max(1, M)
+    reach = P + max(0, int(out_rows))
+    shape = geometry.attention_shape
+    if leased_paged:
+        # The suffix's body chunks, then its last token, on the pages.
+        body_q = min(max(0, M - 1), chunk)
+        route_offset = R + max(1, body_q)
+        prefill_offset: int | None = route_offset
+    elif repages:
+        # The prefill runs in the contiguous cache; decode is the first call.
+        body_q = 0
+        route_offset = P + verify
+        prefill_offset = None
+    else:
+        body_q = min(max(0, P - 1), chunk)
+        route_offset = max(1, body_q)
+        prefill_offset = route_offset
+    if shape is None:
+        # An unknown attention shape prices the route that builds most: the
+        # q4 bank (kernel), the q8 mirror (dequant).
+        route = "kernel" if bits == 4 else "dequant"
+    else:
+        route = kv_quant_decode_route(
+            bits, route_offset=route_offset, attention_shape=shape
+        )
+    kernel_q = (
+        kv_quant_kernel_q_len(bits, shape)
+        if route == "kernel" and shape is not None
+        else 0
+    )
+    detail: dict[str, Any] = {"route": route, "kernel_q_len": int(kernel_q)}
+    if bits == 4:
+        if route != "kernel":
+            return 0, {**detail, "builds": None, "rows": 0}
+        # Kernel calls (decode's, a lease's one-token tail) build the bank
+        # from the prompt's end and extend it through the reservation.
+        existing, first, last = int(existing_rows), P, reach
+        builds = "q4_head_major_bank"
+    elif route == "dequant":
+        existing = int(existing_rows)
+        first = prefill_offset if prefill_offset is not None else P + verify
+        last = reach
+        builds = "q8_bf16_mirror"
+    else:
+        prefill_declined = body_q > kernel_q
+        decode_declined = verify > kernel_q
+        if not (prefill_declined or decode_declined):
+            return 0, {**detail, "builds": None, "rows": 0}
+        # The latch released any earlier mirror; the declined calls rebuild
+        # it: through the prompt for a wide suffix chunk, through the
+        # reservation for a wide verify.
+        existing = 0
+        first = prefill_offset if prefill_declined and prefill_offset else P + verify
+        last = reach if decode_declined else P
+        builds = "q8_bf16_mirror"
+    rows = kv_quant_working_copy_peak_rows(
+        existing_rows=existing,
+        first_offset=first,
+        last_offset=last,
+        capacity_rows=max(int(capacity_tokens), 0),
+        block_size=max(1, int(block_size)),
+    )
+    return int(rows) * width, {
+        **detail,
+        "builds": builds,
+        "rows": int(rows),
+        "existing_rows": int(existing),
     }
 
 
@@ -20621,6 +20930,8 @@ def _admission_growth(
     scratch_bytes: int,
     lease: Mapping[str, Any] | None = None,
     context_transient_bytes_per_token: int | None = None,
+    prefill_chunk_tokens: int | None = None,
+    verify_tokens: int = 1,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -20643,7 +20954,9 @@ def _admission_growth(
                     snapshot reads the cache's ``state``, which dequantizes
                     to full width: 15.3 GiB for a 250K-token 27B prompt,
                     not the 4.9 GiB of its q4 pages (the review of
-                    9c96dd9c).
+                    9c96dd9c). The working copy is charged only when
+                    this request builds or grows it
+                    (``_admission_quant_working``).
 
     Nothing already resident is added again: the restore source's own
     snapshot is inside the measured bytes, and a pure lease writes into the
@@ -20726,12 +21039,33 @@ def _admission_growth(
     repage = live_prefill + paged_copy if repages else 0
     quant = str(geometry.kv_quantization or "off").lower()
     quantized = paged_live and quant in {"q4", "q8"}
-    aux_w = max(0, int(geometry.aux_bytes_per_token))
     quant_working = 0
+    quant_detail: dict[str, Any] = {}
     if quantized:
-        kv_live_w = max(0, live_w - aux_w)
-        kv_paged_w = max(0, paged_w - aux_w)
-        quant_working = P * (kv_live_w if quant == "q8" else kv_paged_w)
+        if leased_paged and lease_capacity_after is not None:
+            capacity = int(lease_capacity_after)
+        elif leased_paged and lease is not None and lease.get("capacity_tokens"):
+            capacity = int(lease["capacity_tokens"])
+        else:
+            capacity = P + out_rows
+        quant_working, quant_detail = _admission_quant_working(
+            geometry,
+            bits=8 if quant == "q8" else 4,
+            prompt_tokens=P,
+            reused_tokens=R,
+            out_rows=out_rows,
+            leased_paged=leased_paged,
+            repages=repages,
+            capacity_tokens=capacity,
+            existing_rows=(
+                int(lease.get("working_rows") or 0)
+                if leased_paged and lease is not None
+                else 0
+            ),
+            block_size=int((lease or {}).get("block_size") or 16),
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            verify_tokens=verify_tokens,
+        )
     if repages:
         live_decode = paged_copy + quant_working
         live_total = paged_copy
@@ -20758,6 +21092,7 @@ def _admission_growth(
         "repage_copy_bytes": int(paged_copy),
         "output_reserve_bytes": int(out_rows * paged_w),
         "quant_working_bytes": int(quant_working),
+        "quant_working": quant_detail or None,
         "publish_copy_bytes": int(publish_copy),
         "lease_capacity_tokens": (
             int(lease["capacity_tokens"])
@@ -21141,6 +21476,7 @@ def _run_prefill_admission(
         _store_on_prefill_min_suffix,
         prefill_cache_layout,
     )
+    from mtplx.session_bank import QueuedPersistenceCancelError
 
     prompt_tokens = len(prompt_ids)
     if prompt_tokens <= 0:
@@ -21178,6 +21514,12 @@ def _run_prefill_admission(
         # warm allocator for nothing. The Mac is read again as well: what
         # the engine gives back lands in the free pages.
         stats = _mlx_memory_stats_live()
+        failure = _allocator_reading_failure(stats)
+        if failure is not None:
+            # Fail-open like any guard step that cannot run: the caller
+            # admits, reports guard_degraded, and the per-chunk check runs
+            # with its fallback reservation and the Mac's own lines.
+            raise _AllocatorReadingError(failure)
         active = int(stats.get("active_memory_bytes") or 0)
         cache = int(stats.get("cache_memory_bytes") or 0)
         live, fields = _footprint_floor(
@@ -21266,6 +21608,8 @@ def _run_prefill_admission(
             scratch_bytes=scratch,
             lease=lease,
             context_transient_bytes_per_token=transient_per_token,
+            prefill_chunk_tokens=width,
+            verify_tokens=max(1, int(mtp_depth or 0) + 1),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
@@ -21577,6 +21921,17 @@ def _run_prefill_admission(
                 clear_pool()
                 now = measure()
                 steps.append("queued_persistence")
+            except QueuedPersistenceCancelError as exc:
+                # Some jobs could not be cancelled and still hold their
+                # entries (the bank keeps counting them); what was let go is
+                # in the receipt, and the Mac is read again.
+                receipt["queued_persistence_error"] = repr(exc)
+                step_errors.append(exc)
+                if isinstance(exc.receipt, dict):
+                    receipt["queued_persistence_release"] = exc.receipt
+                clear_pool()
+                now = measure()
+                steps.append("queued_persistence")
             except Exception as exc:
                 receipt["queued_persistence_error"] = repr(exc)
                 step_errors.append(exc)
@@ -21599,9 +21954,19 @@ def _run_prefill_admission(
                     )
                     cancel = getattr(session_bank, "cancel_session_persistence", None)
                     if callable(cancel):
-                        receipt["superseded_persistence_cancelled"] = int(
-                            cancel(session_id)
-                        )
+                        try:
+                            receipt["superseded_persistence_cancelled"] = int(
+                                cancel(session_id)
+                            )
+                        except QueuedPersistenceCancelError as exc:
+                            # The entries are gone from RAM; the jobs that
+                            # could not be cancelled still hold theirs. The
+                            # steps below still run.
+                            receipt["superseded_persistence_cancelled"] = int(
+                                exc.cancelled
+                            )
+                            receipt["superseded_persistence_error"] = repr(exc)
+                            step_errors.append(exc)
                     clear_pool()
                     now = measure()
                     steps.append("superseded_session")
@@ -21617,15 +21982,20 @@ def _run_prefill_admission(
                 remaining = deficit(now)
                 bank_bytes_now = int(session_bank.total_nbytes)
                 if remaining > 0 and bank_bytes_now > 0:
-                    receipt["lru_entries_evicted"] = int(
-                        session_bank.shrink_to_bytes(
-                            max(0, bank_bytes_now - remaining),
-                            reason="prefill_admission",
-                            protect_active=True,
-                            protect_keys=restore["keys"],
-                            protect_session_ids=in_flight_ids,
+                    try:
+                        receipt["lru_entries_evicted"] = int(
+                            session_bank.shrink_to_bytes(
+                                max(0, bank_bytes_now - remaining),
+                                reason="prefill_admission",
+                                protect_active=True,
+                                protect_keys=restore["keys"],
+                                protect_session_ids=in_flight_ids,
+                            )
                         )
-                    )
+                    except QueuedPersistenceCancelError as exc:
+                        receipt["lru_entries_evicted"] = int(exc.receipt or 0)
+                        receipt["lru_persistence_error"] = repr(exc)
+                        step_errors.append(exc)
                     clear_pool()
                     now = measure()
                     steps.append("lru_idle_entries")
@@ -21643,13 +22013,18 @@ def _run_prefill_admission(
                     bank_bytes_now = int(session_bank.total_nbytes)
                     chain_fn = getattr(session_bank, "shrink_for_admission", None)
                     if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
-                        chain_evicted, terminal_evicted = chain_fn(
-                            max(0, bank_bytes_now - remaining),
-                            protect_tokens=probe_ids,
-                            reason="prefill_admission_chain",
-                            protect_keys=restore["keys"],
-                            protect_session_ids=in_flight_ids,
-                        )
+                        try:
+                            chain_evicted, terminal_evicted = chain_fn(
+                                max(0, bank_bytes_now - remaining),
+                                protect_tokens=probe_ids,
+                                reason="prefill_admission_chain",
+                                protect_keys=restore["keys"],
+                                protect_session_ids=in_flight_ids,
+                            )
+                        except QueuedPersistenceCancelError as exc:
+                            chain_evicted, terminal_evicted = exc.receipt or (0, 0)
+                            receipt["chain_persistence_error"] = repr(exc)
+                            step_errors.append(exc)
                         receipt["chain_entries_evicted"] = int(chain_evicted)
                         receipt["terminal_entries_evicted"] = int(terminal_evicted)
                         clear_pool()
@@ -21696,6 +22071,13 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["idle_release_error"] = repr(exc)
             step_errors.append(exc)
+            partial = getattr(exc, "receipt", None)
+            if isinstance(partial, dict):
+                # The release ran; a queued job it could not cancel still
+                # holds its entry (QueuedPersistenceCancelError).
+                rounds.append(partial)
+                clear_pool()
+                now = measure()
         if rounds:
             receipt["idle_release"] = _merge_release_receipts(rounds)
 
@@ -21731,6 +22113,11 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["own_session_release_error"] = repr(exc)
             step_errors.append(exc)
+            partial = getattr(exc, "receipt", None)
+            if isinstance(partial, dict):
+                receipt["own_session_release"] = partial
+                clear_pool()
+                now = measure()
 
     if chosen is _ADMISSION_NO_FIT:
         # Re-priced on what reclamation left: the widest chunk that now fits
@@ -22171,8 +22558,11 @@ async def _memory_pressure_loop(
                                     "bank_bytes_after": int(bank.total_nbytes),
                                 },
                             )
-                except Exception:
-                    pass
+                    _note_guard_health(state, where="dynamic_ceiling", error=None)
+                except Exception as exc:  # noqa: BLE001
+                    # A reclamation step that raises is reported (the review
+                    # of 23a94abf: a failed queued-job cancel passed silently).
+                    _note_guard_health(state, where="dynamic_ceiling", error=exc)
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
@@ -22190,20 +22580,47 @@ async def _memory_pressure_loop(
             if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
+                trim_error: BaseException | None = None
                 if bank is not None:
                     target = (
                         0
                         if level >= 4
                         else min(int(bank.total_nbytes), int(bank.max_bytes)) // 2
                     )
-                    evicted = bank.shrink_to_bytes(
-                        target,
-                        reason=(
-                            "memory_pressure_critical"
-                            if level >= 4
-                            else "memory_pressure_warning"
-                        ),
-                    )
+                    # Never a conversation that is generating, as in every
+                    # other reclamation step: its entries are what its next
+                    # turn restores from, and a lease's entry holds the very
+                    # cache the request is writing, so taking it gives back
+                    # nothing before the request ends and turns the next turn
+                    # into a cold prefill. The review of 23a94abf: after 60 s
+                    # of WARNING during a generation, an 8 GiB conversation
+                    # in a 16 GiB bank was evicted (half of what the bank
+                    # holds), where the old half-the-budget target took
+                    # nothing. The request's own growth is held by its
+                    # admission, the per-chunk check and the sustained abort.
+                    try:
+                        evicted = bank.shrink_to_bytes(
+                            target,
+                            reason=(
+                                "memory_pressure_critical"
+                                if level >= 4
+                                else "memory_pressure_warning"
+                            ),
+                            protect_session_ids=_in_flight_session_ids(state),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # The trim gives back what it can (a queued job it
+                        # could not cancel still holds its entry, and the bank
+                        # keeps counting it), and the loop goes on; the failure
+                        # is reported, never silent (the review of 23a94abf).
+                        trim_error = exc
+                        receipt_evicted = getattr(exc, "receipt", None)
+                        evicted = (
+                            int(receipt_evicted)
+                            if isinstance(receipt_evicted, int)
+                            else 0
+                        )
+                    _note_guard_health(state, where="pressure_trim", error=trim_error)
                 if level >= 4:
                     # Under CRITICAL, shedding the buffer pool is not enough:
                     # retrieval weights are whole GB and reload in seconds, so
@@ -22250,6 +22667,9 @@ async def _memory_pressure_loop(
                     ),
                     "deferred_s": deferred_s,
                 }
+                if trim_error is not None:
+                    action_receipt["trim_error"] = repr(trim_error)
+                    action_receipt["guard_degraded"] = True
                 _record_guard_event(state, action_receipt)
                 print(
                     "[mtplx] memory pressure guard " + json.dumps(action_receipt),
@@ -28842,8 +29262,15 @@ def _run_generation(
             request_env = dict(dynamic_kv_reservation["env"])
             if prompt_publish_skipped:
                 request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
+            prefill_after_forward: dict[str, Any] = {}
             try:
                 prefill_chunk_reserve = _prefill_chunk_reserve_bytes(
+                    state,
+                    prompt_tokens=len(prompt_ids),
+                    chunk_tokens=prefill_chunk_tokens,
+                    priced=admission_pricing.get("growth"),
+                )
+                prefill_after_forward = _prefill_after_forward_plan(
                     state,
                     prompt_tokens=len(prompt_ids),
                     chunk_tokens=prefill_chunk_tokens,
@@ -28877,7 +29304,9 @@ def _run_generation(
             else:
                 _note_guard_health(state, where="prefill_chunk_reserve", error=None)
             prefill_system_guard = _PrefillSystemGuard(
-                state, chunk_reserve_bytes=prefill_chunk_reserve
+                state,
+                chunk_reserve_bytes=prefill_chunk_reserve,
+                **prefill_after_forward,
             )
 
             def _prefill_abort_check() -> bool:
@@ -28886,6 +29315,15 @@ def _run_generation(
                 if _pressure_abort_requested(state):
                     return True
                 return prefill_system_guard()
+
+            # The generation's prefill progress also tells the per-chunk
+            # check when the forwards are done.
+            _outer_prefill_callback = prefill_callback
+
+            def _guarded_prefill_callback(payload: dict[str, Any]) -> None:
+                prefill_system_guard.note_prefill_progress(payload)
+                if _outer_prefill_callback is not None:
+                    _outer_prefill_callback(payload)
             # Install the per-request live decode sink (flight recorder) so
             # _DecodeTrace publishes by-depth acceptance at 1 Hz mid-request.
             # Owner-thread module slot; cleared in the lock-release finally.
@@ -28939,7 +29377,7 @@ def _run_generation(
                         token_callback=record_tokens,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
+                        prefill_callback=_guarded_prefill_callback,
                         # The repetition trimmer retracts already-committed
                         # tokens, which would desync the grammar matcher;
                         # constrained output is schema-shaped, not freeform.
@@ -29015,7 +29453,7 @@ def _run_generation(
                         commit_prompt_state_keep_live_ref=False,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
+                        prefill_callback=_guarded_prefill_callback,
                         adaptive_policy=adaptive_policy,
                         repetition_stop=uncapped_repetition_stop,
                         loop_guard=_loop_guard_enabled(),

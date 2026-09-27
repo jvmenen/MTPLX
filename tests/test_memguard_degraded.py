@@ -141,3 +141,88 @@ def test_a_reclamation_step_that_raises_is_degraded_too(monkeypatch):
     health = srv._memory_guard_health(state)
     assert health["guard_degraded"] is True
     assert health["degraded"][0]["where"] == "prefill_admission_reclamation"
+
+
+class TestAFailedAllocatorReading:
+    """The review of 23a94abf (finding 4): a failed MLX reading was read as
+    zero active memory, so the admission returned None and the per-chunk
+    check skipped the engine line, with guard_degraded false. A reading that
+    fails is not a reading of zero: the step is degraded, the request is
+    admitted unchecked, and the backstops run on what can still be read."""
+
+    FAILED = (
+        {"ok": False, "error": "mlx unavailable: ImportError()"},
+        {"ok": True, "active_memory_bytes": None, "cache_memory_bytes": None},
+    )
+
+    @pytest.mark.parametrize("reading", FAILED)
+    def test_the_admission_reports_it_and_admits_unchecked(self, monkeypatch, reading):
+        state = _state()
+        monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: dict(reading))
+        monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
+        receipt = srv._prefill_admission_shed(
+            state,
+            prompt_ids=list(range(30_000)),
+            session_bank=state.sessions.bank,
+            session_id="fresh",
+            prefill_chunk_tokens=4096,
+        )
+        assert receipt is not None
+        assert receipt["admitted_unchecked"] is True
+        assert receipt["guard_degraded"] is True
+        health = srv._memory_guard_health(state)
+        assert health["guard_degraded"] is True
+        assert health["degraded"][0]["where"] == "prefill_admission"
+        assert "_AllocatorReadingError" in health["degraded"][0]["error"]
+
+    @pytest.mark.parametrize("reading", FAILED)
+    def test_the_per_chunk_check_reports_it_and_keeps_the_macs_lines(
+        self, monkeypatch, reading
+    ):
+        import mtplx.system_memory as sm
+
+        state = _state()
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: dict(reading))
+        supply = [40 * GIB]
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: sm.SystemMemory(
+                available_bytes=supply[0],
+                total_bytes=128 * GIB,
+                level_percent=30,
+                free_bytes=supply[0] // 2,
+                file_backed_bytes=supply[0] // 2,
+                wired_bytes=80 * GIB,
+                compressor_bytes=GIB,
+                swap_used_bytes=0,
+            ),
+        )
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+        # The Mac has room: no trip, but the check that could not read the
+        # engine's account is reported.
+        assert guard() is False
+        health = srv._memory_guard_health(state)
+        assert health["guard_degraded"] is True
+        assert health["degraded"][0]["where"] == "prefill_system_check"
+        # The Mac's own line still stops the prefill.
+        supply[0] = 6 * GIB
+        assert guard() is True
+        assert guard.tripped["reason"] == "under_abort_floor"
+
+    def test_a_clean_reading_clears_it(self, monkeypatch):
+        import mtplx.system_memory as sm
+
+        state = _state()
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(sm, "_reader", lambda: None)
+        readings = [dict(self.FAILED[0])]
+        monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: readings[0])
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+        assert guard() is False
+        assert srv._memory_guard_health(state)["guard_degraded"] is True
+        readings[0] = {"ok": True, "active_memory_bytes": 40 * GIB, "cache_memory_bytes": 0}
+        monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+        assert guard() is False
+        assert srv._memory_guard_health(state)["guard_degraded"] is False

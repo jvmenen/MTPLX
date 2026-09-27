@@ -29,6 +29,7 @@ from .session_bank import (
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
     DEFAULT_PREFIX_BLOCK_SIZE,
+    QueuedPersistenceCancelError,
     SessionBank,
     block_aligned_prefix_len,
 )
@@ -1479,6 +1480,13 @@ class EngineSession:
             with self._release_guard:
                 acquired = self._lock.acquire(blocking=False)
                 releasing = not acquired and self._release_seq % 2 == 1
+                if acquired:
+                    # The slot and its flag in one step: stale eviction and
+                    # the in-flight readers take this guard too.
+                    self._hold_for_generation(cancel_event)
+            if acquired:
+                self.touch()
+                return True
             if releasing:
                 # A memory release holds the slot for the milliseconds it
                 # takes to evict this session's RAM entries. Wait for it:
@@ -1487,11 +1495,25 @@ class EngineSession:
                 acquired = self._lock.acquire(timeout=_RELEASE_HOLD_WAIT_S)
         if not acquired:
             return False
+        # A waiting acquire cannot hold the guard while it blocks; the flag
+        # follows under it, and until then the held slot itself (``locked``)
+        # is what stale eviction and the in-flight readers see.
+        with self._release_guard:
+            self._hold_for_generation(cancel_event)
+        self.touch()
+        return True
+
+    def _hold_for_generation(self, cancel_event: Any | None) -> None:
         self._holder_cancel_event = cancel_event
         self.in_flight = True
         self.in_flight_started_s = time.time()
-        self.touch()
-        return True
+
+    def slot_in_use(self) -> bool:
+        """Whether a request or a memory release owns this session now: its
+        flag, or its slot taken by an acquire whose flag has not landed yet.
+        Callers that act on the answer hold ``_release_guard``."""
+
+        return bool(self.in_flight or self.release_held or self._lock.locked())
 
     def holder_cancel_requested(self) -> bool:
         """True when the generation holding the slot has been cancelled."""
@@ -2444,28 +2466,51 @@ class EngineSessionManager:
                 raise
             return session.end_release_hold
 
-        receipt = self.bank.release_sessions(
-            target_bytes,
-            keep_session_ids=kept,
-            protect_tokens=protect_tokens,
-            restore_identity=restore_identity,
-            hold_session=hold,
-            reason=reason,
-        )
+        try:
+            receipt = self.bank.release_sessions(
+                target_bytes,
+                keep_session_ids=kept,
+                protect_tokens=protect_tokens,
+                restore_identity=restore_identity,
+                hold_session=hold,
+                reason=reason,
+            )
+        except QueuedPersistenceCancelError as exc:
+            # The release happened; a queued job it could not cancel still
+            # holds its entry. The caller gets the receipt and the failure.
+            if isinstance(exc.receipt, dict):
+                exc.receipt["postcommits_aborted"] = len(postcommits_aborted)
+                exc.receipt["kept_sessions"] = sorted(kept)
+            raise
         receipt["postcommits_aborted"] = len(postcommits_aborted)
         receipt["kept_sessions"] = sorted(kept)
         return receipt
 
     def evict_stale(self) -> int:
+        """Drop the records (and bank entries) of sessions idle past their TTL.
+
+        Never a session whose slot is owned: each record is checked and
+        dropped under its own ``_release_guard``, the guard a request's
+        non-blocking acquire and a release hold take the slot and set the
+        flag under, and a slot taken by a waiting acquire whose flag has not
+        landed yet counts as owned (the review of 23a94abf: paused between
+        taking the slot and setting ``in_flight``, the record was dropped,
+        and the next request created and took a second one under the same
+        id: two held slots for one session).
+        """
+
         now = time.time()
+        stale_ids: list[str] = []
         with self._lock:
-            stale_ids = [
-                session_id
-                for session_id, session in self._sessions.items()
-                if session.is_stale(now_s=now) and not session.in_flight
-            ]
+            for session_id, session in list(self._sessions.items()):
+                if not session.is_stale(now_s=now):
+                    continue
+                with session._release_guard:
+                    if session.slot_in_use():
+                        continue
+                    self._sessions.pop(session_id, None)
+                stale_ids.append(session_id)
             for session_id in stale_ids:
-                self._sessions.pop(session_id, None)
                 self.bank.clear(session_id=session_id)
         return len(stale_ids)
 

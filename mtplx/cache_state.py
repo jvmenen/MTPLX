@@ -785,6 +785,97 @@ def paged_lease_capacity_after(
     return int(capacity)
 
 
+def kv_quant_decode_route(
+    bits: int,
+    *,
+    route_offset: int,
+    attention_shape: tuple[int, int, int, int] | None,
+) -> str:
+    """The numerics route a request on a quantized paged cache latches:
+    ``VllmMetalPagedKVCache._kv_quant_route_decision``'s rule, read from the
+    model's attention shape (query heads, KV heads, key and value head
+    dims) instead of a live cache, for pricing a request before it runs."""
+
+    if not VllmMetalPagedKVCache._kv_quant_kernel_enabled() or attention_shape is None:
+        return "dequant"
+    query_heads, kv_heads, k_dim, v_dim = (int(x) for x in attention_shape)
+    if int(bits) == 8:
+        if (
+            VllmMetalPagedKVCache._safe_2pass_paged_q_len(
+                query_heads=query_heads, kv_heads=kv_heads
+            )
+            < 1
+        ):
+            return "dequant"
+    elif int(bits) == 4:
+        if not VllmMetalPagedKVCache._kv_quant_q4_kernel_enabled():
+            return "dequant"
+        if (
+            VllmMetalPagedKVCache._packed_quant_safe_q_len_for(
+                query_heads=query_heads, kv_heads=kv_heads, k_dim=k_dim, v_dim=v_dim
+            )
+            < 1
+        ):
+            return "dequant"
+    else:
+        return "dequant"
+    threshold = int(
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1024") or "1024"
+    )
+    return "kernel" if int(route_offset) >= threshold else "dequant"
+
+
+def kv_quant_kernel_q_len(bits: int, attention_shape: tuple[int, int, int, int]) -> int:
+    """The widest call (query rows) the route's kernel takes: wider calls
+    fall back to dequantizing (q8: into the bf16 mirror)."""
+
+    query_heads, kv_heads, k_dim, v_dim = (int(x) for x in attention_shape)
+    if int(bits) == 8:
+        return VllmMetalPagedKVCache._safe_2pass_paged_q_len(
+            query_heads=query_heads, kv_heads=kv_heads
+        )
+    return VllmMetalPagedKVCache._packed_quant_safe_q_len_for(
+        query_heads=query_heads, kv_heads=kv_heads, k_dim=k_dim, v_dim=v_dim
+    )
+
+
+def kv_quant_working_copy_peak_rows(
+    *,
+    existing_rows: int,
+    first_offset: int,
+    last_offset: int,
+    capacity_rows: int,
+    block_size: int,
+) -> int:
+    """The most rows of decode's working copy (the q8 bf16 mirror, the q4
+    head-major bank) a request adds over what its cache already holds.
+
+    Both grow the same way (``_dequant_active_arrays``,
+    ``_quant_bank_arrays``): when a call's offset passes the allocated rows,
+    a buffer of min(capacity, max(offset, 1.5 x rows, block)) rows is
+    allocated and the valid rows copied in, the old buffer alive until the
+    copy lands. A working copy that already holds the reach adds nothing; a
+    new one allocates the prompt's rows at the first call and regrows at the
+    next, so its peak is the first buffer plus the second.
+    """
+
+    rows = max(0, int(existing_rows))
+    base = rows
+    capacity = max(0, int(capacity_rows))
+    last = int(last_offset)
+    offset = max(1, int(first_offset))
+    peak = 0
+    while offset <= last:
+        if offset > rows:
+            grown = min(capacity, max(offset, (rows * 3) // 2, int(block_size)))
+            if grown <= rows:
+                break
+            peak = max(peak, rows + grown - base)
+            rows = grown
+        offset = rows + 1
+    return int(peak)
+
+
 def _paged_attention_requires_external_ops(
     *,
     turboquant_config: Any | None = None,
@@ -1436,9 +1527,18 @@ class VllmMetalPagedKVCache:
         if self._shape is None:
             return 0
         kv_heads, k_dim, v_dim = (int(x) for x in self._shape)
+        return self._packed_quant_safe_q_len_for(
+            query_heads=query_heads, kv_heads=kv_heads, k_dim=k_dim, v_dim=v_dim
+        )
+
+    @staticmethod
+    def _packed_quant_safe_q_len_for(
+        *, query_heads: int, kv_heads: int, k_dim: int, v_dim: int
+    ) -> int:
+        k_dim, v_dim = int(k_dim), int(v_dim)
         if k_dim != v_dim or k_dim not in (64, 128, 256):
             return 0
-        query_heads = int(query_heads)
+        query_heads, kv_heads = int(query_heads), int(kv_heads)
         if kv_heads <= 0 or query_heads <= 0 or query_heads % kv_heads:
             return 0
         if 32 * (query_heads // kv_heads) > 1024:
@@ -1845,6 +1945,18 @@ class VllmMetalPagedKVCache:
             bank["tokens"] = offset
             self.kv_quant_bank_extended_tokens += offset - valid
         return bank["k"], bank["v"], bank["ks"], bank["vs"]
+
+    def kv_quant_working_rows(self) -> int:
+        """Rows allocated to decode's working copy right now: the q8 bf16
+        mirror or the q4 head-major bank (0 when this cache holds neither)."""
+
+        memo = self._dequant_memo
+        if memo is not None and memo.get("mirror_k") is not None:
+            return int(memo["mirror_k"].shape[0])
+        bank = self._quant_bank
+        if bank is not None and bank.get("k") is not None:
+            return int(bank["k"].shape[2])
+        return 0
 
     def _dequant_active_arrays(self) -> tuple[Any, Any]:
         """Full active K/V for kv_quant, dequantizing only the unseen tail.

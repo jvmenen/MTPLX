@@ -295,3 +295,120 @@ class TestRetryAdvice:
         assert "only a restart" not in text
         assert "nothing else the engine holds can be released" not in text
         assert "queued SSD writes" in srv._RETRY_SENTENCES["after_host_memory_returns"]
+
+
+class _RefusingLane(_Lane):
+    """An idle lane whose cancel raises: the job stays queued, holding its
+    entry's arrays."""
+
+    def cancel(self, key: str) -> int:
+        raise RuntimeError("idle lane refused the cancel")
+
+
+def _pushed_out_conversation(lane: _Lane):
+    """A 9 GiB conversation the budget pushed out of RAM with its encode
+    queued, and another session's 4 GiB entry resident."""
+
+    bank = _bank(lane, max_bytes=10 * GIB)
+    manager = _manager(bank)
+    pushed_out = _put(
+        bank, range(0, 10_000), session_id="old", row_bytes=int(0.9 * GIB) // 1_000
+    )
+    _age(bank, "old")
+    resident = _put(bank, range(50_000, 54_000), session_id="other", row_bytes=GIB // 1_000)
+    assert pushed_out.token_ids not in bank._entries
+    assert "ssd_cold:old" in lane.pending
+    return manager, bank, pushed_out, resident
+
+
+class TestACancelThatFails:
+    """The review of 23a94abf (finding 6): the bank dropped a job's tracking
+    before cancelling it and swallowed the cancel's error. The closure kept
+    its 1 GiB while the queued bytes read zero, and the error never reached
+    guard_degraded. A job that could not be cancelled is still queued and
+    still holds its entry: it stays counted, the failure is raised, and the
+    guard reports it."""
+
+    def test_the_job_stays_counted_and_the_failure_is_raised(self):
+        lane = _RefusingLane()
+        _manager_, bank, pushed_out, _resident = _pushed_out_conversation(lane)
+        assert bank.queued_persistence_bytes == pushed_out.nbytes
+        with pytest.raises(RuntimeError) as raised:
+            bank.cancel_queued_persistence(None)
+        # Nothing was let go, and the receipt says so.
+        assert raised.value.receipt["entries"] == 0
+        assert raised.value.receipt["held_bytes"] == 0
+        assert "ssd_cold:old" in lane.pending
+        assert bank.queued_persistence_bytes == pushed_out.nbytes
+        assert bank.eviction_log[-1]["persistence_cancel_failures"] == 1
+
+    def test_an_eviction_that_cannot_cancel_its_job_still_evicts_and_raises(self):
+        """A pressure trim takes the entry out of RAM, keeps going, and
+        reports the job it could not cancel; the bank keeps counting it."""
+
+        lane = _RefusingLane()
+        bank = _bank(lane)
+        entry = _put(bank, range(0, 4_000), session_id="old", row_bytes=GIB // 1_000)
+        _age(bank, "old")
+        other = _put(bank, range(50_000, 52_000), session_id="other", row_bytes=GIB // 1_000)
+        _age(bank, "other")
+        with pytest.raises(RuntimeError) as raised:
+            bank.shrink_to_bytes(0, reason="memory_pressure_critical")
+        assert raised.value.receipt == 2
+        assert entry.token_ids not in bank._entries
+        assert other.token_ids not in bank._entries
+        assert bank.queued_persistence_bytes == entry.nbytes + other.nbytes
+
+    def test_the_admission_reports_it_and_does_not_count_it_as_freed(self, monkeypatch):
+        lane = _RefusingLane()
+        manager, bank, pushed_out, _resident = _pushed_out_conversation(lane)
+        machine = _Machine(bank, base_gib=80.0, cache_gib=0.0, host_gib=6.0, lane=lane)
+        _install(monkeypatch, machine)
+        state = _flash_next_state(manager)
+        receipt = _compaction(state, manager)
+        assert receipt.get("queued_persistence_error")
+        assert receipt.get("guard_degraded") is True
+        health = srv._memory_guard_health(state)
+        assert health["guard_degraded"] is True
+        assert [row["where"] for row in health["degraded"]] == [
+            "prefill_admission_reclamation"
+        ]
+        # The queued closure still holds the conversation (and whatever a
+        # later step evicted with its job still queued), and the bank's
+        # account agrees with what the lane retains.
+        assert machine.queued() >= pushed_out.nbytes
+        assert bank.queued_persistence_bytes == machine.queued()
+        assert receipt["queued_persistence_release"]["held_bytes"] == 0
+
+    def test_a_pressure_trim_that_cannot_cancel_reports_degraded(self, monkeypatch):
+        from tests.test_memguard_admission import _run_loop
+
+        lane = _RefusingLane()
+        bank = _bank(lane, max_bytes=16 * GIB)
+        manager = _manager(bank)
+        _put(bank, range(0, 4_000), session_id="old", row_bytes=GIB // 1_000)
+        _age(bank, "old")
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: sm.SystemMemory(
+                available_bytes=2 * GIB,
+                total_bytes=128 * GIB,
+                level_percent=10,
+                free_bytes=GIB,
+                file_backed_bytes=GIB,
+                wired_bytes=0,
+                compressor_bytes=4 * GIB,
+                swap_used_bytes=0,
+            ),
+        )
+        state = SimpleNamespace(
+            sessions=manager,
+            dashboard=SimpleNamespace(last_memory_pressure_level=0),
+        )
+        _run_loop(state, monkeypatch, seconds=0.05)
+        assert bank.total_nbytes == 0
+        health = srv._memory_guard_health(state)
+        assert health["guard_degraded"] is True
+        assert health["degraded"][0]["where"] == "pressure_trim"
+        assert "idle lane refused the cancel" in health["degraded"][0]["error"]

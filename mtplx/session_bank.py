@@ -832,6 +832,37 @@ class SessionBankRestore:
     extra_state: dict[str, Any] | None = None
 
 
+class QueuedPersistenceCancelError(RuntimeError):
+    """The idle lane failed to cancel queued jobs that hold released entries.
+
+    A queued settle or SSD encode keeps its entry's arrays until it runs or
+    is cancelled. A cancel that raised left the job queued, so its entry
+    stays tracked (``queued_persistence`` still counts what it holds) and the
+    failure reaches the caller instead of passing as memory given back (the
+    review of 23a94abf: the tracking was dropped before the cancel, whose
+    error was swallowed, and a queued closure kept 1 GiB while the queued
+    bytes read zero). ``failures`` pairs each key with its error;
+    ``receipt`` is what the operation did before raising.
+    """
+
+    def __init__(
+        self,
+        failures: list[tuple[str, str]],
+        *,
+        cancelled: int = 0,
+        keys: set[str] | None = None,
+    ) -> None:
+        self.failures = list(failures)
+        self.cancelled = int(cancelled)
+        self.keys = set(keys or ())
+        self.receipt: Any = None
+        first = self.failures[0] if self.failures else ("", "")
+        super().__init__(
+            f"{len(self.failures)} queued persistence job(s) could not be "
+            f"cancelled (first: {first[0]}: {first[1]})"
+        )
+
+
 class SessionBank:
     """In-memory exact prefix table for warm target prefill."""
 
@@ -3303,6 +3334,7 @@ class SessionBank:
         """
 
         evicted = 0
+        cancel_failure: QueuedPersistenceCancelError | None = None
         target = max(0, int(target_bytes))
         active = self._active_session_ids()
         keep_keys = {tuple(key) for key in (protect_keys or ())}
@@ -3337,11 +3369,16 @@ class SessionBank:
                 ),
             )
             before = len(self._entries)
-            self._evict_entry(
-                victim,
-                reason=reason,
-                cancel_queued_persistence=cancel_queued_persistence,
-            )
+            try:
+                self._evict_entry(
+                    victim,
+                    reason=reason,
+                    cancel_queued_persistence=cancel_queued_persistence,
+                )
+            except QueuedPersistenceCancelError as exc:
+                # The entry left RAM; its queued job did not. Keep giving
+                # memory back, then report the failure.
+                cancel_failure = cancel_failure or exc
             if len(self._entries) >= before:
                 # Defensive: an entry whose dict key drifted from its
                 # token_ids would make this loop spin forever while
@@ -3351,6 +3388,9 @@ class SessionBank:
                 # never an acceptable failure mode for a pressure responder.
                 break
             evicted += 1
+        if cancel_failure is not None:
+            cancel_failure.receipt = evicted
+            raise cancel_failure
         return evicted
 
     def restore_plan(
@@ -3583,6 +3623,7 @@ class SessionBank:
         cancel = self.cold_enqueue_cancel
         cancelled = 0
         keys: set[str] = set()
+        failures: list[tuple[str, str]] = []
         for key, entry_ref in list(self._persistence_pending.items()):
             entry = entry_ref()
             if entry is None:
@@ -3591,20 +3632,33 @@ class SessionBank:
                 continue
             if id(entry) not in released:
                 continue
-            self._persistence_pending.pop(key, None)
-            keys.add(key)
             if not callable(cancel):
+                # Nothing can cancel it: the job keeps the entry's arrays
+                # until the idle lane runs it, and stays counted until then.
                 continue
             try:
-                cancelled += int(cancel(key) or 0)
+                count = int(cancel(key) or 0)
             except Exception as exc:
+                # Still queued, still holding the arrays: it stays tracked,
+                # and the caller hears about it.
+                error = f"{type(exc).__name__}: {exc}"
+                failures.append((key, error))
                 self.eviction_log.append(
                     {
                         "reason": "release_persistence_cancel_error",
                         "session_id": entry.session_id,
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": error,
                     }
                 )
+                continue
+            # Cancelled, or no longer queued under the key (it ran, or was
+            # dropped): no queued job holds the entry for it any more.
+            if self._persistence_pending.get(key) is entry_ref:
+                self._persistence_pending.pop(key, None)
+            cancelled += count
+            keys.add(key)
+        if failures:
+            raise QueuedPersistenceCancelError(failures, cancelled=cancelled, keys=keys)
         return cancelled, keys
 
     def cancel_session_persistence(self, session_id: str | None) -> int:
@@ -3678,32 +3732,50 @@ class SessionBank:
             if not (row["entry"].session_id and row["entry"].session_id in kept)
         ]
         rows.sort(key=lambda row: float(row["entry"].last_access_s))
-        released: set[int] = set()
-        freed = 0
-        sessions: list[str | None] = []
+        chosen: list[dict[str, Any]] = []
+        planned = 0
         for row in rows:
-            if target is not None and freed >= target:
+            if target is not None and planned >= target:
                 break
-            released.add(id(row["entry"]))
-            freed += int(row["entry"].nbytes)
-            sessions.append(row["entry"].session_id)
-        cancelled, keys = self._cancel_queued_persistence(released)
-        if released:
+            chosen.append(row)
+            planned += int(row["entry"].nbytes)
+        failure: QueuedPersistenceCancelError | None = None
+        try:
+            cancelled, keys = self._cancel_queued_persistence(
+                {id(row["entry"]) for row in chosen}
+            )
+        except QueuedPersistenceCancelError as exc:
+            failure = exc
+            cancelled, keys = exc.cancelled, exc.keys
+        # Let go = no queued job holds the entry any more: a failed cancel,
+        # or a bank with no canceller, keeps it held and counted.
+        still_held = {id(row["entry"]) for row in self._queued_holders()}
+        let_go = [row for row in chosen if id(row["entry"]) not in still_held]
+        freed = int(sum(int(row["entry"].nbytes) for row in let_go))
+        if chosen:
             self.eviction_log.append(
                 {
                     "reason": reason,
-                    "entries": len(released),
-                    "held_bytes": int(freed),
+                    "entries": len(let_go),
+                    "held_bytes": freed,
                     "persistence_cancelled": int(cancelled),
+                    "persistence_cancel_failures": (
+                        len(failure.failures) if failure is not None else 0
+                    ),
                 }
             )
-        return {
-            "entries": len(released),
-            "held_bytes": int(freed),
+        result = {
+            "entries": len(let_go),
+            "held_bytes": freed,
             "persistence_cancelled": int(cancelled),
             "keys": sorted(keys),
-            "sessions": sessions[:16],
+            "sessions": [row["entry"].session_id for row in let_go][:16],
         }
+        if failure is not None:
+            result["persistence_cancel_failures"] = len(failure.failures)
+            failure.receipt = result
+            raise failure
+        return result
 
     def entry_is_durable(self, entry: SessionBankEntry) -> bool:
         """Whether the cold tier has PUBLISHED this entry (its manifest row
@@ -3878,9 +3950,22 @@ class SessionBank:
             finally:
                 if releaser is not None:
                     releaser()
-        persistence_cancelled, cancelled_keys = self._cancel_queued_persistence(
-            released_ids
-        )
+        cancel_failure: QueuedPersistenceCancelError | None = None
+        try:
+            persistence_cancelled, cancelled_keys = self._cancel_queued_persistence(
+                released_ids
+            )
+        except QueuedPersistenceCancelError as exc:
+            # Finish the release (its evictions stand), then report it.
+            cancel_failure = exc
+            persistence_cancelled, cancelled_keys = exc.cancelled, exc.keys
+        # What a queued job still holds is not given back, whatever the
+        # release chose: a failed cancel, or a bank with no canceller.
+        still_held = {
+            id(row["entry"]): int(row["entry"].nbytes)
+            for row in self._queued_holders()
+            if id(row["entry"]) in released_ids
+        }
         redispatched = 0
         if cancelled_keys and self.cold_enqueue_dispatch is not None:
             # A kept entry whose own job was coalesced away by the released
@@ -3925,7 +4010,8 @@ class SessionBank:
                 # pin exists to protect state that is about to be extended.
                 self._session_last_active.pop(str(session_id), None)
         source = plan["source"]
-        return {
+        still_held_bytes = int(sum(still_held.values()))
+        result = {
             "sessions": sorted(rows, key=lambda row: -int(row["held_bytes"])),
             "entries": int(sum(row["entries"] for row in rows)),
             "queued_persistence_entries": int(
@@ -3934,7 +4020,8 @@ class SessionBank:
             "queued_persistence_bytes": int(
                 sum(row["queued_persistence_bytes"] for row in rows)
             ),
-            "held_bytes": int(released_bytes),
+            "held_bytes": int(max(0, released_bytes - still_held_bytes)),
+            "queued_persistence_still_held_bytes": still_held_bytes,
             "dropped_entries": int(sum(row["dropped_entries"] for row in rows)),
             "persistence_cancelled": int(persistence_cancelled),
             "persistence_redispatched": int(redispatched),
@@ -3945,6 +4032,11 @@ class SessionBank:
             "skipped_busy_sessions": skipped_busy,
             "kept_sessions": sorted(kept),
         }
+        if cancel_failure is not None:
+            result["persistence_cancel_failures"] = len(cancel_failure.failures)
+            cancel_failure.receipt = result
+            raise cancel_failure
+        return result
 
     def shrink_for_admission(
         self,
@@ -3987,6 +4079,8 @@ class SessionBank:
         protected_keys |= {tuple(key) for key in (protect_keys or ())}
         busy_sessions = {str(sid) for sid in (protect_session_ids or ()) if sid}
 
+        cancel_failures: list[QueuedPersistenceCancelError] = []
+
         def _walk(candidates_fn, order_key) -> int:
             evicted = 0
             while self._entries and self.total_nbytes > target:
@@ -3995,11 +4089,24 @@ class SessionBank:
                     break
                 victim = min(candidates, key=order_key)
                 before = len(self._entries)
-                self._evict_entry(victim, reason=reason, cancel_queued_persistence=True)
+                try:
+                    self._evict_entry(
+                        victim, reason=reason, cancel_queued_persistence=True
+                    )
+                except QueuedPersistenceCancelError as exc:
+                    # Out of RAM, its job still queued: keep walking, report
+                    # it at the end.
+                    cancel_failures.append(exc)
                 if len(self._entries) >= before:
                     break
                 evicted += 1
             return evicted
+
+        def _done(non_terminal: int, terminal: int) -> tuple[int, int]:
+            if cancel_failures:
+                cancel_failures[0].receipt = (non_terminal, terminal)
+                raise cancel_failures[0]
+            return non_terminal, terminal
 
         def _evictable(entry) -> bool:
             # Entries holding a live cache reference are the live session's
@@ -4047,7 +4154,7 @@ class SessionBank:
             ),
         )
         if self.total_nbytes <= target:
-            return non_terminal, 0
+            return _done(non_terminal, 0)
 
         active = self._active_session_ids()
         terminal_evicted = _walk(
@@ -4063,7 +4170,7 @@ class SessionBank:
                 entry.created_at_s,
             ),
         )
-        return non_terminal, terminal_evicted
+        return _done(non_terminal, terminal_evicted)
 
     def _evict_entry(
         self,
@@ -4094,25 +4201,36 @@ class SessionBank:
         # it). Without this an "evicted" lease kept its paged KV allocated.
         entry.release_live_refs()
         persistence_cancelled = 0
+        cancel_error: QueuedPersistenceCancelError | None = None
         if cancel_queued_persistence:
-            persistence_cancelled, _keys = self._cancel_queued_persistence({id(entry)})
-        self.eviction_log.append(
-            {
-                "reason": reason,
-                "session_id": entry.session_id,
-                "prefix_len": entry.prefix_len,
-                "token_hash": entry.token_hash,
-                "nbytes": entry.nbytes,
-                "held_nbytes": held_nbytes,
-                "live_ref_only": bool(entry.live_ref_only),
-                "last_access_s": entry.last_access_s,
-                "persistence_cancelled": int(persistence_cancelled),
-                "session_active": bool(
-                    entry.session_id
-                    and entry.session_id in self._active_session_ids()
-                ),
-            }
-        )
+            try:
+                persistence_cancelled, _keys = self._cancel_queued_persistence(
+                    {id(entry)}
+                )
+            except QueuedPersistenceCancelError as exc:
+                # The entry is out of RAM either way; its job is not.
+                persistence_cancelled = exc.cancelled
+                cancel_error = exc
+        record = {
+            "reason": reason,
+            "session_id": entry.session_id,
+            "prefix_len": entry.prefix_len,
+            "token_hash": entry.token_hash,
+            "nbytes": entry.nbytes,
+            "held_nbytes": held_nbytes,
+            "live_ref_only": bool(entry.live_ref_only),
+            "last_access_s": entry.last_access_s,
+            "persistence_cancelled": int(persistence_cancelled),
+            "session_active": bool(
+                entry.session_id
+                and entry.session_id in self._active_session_ids()
+            ),
+        }
+        if cancel_error is not None:
+            record["persistence_cancel_error"] = str(cancel_error)
+        self.eviction_log.append(record)
+        if cancel_error is not None:
+            raise cancel_error
 
 
 def prefill_target(

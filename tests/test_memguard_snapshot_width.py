@@ -51,7 +51,9 @@ def _served_profile(monkeypatch):
 
 
 def _geometry(quant: str):
-    """What the admission reads off a real plan with this KV quantization."""
+    """What the admission reads off a real plan with this KV quantization,
+    and the 27B's attention shape (24 query heads, 4 KV heads, 256 dims:
+    the q8 kernel takes 5 query rows, the q4 kernel 8)."""
 
     plan = plan_memory(
         total_ram_bytes=128 * GIB,
@@ -61,7 +63,9 @@ def _geometry(quant: str):
         model_max_context=262_144,
     )
     assert plan.kv_bytes_per_token_effective == {"off": Q27_KV, "q8": Q8, "q4": Q4}[quant]
-    return srv._admission_geometry(SimpleNamespace(memory_plan=plan, runtime=None))
+    return srv._admission_geometry(
+        SimpleNamespace(memory_plan=plan, runtime=_q27_runtime())
+    )
 
 
 def _cold(geometry, prompt: int, *, publish: bool = True):
@@ -86,18 +90,51 @@ class TestQuantizedSnapshot:
         # Not the 4.9 GiB of its q4 pages.
         assert growth["publish_copy_bytes"] > 3 * (250_000 * Q4)
 
-    def test_q4_decode_keeps_its_head_major_bank_beside_the_pages(self):
+    def test_q4_decode_builds_its_head_major_bank_beside_the_pages(self):
+        """The kernel route builds the bank at decode's first call (the
+        prompt's 250,000 rows) and regrows it at the next to the pages'
+        capacity (266,386 rows), the first buffer alive while the second is
+        filled (``_quant_bank_arrays``)."""
+
         growth = _cold(_geometry("q4"), 250_000, publish=False)
-        assert growth["quant_working_bytes"] == 250_000 * Q4
+        assert growth["quant_working_bytes"] == (250_000 + 266_386) * Q4
+        assert growth["quant_working"]["route"] == "kernel"
+        assert growth["quant_working"]["rows"] == 250_000 + 266_386
         assert growth["decode_start_bytes"] == (
-            (250_000 + 16_386) * Q4 + 250_000 * Q4
+            (250_000 + 16_386) * Q4 + (250_000 + 266_386) * Q4
         )
 
-    def test_q8_decode_keeps_a_full_width_mirror(self):
+    def test_q8_decode_on_the_kernel_route_builds_no_mirror(self):
+        """A 100K prompt latches the q8 kernel, whose calls read the pages:
+        no bf16 mirror, where the old bill charged 6.1 GiB of one."""
+
         growth = _cold(_geometry("q8"), 100_000, publish=False)
-        assert growth["quant_working_bytes"] == 100_000 * Q27_KV
+        assert growth["quant_working_bytes"] == 0
+        assert growth["quant_working"]["route"] == "kernel"
         growth = _cold(_geometry("q8"), 100_000)
         assert growth["publish_copy_bytes"] == 100_000 * Q27_KV
+
+    def test_q8_decode_builds_the_mirror_for_calls_the_kernel_declines(self):
+        # A six-row verify (MTP depth 5) is wider than the kernel's five.
+        growth = srv._admission_growth(
+            _geometry("q8"),
+            prompt_tokens=100_000,
+            reused_tokens=0,
+            restore_copies_prefix=True,
+            layout="contiguous_then_repage",
+            source_layout=None,
+            output_tokens=16_386,
+            publish=False,
+            scratch_bytes=3 * GIB,
+            verify_tokens=6,
+        )
+        assert growth["quant_working"]["builds"] == "q8_bf16_mirror"
+        assert growth["quant_working"]["rows"] == 100_006 + 116_386
+        assert growth["quant_working_bytes"] == (100_006 + 116_386) * Q27_KV
+        # Under the kernel's threshold the dequant route builds it too.
+        short = _cold(_geometry("q8"), 800, publish=False)
+        assert short["quant_working"]["route"] == "dequant"
+        assert short["quant_working_bytes"] > 800 * Q27_KV
 
     def test_plain_pages_are_copied_at_their_own_width(self):
         growth = _cold(_geometry("off"), 150_000)
@@ -146,6 +183,95 @@ class TestQuantizedSnapshot:
         )
         assert 200_000 * Q4 < 10 * GIB < 200_000 * Q27_KV
         assert pricing["growth"]["publish_copy_bytes"] == 0
+
+
+def _lease(geometry, *, prompt: int, working_rows: int, capacity: int = 196_608):
+    """A warm turn that extends a leased paged cache in place by one token."""
+
+    return srv._admission_growth(
+        geometry,
+        prompt_tokens=prompt,
+        reused_tokens=prompt - 1,
+        restore_copies_prefix=False,
+        layout="contiguous_then_repage",
+        source_layout="contiguous_then_repage",
+        output_tokens=16_386,
+        publish=False,
+        scratch_bytes=3 * GIB,
+        lease={
+            "paged": True,
+            "capacity_tokens": capacity,
+            "paged_layers": 16,
+            "block_size": 16,
+            "working_rows": working_rows,
+        },
+    )
+
+
+class TestTheWorkingCopyOfALease:
+    """The review of 23a94abf (finding 3): the whole prefix's working copy
+    was charged for every quantized request, whether the copy was already
+    resident or would never be built."""
+
+    def test_the_geometry_carries_the_attention_shape(self):
+        assert _geometry("q4").attention_shape == (24, 4, 256, 256)
+
+    def test_a_q4_lease_whose_bank_holds_the_reach_adds_nothing(self):
+        """150K tokens with spare capacity, the bank already allocated past
+        the request's reach (150,000 + 16,386): it was charged 2.75 GiB."""
+
+        growth = _lease(_geometry("q4"), prompt=150_000, working_rows=175_000)
+        assert growth["quant_working_bytes"] == 0
+        assert round(150_000 * Q4 / GIB, 2) == 2.75
+
+    def test_a_q4_lease_whose_bank_must_grow_adds_the_new_buffer(self):
+        growth = _lease(_geometry("q4"), prompt=150_000, working_rows=150_000)
+        # min(capacity, 1.5 x 150,000) rows, the old buffer already resident.
+        assert growth["quant_working_bytes"] == 196_608 * Q4
+        assert growth["quant_working"]["rows"] == 196_608
+
+    def test_a_one_token_q8_extension_on_the_kernel_route_needs_no_mirror(self):
+        """It was charged 9.16 GiB of bf16 mirror."""
+
+        growth = _lease(_geometry("q8"), prompt=150_000, working_rows=0)
+        assert growth["quant_working_bytes"] == 0
+        assert growth["quant_working"]["route"] == "kernel"
+        assert round(150_000 * Q27_KV / GIB, 2) == 9.16
+
+
+class TestTheCachesOwnRule:
+    def test_the_growth_rule_matches_the_caches(self):
+        from mtplx.cache_state import kv_quant_working_copy_peak_rows
+
+        # A new copy: the prompt's rows, then the capacity beside them.
+        assert kv_quant_working_copy_peak_rows(
+            existing_rows=0, first_offset=1_000, last_offset=1_100,
+            capacity_rows=1_200, block_size=16,
+        ) == 1_000 + 1_200
+        # Already past the reach: nothing.
+        assert kv_quant_working_copy_peak_rows(
+            existing_rows=2_000, first_offset=1_000, last_offset=1_900,
+            capacity_rows=4_000, block_size=16,
+        ) == 0
+        # Several regrows (100 -> 150 -> 225 -> 337 -> 505 rows): the last
+        # old-plus-new pair, less the 100 rows already resident.
+        assert kv_quant_working_copy_peak_rows(
+            existing_rows=100, first_offset=101, last_offset=400,
+            capacity_rows=10_000, block_size=16,
+        ) == 337 + 505 - 100
+
+    def test_the_route_rule_is_the_caches(self):
+        from mtplx.cache_state import kv_quant_decode_route
+
+        shape = (24, 4, 256, 256)
+        assert kv_quant_decode_route(8, route_offset=1_024, attention_shape=shape) == "kernel"
+        assert kv_quant_decode_route(8, route_offset=1_023, attention_shape=shape) == "dequant"
+        assert kv_quant_decode_route(4, route_offset=4_096, attention_shape=shape) == "kernel"
+        # The q4 kernel takes head dims of 64, 128 or 256 only.
+        assert (
+            kv_quant_decode_route(4, route_offset=4_096, attention_shape=(24, 4, 192, 192))
+            == "dequant"
+        )
 
 
 class TestMtpHistory:
