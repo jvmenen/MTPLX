@@ -61,6 +61,72 @@ De runs `h1-52-hook` en `k1-52-kaal` komen in `runall.zsh` na de negen runs van 
 - De mislukte resultaten weggooien en opnieuw draaien (`RUNALL_OPNIEUW=1`), zelfde volgorde. Geschat 40 tot 65 minuten.
 - De rest van het plan (beslisregels in `analyse.py`) blijft ongewijzigd.
 
+## 5. Meting 27 september avond (20:38-21:49, 100 W-lader)
+
+Volledige herhaling na de mislukte poging in §1-4, nu met een 100 W-lader in plaats van de 8 W USB-lader. Alle elf runs uit `runall.zsh` doorlopen: `o1-oud`, `m1-main`, `i1-integratie`, `d1-main-dense`, `g1-main-gate`, `b1-main-beide`, `i2-integratie`, `m2-main`, `o2-oud`, `h1-52-hook`, `k1-52-kaal` (`runall.log`, `analyse.txt`).
+
+### 5.1 Welke varianten compleet waren
+
+Tussen ongeveer 21:38 en 21:41 draaide per ongeluk een tweede meetscript mee op poort 8000. Dat heeft twee runs echt beschadigd:
+
+- `i2-integratie` (tweede run van de integratietak): de server gaf halverwege "connection refused"; alleen `decode_t0` en `decode_std` haalden hun volledige aantal verzoeken, de chatmetingen niet.
+- `m2-main` (tweede run van main): twee mtplx-servers tegelijk actief op poort 8000, meting direct afgebroken (resultaatbestand vrijwel leeg, 723 bytes).
+
+Beide zijn bij de analyse buiten beschouwing gelaten. De runs die er vlak na kwamen (`o2-oud`, `h1-52-hook`, `k1-52-kaal`) liepen daarna schoon door: exit 0, juiste aantal verzoeken, geen tracebacks. `runall.zsh` merkt in het log toch elke run als "METING ONVOLLEDIG", inclusief deze drie: dat label komt van de geforceerde herhaalvlag (`RUNALL_OPNIEUW`, die de voltooid-check altijd op "nee" zet, ook voor geslaagde runs) en betekent hier niet dat de meting mislukt is. De resultaatbestanden van `o2-oud`, `h1-52-hook` en `k1-52-kaal` hebben een geldig `klaar`-tijdstip en het verwachte aantal verzoeken; alleen `i2-integratie` en `m2-main` hebben een echt VERSTOORD-signaal in het log.
+
+Bruikbare tellingen per variant:
+
+| Variant | Runs die meetellen |
+|---|---|
+| oud | 2 volledig (o1 + o2) |
+| main | 1 volledig (m1); de herhaling (m2) is weggegooid |
+| main-dense, main-gate, main-beide | elk 1 volledige run |
+| integratie | 1 volledig (i1) plus de decode-tellingen van i2 (chat ontbreekt daar) |
+| 52-hook, 52-kaal | elk 1 volledige run, 42 verzoeken |
+
+### 5.2 Vondst 60: systematisch verschil of tekstgeluk
+
+Chatgesprek, gretig (`chat_t0`, mediaan over alle beurten, tegen 2.11.3):
+
+| Variant | Server-decode (tok/s) | Tokens per ronde | Ronde­tijd (ms) | Gelijke gretige antwoorden tegen 2.11.3 |
+|---|---|---|---|---|
+| main | -4,0% | -3,1% | +0,6% | 4/15 |
+| main-dense | +6,8% | -2,3% | -8,4% | 3/15 |
+| main-gate | +5,5% | -3,4% | -9,7% | 9/15 |
+| main-beide | +10,3% | +0,0% | -10,0% | 15/15 |
+| integratie | -4,2% | -3,1% | +5,5% | 3/15 |
+
+Onder serverstandaard (`chat_std`, temperatuur 0,6, 36 tot 72 verzoeken per variant) verdwijnt het verschil in tokens per ronde volledig: alle 95%-betrouwbaarheidsintervallen bevatten 0 (bijvoorbeeld integratie -1,3% [-3,9%, +1,3%], main -1,0% [-3,4%, +1,4%]).
+
+**Conclusie: het verschil bij greedy decoderen (t0) op main en integratie is tekstgeluk, geen systematische regressie.** De rondetijd zelf is gelijk of korter; het verschil in tok/s komt puur doordat de tekst net iets anders uitvalt (minder rondes met een geaccepteerd copy-token), en dat effect verdwijnt zodra je middelt over de serverstandaard-bemonstering.
+
+De uitzondering is **main-beide** (de dense-route-wijziging en de gate-route-wijziging samen toegepast): 100% van de gretige antwoorden is daar bit-voor-bit gelijk aan 2.11.3, tegen 20% voor alleen de dense-fix en 60% voor alleen de gate-fix. Tegelijk is main-beide niet trager (rondetijd -10,0%, dus zelfs iets sneller) en gelijk in tokens per ronde (+0,0%). Dat is een aanwijzing sterk genoeg om niet als toeval af te doen: de combinatie van de verify-numeriek uit e36f5ffb en de prefill-grensindeling samen verklaart en herstelt de tekstverschuiving tussen 2.11.3 en 2.12.0 volledig; los toegepast doet geen van beide dat.
+
+**Kanttekening:** de rondetijd drift tussen twee runs van dezelfde variant tot 25,1% (oud zelf: 28,53 naar 24,96 ms bij `decode_t0`, +14,3%; 39,94 naar 31,94 ms bij `chat_t0`, +25,1%). Verschillen tussen varianten van een paar procent vallen binnen die ruis; alleen de main-beide-uitkomst (100% identieke tekst, consistente rondetijdwinst) staat daar duidelijk boven.
+
+### 5.3 Vondst 52: verdeling van het gat en de postcommit-hercodering
+
+Client-tijd min `elapsed_s` (mediaan, ms), `k1-52-kaal` (zonder meethook, dichtst bij productie) tegen `h1-52-hook` (met meethook):
+
+| Cel | Gat zonder hook (k1) | Gat met hook (h1) | Hook-kosten (totale clienttijd) |
+|---|---|---|---|
+| chat kort, stream | 7,5 | 8,6 | +11,3 ms |
+| chat kort, json | 7,5 | 8,4 | +18,0 ms |
+| chat lang, stream | 47,0 | 51,9 | +14,3 ms |
+| chat lang, json | 51,9 | 54,1 | +5,7 ms |
+| completion kort, stream | 2,6 | 2,9 | +5,2 ms |
+| completion kort, json | 2,6 | 2,8 | +4,5 ms |
+
+**De fase-uitsplitsing is niet gelukt.** De hook logde per run 2299 tot 2314 losse gebeurtenissen (`send`, `fn`, `endpoint`, `submit`, `recv`, …), maar `analyse.py` kon voor geen van de 42 verzoeken in beide runs een bruikbaar `voor`/`na`-faseoverzicht reconstrueren ("0 met fasetijden"). Of de postcommit-hercodering van het hele gesprek daadwerkelijk de grootste post is, blijft daardoor onbeantwoord: er is geen betrouwbare verdeling van het gat over fasen, alleen het totale gat per cel.
+
+Wat wel duidelijk is: het gat schaalt sterk met gespreks-/contextlengte. Kort gesprek (weinig geschiedenis): ~7,5 ms. Lang gesprek: 47,0 tot 51,9 ms. Completion zonder geschiedenis: 2,6 ms, nauwelijks meer dan bij een kort gesprek zonder de rest van de bagage. Dat past bij de hypothese dat het vooral aan iets ligt dat met de opgebouwde gespreksgeschiedenis samenhangt (zoals de postcommit-hercodering), maar is met deze meting niet hard bewezen.
+
+**Kanttekening:** de meethook zelf kost tot 18,0 ms per verzoek (chat kort, json). Dat is dezelfde orde van grootte als een deel van het gat dat gemeten wordt; kleine verschillen tussen cellen of runs met en zonder hook niet hard toeschrijven aan echte serveroverhead.
+
+### 5.4 Nieuwe vondst: platform-script-taken hebben een harde grens van 1 uur
+
+Los van vondst 60/52: deze meting liep als platform-script-taak en botste op een grens die niet in `timeout` zit. Zie vondst 62 in [VONDSTEN.md](VONDSTEN.md).
+
 ## Bestanden
 
-- `~/Dev/laya-nl/decode-onderzoek/`: `README.md` (opzet), `runall.zsh`, `bench60.py`, `meet52.py`, `analyse.py`; `logs/meting-*.log` (per verzoek), `resultaten/o1-oud.json`, `m1-main.json` (deels bruikbaar), `i1-integratie.json` (onbruikbaar).
+- `~/Dev/laya-nl/decode-onderzoek/`: `README.md` (opzet), `runall.zsh`, `bench60.py`, `meet52.py`, `analyse.py`; `runall.log` en `analyse.txt` (meting 27 sep avond); `logs/meting-*.log` (per verzoek), `resultaten/o1-oud.json`, `m1-main.json` (deels bruikbaar), `i1-integratie.json` (onbruikbaar) (meting 27 sep 18:30, mislukt door de stroomvoorziening); `resultaten/o1-oud.json`, `o2-oud.json`, `m1-main.json`, `d1-main-dense.json`, `g1-main-gate.json`, `b1-main-beide.json`, `i1-integratie.json`, `h1-52-hook.json`, `k1-52-kaal.json` (meting 27 sep avond, bruikbaar); `resultaten/i2-integratie.json`, `m2-main.json` (verstoord door een tweede meetscript, niet meegeteld).
