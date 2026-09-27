@@ -167,6 +167,24 @@ def _install(monkeypatch, machine: _Machine) -> None:
     monkeypatch.setattr(srv, "phys_footprint_bytes", machine.footprint)
 
 
+def _admit(state, **kwargs):
+    """The admission as the build under test takes it.
+
+    With MTPLX_TEST_BASELINE=1 the keywords an older build does not have are
+    left out, so the field reproductions (#499, #525) run on that build and
+    fail by what it does: the review of 9c96dd9c found them failing on
+    1de2b1c0 with a TypeError, which proves nothing. Without it, every
+    keyword is passed and an unknown one raises as usual."""
+
+    import inspect
+    import os
+
+    if os.environ.get("MTPLX_TEST_BASELINE") == "1":
+        params = inspect.signature(srv._prefill_admission_shed).parameters
+        kwargs = {key: value for key, value in kwargs.items() if key in params}
+    return srv._prefill_admission_shed(state, **kwargs)
+
+
 def _flash_next_runtime():
     args = SimpleNamespace(
         layer_types=["linear_attention"] * 36 + ["full_attention"] * 12,
@@ -484,7 +502,7 @@ class Test499FortyEightGigSeat:
         prompt = list(conversation) + list(range(3_000_000, 3_003_185))
         assert len(prompt) == 99_355
         try:
-            receipt = srv._prefill_admission_shed(
+            receipt = _admit(
                 state,
                 prompt_ids=prompt,
                 session_bank=manager.bank,
@@ -1176,7 +1194,7 @@ class Test525SixtyFourGigSeat:
         )
         prompt = list(range(10_000_000, 10_250_000))
         try:
-            receipt = srv._prefill_admission_shed(
+            receipt = _admit(
                 state,
                 prompt_ids=prompt,
                 session_bank=manager.bank,
