@@ -282,6 +282,45 @@ def test_added_token_flag_change_is_not_served_stale(memo, monkeypatch):
     assert obs["chat_segment_memo"]["hits"] == 0
 
 
+def _special_marker_tokenizer(**kwargs):
+    """A real fast tokenizer with ``<|im_start|>`` as a special token."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"[UNK]": 0}
+    for word in ["abc", "hi", "<", "|", "im_start", ">", "\n"]:
+        vocab[word] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w+|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_special_tokens(
+        [tokenizers.AddedToken("<|im_start|>", normalized=False, special=True)]
+    )
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", **kwargs
+    )
+
+
+def test_split_policy_change_is_not_served_stale(memo, monkeypatch):
+    """Warm with split_special_tokens on, then turn it off. transformers
+    copies the flag to the Rust tokenizer only on its next encode, so the
+    Rust flag still says split; the key must see the transformers flag
+    change on its own."""
+    tok = _special_marker_tokenizer(split_special_tokens=True)
+    text, cut = "<|im_start|>hi<|im_start|>hi", [14]
+    split_ids = _segmented(tok, text, cut)
+    assert 8 not in split_ids  # the marker went in as text
+
+    tok.split_special_tokens = False
+    assert tok._tokenizer.encode_special_tokens is True  # not synced yet
+    obs: dict = {}
+    ids = _segmented(tok, text, cut, obs)
+    assert ids == [8, 2, 8, 2]
+    assert obs["chat_segment_memo"]["hits"] == 0
+
+
 class ChangingTokenizer(GreedyTokenizer):
     """Gains a token during its first encode call, as a shared tokenizer
     reconfigured by another thread would, and can drop it again."""

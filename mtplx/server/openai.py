@@ -15197,7 +15197,10 @@ def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
     """Hash of the encoding state a live tokenizer can change in place: the
     base vocab size, every added token with its content, id and matching
     flags (single_word, lstrip, rstrip, normalized, special), and the
-    special-token split policy.
+    special-token split policy of every layer on its own. transformers
+    copies its ``split_special_tokens`` to the Rust ``encode_special_tokens``
+    only when it next encodes, so right after a change the two disagree,
+    and an OR of them would keep the old key.
 
     Recomputed on every call because nothing signals a change. It costs
     14-19 us on the Gemma 4, Qwen 3.6/3.8, MiMo and Bonsai tokenizers (24-33
@@ -15209,9 +15212,13 @@ def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
         digest.update(f"vocab={int(tokenizer.vocab_size)}".encode())
     except (AttributeError, TypeError, ValueError):
         digest.update(b"vocab=?")
-    digest.update(
-        b"split=1" if _chat_tokenizer_splits_special_tokens(tokenizer) else b"split=0"
-    )
+    for index, layer in enumerate(_chat_tokenizer_layers(tokenizer)):
+        digest.update(
+            f"|layer{index}"
+            f":split_special_tokens={getattr(layer, 'split_special_tokens', None)!r}"
+            f":encode_special_tokens={getattr(layer, 'encode_special_tokens', None)!r}"
+            .encode("utf-8", errors="surrogatepass")
+        )
     try:
         added = list(tokenizer.added_tokens_decoder.items())
     except (AttributeError, TypeError):

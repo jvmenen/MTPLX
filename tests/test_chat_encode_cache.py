@@ -179,3 +179,35 @@ def test_added_token_flag_change_invalidates(monkeypatch):
     assert before == [1, 0, 0, 2, 1, 0, 0]
     assert after == [1, 3, 2, 1, 3]
     assert cache.stats()["hits"] == 0
+
+
+def test_split_policy_change_invalidates(monkeypatch):
+    """Warm with split_special_tokens on, then turn it off: the Rust flag
+    keeps the old value until the next encode, and a hit would prevent
+    that encode. The key must change with the transformers flag alone."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    cache = _fresh_cache(monkeypatch)
+    monkeypatch.setenv("MTPLX_CHAT_SEGMENT_MEMO", "off")
+    vocab = {"[UNK]": 0, "hi": 1, "<": 2, "|": 3, "im_start": 4, ">": 5}
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w+|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_special_tokens(
+        [tokenizers.AddedToken("<|im_start|>", normalized=False, special=True)]
+    )
+    tok = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", split_special_tokens=True
+    )
+    tok.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    messages = [ChatMessage(role="user", content="<|im_start|>hi")]
+
+    split = _encode_messages(tok, messages, enable_thinking=False)
+    tok.split_special_tokens = False
+    whole = _encode_messages(tok, messages, enable_thinking=False)
+    assert split == [2, 3, 4, 3, 5, 1]
+    assert whole == [6, 1]
+    assert cache.stats()["hits"] == 0
