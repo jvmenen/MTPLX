@@ -23569,6 +23569,143 @@ def _store_generation_final_history_snapshot(
     return outcome
 
 
+def _postcommit_after_response_enabled() -> bool:
+    """Finish the chat response before the session postcommit (opt-in, T7).
+
+    Off by default. With ``MTPLX_POSTCOMMIT_AFTER_RESPONSE=1`` the terminal
+    frame (stream) or JSON body (non-stream) no longer waits for the
+    generation-final history snapshot: its history re-encode costs ~20 ms at
+    a 32k context and buys the client nothing. The commit still runs, as a
+    post-response tail tracked by ``_PostResponseTails``; every chat or
+    completions request waits for all tails to land before it reads session
+    or bank state, so the next turn never sees a half-committed session.
+    The visible text is unchanged; only ``session_postcommit_snapshot`` in
+    the response stats reads ``after_response`` (the real outcome lands in
+    the request metrics).
+    """
+    raw = str(os.environ.get("MTPLX_POSTCOMMIT_AFTER_RESPONSE", "")).strip().lower()
+    return raw in {"1", "true", "on", "yes"}
+
+
+def _post_response_tail_wait_s() -> float:
+    """Upper bound for one wait on the post-response tails (and for a tail's
+    own wait on its stream worker). A healthy tail lands in tens of ms; the
+    bound only keeps a wedged tail from freezing admission for good."""
+    raw = os.environ.get("MTPLX_POSTCOMMIT_AFTER_RESPONSE_WAIT_S")
+    try:
+        value = float(str(raw).strip()) if raw is not None and str(raw).strip() else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    if value > 0.0:
+        return value
+    return max(60.0, STREAM_COMMIT_WAIT_MAX_S + 30.0)
+
+
+_POST_RESPONSE_SNAPSHOT_MARKER: dict[str, Any] = {
+    "stored": None,
+    "mode": "after_response",
+    "reason": "postcommit_after_response",
+}
+
+
+class _PostResponseTails:
+    """Session commits that run after their response was sent (T7).
+
+    ``enter`` is called before the response is released, ``leave`` once the
+    commit and the stream worker are fully done. Admission waits in
+    ``wait_idle`` so a request never observes a half-committed session: the
+    scheduler is serial, but the session frontier, the prompt-prefix commit
+    and the generation slot are written outside it.
+    """
+
+    def __init__(self) -> None:
+        self._cond = Condition()
+        self._active = 0
+        self._tasks: set[Any] = set()
+        self.entered = 0
+        self.completed = 0
+        self.waits = 0
+        self.wait_timeouts = 0
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def enter(self) -> None:
+        with self._cond:
+            self._active += 1
+            self.entered += 1
+
+    def leave(self) -> None:
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self.completed += 1
+            if self._active == 0:
+                self._cond.notify_all()
+
+    def wait_idle(self, timeout_s: float) -> bool:
+        with self._cond:
+            self.waits += 1
+            idle = self._cond.wait_for(lambda: self._active == 0, timeout=timeout_s)
+            if not idle:
+                self.wait_timeouts += 1
+            return bool(idle)
+
+    def track(self, task: Any) -> None:
+        # Keep a strong reference: the event loop holds only weak ones.
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def to_admin_dict(self) -> dict[str, int]:
+        return {
+            "active": int(self._active),
+            "entered": int(self.entered),
+            "completed": int(self.completed),
+            "waits": int(self.waits),
+            "wait_timeouts": int(self.wait_timeouts),
+        }
+
+
+def _post_response_tails(state: Any) -> _PostResponseTails:
+    tails = getattr(state, "post_response_tails", None)
+    if not isinstance(tails, _PostResponseTails):
+        tails = _PostResponseTails()
+        state.post_response_tails = tails
+    return tails
+
+
+async def _await_post_response_tails(state: Any) -> dict[str, Any] | None:
+    """Admission barrier for T7: wait until every post-response session
+    commit landed. Returns a receipt when there was something to wait for."""
+    tails = getattr(state, "post_response_tails", None)
+    if not isinstance(tails, _PostResponseTails) or tails.active <= 0:
+        return None
+    started = time.perf_counter()
+    idle = await asyncio.to_thread(tails.wait_idle, _post_response_tail_wait_s())
+    return {
+        "waited_s": round(time.perf_counter() - started, 6),
+        "idle": bool(idle),
+    }
+
+
+def _merge_post_response_stats(
+    state: Any, response_id: str | None, stats: dict[str, Any]
+) -> None:
+    """Land a tail's real commit outcome in the request metrics row."""
+    rows = getattr(state, "last_metrics", None)
+    if not rows:
+        return
+    latest = rows[-1]
+    if not isinstance(latest, dict) or latest.get("request_id") not in (
+        None,
+        response_id,
+    ):
+        return
+    for key in ("session_postcommit_snapshot", "session_prompt_prefix_commit"):
+        if key in stats:
+            latest[key] = _json_safe(stats[key])
+
+
 _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
 
@@ -31519,6 +31656,15 @@ def create_app(state: ServerState) -> FastAPI:
             "last_request_started_at": getattr(state, "last_request_started_at", 0.0),
             "requests_completed": getattr(state, "requests_completed", 0),
             "requests_cancelled": getattr(state, "requests_cancelled", 0),
+            # T7 (MTPLX_POSTCOMMIT_AFTER_RESPONSE): post-response commits
+            # and admission waits; null until the first tail ran.
+            "post_response_tails": (
+                state.post_response_tails.to_admin_dict()
+                if isinstance(
+                    getattr(state, "post_response_tails", None), _PostResponseTails
+                )
+                else None
+            ),
             "last_request_at": getattr(state, "last_request_at", 0.0),
             "idle_seconds": (
                 time.time() - getattr(state, "last_request_at", 0.0)
@@ -32818,6 +32964,9 @@ def create_app(state: ServerState) -> FastAPI:
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
         request_received_monotonic_s = time.perf_counter()
+        # T7: a previous turn's post-response session commit must land before
+        # this request resolves its session or looks up the bank.
+        post_response_tail_wait = await _await_post_response_tails(state)
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
@@ -33328,6 +33477,8 @@ def create_app(state: ServerState) -> FastAPI:
             request_depth=request_depth,
         )
         request_observability["request_received_monotonic_s"] = request_received_monotonic_s
+        if post_response_tail_wait is not None:
+            request_observability["post_response_tail_wait"] = post_response_tail_wait
         if constraint_spec is not None:
             request_observability["constrained_decoding"] = constraint_spec.source_type
         if vision_splice is not None:
@@ -33769,6 +33920,7 @@ def create_app(state: ServerState) -> FastAPI:
             assistant_content: str,
             assistant_tool_calls: list[dict[str, Any]] | None = None,
             stream_response: bool = False,
+            after_response: bool = False,
         ) -> None:
             if session is None:
                 return
@@ -33781,20 +33933,39 @@ def create_app(state: ServerState) -> FastAPI:
                 }
                 return
             started = time.perf_counter()
-            compatibility = _generation_final_postcommit_compatibility(
-                state,
-                prompt_ids=prompt_ids,
-                generated=generated,
-                messages=raw_messages_for_postcommit,
-                assistant_content=assistant_content,
-                assistant_tool_calls=assistant_tool_calls,
-                thinking_enabled=thinking_enabled,
-                reasoning_effort=reasoning_effort,
-                tool_specs=postcommit_tool_specs,
-                tool_prompt_mode=postcommit_tool_prompt_mode,
-                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
-                session=session,
-            )
+
+            def postcommit_compatibility() -> dict[str, Any]:
+                return _generation_final_postcommit_compatibility(
+                    state,
+                    prompt_ids=prompt_ids,
+                    generated=generated,
+                    messages=raw_messages_for_postcommit,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                    thinking_enabled=thinking_enabled,
+                    reasoning_effort=reasoning_effort,
+                    tool_specs=postcommit_tool_specs,
+                    tool_prompt_mode=postcommit_tool_prompt_mode,
+                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    session=session,
+                )
+
+            if after_response:
+                # T7 tail: the history re-encode runs as serial model work
+                # (the stream twin's home), never on the event loop that is
+                # still flushing the response it no longer delays.
+                compatibility = await asyncio.wrap_future(
+                    _submit_foreground_model_work(
+                        state,
+                        postcommit_compatibility,
+                        batch_key=(
+                            "postcommit.after_response:"
+                            f"{session_id or 'stateless'}"
+                        ),
+                    )
+                )
+            else:
+                compatibility = postcommit_compatibility()
             final_state = generated.get("_final_state")
             if final_state is not None and _generation_final_prompt_boundary_available(
                 state,
@@ -33891,6 +34062,54 @@ def create_app(state: ServerState) -> FastAPI:
                 ),
             )
             generated["stats"]["session_postcommit_snapshot"] = postcommit
+
+        async def finish_postcommit_snapshot(
+            generated: dict[str, Any],
+            *,
+            assistant_content: str,
+            assistant_tool_calls: list[dict[str, Any]] | None = None,
+        ) -> None:
+            """Run the non-stream postcommit inline, or (T7) after the JSON
+            body went out. The deferred tail works on its own shallow copy
+            of the stats, so the response being rendered never races it."""
+            if session is None or not _postcommit_after_response_enabled():
+                await store_postcommit_snapshot(
+                    generated,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                )
+                return
+            tail_generated = dict(generated)
+            tail_generated["stats"] = dict(generated.get("stats") or {})
+            generated.setdefault("stats", {})["session_postcommit_snapshot"] = dict(
+                _POST_RESPONSE_SNAPSHOT_MARKER
+            )
+            tails = _post_response_tails(state)
+
+            async def tail() -> None:
+                try:
+                    await store_postcommit_snapshot(
+                        tail_generated,
+                        assistant_content=assistant_content,
+                        assistant_tool_calls=assistant_tool_calls,
+                        after_response=True,
+                    )
+                    _merge_post_response_stats(
+                        state, response_id, tail_generated.get("stats") or {}
+                    )
+                except BaseException as exc:  # noqa: BLE001 best-effort cache work
+                    _safe_stdout_print(
+                        f"[mtplx] post-response session postcommit failed: {exc!r}"
+                    )
+                finally:
+                    tails.leave()
+
+            tails.enter()
+            try:
+                tails.track(asyncio.create_task(tail()))
+            except BaseException:
+                tails.leave()
+                raise
 
         # A live user request never queues behind cache maintenance
         # (POSTCOMMIT_STALL_DESIGN step 2, 2026-07-17): if the prior turn's
@@ -35263,6 +35482,9 @@ def create_app(state: ServerState) -> FastAPI:
                         queue.put(("done", generated))
 
                 generation_future: Future = Future()
+                # Set once the worker thread is fully out (generation slot
+                # released); the T7 post-response tail waits on it.
+                worker_exited = Event()
 
                 def run_worker_thread() -> None:
                     try:
@@ -35274,6 +35496,8 @@ def create_app(state: ServerState) -> FastAPI:
                     else:
                         if not generation_future.done():
                             generation_future.set_result(None)
+                    finally:
+                        worker_exited.set()
 
                 Thread(
                     target=run_worker_thread,
@@ -36595,266 +36819,355 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 commit_state["commit"] = True
                                 commit_event.set()
-                                # Bounded commit wait (#F34): the session
-                                # postcommit runs on the model owner. Behind a
-                                # competing foreground job this wait is long
-                                # but alive (the owner heartbeat keeps
-                                # ticking), while the old unbounded
-                                # ``queue.get()`` held the stream open with
-                                # heartbeats dead and hung forever on a wedged
-                                # owner. Poll at the stream cadence so client
-                                # heartbeats keep flowing, and reuse the
-                                # stall-probe idiom for a visible error finish
-                                # instead of a silent hang.
-                                commit_wait_probe = _OwnerStallProbe(
-                                    deadline_s=STREAM_STALL_DEADLINE_S
-                                )
-                                commit_wait_started_s = time.perf_counter()
-                                while True:
-                                    try:
-                                        commit_kind, commit_item = await queue.get(
-                                            0.25
-                                        )
-                                    except Empty:
-                                        now_s = time.perf_counter()
-                                        if (
-                                            STREAM_COMMIT_WAIT_MAX_S > 0
-                                            and now_s - commit_wait_started_s
-                                            >= STREAM_COMMIT_WAIT_MAX_S
-                                        ):
-                                            # #425: the owner is alive but busy
-                                            # with someone else's prefill and
-                                            # our postcommit is queued behind
-                                            # it. Close the stream now; the
-                                            # snapshot lands when the owner
-                                            # reaches it.
-                                            waited_s = now_s - commit_wait_started_s
-                                            _log_stream_commit_wait_deferred(
-                                                state,
-                                                response_id=response_id,
-                                                session_id=session_id,
-                                                waited_s=waited_s,
-                                                streamed_tokens=(
-                                                    streamed_progress_tokens
-                                                ),
+                                async def await_stream_commit(
+                                    generated: dict[str, Any],
+                                    outcome: dict[str, Any],
+                                    *,
+                                    deferred: bool = False,
+                                    # Bound now: the deferred tail runs after
+                                    # this loop iteration is gone.
+                                    assistant_history_content: str = (
+                                        assistant_history_content
+                                    ),
+                                    assistant_tool_calls: Any = assistant_tool_calls,
+                                    streamed_progress_tokens: int = (
+                                        streamed_progress_tokens
+                                    ),
+                                    last_token_s: Any = last_token_s,
+                                ):
+                                    """Wait for the worker's session commit and apply its outcome.
+
+                                    Yields the SSE frames the wait produces (heartbeats, a terminal
+                                    error); the caller marks and sends them, or (T7, ``deferred``)
+                                    drops them because the response already ended. Sets
+                                    ``outcome["generated"]``, or ``outcome["stop"]`` when the stream
+                                    must end after the yielded frames.
+                                    """
+                                    # Bounded commit wait (#F34): the session
+                                    # postcommit runs on the model owner. Behind a
+                                    # competing foreground job this wait is long
+                                    # but alive (the owner heartbeat keeps
+                                    # ticking), while the old unbounded
+                                    # ``queue.get()`` held the stream open with
+                                    # heartbeats dead and hung forever on a wedged
+                                    # owner. Poll at the stream cadence so client
+                                    # heartbeats keep flowing, and reuse the
+                                    # stall-probe idiom for a visible error finish
+                                    # instead of a silent hang.
+                                    commit_wait_probe = _OwnerStallProbe(
+                                        deadline_s=STREAM_STALL_DEADLINE_S
+                                    )
+                                    commit_wait_started_s = time.perf_counter()
+                                    while True:
+                                        try:
+                                            commit_kind, commit_item = await queue.get(
+                                                0.25
                                             )
-                                            commit_kind = "released"
-                                            commit_item = {
-                                                "generated": generated,
-                                                "postcommit": {
-                                                    "stored": False,
-                                                    "deferred": (
-                                                        "stream_commit_wait_deadline"
-                                                    ),
-                                                    "waited_s": round(waited_s, 3),
-                                                },
-                                            }
-                                            break
-                                        frozen_for_s = commit_wait_probe.observe(
-                                            now_s
-                                        )
-                                        if frozen_for_s is not None:
-                                            _log_stream_stall_break(
-                                                state,
-                                                response_id=response_id,
-                                                session_id=session_id,
-                                                frozen_for_s=frozen_for_s,
-                                                streamed_tokens=(
-                                                    streamed_progress_tokens
-                                                ),
-                                            )
-                                            if hasattr(
-                                                session,
-                                                "abort_pending_postcommit",
+                                        except Empty:
+                                            now_s = time.perf_counter()
+                                            if (
+                                                STREAM_COMMIT_WAIT_MAX_S > 0
+                                                and now_s - commit_wait_started_s
+                                                >= STREAM_COMMIT_WAIT_MAX_S
                                             ):
-                                                session.abort_pending_postcommit(
-                                                    "stream_stall_watchdog"
+                                                # #425: the owner is alive but busy
+                                                # with someone else's prefill and
+                                                # our postcommit is queued behind
+                                                # it. Close the stream now; the
+                                                # snapshot lands when the owner
+                                                # reaches it.
+                                                waited_s = now_s - commit_wait_started_s
+                                                _log_stream_commit_wait_deferred(
+                                                    state,
+                                                    response_id=response_id,
+                                                    session_id=session_id,
+                                                    waited_s=waited_s,
+                                                    streamed_tokens=(
+                                                        streamed_progress_tokens
+                                                    ),
                                                 )
-                                            yield mark_sse_sent(
-                                                error_chunk(
-                                                    TimeoutError(
-                                                        "model owner made no "
-                                                        "progress for "
-                                                        f"{frozen_for_s:.0f}s "
-                                                        "while committing the "
-                                                        "session after "
-                                                        "generation; request "
-                                                        "aborted by the stream "
-                                                        "stall watchdog "
-                                                        "(MTPLX_STREAM_STALL_DEADLINE_S)"
+                                                commit_kind = "released"
+                                                commit_item = {
+                                                    "generated": generated,
+                                                    "postcommit": {
+                                                        "stored": False,
+                                                        "deferred": (
+                                                            "stream_commit_wait_deadline"
+                                                        ),
+                                                        "waited_s": round(waited_s, 3),
+                                                    },
+                                                }
+                                                break
+                                            frozen_for_s = commit_wait_probe.observe(
+                                                now_s
+                                            )
+                                            if frozen_for_s is not None:
+                                                _log_stream_stall_break(
+                                                    state,
+                                                    response_id=response_id,
+                                                    session_id=session_id,
+                                                    frozen_for_s=frozen_for_s,
+                                                    streamed_tokens=(
+                                                        streamed_progress_tokens
+                                                    ),
+                                                )
+                                                if hasattr(
+                                                    session,
+                                                    "abort_pending_postcommit",
+                                                ):
+                                                    session.abort_pending_postcommit(
+                                                        "stream_stall_watchdog"
+                                                    )
+                                                yield (
+                                                    error_chunk(
+                                                        TimeoutError(
+                                                            "model owner made no "
+                                                            "progress for "
+                                                            f"{frozen_for_s:.0f}s "
+                                                            "while committing the "
+                                                            "session after "
+                                                            "generation; request "
+                                                            "aborted by the stream "
+                                                            "stall watchdog "
+                                                            "(MTPLX_STREAM_STALL_DEADLINE_S)"
+                                                        )
                                                     )
                                                 )
-                                            )
-                                            yield mark_sse_sent(
-                                                "data: [DONE]\n\n"
-                                            )
-                                            return
-                                        if (
-                                            now_s - last_sse_sent_s
-                                            >= STREAM_HEARTBEAT_INTERVAL_S
-                                        ):
-                                            maybe_log_stream_silence(now_s)
-                                            yield mark_sse_sent(
-                                                progress_chunk(
-                                                    _stream_heartbeat_payload(
-                                                        completion_tokens=(
-                                                            streamed_progress_tokens
-                                                        ),
-                                                        stream_started_s=(
-                                                            stream_started_s
-                                                        ),
-                                                        last_token_s=last_token_s,
-                                                        now_s=now_s,
+                                                yield (
+                                                    "data: [DONE]\n\n"
+                                                )
+                                                outcome["stop"] = True
+                                                return
+                                            if (
+                                                not deferred
+                                                and now_s - last_sse_sent_s
+                                                >= STREAM_HEARTBEAT_INTERVAL_S
+                                            ):
+                                                maybe_log_stream_silence(now_s)
+                                                yield (
+                                                    progress_chunk(
+                                                        _stream_heartbeat_payload(
+                                                            completion_tokens=(
+                                                                streamed_progress_tokens
+                                                            ),
+                                                            stream_started_s=(
+                                                                stream_started_s
+                                                            ),
+                                                            last_token_s=last_token_s,
+                                                            now_s=now_s,
+                                                        )
                                                     )
                                                 )
+                                            continue
+                                        break
+                                    if commit_kind == "committed":
+                                        generated = commit_item
+                                    elif commit_kind == "error":
+                                        yield error_chunk(commit_item)
+                                        yield "data: [DONE]\n\n"
+                                        outcome["stop"] = True
+                                        return
+                                    elif commit_kind == "released":
+                                        release = (
+                                            commit_item
+                                            if isinstance(commit_item, dict)
+                                            else {
+                                                "generated": generated,
+                                                "postcommit": {},
+                                            }
+                                        )
+                                        generated = release.get("generated") or generated
+                                        postcommit = release.get("postcommit") or {}
+                                        prompt_prefix_boundary_kind = (
+                                            "tool_call_prompt_prefix"
+                                            if assistant_tool_calls
+                                            else "postcommit_prompt_prefix"
+                                        )
+                                        if read_only_force_answer_contract_active or vision_splice is not None:
+                                            prompt_prefix_commit_info = {
+                                                "committed": False,
+                                                "reason": (
+                                                    "vision_session_frontier_skip"
+                                                    if vision_splice is not None
+                                                    else "transient_generation_contract"
+                                                ),
+                                                "prefix_len": int(
+                                                    getattr(session, "prefix_len", 0) or 0
+                                                ),
+                                                "boundary_kind": prompt_prefix_boundary_kind,
+                                            }
+                                            prompt_prefix_len = int(
+                                                prompt_prefix_commit_info["prefix_len"]
                                             )
-                                        continue
-                                    break
-                                if commit_kind == "committed":
-                                    generated = commit_item
-                                elif commit_kind == "error":
-                                    yield mark_sse_sent(error_chunk(commit_item))
-                                    yield mark_sse_sent("data: [DONE]\n\n")
-                                    return
-                                elif commit_kind == "released":
-                                    release = (
-                                        commit_item
-                                        if isinstance(commit_item, dict)
-                                        else {
-                                            "generated": generated,
-                                            "postcommit": {},
-                                        }
-                                    )
-                                    generated = release.get("generated") or generated
-                                    postcommit = release.get("postcommit") or {}
-                                    prompt_prefix_boundary_kind = (
-                                        "tool_call_prompt_prefix"
-                                        if assistant_tool_calls
-                                        else "postcommit_prompt_prefix"
-                                    )
-                                    if read_only_force_answer_contract_active or vision_splice is not None:
-                                        prompt_prefix_commit_info = {
-                                            "committed": False,
-                                            "reason": (
-                                                "vision_session_frontier_skip"
-                                                if vision_splice is not None
-                                                else "transient_generation_contract"
-                                            ),
-                                            "prefix_len": int(
-                                                getattr(session, "prefix_len", 0) or 0
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit_info["prefix_len"]
-                                        )
-                                    else:
-                                        # The trailing tool-result continuation
-                                        # hint is transient: the client never
-                                        # echoes it, so a committed stream that
-                                        # includes it can never be extended by
-                                        # any future prompt (strict prefix rule)
-                                        # - the committed frontier froze exactly
-                                        # there (2026-08-21: 15,389 while the
-                                        # true stream passed 76k). Commit only
-                                        # the stable prefix; the hint's KV stays
-                                        # live for this turn regardless.
-                                        _stable_prefix = template_observability.get(
-                                            "stable_prefix_len"
-                                        )
-                                        _prefix_commit_ids = prompt_ids
-                                        if (
-                                            isinstance(_stable_prefix, int)
-                                            and 0 < _stable_prefix < len(prompt_ids)
-                                        ):
-                                            _prefix_commit_ids = prompt_ids[
-                                                :_stable_prefix
-                                            ]
-                                        prompt_prefix_commit = session.commit_prompt_prefix(
-                                            prompt_ids=_prefix_commit_ids,
-                                            finish_reason=str(
-                                                generated.get("finish_reason") or "stop"
-                                            ),
-                                            boundary_kind=prompt_prefix_boundary_kind,
-                                        )
-                                        prompt_prefix_commit_info = {
-                                            "committed": bool(
-                                                prompt_prefix_commit.committed
-                                            ),
-                                            "reason": prompt_prefix_commit.reason,
-                                            "prefix_len": int(
+                                        else:
+                                            # The trailing tool-result continuation
+                                            # hint is transient: the client never
+                                            # echoes it, so a committed stream that
+                                            # includes it can never be extended by
+                                            # any future prompt (strict prefix rule)
+                                            # - the committed frontier froze exactly
+                                            # there (2026-08-21: 15,389 while the
+                                            # true stream passed 76k). Commit only
+                                            # the stable prefix; the hint's KV stays
+                                            # live for this turn regardless.
+                                            _stable_prefix = template_observability.get(
+                                                "stable_prefix_len"
+                                            )
+                                            _prefix_commit_ids = prompt_ids
+                                            if (
+                                                isinstance(_stable_prefix, int)
+                                                and 0 < _stable_prefix < len(prompt_ids)
+                                            ):
+                                                _prefix_commit_ids = prompt_ids[
+                                                    :_stable_prefix
+                                                ]
+                                            prompt_prefix_commit = session.commit_prompt_prefix(
+                                                prompt_ids=_prefix_commit_ids,
+                                                finish_reason=str(
+                                                    generated.get("finish_reason") or "stop"
+                                                ),
+                                                boundary_kind=prompt_prefix_boundary_kind,
+                                            )
+                                            prompt_prefix_commit_info = {
+                                                "committed": bool(
+                                                    prompt_prefix_commit.committed
+                                                ),
+                                                "reason": prompt_prefix_commit.reason,
+                                                "prefix_len": int(
+                                                    prompt_prefix_commit.prefix_len
+                                                ),
+                                                "boundary_kind": prompt_prefix_boundary_kind,
+                                            }
+                                            prompt_prefix_len = int(
                                                 prompt_prefix_commit.prefix_len
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit.prefix_len
+                                            )
+                                        generated["stats"][
+                                            "session_prompt_prefix_commit"
+                                        ] = prompt_prefix_commit_info
+                                        unsafe_reason = str(
+                                            postcommit.get("reason") or "unsafe_history"
                                         )
-                                    generated["stats"][
-                                        "session_prompt_prefix_commit"
-                                    ] = prompt_prefix_commit_info
-                                    unsafe_reason = str(
-                                        postcommit.get("reason") or "unsafe_history"
-                                    )
-                                    postcommit_snapshot = (
-                                        _skipped_idle_postcommit_snapshot(
-                                            state=state,
-                                            unsafe_reason=unsafe_reason,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            prompt_prefix_len=(prompt_prefix_len),
-                                        )
-                                    )
-                                    if postcommit_snapshot is not None:
                                         postcommit_snapshot = (
-                                            _attach_skipped_postcommit_cleanup(
-                                                state,
-                                                postcommit_snapshot,
+                                            _skipped_idle_postcommit_snapshot(
+                                                state=state,
+                                                unsafe_reason=unsafe_reason,
+                                                assistant_tool_calls=assistant_tool_calls,
+                                                prompt_prefix_len=(prompt_prefix_len),
                                             )
                                         )
-                                    else:
-                                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
-                                            state,
-                                            session_id=session_id,
-                                            messages=raw_messages_for_postcommit,
-                                            assistant_content=(
-                                                assistant_history_content
-                                            ),
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            thinking_enabled=thinking_enabled,
-                                            reasoning_effort=reasoning_effort,
-                                            policy_fingerprint=postcommit_policy_fingerprint,
-                                            unsafe_reason=unsafe_reason,
-                                            tool_specs=postcommit_tool_specs,
-                                            session=session,
-                                            expected_session_revision=getattr(
-                                                session, "revision", None
-                                            ),
-                                            keep_live_ref=session_keep_live_ref,
-                                            tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
-                                            committed_stream_ids=[
-                                                int(token) for token in prompt_ids
-                                            ]
-                                            + [
-                                                int(token)
-                                                for token in (
-                                                    generated.get("tokens") or []
+                                        if postcommit_snapshot is not None:
+                                            postcommit_snapshot = (
+                                                _attach_skipped_postcommit_cleanup(
+                                                    state,
+                                                    postcommit_snapshot,
                                                 )
-                                            ],
-                                        )
-                                    generated["stats"][
-                                        "session_postcommit_snapshot"
-                                    ] = postcommit_snapshot
-                                else:
-                                    yield mark_sse_sent(
-                                        error_chunk(
-                                            RuntimeError(
-                                                f"unexpected commit event: {commit_kind}"
+                                            )
+                                        else:
+                                            postcommit_snapshot = _schedule_idle_postcommit_snapshot(
+                                                state,
+                                                session_id=session_id,
+                                                messages=raw_messages_for_postcommit,
+                                                assistant_content=(
+                                                    assistant_history_content
+                                                ),
+                                                assistant_tool_calls=assistant_tool_calls,
+                                                thinking_enabled=thinking_enabled,
+                                                reasoning_effort=reasoning_effort,
+                                                policy_fingerprint=postcommit_policy_fingerprint,
+                                                unsafe_reason=unsafe_reason,
+                                                tool_specs=postcommit_tool_specs,
+                                                session=session,
+                                                expected_session_revision=getattr(
+                                                    session, "revision", None
+                                                ),
+                                                keep_live_ref=session_keep_live_ref,
+                                                tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                                committed_stream_ids=[
+                                                    int(token) for token in prompt_ids
+                                                ]
+                                                + [
+                                                    int(token)
+                                                    for token in (
+                                                        generated.get("tokens") or []
+                                                    )
+                                                ],
+                                            )
+                                        generated["stats"][
+                                            "session_postcommit_snapshot"
+                                        ] = postcommit_snapshot
+                                    else:
+                                        yield (
+                                            error_chunk(
+                                                RuntimeError(
+                                                    f"unexpected commit event: {commit_kind}"
+                                                )
                                             )
                                         )
+                                        yield "data: [DONE]\n\n"
+                                        outcome["stop"] = True
+                                        return
+                                    outcome["generated"] = generated
+
+                                async def stream_commit_after_response(
+                                    tail_generated: dict[str, Any],
+                                    tails: _PostResponseTails,
+                                ) -> None:
+                                    """T7 tail: land the session commit after the response ended."""
+                                    try:
+                                        outcome: dict[str, Any] = {}
+                                        async for _frame in await_stream_commit(
+                                            tail_generated, outcome, deferred=True
+                                        ):
+                                            pass  # the response is closed; nobody reads these
+                                        # The generation slot is released only when the worker
+                                        # thread exits; the next same-session turn must find it free.
+                                        await asyncio.to_thread(
+                                            worker_exited.wait, _post_response_tail_wait_s()
+                                        )
+                                        landed = outcome.get("generated") or tail_generated
+                                        _merge_post_response_stats(
+                                            state, response_id, landed.get("stats") or {}
+                                        )
+                                    except BaseException as exc:  # noqa: BLE001 best-effort cache work
+                                        _safe_stdout_print(
+                                            "[mtplx] post-response stream session commit failed: "
+                                            f"{exc!r}"
+                                        )
+                                    finally:
+                                        tails.leave()
+
+                                if _postcommit_after_response_enabled():
+                                    # T7: release the terminal frame now. The tail keeps the
+                                    # worker's own dict; this stream renders a shallow copy so
+                                    # the worker's stats writes can never race the render.
+                                    post_response_tails = _post_response_tails(state)
+                                    post_response_tails.enter()
+                                    try:
+                                        post_response_tails.track(
+                                            asyncio.create_task(
+                                                stream_commit_after_response(
+                                                    generated, post_response_tails
+                                                )
+                                            )
+                                        )
+                                    except BaseException:
+                                        post_response_tails.leave()
+                                        raise
+                                    generated = dict(generated)
+                                    generated["stats"] = dict(generated.get("stats") or {})
+                                    generated["stats"]["session_postcommit_snapshot"] = dict(
+                                        _POST_RESPONSE_SNAPSHOT_MARKER
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
-                                    return
+                                else:
+                                    commit_outcome: dict[str, Any] = {}
+                                    async for commit_frame in await_stream_commit(
+                                        generated, commit_outcome
+                                    ):
+                                        yield mark_sse_sent(commit_frame)
+                                    if commit_outcome.get("stop"):
+                                        return
+                                    generated = commit_outcome["generated"]
                             generated = attach_response_observability(generated)
                             _attach_dashboard_progress_stats(
                                 state,
@@ -37403,7 +37716,7 @@ def create_app(state: ServerState) -> FastAPI:
                 if extraction is not None and extraction.cleaned_text
                 else ""
             )
-            await store_postcommit_snapshot(
+            await finish_postcommit_snapshot(
                 generated,
                 assistant_content=assistant_content,
                 assistant_tool_calls=tool_calls,
@@ -37509,7 +37822,7 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["stats"]["stop_sequence_hit"] = True
                     generated["stats"]["stop_sequence_matched"] = matched_stop
             _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
-            await store_postcommit_snapshot(
+            await finish_postcommit_snapshot(
                 generated,
                 assistant_content=display_text,
             )
@@ -37676,6 +37989,9 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        # T7 admission barrier (see chat_completions): no bank reads while a
+        # chat turn's post-response commit is still landing.
+        await _await_post_response_tails(state)
         headers = dict(raw_request.headers)
         raw_metadata = _request_extra(request, "metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
