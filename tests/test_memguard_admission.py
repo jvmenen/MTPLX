@@ -15,11 +15,13 @@ with MLX's allocator and the process footprint mocked (no model, no GPU):
 * the warm 114K turn with a clone restore in the same report (94.9 to 100.2
   GiB during ordinary turns).
 
-Plus the per-chunk supply check and #525's points A and B.
+Plus the per-chunk supply check, the pressure loop's death signature and
+#525's three points.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -759,6 +761,107 @@ class TestPerChunkSupplyCheck:
         assert error.detail["memory"]["reason"] == "death_signature"
 
 
+class _LoopBank:
+    def __init__(self, total, max_bytes):
+        self.total_nbytes = total
+        self.max_bytes = max_bytes
+        self.calls = []
+
+    def shrink_to_bytes(self, target, *, reason, protect_active=False):
+        self.calls.append((target, reason))
+        self.total_nbytes = min(self.total_nbytes, target)
+        return 1
+
+
+def _run_loop(
+    state, monkeypatch, *, seconds: float, interval_s: float = 3600, macos_level: int = 1
+):
+    monkeypatch.setattr(srv, "_memory_pressure_level", lambda: macos_level)
+
+    async def run():
+        task = asyncio.ensure_future(srv._memory_pressure_loop(state, interval_s=interval_s))
+        await asyncio.sleep(seconds)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
+def _loop_state(bank):
+    return SimpleNamespace(
+        sessions=SimpleNamespace(bank=bank),
+        dashboard=SimpleNamespace(last_memory_pressure_level=0),
+    )
+
+
+class TestPressureLoop:
+    def test_the_death_signature_between_two_ticks_is_critical(self, monkeypatch):
+        events: list[dict] = []
+        monkeypatch.setattr(
+            srv, "_record_guard_event", lambda state, payload: events.append(payload)
+        )
+        readings = [
+            TestPerChunkSupplyCheck._reading(
+                None, available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0
+            ),
+            TestPerChunkSupplyCheck._reading(
+                None, available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0
+            ),
+        ]
+        sequence = iter(readings)
+        last = [None]
+
+        def reader():
+            try:
+                last[0] = next(sequence)
+            except StopIteration:
+                pass
+            return last[0]
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
+        state = _loop_state(bank)
+        _run_loop(state, monkeypatch, seconds=0.2, interval_s=0.01)
+        # Each reading alone reads normal (20 GiB of file cache); the second
+        # against the first is the crash receipts' shape.
+        assert (0, "memory_pressure_critical") in bank.calls
+        trims = [e for e in events if e["action"] == "pressure_trim"]
+        assert trims and trims[0]["system_thrashing"] is True
+
+    def test_a_warning_trim_halves_what_is_resident(self, monkeypatch):
+        """#525 point C: the WARNING target was half the budget, a no-op
+        for a bank already under it (421 trims in a row evicted nothing)."""
+
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: TestPerChunkSupplyCheck._reading(
+                None, available_gib=5, free_gib=2, compressor_gib=4, at_s=0.0, wired_gib=0
+            ),
+        )
+        bank = _LoopBank(total=3 * GIB, max_bytes=8 * GIB)
+        state = _loop_state(bank)
+        _run_loop(state, monkeypatch, seconds=0.05)
+        assert bank.calls == [(3 * GIB // 2, "memory_pressure_warning")]
+
+    def test_the_macs_own_warning_does_not_wait_for_an_idle_engine(self, monkeypatch):
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: TestPerChunkSupplyCheck._reading(
+                None, available_gib=5, free_gib=2, compressor_gib=4, at_s=0.0, wired_gib=0
+            ),
+        )
+        monkeypatch.setattr(srv, "_engine_busy_signal", lambda state: True)
+        bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
+        state = _loop_state(bank)
+        _run_loop(state, monkeypatch, seconds=0.05)
+        assert bank.calls == [(4 * GIB, "memory_pressure_warning")]
+
+
 class TestPlannerReserve:
     def test_the_steady_reserve_covers_the_committed_window_with_aux(self):
         """#525 point B: the reserve stopped at the dense ceiling and counted
@@ -895,3 +998,58 @@ class Test525SixtyFourGigSeat:
         assert plan.bank_steady_bytes == (
             48 * GIB - R525_WEIGHTS - 3 * GIB - R525_WINDOW * R525_Q4
         )
+
+    def test_a_warning_trim_reaches_a_bank_under_half_its_budget(self, monkeypatch):
+        """Point C. macOS WARNING, the engine under its own line: at the
+        base commit the target was half the 30.1 GiB budget (15.05 GiB), so
+        a 14.2 GiB bank evicted nothing (421 receipts in a row). Half of what
+        is resident is 7.1 GiB."""
+
+        events: list[dict] = []
+        monkeypatch.setattr(
+            srv, "_record_guard_event", lambda state, payload: events.append(payload)
+        )
+        plan = _r525_plan()
+        bank = SessionBank(
+            max_entries=64,
+            max_bytes=plan.bank_idle_max_bytes,
+            per_session_max_bytes=16 * GIB,
+        )
+        for index in range(4):
+            _put(
+                bank,
+                range(index * 10_000, index * 10_000 + 1_000),
+                session_id=f"s{index}",
+                row_bytes=R525_BANK // 4000,
+            )
+        assert bank.total_nbytes == 4 * 1_000 * (R525_BANK // 4000)
+        monkeypatch.setattr(
+            srv,
+            "_mlx_memory_stats_live",
+            lambda: {
+                "ok": True,
+                "active_memory_bytes": R525_WEIGHTS + GIB + int(bank.total_nbytes),
+                "cache_memory_bytes": int(3.45 * GIB),
+            },
+        )
+        monkeypatch.setattr(
+            srv,
+            "phys_footprint_bytes",
+            lambda *a, **k: R525_WEIGHTS + GIB + int(bank.total_nbytes) + int(5.45 * GIB),
+        )
+        state = SimpleNamespace(
+            sessions=SimpleNamespace(bank=bank),
+            dashboard=SimpleNamespace(last_memory_pressure_level=0),
+            metal_memory_caps={
+                "memory_limit_bytes": plan.usable_bytes,
+                "total_ram_bytes": R525_RAM,
+            },
+            memory_budget_bytes=None,
+        )
+        _run_loop(state, monkeypatch, seconds=0.05, macos_level=2)
+        [trim] = [e for e in events if e["action"] == "pressure_trim"]
+        assert trim["level"] == 2
+        assert trim["level_source"] == "macos"
+        assert trim["bank_entries_evicted"] == 2
+        assert trim["bank_bytes_after"] <= R525_BANK // 2
+

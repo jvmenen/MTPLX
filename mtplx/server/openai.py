@@ -20567,11 +20567,24 @@ async def _memory_pressure_loop(
       * mx.clear_cache() runs only when the bank actually evicted or at
         CRITICAL — routine allocator trimming is the default cache bound's
         job (_configure_mlx_cache_limit), not this loop's.
+
+    The whole Mac (2026-09-27): the loop reads what the kernel can hand out
+    without compressing (mtplx/system_memory.py) every 10 s, every 2 s while
+    that supply is under its shed floor, and keeps the previous reading so
+    free pages under the abort floor while the compressor or swap grew in
+    between (the death signature of the crash receipts) reads CRITICAL. A
+    WARNING from that supply does not wait for the engine to go idle: a busy
+    prefill is what drains it. A WARNING trim halves what the bank holds, not
+    its budget, so it cannot be a no-op when the bank already sits under half
+    (#525: 421 WARNING trims in a row evicted nothing). The sustained abort
+    still needs three CRITICAL ticks; within a request, the prefill reads the
+    supply itself before every chunk (_PrefillSystemGuard) and stops at once.
     """
 
     guard = _MemoryPressureGuard()
     abort_streak = 0
     system_level = 1
+    previous_system_memory = None
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
@@ -20597,7 +20610,14 @@ async def _memory_pressure_loop(
             # the macOS level stays "normal" until the swap storm has begun.
             # It only ever raises the level.
             system_memory = _read_system_memory()
-            system_level = _system_pressure_level(system_memory)
+            system_level = _system_pressure_level(
+                system_memory, previous_system_memory
+            )
+            system_thrashing = _system_memory_thrashing(
+                system_memory, previous_system_memory
+            )
+            if system_memory is not None:
+                previous_system_memory = system_memory
             if system_level > level:
                 level = system_level
                 level_source = "system_available"
@@ -20668,11 +20688,19 @@ async def _memory_pressure_loop(
                 state, level, critical_busy, abort_streak
             )
             deferred_s = guard.deferred_for_s(time.monotonic())
-            if guard.decide(level, time.monotonic(), busy):
+            # A WARNING read from the Mac's own supply acts at once: a busy
+            # prefill is what drains it. The allocator's and macOS's WARNING
+            # still wait for an idle engine, up to warning_defer_max_s.
+            defer_busy = busy and level_source != "system_available"
+            if guard.decide(level, time.monotonic(), defer_busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
                 if bank is not None:
-                    target = 0 if level >= 4 else int(bank.max_bytes) // 2
+                    target = (
+                        0
+                        if level >= 4
+                        else min(int(bank.total_nbytes), int(bank.max_bytes)) // 2
+                    )
                     evicted = bank.shrink_to_bytes(
                         target,
                         reason=(
@@ -20715,6 +20743,10 @@ async def _memory_pressure_loop(
                         int(system_memory.available_bytes)
                         if system_memory is not None
                         else None
+                    ),
+                    "system_thrashing": bool(system_thrashing),
+                    "system_memory": (
+                        system_memory.to_dict() if system_memory is not None else None
                     ),
                     "phys_footprint_bytes": phys_footprint_bytes(),
                     "bank_entries_evicted": evicted,
