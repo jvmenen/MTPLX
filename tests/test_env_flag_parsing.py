@@ -229,6 +229,11 @@ def test_kv_quant_health_detail_describes_the_routes_that_run(
     assert detail["compiled_verify"].startswith("kept" if bank_kept else "off")
     assert ("compiled_verify_graphbank" in detail["detached_fast_paths"]) is not bank_kept
     assert "dense_two_pass_paged" in detail["detached_fast_paths"]
+    # The q8 mirror holds the cache's source dtypes (fp16 for an FP16 pack),
+    # so the payload must not call it a bf16 mirror.
+    assert "bf16" not in detail["decode"]
+    if mode == "q8":
+        assert "an unquantized working mirror of the pages" in detail["decode"]
 
 
 def test_paged_kv_quant_rejects_an_unknown_mode(monkeypatch) -> None:

@@ -18150,7 +18150,9 @@ def _paged_kv_quantization_detail() -> dict[str, Any]:
         or "1024"
     )
     dequant = (
-        "a bf16 working mirror of the pages"
+        # The mirror holds the pages in the cache's source dtypes (bf16 or
+        # fp16, whichever the model runs), not a fixed bf16.
+        "an unquantized working mirror of the pages"
         if mode == "q8"
         else "dequantized in bounded chunks"
     )
