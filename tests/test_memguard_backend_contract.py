@@ -378,6 +378,30 @@ class TestGemmaAdmission:
         geometry = srv._admission_geometry(_gemma_state(manager))
         assert geometry.live_bytes_per_token == GEMMA_PLANNED_KV
 
+    def test_the_whole_prompt_path_is_charged_the_attention_it_builds(self, monkeypatch):
+        """``whole`` restores the one forward and its every-layer row width,
+        not 2.12.0's attention charge. Both paths materialize the
+        full-attention layers' scores (their 512-wide heads never fuse:
+        ``evidence/gemma-chunked-prefill/sdpa-routing-probe.txt``), which
+        2.12.0 charged only through the sliding mask: nothing for a
+        1,024-token cold prompt (80 MiB here) and 77,904,000 bytes for a
+        600-token turn over 30,000 cached tokens (1,468,800,000 here, the
+        full-attention block). Its figures would admit that warm turn
+        1.4 GB short, so ``whole`` keeps the corrected charge."""
+
+        monkeypatch.setenv(GEMMA_WHOLE, "whole")
+        runtime = _gemma_runtime()
+        assert runtime.prefill_forward_widths(30_600, None) == [None]
+        assert runtime.prefill_attention_bytes(1024, 0) == 80 * 1024 * 1024
+        assert runtime.prefill_attention_bytes(600, 30_000) == 80 * 600 * 30_600
+        assert 80 * 600 * 30_600 == 1_468_800_000
+        # 2.12.0: the sliding mask alone, rows x (cached window + rows), and
+        # nothing inside the window.
+        assert 80 * 600 * (1023 + 600) == 77_904_000
+        # For a cold prompt past the window the two charges agree: 16,384 x
+        # 16,384 pairs either way (the cold parity test above).
+        assert runtime.prefill_attention_bytes(16_384, 0) == 80 * 16_384 * 16_384
+
     def test_a_warm_turn_is_charged_what_the_restored_cache_keeps(self):
         """A 30,000-token conversation restored by clone for a 600-token
         turn: the restore copies the full-attention KV, the drafter's
