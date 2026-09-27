@@ -13,13 +13,16 @@ ordinary host memory on top reads 1.06 to 1.08 of the limit. That is
 CRITICAL at rest, which empties the warm session cache and arms the prefill
 abort. These tests pin the re-based floor and keep the strict one reachable.
 
-2026-09-27: the allowance is the fixed measured floor (8 GiB). It used to be
-the larger of that and RAM - system reserve - limit, which kept the guard's
-process ceiling at RAM minus the reserve whatever the limit (112 GiB on a
-128 GB Mac at 96, 90 or 88 GiB): lowering MTPLX_MEMORY_LIMIT_BYTES did not
-lower it, and 14 GiB of leaked host memory (#546) was forgiven up to 16 GiB.
-The seats that motivated the old rule (48 GB / 27B, 96 GB / Flash-Next) stay
-quiet on the floor alone.
+2026-09-27: the allowance is a sixteenth of the machine, capped at the 8 GiB
+measured on a 128 GB Flash-Next daemon (1 GiB on 16 GB, 3 on 48, 6 on 96, 8
+from 128 GB up). It used to be the larger of 8 GiB and RAM - system reserve -
+limit, which kept the guard's process ceiling at RAM minus the reserve
+whatever the limit (112 GiB on a 128 GB Mac at 96, 90 or 88 GiB): lowering
+MTPLX_MEMORY_LIMIT_BYTES did not lower it, and 14 GiB of leaked host memory
+(#546) was forgiven up to 16 GiB. A flat 8 GiB would put a 16 GB Mac's
+ceiling (12 GiB limit + 8) past its RAM. The seats that motivated the old
+rule stay quiet: 48 GB / 27B with 3 GiB of host memory, 96 GB / Flash-Next
+with 5.
 """
 
 from __future__ import annotations
@@ -72,11 +75,31 @@ def _no_inherited_override(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The allowance is one measured floor, whatever the seat
+# The allowance is sized to the seat
 # --------------------------------------------------------------------------
 
 
-def test_the_allowance_is_the_measured_floor():
+@pytest.mark.parametrize(
+    "ram_gib, allowance_gib",
+    [(16, 1), (48, 3), (96, 6), (128, 8), (512, 8)],
+)
+def test_the_allowance_is_sized_to_the_seat(ram_gib, allowance_gib):
+    """A sixteenth of the machine, capped at the 8 GiB measured on 128 GB.
+
+    A flat 8 GiB put a 16 GB Mac's process ceiling (12 GiB limit + 8) past
+    its RAM; the 2026-09-27 review of this change caught it."""
+
+    state = _state(total_gib=ram_gib, limit_gib=ram_gib * 0.75)
+    assert srv._host_memory_allowance_bytes(state) == allowance_gib * GIB
+
+
+def test_a_simulated_seat_gets_its_own_allowance():
+    # --memory-budget 48G on a 128 GB Mac plans (and guards) a 48 GB seat.
+    state = _state(total_gib=128, limit_gib=36, budget_gib=48)
+    assert srv._host_memory_allowance_bytes(state) == 3 * GIB
+
+
+def test_an_unknown_machine_gets_the_cap():
     assert srv._host_memory_allowance_bytes() == 8 * GIB
 
 
@@ -199,13 +222,29 @@ class _EmptyBank:
 
 def test_admission_does_not_refuse_a_request_the_plan_sized_to_fit(monkeypatch):
     state = _state(total_gib=48, limit_gib=36)
-    _pin(monkeypatch, allocator_gib=28, footprint_gib=38)  # overhang 10, charged 2
+    # 3 GiB of ordinary host memory, inside the seat's 3 GiB allowance.
+    _pin(monkeypatch, allocator_gib=28, footprint_gib=31)
 
-    # 8,192 new tokens: 0.25 GiB of KV plus 3 GiB of transients on 30 GiB.
+    # 8,192 new tokens: 0.25 GiB of KV plus 3 GiB of transients on 28 GiB.
     receipt = srv._prefill_admission_shed(
         state, prompt_ids=list(range(8192)), session_bank=_EmptyBank(), session_id="pi"
     )
     assert receipt is None
+
+
+def test_a_leak_on_a_48gb_seat_is_charged_not_forgiven(monkeypatch):
+    """10 GiB outside MLX on a 48 GB Mac. This test used to admit it: the old
+    allowance (8 GiB on this seat) charged 2 GiB. The seat's 3 GiB allowance
+    charges 7, and the same request no longer fits the 36 GiB limit."""
+
+    state = _state(total_gib=48, limit_gib=36)
+    _pin(monkeypatch, allocator_gib=28, footprint_gib=38)
+    receipt = srv._prefill_admission_shed(
+        state, prompt_ids=list(range(8192)), session_bank=_EmptyBank(), session_id="pi"
+    )
+    assert receipt is not None
+    assert receipt["host_overhang_charged_bytes"] == 7 * GIB
+    assert receipt["refused"] is True
 
 
 def test_the_admission_receipt_explains_what_it_charged(monkeypatch):

@@ -18810,13 +18810,38 @@ def _vision_bank_session_id(bank: Any, prompt_ids: list[int], splice: Any) -> st
 # Measured 3 to 6 GiB on a Flash-Next daemon on 2026-09-16 (phys_footprint
 # 88.58 GB, 77 GB of it weights), about 3 GiB on a fresh one, and the SSD
 # writer alone may stage up to MTPLX_SSD_WRITER_BACKLOG_BYTES (4 GiB). The
-# allowance is that measurement plus headroom; MTPLX_HOST_MEMORY_ALLOWANCE_BYTES
-# overrides it.
-_HOST_MEMORY_ALLOWANCE_FLOOR_BYTES = 8 * 1024**3
+# allowance is that measurement plus headroom on the large seats, and a
+# sixteenth of the machine below 128 GB: 8 GiB outside Metal on a 16 GB Mac
+# (limit 12 GiB) would put the guard's process ceiling past the RAM itself.
+# 16 GB: 1 GiB, 48 GB: 3 GiB, 96 GB: 6 GiB, 128 GB and up: 8 GiB.
+# MTPLX_HOST_MEMORY_ALLOWANCE_BYTES overrides it.
+_HOST_MEMORY_ALLOWANCE_CAP_BYTES = 8 * 1024**3
+_HOST_MEMORY_ALLOWANCE_MIN_BYTES = 1 * 1024**3
+_HOST_MEMORY_ALLOWANCE_RAM_DIVISOR = 16
 
 
-def _host_memory_allowance_bytes() -> int:
-    """How much process memory outside MLX's account is normal: a fixed floor.
+def _planning_ram_bytes(state: Any) -> int | None:
+    """The machine the engine plans for: its RAM, or the tighter
+    ``--memory-budget`` a smaller seat is simulated with."""
+
+    ram = None
+    caps = getattr(state, "metal_memory_caps", None)
+    if isinstance(caps, dict):
+        value = caps.get("total_ram_bytes")
+        if isinstance(value, int) and value > 0:
+            ram = value
+    if ram is None:
+        from mtplx.memory_plan import detect_total_ram_bytes
+
+        ram = detect_total_ram_bytes()
+    budget = getattr(state, "memory_budget_bytes", None)
+    if isinstance(budget, int) and budget > 0:
+        ram = budget if ram is None else min(int(ram), budget)
+    return None if ram is None else int(ram)
+
+
+def _host_memory_allowance_bytes(state: Any = None) -> int:
+    """How much process memory outside MLX's account is normal for this seat.
 
     The allocator limit is not the process's budget: the plan fits weights,
     KV, transients and the session cache inside it and a healthy daemon also
@@ -18825,17 +18850,17 @@ def _host_memory_allowance_bytes() -> int:
     48 GB Mac with the 27B (limit 36 GiB), 34 GiB in MLX's account plus 3 GiB
     of host memory was CRITICAL at rest, and Flash-Next on a 96 GB Mac (limit
     84 GiB, 80 + 5) sat in WARNING for good (the 2026-09-16 review of
-    PR #500). Both seats hold well under this floor outside Metal, so the
-    floor alone keeps them quiet.
+    PR #500). The allowance (3 and 6 GiB on those seats) keeps both quiet.
 
-    It used to be the larger of this floor and RAM - system reserve - limit.
-    That made the guard's process ceiling (limit + allowance) equal RAM minus
-    the reserve whatever the limit was: 112 GiB on a 128 GB Mac at a 96, 90
-    or 88 GiB limit, so MTPLX_MEMORY_LIMIT_BYTES=90G did not lower it (the
+    It used to be the larger of 8 GiB and RAM - system reserve - limit. That
+    made the guard's process ceiling (limit + allowance) equal RAM minus the
+    reserve whatever the limit was: 112 GiB on a 128 GB Mac at a 96, 90 or
+    88 GiB limit, so MTPLX_MEMORY_LIMIT_BYTES=90G did not lower it (the
     2026-09-26 field report), and 14 GiB of host memory from a leak (#546)
-    was forgiven up to 16 GiB. With a fixed allowance the ceiling follows the
-    limit (104 GiB at 96, 98 GiB at 90), and host memory past the floor is
-    charged, shown in every receipt, and yields the warm cache.
+    was forgiven up to 16 GiB. Now the ceiling follows the limit (104 GiB at
+    96, 98 GiB at 90 on 128 GB), and host memory past the allowance is
+    charged, shown in every receipt, and yields the warm cache. A leak is
+    shown, not forgiven.
 
     MTPLX_HOST_MEMORY_ALLOWANCE_BYTES=0 is the strict floor PR #500 proposed:
     every byte of footprint above MLX's account counts.
@@ -18846,7 +18871,15 @@ def _host_memory_allowance_bytes() -> int:
         parsed = _parse_byte_limit(raw)
         if parsed is not None and parsed >= 0:
             return int(parsed)
-    return int(_HOST_MEMORY_ALLOWANCE_FLOOR_BYTES)
+    ram = _planning_ram_bytes(state) if state is not None else None
+    if not ram:
+        return int(_HOST_MEMORY_ALLOWANCE_CAP_BYTES)
+    return int(
+        max(
+            _HOST_MEMORY_ALLOWANCE_MIN_BYTES,
+            min(_HOST_MEMORY_ALLOWANCE_CAP_BYTES, ram // _HOST_MEMORY_ALLOWANCE_RAM_DIVISOR),
+        )
+    )
 
 
 def _footprint_floor(
@@ -18866,7 +18899,7 @@ def _footprint_floor(
     if not footprint:
         return int(allocator_bytes), fields
     overhang = max(0, int(footprint) - int(allocator_bytes))
-    allowance = _host_memory_allowance_bytes()
+    allowance = _host_memory_allowance_bytes(state)
     charged = max(0, overhang - allowance)
     fields["host_overhang_bytes"] = int(overhang)
     fields["host_allowance_bytes"] = int(allowance)
