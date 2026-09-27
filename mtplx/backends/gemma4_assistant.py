@@ -2562,6 +2562,39 @@ def _gemma4_prefill_prompt(
     )
 
 
+def gemma4_prompt_scoring_logit_chunks(
+    runtime: Gemma4AssistantRuntime,
+    prompt_ids: list[int],
+    *,
+    chunk_size: int,
+):
+    """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
+
+    Same forward as the generation prefill (``_gemma4_prefill_prompt``): the
+    whole prompt in one target pass without logits on a fresh cache. The
+    logits head then runs per chunk of hidden rows, so at most
+    ``chunk_size x vocab`` logits are resident at once.
+    """
+
+    _ensure_thread_streams()
+    mx = _require_mlx_core()
+    output = runtime.forward_target(
+        mx.array([prompt_ids], dtype=mx.int32),
+        cache=runtime.make_cache(),
+        phase="prefill",
+        compute_logits=False,
+    )
+    hidden = output.hidden
+    del output
+    mx.eval(hidden)
+    n = len(prompt_ids)
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        logits = runtime.target.logits_from_hidden(hidden[:, start:end, :])
+        yield start, end, logits
+        del logits
+
+
 def _clone_gemma4_prompt_cache(
     runtime: Gemma4AssistantRuntime,
     cache: list[Any],

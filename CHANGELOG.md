@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Prompt scoring works on the Gemma 4 assistant pair.** `/v1/completions` with `echo`, `logprobs` and `max_tokens: 0` answered HTTP 500 on the `gemma4_assistant` backend: `score_prompt_logprobs` called `rt.forward_ar`, which `Gemma4AssistantRuntime` does not have. Scoring now takes its per-chunk logits from a small generator. Other backends keep the existing path (`forward_ar` per chunk on one prefill cache). The Gemma pair runs the same target forward as its generation prefill (the whole prompt in one pass without logits) and applies the logits head per chunk of 256 hidden rows, so at most chunk x vocabulary logits are resident, as before. M5 Pro 64 GB, Gemma4 MTPLX Optimized-Speed, profile turbo, fan mode default, 1de2b1c0 plus this change, 2026-09-27: 60 classifier prompts on each of two fresh servers returned HTTP 200 60/60, identical values across both servers and on a repeated request, and a top-1 token equal to the greedy first token for 60/60. Host tests in `tests/test_gemma4_prompt_scoring.py`.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
