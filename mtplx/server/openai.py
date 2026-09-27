@@ -19639,7 +19639,14 @@ def _forward_row_bytes(args: Any) -> int | None:
                      projection;
       gated delta    input, the q/k/v and z projections, the convolved
                      q/k/v, float32 q, k, v and output, the output
-                     projection.
+                     projection;
+      routed MoE     input, the router's float32 scores and their softmax
+                     and top-k over every expert, then for each of the
+                     ``num_experts_per_tok`` experts a row takes its gate, up
+                     and activated product at ``moe_intermediate_size`` and
+                     its output at the hidden size, plus the shared experts'
+                     gate, up and product (``shared_expert_intermediate_size``,
+                     or ``n_shared_experts`` routed-size experts).
 
     Attention runs fused kernels, so no score matrix is charged: on the 27B
     geometry the working memory does not grow with the keys (Bonsai 2 27B,
@@ -19679,6 +19686,31 @@ def _forward_row_bytes(args: Any) -> int | None:
             # The KV-shared layers run a double-width MLP (Gemma 4 E-series).
             intermediate *= 2
         rows.append(2 * (hidden + 3 * intermediate))
+    # A routed MoE layer (the review of 9c96dd9c: the dense MLP term priced
+    # MoE packs by a field their expert layers do not use). Field names
+    # across the families: Qwen MoE and Qwen3-Next, DeepSeek, Gemma 4.
+    experts_per_token = (
+        value("num_experts_per_tok") or value("top_k_experts") or value("moe_topk")
+    )
+    expert_intermediate = value("moe_intermediate_size") or value(
+        "expert_intermediate_size"
+    )
+    if experts_per_token > 0 and expert_intermediate > 0:
+        experts = (
+            value("num_experts") or value("n_routed_experts") or value("num_local_experts")
+        )
+        shared = value("shared_expert_intermediate_size") or (
+            value("n_shared_experts") * expert_intermediate
+        )
+        rows.append(
+            2
+            * (
+                hidden
+                + experts_per_token * (3 * expert_intermediate + hidden)
+                + 3 * shared
+            )
+            + 4 * 3 * experts
+        )
     qk = 2 * value("linear_num_key_heads") * value("linear_key_head_dim")
     v = value("linear_num_value_heads") * value("linear_value_head_dim")
     if qk > 0 and v > 0:
