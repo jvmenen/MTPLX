@@ -82,6 +82,8 @@ from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import (
     CompiledVerifyBank,
     SpecDecodeGraphBank,
+    TensorOffsetQSACache,
+    _fixed_m4_capacity_bucket,
     _fixed_m4_initial_growth_reserve,
     _float32_gdn_key_scale_head_dim,
     _float32_gdn_key_scale_why,
@@ -692,6 +694,17 @@ def _qwen4_fixed_m4_admission(
 _QWEN4_FIXED_M4_PRESSURE_FRACTION = 0.97
 
 
+def _qwen4_text_args(rt: Any) -> Any:
+    """The served QSA model's text args, or None when the runtime has none."""
+
+    model = getattr(rt, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None)
+    if args is None:
+        args = getattr(getattr(text, "model", None), "args", None)
+    return args
+
+
 def _qwen4_fixed_m4_promotion_bytes_per_token(rt: Any) -> int:
     """Bytes the fixed-M4 promotion re-materializes per context token.
 
@@ -702,11 +715,7 @@ def _qwen4_fixed_m4_promotion_bytes_per_token(rt: Any) -> int:
     the served model does not expose that geometry.
     """
 
-    model = getattr(rt, "model", None)
-    text = getattr(model, "language_model", model)
-    args = getattr(text, "args", None)
-    if args is None:
-        args = getattr(getattr(text, "model", None), "args", None)
+    args = _qwen4_text_args(rt)
     layer_types = list(getattr(args, "layer_types", None) or ())
     n_qsa = sum(1 for kind in layer_types if kind != "linear_attention")
     kv_heads = int(getattr(args, "num_key_value_heads", 0) or 0)
@@ -716,6 +725,32 @@ def _qwen4_fixed_m4_promotion_bytes_per_token(rt: Any) -> int:
     if n_qsa <= 0 or kv_heads <= 0 or head_dim <= 0:
         return 0
     return n_qsa * (2 * kv_heads * head_dim * 2 + idx_dim * 2 + (idx_dim * 2) // ratio)
+
+
+def _qwen4_fixed_m4_bank_rows(rt: Any, prompt_tokens: int) -> int:
+    """Rows per QSA layer the fixed-M4 promotion allocates for this prompt.
+
+    The prompt plus the initial growth reserve, rounded the way
+    graphbank.TensorOffsetQSACache.from_qsa_cache rounds it: to the QSA ratio
+    on the dense lane; on the rows-gather lane (MTPLX_QSA_GATHER at
+    MTPLX_QSA_GATHER_MIN_CONTEXT tokens or more) to the K/V step and then up
+    to the capacity bucket, at most 7,936 rows more than the step alone.
+    """
+
+    from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
+
+    prompt_tokens = max(0, int(prompt_tokens))
+    args = _qwen4_text_args(rt)
+    ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
+    return TensorOffsetQSACache._bank_capacity(
+        prompt_tokens + _fixed_m4_initial_growth_reserve(),
+        ratio,
+        TensorOffsetQSACache.step,
+        rows_gather=(
+            _qsa_gather_enabled() and prompt_tokens >= _qsa_gather_min_context()
+        ),
+        bucket=_fixed_m4_capacity_bucket(),
+    )
 
 
 def _mlx_live_memory_bytes() -> int:
@@ -1092,8 +1127,10 @@ def _qwen4_fixed_m4_lane_fits(
 
     MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT is an operator belt in prompt tokens;
     0 or unset leaves the live gate alone in charge: live allocator bytes
-    plus the promotion adder (prompt plus the initial growth reserve, at the
-    geometry's bytes per token) must stay under 0.97 of the Metal limit.
+    plus the promotion adder (the bank rows the promotion allocates, prompt
+    plus the initial growth reserve rounded up to the lane's capacity rule
+    and bucket, at the geometry's bytes per token) must stay under 0.97 of
+    the Metal limit.
     """
 
     prompt_tokens = max(0, int(prompt_tokens))
@@ -1111,11 +1148,17 @@ def _qwen4_fixed_m4_lane_fits(
     limit = _metal_memory_limit_bytes(rt)
     if limit <= 0:
         return True
-    need = (prompt_tokens + _fixed_m4_initial_growth_reserve()) * per_token
+    bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens)
+    need = bank_rows * per_token
     live = _mlx_live_memory_bytes()
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
     if receipt is not None:
-        receipt.update(live_bytes_before=live, promotion_bytes=need, threshold_bytes=line)
+        receipt.update(
+            live_bytes_before=live,
+            promotion_bytes=need,
+            promotion_rows=bank_rows,
+            threshold_bytes=line,
+        )
     if live + need <= line:
         return True
     # The allocator cache is free memory the allocator is holding; only
@@ -11054,6 +11097,20 @@ def generate_mtpk(
         return snap
 
     _rt_prev = _route_counter_snapshot() if route_tape.enabled else {}
+    # The installed fixed-M4 bank's capacity and the verify traces the bank
+    # has paid, as the tape last reported them: a round carries a capacity
+    # transition (a bucket edge crossed) and its own traces only when these
+    # move. Read only when the tape is on.
+    _rt_fixed_m4 = (
+        compiled_verify_bank.fixed_m4_capacity_receipt()
+        if route_tape.enabled and compiled_verify_bank is not None
+        else None
+    )
+    _rt_traces = (
+        int(compiled_verify_bank.stats.get("traces", 0))
+        if route_tape.enabled and compiled_verify_bank is not None
+        else 0
+    )
 
     if route_tape.enabled:
         from .kernel_selfcheck import _DISABLED_LANES
@@ -11081,6 +11138,9 @@ def generate_mtpk(
                 "nax_available": bool(nax_available()),
                 "prompt_tokens": len(prompt_ids),
                 "max_tokens": int(max_tokens),
+                # capacity, capacity_bucket, rows_gather, base_offset of the
+                # installed fixed-M4 bank; None off that lane.
+                "fixed_m4": _rt_fixed_m4,
             },
         )
 
@@ -11090,13 +11150,32 @@ def generate_mtpk(
         append_event(event)
         if not route_tape.enabled:
             return
-        nonlocal _rt_prev
+        nonlocal _rt_prev, _rt_fixed_m4, _rt_traces
         cur = _route_counter_snapshot()
         deltas = {
             name: counter_deltas(_rt_prev.get(name, {}), counts)
             for name, counts in cur.items()
         }
         _rt_prev = cur
+        capacity_transition = None
+        verify_traces = 0
+        if compiled_verify_bank is not None:
+            fixed_m4 = compiled_verify_bank.fixed_m4_capacity_receipt()
+            if (
+                fixed_m4 is not None
+                and _rt_fixed_m4 is not None
+                and fixed_m4["capacity"] != _rt_fixed_m4["capacity"]
+            ):
+                capacity_transition = {
+                    "from": _rt_fixed_m4["capacity"],
+                    "to": fixed_m4["capacity"],
+                    "bucket": fixed_m4["capacity_bucket"],
+                    "rows_gather": fixed_m4["rows_gather"],
+                }
+            _rt_fixed_m4 = fixed_m4
+            traces = int(compiled_verify_bank.stats.get("traces", 0))
+            verify_traces = traces - _rt_traces
+            _rt_traces = traces
         verify_route = event.get("verify_route") or "not_run"
         verify_width = event.get("verify_width")
         if verify_width is None:
@@ -11153,6 +11232,11 @@ def generate_mtpk(
                 "timing_s": event.get("timing_s"),
                 "cache_offset": _cache_offset(cache),
                 "fallback_deltas": {k: v for k, v in deltas.items() if v},
+                # Compiled verify traces this round paid (MLX traces a new
+                # input-shape signature once per process), and the fixed-M4
+                # capacity change that caused one, when the bank grew.
+                "verify_traces": verify_traces,
+                "fixed_m4_capacity": capacity_transition,
                 "draft_core_error": event.get("draft_core_error"),
                 "context_copy": event.get("context_copy"),
             },
