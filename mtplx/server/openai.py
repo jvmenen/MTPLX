@@ -22103,6 +22103,12 @@ def _make_adaptive_policy(
     raise ValueError(f"unknown adaptive policy: {policy}")
 
 
+def _bank_maintenance_reads(state: Any) -> Any:
+    """Context in which bank restores do not count as use (postcommit)."""
+    maintenance_reads = getattr(state.sessions.bank, "maintenance_reads", None)
+    return maintenance_reads() if maintenance_reads is not None else nullcontext()
+
+
 def _store_retokenized_history_snapshot(
     state: ServerState,
     *,
@@ -22336,7 +22342,7 @@ def _store_retokenized_history_snapshot(
         try:
             if _abort_requested():
                 raise PostcommitAbort(_abort_reason())
-            with attention_phase("postcommit"):
+            with attention_phase("postcommit"), _bank_maintenance_reads(state):
                 prompt_state = restore_or_prefill_prompt_state(
                     state.runtime,
                     history_ids,

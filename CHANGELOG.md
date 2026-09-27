@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The async postcommit no longer refreshes the recency of the bank entry it restores from.** To re-render a turn's history, the retokenized postcommit restores the turn's own prompt-prefix entry. That read counted as use, so under the per-session retention cap the superseded prompt prefix could outrank a sibling lineage (for example a tool-fed retry that diverged early) and evict the entry the next request needed, which then prefilled from further back. Restores inside the new `SessionBank.maintenance_reads()` block keep `last_access_s` unchanged; the postcommit restore runs inside it, client restores still refresh recency. No switch; code and unit tests only.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
