@@ -90,6 +90,15 @@ def _json_compile_options() -> dict[str, Any]:
     }
 
 
+# The x-guidance keys that together decide JSON whitespace. They interact:
+# whitespace_pattern overrides whitespace_flexible, and with flexible
+# whitespace off the separators carry whatever whitespace is allowed. A client
+# that sets any of them therefore gets exactly its own policy, none of ours.
+_WHITESPACE_OPTION_KEYS = frozenset(
+    {"whitespace_flexible", "whitespace_pattern", "item_separator", "key_separator"}
+)
+
+
 def _grammar_schema_json(schema: dict[str, Any]) -> str:
     """The JSON Schema text llguidance compiles for a request.
 
@@ -101,12 +110,16 @@ def _grammar_schema_json(schema: dict[str, Any]) -> str:
 
     The compile options travel as the schema's own top-level ``x-guidance``
     object, the one place both ``grammar_from_json_schema`` and a lark
-    ``%json`` block read them; keys the client set there win.
+    ``%json`` block read them. The bounded-whitespace defaults apply only when
+    the client's ``x-guidance`` sets no whitespace option of its own.
     """
     client_options = schema.get("x-guidance", {})
     if not isinstance(client_options, dict):
         raise ResponseFormatError("JSON Schema 'x-guidance' must be an object")
-    options = {**_json_compile_options(), **client_options}
+    if _WHITESPACE_OPTION_KEYS.isdisjoint(client_options):
+        options = {**_json_compile_options(), **client_options}
+    else:
+        options = dict(client_options)
     return json.dumps({**schema, "x-guidance": options}, separators=(",", ":"))
 
 

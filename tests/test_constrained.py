@@ -1333,15 +1333,64 @@ def test_compile_options_follow_the_llguidance_whitespace_capability(
             "item_separator": r",\x20?",
             "key_separator": r":\x20?",
         }
-    # A client's own top-level x-guidance keys win over the defaults.
-    client = json.loads(
-        mod._grammar_schema_json(
-            {"type": "object", "x-guidance": {"whitespace_flexible": True}}
-        )
-    )["x-guidance"]
-    assert client["whitespace_flexible"] is True
     with pytest.raises(ResponseFormatError, match="x-guidance"):
         mod._grammar_schema_json({"type": "object", "x-guidance": "compact"})
+
+
+_WS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "a": {"type": "integer"},
+        "b": {"type": "array", "items": {"type": "boolean"}},
+    },
+    "required": ["a", "b"],
+    "additionalProperties": False,
+}
+_WS_LAYOUTS = (
+    '{"a":1,"b":[true,false]}',
+    '{"a": 1, "b": [true, false]}',
+    '{"a" : 1 ,"b":[ true ]}',
+    '{\n  "a": 1,\n  "b": [\n    true\n  ]\n}',
+    '{\r\n"a": 1,\r\n"b": []\r\n}',
+    '{"a":   1,\n\n\n\n"b": []}',
+)
+
+
+@pytest.mark.parametrize(
+    "client_options",
+    [
+        {"whitespace_flexible": False},
+        {"whitespace_flexible": False, "key_separator": ":", "item_separator": ","},
+        {"whitespace_flexible": True},
+        {"whitespace_pattern": r"[\x20\x0A]{1,3}"},
+        {"item_separator": r",\x20{0,2}"},
+    ],
+)
+def test_a_client_whitespace_policy_compiles_exactly_as_sent(client_options):
+    """Whitespace options interact (whitespace_pattern overrides
+    whitespace_flexible; with it off the separators carry the whitespace), so
+    a client that sets any of them must get the grammar llguidance builds from
+    its schema as sent: every layout is accepted or rejected exactly as there."""
+    import llguidance.hf
+
+    hf_tok, _ = _json_ws_tokenizer()
+    schema = {**_WS_SCHEMA, "x-guidance": client_options}
+    ours = _bound(_json_schema_spec(schema), hf_tok)
+    theirs = llguidance.LLMatcher(
+        llguidance.hf.from_tokenizer(hf_tok, n_vocab=_N_VOCAB),
+        llguidance.LLMatcher.grammar_from_json_schema(json.dumps(schema)),
+    )
+    for doc in _WS_LAYOUTS:
+        ids = _ids(hf_tok, doc)
+        assert ours.validate_prefix(ids) == theirs.validate_tokens(ids), doc
+
+
+def test_client_options_that_leave_whitespace_alone_keep_the_bound():
+    hf_tok, vocab = _json_ws_tokenizer()
+    schema = {**_WS_SCHEMA, "x-guidance": {"coerce_one_of": True}}
+    constraint = _bound(_json_schema_spec(schema), hf_tok)
+    constraint.advance_many(_ids(hf_tok, '{"a":'))
+    _assert_whitespace_is_finite(constraint, vocab)
 
 
 def test_single_match_flag_matches_the_installed_llguidance():
