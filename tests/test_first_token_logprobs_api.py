@@ -208,7 +208,9 @@ def test_chat_first_token_logprobs_openai_shape(monkeypatch):
     assert response.json()["usage"]["completion_tokens"] == 1
     assert entry["token"] == sampled
     assert entry["logprob"] == pytest.approx(-0.25)
-    assert entry["bytes"] == list(sampled.encode("utf-8"))
+    # The fake state's tokenizer has no decoder to read bytes from, and a
+    # token's bytes are never guessed from its decoded text.
+    assert entry["bytes"] is None
     assert [alt["token"] for alt in entry["top_logprobs"]] == [
         _decode(state, token) for token, _value in FIRST.top
     ]
@@ -236,12 +238,22 @@ def _byte_level_tokenizer():
     return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
 
 
-def test_chat_logprobs_report_the_bytes_of_byte_level_tokens(monkeypatch):
+@pytest.mark.parametrize(
+    "lead_is_added", [False, True], ids=["vocabulary", "registered_as_added"]
+)
+def test_chat_logprobs_report_the_bytes_of_byte_level_tokens(
+    monkeypatch, lead_is_added
+):
     """The two halves of "é" both decode to U+FFFD, so their UTF-8 is the
     same three bytes. The response must carry each token's own byte, and
-    the two alternatives must stay apart."""
+    the two alternatives must stay apart. Registering the lead piece "Ã"
+    as an added token changes nothing: the ids and the decode stay the
+    same, and so must the bytes (not the UTF-8 of "Ã", [195, 131])."""
     tokenizer = _byte_level_tokenizer()
+    if lead_is_added:
+        tokenizer.add_tokens(["\u00c3"])
     lead, trail = tokenizer.encode("é", add_special_tokens=False)
+    assert tokenizer.decode([lead, trail]) == "é"
     [letter] = tokenizer.encode("a", add_special_tokens=False)
     first = SimpleNamespace(
         token_id=lead,
@@ -420,7 +432,6 @@ def test_token_bytes_spell_the_text_back(make):
 def test_sentencepiece_byte_tokens_and_spaces():
     tokenizer = _sentencepiece_tokenizer()
     token_bytes = openai._token_bytes_reader(tokenizer)
-    assert openai._token_byte_scheme(tokenizer) == "sentencepiece"
     [emoji_lead, *_rest] = tokenizer.encode("😀", add_special_tokens=False)
     assert tokenizer.convert_ids_to_tokens(emoji_lead) == "<0xF0>"
     assert token_bytes(emoji_lead) == [0xF0]
@@ -435,16 +446,79 @@ def test_added_tokens_are_their_content():
     assert openai._token_bytes_reader(tokenizer)(end) == list(b"<|im_end|>")
 
 
-def test_text_tokenizer_reports_decoded_text_or_null():
-    tokenizer = SimpleNamespace(
-        decode=lambda ids, **_kwargs: "".join(
-            "\ufffd" if token >= 0xD800 else chr(token) for token in ids
+def test_byte_level_token_outside_the_byte_table_is_its_text():
+    """The ByteLevel decoder passes a token with a character outside the
+    byte table through unchanged; "｜" is one."""
+    tokenizer = _byte_level_tokenizer()
+    tokenizer.add_tokens(["｜x", "\u00c3｜"])
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    for text in ("｜x", "\u00c3｜"):
+        token = tokenizer.convert_tokens_to_ids(text)
+        assert tokenizer.decode([token]) == text
+        assert token_bytes(token) == list(text.encode("utf-8"))
+
+
+def _pieces_tokenizer(decoder, pieces):
+    """A real tokenizer over ``pieces`` with <0xNN> byte fallback tokens and
+    the given decoder."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"<unk>": 0}
+    for byte in range(256):
+        vocab[f"<0x{byte:02X}>"] = len(vocab)
+    for piece in pieces:
+        vocab[piece] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.BPE(
+            vocab=vocab, merges=[], unk_token="<unk>", byte_fallback=True
         )
     )
+    backend.decoder = decoder
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>"
+    )
+
+
+def test_byte_fallback_alone_keeps_the_literal_space_mark():
+    """Without a Replace or Metaspace step "\u2581" is not a space: the
+    tokenizer decodes it as itself, so its bytes are its UTF-8."""
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = _pieces_tokenizer(
+        tokenizers.decoders.ByteFallback(), ["\u2581", "\u2581hello"]
+    )
     token_bytes = openai._token_bytes_reader(tokenizer)
-    assert openai._token_byte_scheme(tokenizer) == "text"
-    assert token_bytes(ord("é")) == list("é".encode())
-    assert token_bytes(0xD800) is None
+    mark = tokenizer.convert_tokens_to_ids("\u2581")
+    assert tokenizer.decode([mark]) == "\u2581"
+    assert token_bytes(mark) == [0xE2, 0x96, 0x81]
+    assert token_bytes(tokenizer.convert_tokens_to_ids("\u2581hello")) == list(
+        "\u2581hello".encode()
+    )
+    assert token_bytes(tokenizer.convert_tokens_to_ids("<0xC3>")) == [0xC3]
+
+
+def test_metaspace_space_is_its_own_replacement_character():
+    """A Metaspace decoder with "_" as its replacement: "_" is the space and
+    "\u2581" is an ordinary character."""
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = _pieces_tokenizer(
+        tokenizers.decoders.Metaspace(replacement="_", prepend_scheme="always"),
+        ["_hello", "\u2581"],
+    )
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    assert token_bytes(tokenizer.convert_tokens_to_ids("_hello")) == list(b" hello")
+    assert token_bytes(tokenizer.convert_tokens_to_ids("\u2581")) == [0xE2, 0x96, 0x81]
+
+
+def test_unread_decoders_report_null():
+    """No Rust decoder to read (the fake state's tokenizer), or a decoder
+    step not modelled here (WordPiece): the bytes are unknown, not guessed."""
+    tokenizers = pytest.importorskip("tokenizers")
+    fake = SimpleNamespace(decode=lambda ids, **_kwargs: "".join(map(chr, ids)))
+    assert openai._token_bytes_reader(fake)(ord("a")) is None
+
+    tokenizer = _pieces_tokenizer(tokenizers.decoders.WordPiece(), ["hello"])
+    token = tokenizer.convert_tokens_to_ids("hello")
+    assert openai._token_bytes_reader(tokenizer)(token) is None
 
 
 MODELS = Path.home() / ".mtplx/models"

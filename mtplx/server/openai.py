@@ -26023,96 +26023,114 @@ def _gpt2_byte_decoder() -> dict[str, int]:
 
 _GPT2_BYTE_DECODER = _gpt2_byte_decoder()
 _BYTE_FALLBACK_PIECE_RE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
-_TOKEN_BYTE_SCHEMES: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
-
-
-def _token_byte_scheme(tokenizer: Any) -> str:
-    """How the tokenizer's vocabulary pieces spell bytes, read from its
-    decoder: "byte_level" (GPT-2 byte-to-unicode pieces: Qwen, LFM2.5,
-    MiMo, Bonsai), "sentencepiece" ("\u2581" for a space and <0xNN> byte
-    tokens: Gemma 4), or "text" (neither; the decoded text is the token).
-    Kept per tokenizer object."""
-    try:
-        cached = _TOKEN_BYTE_SCHEMES.get(tokenizer)
-    except TypeError:
-        cached = None
-    if cached is not None:
-        return cached
-    scheme = _detect_token_byte_scheme(tokenizer)
-    try:
-        _TOKEN_BYTE_SCHEMES[tokenizer] = scheme
-    except TypeError:
-        pass
-    return scheme
-
-
-def _detect_token_byte_scheme(tokenizer: Any) -> str:
-    for layer in _chat_tokenizer_layers(tokenizer):
-        # A fast tokenizer's decoder serializes to its tokenizer.json entry.
-        try:
-            description = json.loads(getattr(layer, "decoder").__getstate__())
-        except (AttributeError, TypeError, ValueError):
-            continue
-        kinds: set[str] = set()
-        pending = [description]
-        while pending:
-            item = pending.pop()
-            if isinstance(item, dict):
-                if isinstance(item.get("type"), str):
-                    kinds.add(item["type"])
-                pending.extend(item.values())
-            elif isinstance(item, list):
-                pending.extend(item)
-        if "ByteLevel" in kinds:
-            return "byte_level"
-        if kinds & {"ByteFallback", "Metaspace"}:
-            return "sentencepiece"
-    # A slow GPT-2 style tokenizer keeps the table itself.
-    if isinstance(getattr(tokenizer, "byte_decoder", None), dict):
-        return "byte_level"
-    return "text"
 
 
 def _token_bytes_reader(tokenizer: Any) -> Callable[[int], list[int] | None]:
     """A function from token id to the bytes the token stands for, or None
-    when the tokenizer gives no way to recover them.
+    when they cannot be established.
 
-    Added tokens are their content. Otherwise the vocabulary piece is read
-    with the tokenizer's own byte scheme (_token_byte_scheme). A tokenizer
-    with neither reports the UTF-8 of the decoded text, and None when that
-    text holds U+FFFD, since then the token is part of a character.
+    The bytes come from the Rust tokenizer's own decoder configuration,
+    applied to the token's string (an added token's content or the
+    vocabulary piece: the decoder handles both alike). A tokenizer without
+    a Rust decoder to read, or with a decoder step not modelled here, gets
+    None for every token, never a guess.
     """
-    scheme = _token_byte_scheme(tokenizer)
-    to_piece = getattr(tokenizer, "convert_ids_to_tokens", None)
-    if to_piece is None:
-        scheme = "text"
-    try:
-        added = {
-            int(token_id): str(getattr(token, "content", token))
-            for token_id, token in tokenizer.added_tokens_decoder.items()
-        }
-    except (AttributeError, TypeError, ValueError):
-        added = {}
+    rust = _chat_rust_tokenizer(tokenizer)
+    rule = _token_byte_rule(rust)
+    if rule is None:
+        return lambda _token_id: None
 
     def token_bytes(token_id: int) -> list[int] | None:
-        if token_id in added:
-            return list(added[token_id].encode("utf-8"))
-        if scheme == "text":
-            text = tokenizer.decode([token_id])
-            return None if "\ufffd" in text else list(text.encode("utf-8"))
-        piece = to_piece(token_id)
-        if not isinstance(piece, str):
-            return None
-        if scheme == "byte_level":
-            if not all(char in _GPT2_BYTE_DECODER for char in piece):
-                return None
-            return [_GPT2_BYTE_DECODER[char] for char in piece]
-        byte_piece = _BYTE_FALLBACK_PIECE_RE.fullmatch(piece)
-        if byte_piece is not None:
-            return [int(byte_piece.group(1), 16)]
-        return list(piece.replace("\u2581", " ").encode("utf-8"))
+        piece = rust.id_to_token(int(token_id))
+        return None if piece is None else rule(rust, int(token_id), piece)
 
     return token_bytes
+
+
+def _token_byte_rule(
+    rust: Any | None,
+) -> Callable[[Any, int, str], list[int] | None] | None:
+    """How the decoder turns one token's string into bytes, or None when it
+    is not a configuration read exactly here.
+
+    ByteLevel (Qwen, LFM2.5, MiMo, Bonsai) maps each character back through
+    the GPT-2 byte table, and passes a token with a character outside the
+    table through as its UTF-8. A sequence of Replace of one character by a
+    space or Metaspace (that character is a space), then ByteFallback
+    (<0xNN> is that byte), then Fuse and a Strip after it (they only join
+    the tokens and trim the ends of the whole text) is read step by step:
+    Gemma 4 is Replace("\u2581", " "), ByteFallback, Fuse. "\u2581" is a
+    space only when such a step says so. No decoder at all leaves the
+    token's string as its text.
+    """
+    if rust is None:
+        return None
+    decoder = rust.decoder
+    if decoder is None:
+        return lambda _rust, _token_id, piece: list(piece.encode("utf-8"))
+    try:
+        description = json.loads(decoder.__getstate__())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not isinstance(description, dict):
+        return None
+    if description.get("type") == "ByteLevel":
+        return _byte_level_token_bytes
+    steps = (
+        description.get("decoders")
+        if description.get("type") == "Sequence"
+        else [description]
+    )
+    if not isinstance(steps, list):
+        return None
+    space: str | None = None
+    byte_fallback = False
+    fused = False
+    for step in steps:
+        kind = step.get("type") if isinstance(step, dict) else None
+        if kind in {"Replace", "Metaspace"} and not (byte_fallback or fused):
+            if kind == "Replace":
+                pattern = step.get("pattern")
+                old = pattern.get("String") if isinstance(pattern, dict) else None
+                if step.get("content") != " ":
+                    return None
+            else:
+                old = step.get("replacement")
+            if not isinstance(old, str) or len(old) != 1 or space not in (None, old):
+                return None
+            space = old
+        elif kind == "ByteFallback" and not fused:
+            byte_fallback = True
+        elif kind == "Fuse":
+            fused = True
+        elif kind == "Strip" and fused:
+            continue
+        else:
+            return None
+
+    def piece_bytes(_rust: Any, _token_id: int, piece: str) -> list[int]:
+        if byte_fallback:
+            byte_piece = _BYTE_FALLBACK_PIECE_RE.fullmatch(piece)
+            if byte_piece is not None:
+                return [int(byte_piece.group(1), 16)]
+        if space is not None:
+            piece = piece.replace(space, " ")
+        return list(piece.encode("utf-8"))
+
+    return piece_bytes
+
+
+def _byte_level_token_bytes(rust: Any, token_id: int, piece: str) -> list[int] | None:
+    if all(char in _GPT2_BYTE_DECODER for char in piece):
+        data = bytes(_GPT2_BYTE_DECODER[char] for char in piece)
+    else:
+        data = piece.encode("utf-8")
+    # The decoder's own text for this token must agree (U+FFFD for a part
+    # of a character on both sides); if it does not, the bytes are unknown.
+    decoded = rust.decode([token_id], skip_special_tokens=False)
+    if data.decode("utf-8", errors="replace") != decoded:
+        return None
+    return list(data)
 
 
 async def _prompt_scoring_response(
