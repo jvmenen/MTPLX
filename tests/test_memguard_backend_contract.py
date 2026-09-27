@@ -275,7 +275,7 @@ class TestGemmaAdmission:
         chunk's rows, the last chunk's score block (2,048 x 16,384), every
         row at the chunked prefill's width and the windows as it leaves
         them: 9.3 GiB, where the one forward it replaced (16,384 x 16,384
-        pairs, 983,040 B a row) was priced at 46.3 GiB."""
+        pairs, 983,040 B a row) is priced at 45.5 GiB."""
 
         manager = _manager()
         _roomy(monkeypatch, manager)
