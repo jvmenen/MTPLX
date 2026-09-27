@@ -19574,33 +19574,32 @@ def _admission_scratch_bytes(
         return max(1, int(bill["transient_bytes"])), source
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
-    # A backend that builds attention masks as arrays says how large one
-    # forward's is (Gemma 4's sliding layers: rows x (cached window + rows)
-    # booleans). Charged twice: the mask lives for the whole forward, and
-    # building it holds one more array of its size.
-    mask_fn = getattr(runtime, "prefill_mask_bytes", None)
-    mask = (
-        2 * int(mask_fn(rows, max(0, int(prompt_tokens) - rows)))
-        if callable(mask_fn)
+    # A backend whose attention grows with the square of one forward's rows
+    # says how much (Gemma 4's sliding layers: an array mask and one layer's
+    # scores for every query-key pair, measured).
+    attention_fn = getattr(runtime, "prefill_attention_bytes", None)
+    attention = (
+        int(attention_fn(rows, max(0, int(prompt_tokens) - rows)))
+        if callable(attention_fn)
         else 0
     )
-    suffix = "+mask" if mask else ""
+    suffix = "+attention" if attention else ""
     row_bytes = (
         _forward_row_bytes(_runtime_text_args(runtime)) if runtime is not None else None
     )
     if not row_bytes:
-        return flat_share + mask, "flat_per_row" + suffix
+        return flat_share + attention, "flat_per_row" + suffix
     per_row = _ADMISSION_LIVE_LAYERS * int(row_bytes)
     fixed = max(
         _ADMISSION_FIXED_FLOOR_BYTES,
         flat - per_row * _ADMISSION_FLAT_TRANSIENT_ROWS,
     )
-    if getattr(runtime, "prefill_scratch_calibration", None) == "pending":
+    if getattr(runtime, "prefill_scratch_calibration", None):
         # A backend whose one forward covers the whole prompt (Gemma 4): the
-        # chunked families' per-2,048-row reserve does not describe it, so
-        # its own geometry prices it until its peak is measured.
-        return fixed + per_row * rows + mask, "geometry_pending_calibration" + suffix
-    return max(fixed + per_row * rows, flat_share) + mask, "geometry" + suffix
+        # chunked families' per-2,048-row reserve does not describe it; its
+        # activations, the fixed part and its measured attention do.
+        return fixed + per_row * rows + attention, "geometry_calibrated" + suffix
+    return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
 
 
 def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
@@ -20259,8 +20258,9 @@ def _run_prefill_admission(
             lease=lease,
         )
         model["scratch_source"] = scratch_source
-        if scratch_source.startswith("geometry_pending_calibration"):
-            model["scratch_calibration_pending"] = True
+        calibration = getattr(runtime, "prefill_scratch_calibration", None)
+        if calibration and scratch_source.startswith("geometry_calibrated"):
+            model["scratch_calibration"] = str(calibration)
         model["scratch_rows"] = int(max(1, rows))
         model["prefill_chunk_tokens"] = width
         model["chunk_bytes"] = _admission_chunk_bytes(geometry, max(1, rows), scratch)

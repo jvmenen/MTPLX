@@ -157,15 +157,15 @@ def _roomy(monkeypatch, manager):
 
 
 def _gemma_scratch(rows: int, cached: int) -> int:
-    """Its own geometry, the mask twice and the fixed part: the chunked
-    families' 3 GiB per 2,048 rows does not describe one whole-prompt
-    forward, and stays out until Gemma's peak is measured."""
+    """Its layers' activations, the fixed part and its measured attention:
+    the chunked families' 3 GiB per 2,048 rows does not describe one
+    whole-prompt forward."""
 
     per_row = srv._ADMISSION_LIVE_LAYERS * GEMMA_ROW
     fixed = max(srv._ADMISSION_FIXED_FLOOR_BYTES, 3 * GIB - per_row * 2048)
     window = min(1023, cached)
-    mask = rows * (window + rows) if window + rows > 1024 else 0
-    return fixed + per_row * rows + 2 * mask
+    pairs = rows * (window + rows) if window + rows > 1024 else 0
+    return fixed + per_row * rows + gemma4.GEMMA4_PREFILL_PAIR_BYTES * pairs
 
 
 class TestGemmaGeometry:
@@ -192,11 +192,39 @@ class TestGemmaGeometry:
         assert GEMMA_PLANNED_KV == 983_040
         assert gemma4.gemma4_resident_kv_bytes_per_token(args) == GEMMA_RESIDENT == 81_920
         assert gemma4.gemma4_window_cache_bytes(args) == GEMMA_WINDOWS == 838_860_800
-        assert gemma4.gemma4_prefill_mask_bytes(args, 65_536, 0) == 65_536 * 65_536
+        pairs = gemma4.gemma4_prefill_attention_pairs
+        assert pairs(args, 65_536, 0) == 65_536 * 65_536
         # Inside the window no array mask is built.
-        assert gemma4.gemma4_prefill_mask_bytes(args, 1024, 0) == 0
+        assert pairs(args, 1024, 0) == 0
         # A warm suffix sees at most the window's worth of cached keys.
-        assert gemma4.gemma4_prefill_mask_bytes(args, 600, 30_000) == 600 * (1023 + 600)
+        assert pairs(args, 600, 30_000) == 600 * (1023 + 600)
+        assert gemma4.gemma4_prefill_attention_bytes(args, 600, 30_000) == (
+            80 * 600 * (1023 + 600)
+        )
+
+
+class TestGemmaCalibration:
+    """The cold prefill peaks measured on the 31B (4-bit, 128 GB M5 Max,
+    2026-09-27; MLX allocator peak above the 16.5 GiB warm baseline)."""
+
+    MEASURED_GIB = {6_026: 8.7, 12_026: 26.5, 24_026: 75.6}
+
+    def _bill(self, tokens: int) -> int:
+        return tokens * GEMMA_PLANNED_KV + _gemma_scratch(tokens, 0)
+
+    def test_the_bill_bounds_every_measured_peak(self):
+        for tokens, peak in self.MEASURED_GIB.items():
+            assert self._bill(tokens) >= peak * GIB, tokens
+
+    def test_it_is_tightest_where_it_matters(self):
+        # Within 5 percent at 24K, where a miss would freeze the Mac; the
+        # small prompts carry the fixed part and more margin.
+        assert self._bill(24_026) <= 1.06 * 75.6 * GIB
+        assert self._bill(12_026) <= 1.15 * 26.5 * GIB
+        assert self._bill(6_026) <= 1.55 * 8.7 * GIB
+
+    def test_a_32k_cold_prompt_does_not_fit_a_128gb_mac(self):
+        assert self._bill(32_768) > 128 * GIB
 
 
 class TestGemmaAdmission:
@@ -220,11 +248,9 @@ class TestGemmaAdmission:
         growth = pricing["growth"]
         assert growth["prefill_chunk_tokens"] is None
         assert growth["scratch_rows"] == 16_384
-        assert growth["scratch_source"] == "geometry_pending_calibration+mask"
-        assert growth["scratch_calibration_pending"] is True
+        assert growth["scratch_source"] == "geometry_calibrated+attention"
+        assert growth["scratch_calibration"] == gemma4.GEMMA4_PREFILL_CALIBRATION
         assert growth["scratch_bytes"] == _gemma_scratch(16_384, 0)
-        # 11.8 GB, where the flat share would have charged 26.3 GB.
-        assert growth["scratch_bytes"] < 3 * GIB * 16_384 // 2048
         assert growth["layout"] == "contiguous_dense_decode"
         assert growth["repage_copy_bytes"] == 0
         assert growth["chunk_bytes"] == 16_384 * GEMMA_PLANNED_KV + _gemma_scratch(16_384, 0)

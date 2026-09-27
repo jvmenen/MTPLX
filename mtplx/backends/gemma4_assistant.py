@@ -782,12 +782,26 @@ def gemma4_window_cache_bytes(config: Any) -> int:
     )
 
 
-def gemma4_prefill_mask_bytes(config: Any, rows: int, cached_tokens: int) -> int:
-    """The boolean mask one prefill forward of ``rows`` tokens builds for the
-    sliding layers (``Gemma4RollbackRotatingKVCache.make_mask``): once the
-    rows and the cached window pass the window, ``create_causal_mask``
-    returns a rows x (cached window + rows) array that lives for the whole
-    forward. A 65,536-token cold prompt builds 4.3 GB of it."""
+# Cold prefill peaks measured on the 31B (4-bit, M5 Max 128 GB,
+# 2026-09-27; the MLX allocator peak above the 16.5 GiB warm baseline):
+# 6,026 tokens +8.7 GiB, 12,026 +26.5 GiB, 24,026 +75.6 GiB, with the time
+# to first token growing the same way. Both grow with the square of the
+# prompt: the sliding layers attend with an array mask, and one layer's
+# scores for every head are materialized beside it (32 heads x bf16 = 64 B
+# per query-key pair). With the rows at full width (983,040 B a token) and
+# the layers' activations from the geometry, 80 B per pair bounds all three
+# points (+53, +13 and +5 percent); a 32K cold prompt comes to 129 GiB.
+GEMMA4_PREFILL_PAIR_BYTES = 80
+GEMMA4_PREFILL_CALIBRATION = (
+    "gemma4-31b-4bit cold prefill peaks at 6,026 / 12,026 / 24,026 tokens, 2026-09-27"
+)
+
+
+def gemma4_prefill_attention_pairs(config: Any, rows: int, cached_tokens: int) -> int:
+    """Query-key pairs one prefill forward of ``rows`` tokens attends over
+    with an array mask: the sliding layers
+    (``Gemma4RollbackRotatingKVCache.make_mask``) build one once the rows and
+    the cached window pass the window, rows x (cached window + rows)."""
 
     window = _config_int(config, "sliding_window")
     rows = max(0, int(rows))
@@ -798,6 +812,15 @@ def gemma4_prefill_mask_bytes(config: Any, rows: int, cached_tokens: int) -> int
     if cached + rows <= window:
         return 0
     return rows * (cached + rows)
+
+
+def gemma4_prefill_attention_bytes(config: Any, rows: int, cached_tokens: int) -> int:
+    """The part of one prefill forward that grows with the square of its
+    rows: the mask and a layer's scores, measured (GEMMA4_PREFILL_PAIR_BYTES)."""
+
+    return GEMMA4_PREFILL_PAIR_BYTES * gemma4_prefill_attention_pairs(
+        config, rows, cached_tokens
+    )
 
 
 class Gemma4TargetAdapter:
@@ -1558,10 +1581,10 @@ class Gemma4AssistantRuntime:
 
     # The reserve the chunked families are held to (3 GiB a 2,048-row chunk,
     # measured on the 27B) does not describe one forward over the whole
-    # prompt. This backend's scratch is priced from its own geometry (the
-    # layers' activations, the mask twice, a fixed part) until its cold
-    # prefill peak is measured; receipts say so.
-    prefill_scratch_calibration = "pending"
+    # prompt. This backend's scratch is its geometry's activations, a fixed
+    # part and its measured attention (GEMMA4_PREFILL_PAIR_BYTES); receipts
+    # carry the calibration they were priced with.
+    prefill_scratch_calibration = GEMMA4_PREFILL_CALIBRATION
 
     def text_args(self) -> Any:
         """The target's text config, for the admission's geometry."""
@@ -1584,8 +1607,8 @@ class Gemma4AssistantRuntime:
         del context_tokens
         return "contiguous_dense_decode"
 
-    def prefill_mask_bytes(self, rows: int, cached_tokens: int) -> int:
-        return gemma4_prefill_mask_bytes(self.text_args(), rows, cached_tokens)
+    def prefill_attention_bytes(self, rows: int, cached_tokens: int) -> int:
+        return gemma4_prefill_attention_bytes(self.text_args(), rows, cached_tokens)
 
     def resident_kv_bytes_per_token(self) -> int:
         return gemma4_resident_kv_bytes_per_token(self.text_args())
