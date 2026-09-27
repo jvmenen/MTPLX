@@ -19,7 +19,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .attention_context import attention_phase, note_compiled_replay
+from .attention_context import attention_phase, compiled_dispatch
 from .compile_state import compiled_step_body
 from .demotions import note as _note_demotion, note_bank_fallback as _note_bank_fallback
 from .gdn_capture import resolve_gdn_capture_backend
@@ -214,8 +214,8 @@ class SpecDecodeGraphBank:
                         hidden_variant=hidden_variant,
                     )
                 self._compiled[key] = fn
-            note_compiled_replay()
-            result = fn(input_ids)
+            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+                result = fn(input_ids)
             self.stats.compiled_calls += 1
             self.stats.elapsed_s += time.perf_counter() - started
             return result
@@ -2625,10 +2625,11 @@ class CompiledVerifyBank:
         t2 = clock()
         # Argument order is the trace's contract (``_make_verify_step``):
         # ids, the auxiliary, the rotary delta of an image request, the state.
-        note_compiled_replay()
-        outputs = dispatch["fn"](
-            input_ids, compiled_aux, *dispatch["rope_args"], *state_in
-        )
+        identity = (id(dispatch["fn"]), tuple(getattr(input_ids, "shape", ())))
+        with compiled_dispatch(identity):
+            outputs = dispatch["fn"](
+                input_ids, compiled_aux, *dispatch["rope_args"], *state_in
+            )
         t3 = clock()
         host_split["aux"] += t1 - t0
         host_split["input_eval"] += t2 - t1
@@ -3606,12 +3607,12 @@ class CompiledVerifyBank:
             # Same positional contract as the installed replay: ids, the
             # auxiliary when the runtime prepares one, the rotary delta of an
             # image request, the state leaves.
-            note_compiled_replay()
-            outputs = (
-                fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
-                if compiled_aux is not None
-                else fn(input_ids, *self._rope_args(), *state_in)
-            )
+            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+                outputs = (
+                    fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
+                    if compiled_aux is not None
+                    else fn(input_ids, *self._rope_args(), *state_in)
+                )
             logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
             if donate:
                 # A2.1 commit-first ownership handoff — commit + schedule

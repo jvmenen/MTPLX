@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import contextlib
 from contextvars import ContextVar
-from typing import Iterator
+from typing import Hashable, Iterator
 
 _COMPILE_TRACE_ACTIVE = False
 
@@ -64,6 +64,42 @@ def compiled_step_body() -> Iterator[None]:
         yield
     finally:
         _IN_COMPILED_STEP_BODY.reset(token)
+
+
+# The specialization a compiled dispatcher is calling: the compiled callable
+# and the input shapes that select its graph. A trace records under it (the
+# KV attention record, issue #526), so a later replay of the same graph can be
+# matched to its own trace and never to another width's.
+_DISPATCH_IDENTITY: ContextVar[Hashable | None] = ContextVar(
+    "mtplx_compiled_dispatch_identity", default=None
+)
+
+
+def current_dispatch_identity() -> Hashable | None:
+    """The specialization of the compiled call in progress, if any."""
+    return _DISPATCH_IDENTITY.get()
+
+
+@contextlib.contextmanager
+def compiled_dispatch_scope(identity: Hashable) -> Iterator[None]:
+    """Wrap one call into a compiled step (its trace on a first call, else a replay).
+
+    Also restores the step-body flag when the call returns or raises. A traced
+    body clears the flag on its way out, except when MLX abandons the traced
+    Python frame: ``np.asarray`` on a tracer raises MLX's refusal as a C++
+    exception through numpy's buffer protocol, and no ``finally`` between it
+    and the compiled call runs. This frame does unwind (the exception reaches
+    it as a Python exception), so the flag cannot stay set for every later
+    call on the thread.
+    """
+
+    flag = _IN_COMPILED_STEP_BODY.get()
+    token = _DISPATCH_IDENTITY.set(identity)
+    try:
+        yield
+    finally:
+        _DISPATCH_IDENTITY.reset(token)
+        _IN_COMPILED_STEP_BODY.set(flag)
 
 
 _COMPILE_TRACE_REFUSAL = "during function transformations"

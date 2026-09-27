@@ -6,8 +6,10 @@ emits one line per call under MTPLX_KV_ATTENTION_TRACE=1, only for
 non-finite outputs under MTPLX_KV_ATTENTION_TRACE=nonfinite, and in every mode
 records the call's host facts in the current request's record. The error
 captures that record where it is raised, so the server reports the failing
-request's own attention, and a failure after a compiled replay names the
-traced call instead of a stale eager record.
+request's own attention. A failure after a compiled replay names the trace of
+the graph that ran (matched by the dispatched specialization), or says that
+metadata is unavailable, instead of a stale eager record or another width's
+trace.
 """
 
 from __future__ import annotations
@@ -16,16 +18,17 @@ import logging
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mtplx.attention_context import (
+    compiled_dispatch,
     kv_attention_failure_line,
     kv_attention_request_scope,
-    note_compiled_replay,
 )
 from mtplx.attention_split import configure_split_full_attention
 from mtplx.cache_state import TensorOffsetQuantizedPagedKVCache, VllmMetalPagedKVCache
-from mtplx.compile_state import compiled_step_body
+from mtplx.compile_state import compiled_step_body, in_compiled_step_body
 from mtplx.kv_quant import PagedKVQuantConfig
 from mtplx.sampling import NonFiniteLogitsError
 
@@ -199,25 +202,33 @@ def test_the_error_carries_the_record_of_the_request_that_raised_it(attn, caplog
     assert event["kv_attention"] == error_a.kv_attention
 
 
-def test_a_failure_after_a_compiled_replay_names_the_traced_call(attn, capsys, monkeypatch):
-    """The Python forward runs when a compiled step is traced, never when it
-    replays. A record made in the traced body is kept as a trace, and after
-    the dispatcher marks a replay the failure line says so, instead of
-    presenting the last eager call as the failing dispatch."""
-
-    monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
-    attn(_x(), mask="causal", cache=_pages())  # an eager call first
-    adapter = TensorOffsetQuantizedPagedKVCache.from_paged_cache(_pages())
-    leaves = list(adapter.cache)
+def _compiled_step(attn, adapter):
+    """A compiled step over ``adapter``'s leaves, like the verify banks'."""
 
     def step(x, *state):
         for slot, leaf in enumerate(state):
             adapter.cache[slot] = leaf
         with compiled_step_body():
-            return attn(x, mask=adapter.make_mask(2), cache=adapter)
+            return attn(x, mask=adapter.make_mask(int(x.shape[1])), cache=adapter)
 
-    note_compiled_replay()
-    mx.eval(mx.compile(step)(_x(), *leaves))
+    return mx.compile(step)
+
+
+def test_a_failure_after_a_compiled_replay_names_the_traced_call(attn, capsys, monkeypatch):
+    """The Python forward runs when a compiled step is traced, never when it
+    replays. A record made in the traced body is kept as a trace of the
+    dispatched graph, and after the dispatch the failure line says so,
+    instead of presenting the last eager call as the failing dispatch."""
+
+    monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
+    attn(_x(), mask="causal", cache=_pages())  # an eager call first
+    adapter = TensorOffsetQuantizedPagedKVCache.from_paged_cache(_pages())
+    leaves = list(adapter.cache)
+    step = _compiled_step(attn, adapter)
+
+    x = _x()
+    with compiled_dispatch((id(step), tuple(x.shape))):
+        mx.eval(step(x, *leaves))
     line = kv_attention_failure_line()
     assert line.startswith(
         "mtplx_kv_attention dispatch=compiled_replay_of_trace layer=0 phase=unknown "
@@ -228,9 +239,9 @@ def test_a_failure_after_a_compiled_replay_names_the_traced_call(attn, capsys, m
     # With the trace mode on, the printed trace line says what it is.
     monkeypatch.setenv("MTPLX_KV_ATTENTION_TRACE", "1")
     fresh = TensorOffsetQuantizedPagedKVCache.from_paged_cache(_pages())
-    adapter = fresh
-    leaves = list(fresh.cache)
-    mx.eval(mx.compile(step)(_x(), *leaves))
+    fresh_step = _compiled_step(attn, fresh)
+    with compiled_dispatch((id(fresh_step), tuple(x.shape))):
+        mx.eval(fresh_step(x, *list(fresh.cache)))
     (printed,) = _lines(capsys)
     assert "offset=traced" in printed and printed.endswith("finite=traced")
 
@@ -238,6 +249,77 @@ def test_a_failure_after_a_compiled_replay_names_the_traced_call(attn, capsys, m
     monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
     attn(_x(), mask="causal", cache=_pages())
     assert kv_attention_failure_line().startswith("mtplx_kv_attention dispatch=eager ")
+
+
+def test_a_replay_is_matched_to_the_trace_of_its_own_specialization(attn, monkeypatch):
+    """Speculative decode alternates verify widths within one request. Trace a
+    four-row and then a two-row graph, replay the cached four-row one: the
+    failure names the four-row trace. Before, the record held one trace per
+    layer and the replay marker no identity, so it named the two-row trace."""
+
+    monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
+    adapter = TensorOffsetQuantizedPagedKVCache.from_paged_cache(_pages())
+    leaves = list(adapter.cache)
+    step = _compiled_step(attn, adapter)
+    x4, x2 = _x(4), _x(2)
+    four = (id(step), tuple(x4.shape))
+    two = (id(step), tuple(x2.shape))
+
+    for identity, x in ((four, x4), (two, x2)):  # the two traces
+        with compiled_dispatch(identity):
+            mx.eval(step(x, *leaves))
+    for identity, x, q_len in ((four, x4, 4), (two, x2, 2), (four, x4, 4)):  # replays
+        with compiled_dispatch(identity):
+            mx.eval(step(x, *leaves))
+        line = kv_attention_failure_line()
+        assert line.startswith("mtplx_kv_attention dispatch=compiled_replay_of_trace ")
+        assert f" q_len={q_len} " in line, line
+
+
+def test_a_replay_of_a_graph_this_request_did_not_trace_says_so(attn, monkeypatch):
+    monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
+    adapter = TensorOffsetQuantizedPagedKVCache.from_paged_cache(_pages())
+    leaves = list(adapter.cache)
+    step = _compiled_step(attn, adapter)
+    x = _x()
+    identity = (id(step), tuple(x.shape))
+    with kv_attention_request_scope():  # an earlier request traced it
+        with compiled_dispatch(identity):
+            mx.eval(step(x, *leaves))
+    attn(_x(), mask="causal", cache=_pages())  # this request: an eager call, then the replay
+    with compiled_dispatch(identity):
+        mx.eval(step(x, *leaves))
+    line = kv_attention_failure_line()
+    assert line.startswith("mtplx_kv_attention dispatch=compiled_replay (")
+    assert "metadata is unavailable" in line
+
+
+def test_an_abandoned_trace_does_not_leave_later_calls_labelled_as_traces(attn, monkeypatch):
+    """MLX can abandon a traced Python frame without running its exit:
+    ``np.asarray`` on a tracer raises MLX's refusal as a C++ exception through
+    numpy's buffer protocol, and every ``finally`` up to the compiled call is
+    skipped. The bank catches the failure and falls back eager, as it should,
+    but the step-body flag the traced body had set stayed set, so every later
+    eager call on the thread was recorded as a trace and a failure named a
+    "compiled replay". The dispatcher now restores the flag it found."""
+
+    from mtplx.graphbank import SpecDecodeGraphBank
+
+    monkeypatch.delenv("MTPLX_KV_ATTENTION_TRACE", raising=False)
+
+    class _NumpyRuntime:
+        def forward_ar(self, input_ids, cache=None, return_hidden=True, hidden_variant=None):
+            ids = np.asarray(input_ids)  # a tracer cannot be converted
+            logits = mx.zeros((1, int(ids.shape[-1]), 4))
+            return (logits, logits) if return_hidden else logits
+
+    bank = SpecDecodeGraphBank(_NumpyRuntime())
+    bank.forward_ar(mx.array([[1, 2]]))
+    assert bank.stats.fallback_reasons == {"compile_error:ValueError": 1}
+    # Old code: True from here on.
+    assert in_compiled_step_body() is False
+    attn(_x(), mask="causal", cache=_pages())
+    assert kv_attention_failure_line().startswith("mtplx_kv_attention dispatch=eager layer=0 ")
 
 
 def test_each_model_work_item_gets_its_own_record(attn, monkeypatch):

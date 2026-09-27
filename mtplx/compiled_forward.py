@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
-from mtplx.attention_context import note_compiled_replay
+from mtplx.attention_context import compiled_dispatch
 from mtplx.compile_state import compile_trace, compiled_step_body
 from mtplx.graphbank import TensorOffsetKVCache
 
@@ -126,11 +126,12 @@ class CompiledARForward:
         global _COMPILED_FORWARD_CALLS
         self._ensure_compiled(cache)
         try:
-            note_compiled_replay()
             # Mark the trace so the model forward suppresses its per-layer
             # async_eval submit cadence (illegal inside a graph transformation,
             # and obsolete once the whole forward is one traced submission).
-            with compile_trace():
+            with compile_trace(), compiled_dispatch(
+                (id(self._compiled), tuple(getattr(input_ids, "shape", ())))
+            ):
                 result = self._compiled(input_ids, *self._state)  # type: ignore[misc]
         except Exception:
             # The trace fires on the first call; a host-sync buried in the model
