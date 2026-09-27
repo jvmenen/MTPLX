@@ -84,7 +84,7 @@ competitors = [
 ]
 server = [
   "fastapi>=0.136",
-  "llguidance>=1.7",
+  "llguidance>=1.8",
   "uvicorn>=0.46",
 ]
 dev = [
