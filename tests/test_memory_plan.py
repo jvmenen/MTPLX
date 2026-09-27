@@ -106,10 +106,13 @@ def test_48g_speed_fit() -> None:
     # Idle bank stays aggressive (~13.1G, same class as the shipped
     # half-surplus 14.05G) ...
     assert plan.bank_idle_max_bytes == 14_119_530_400
-    # ... and the advertised under-load budget subtracts KV at the dense
-    # ceiling (131,072 x 64 KiB = 8 GiB) so the machine can never be
-    # walked into swap by its own warm cache.
-    assert plan.bank_steady_bytes == 5_529_595_808
+    # ... and the advertised under-load budget subtracts the KV of the whole
+    # committed window (196,608 x 64 KiB = 12 GiB) so the machine can never
+    # be walked into swap by its own warm cache. It subtracted only the
+    # dense ceiling's 131,072 tokens (8 GiB) and advertised 5.15 GiB before
+    # #525: the committed rest rides the paged lane and is just as resident.
+    assert plan.kv_reserve_tokens == 196_608
+    assert plan.bank_steady_bytes == 1_234_628_512
     total = (
         plan.model_weights_bytes
         + plan.kv_reserve_bytes

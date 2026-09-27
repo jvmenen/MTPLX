@@ -260,4 +260,7 @@ def test_48g_seat_plan_is_unchanged():
         dense_decode_ceiling=131_072,
     )
     assert round(final.bank_idle_max_bytes / GIB, 1) == 13.7
-    assert round(final.bank_steady_bytes / GIB, 1) == 5.7
+    # The under-load figure reserves the whole 204,800-token window (#525);
+    # it reserved the 131,072-token dense ceiling and read 5.7 GiB before.
+    assert final.kv_reserve_tokens == 204_800
+    assert round(final.bank_steady_bytes / GIB, 1) == 1.2

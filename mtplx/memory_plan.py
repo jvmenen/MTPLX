@@ -654,14 +654,17 @@ def plan_memory(
         )
 
     # --- bank budgets -------------------------------------------------------
-    # Steady-state KV projection: sessions decode dense up to the dense
-    # ceiling; that much KV WILL routinely be resident, so the bank's
-    # advertised under-load budget subtracts it. Past the ceiling (paged
-    # lane) the dynamic ceiling yields further at runtime.
-    reserve_tokens = min(
-        resolved, int(dense_decode_ceiling) if dense_decode_ceiling else resolved
-    )
-    kv_reserve = reserve_tokens * kv_effective
+    # Steady-state KV projection: a session may hold the whole committed
+    # window, so the bank's advertised under-load budget subtracts the KV
+    # and the family's per-token working set (QSA streams, the MTP head's KV)
+    # of the resolved window. It used to stop at the dense-decode ceiling
+    # and count KV alone (#525: a 262K window on 64 GB reserved 157K tokens,
+    # and the committed rest rode the paged lane unpriced).
+    # ``dense_decode_ceiling`` no longer narrows it: the paged lane past the
+    # ceiling holds the same tokens. The runtime ceiling
+    # (bank_dynamic_ceiling) still reads the live working set.
+    reserve_tokens = int(resolved)
+    kv_reserve = reserve_tokens * (kv_effective + aux_pt)
     bank_idle = usable - weights - transients
     bank_idle = max(bank_floor, min(BANK_CAP_BYTES, bank_idle))
     bank_steady = usable - weights - transients - kv_reserve
