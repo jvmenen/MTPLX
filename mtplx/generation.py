@@ -147,6 +147,7 @@ from .runtime_options import (
     block_prefix_restore_enabled,
     env_bool,
     qwen4_opdiet_enabled,
+    session_head_anchor_enabled,
 )
 from .route_tape import RouteTape, counter_deltas
 
@@ -1810,9 +1811,11 @@ def _predicted_first_prefill_span(
         # Boundaries recorded inside the forwards: the loop runs the plain
         # grid whatever the tail looks like.
         return plain[0]
-    cold_edges: tuple[int, ...] = ()
-    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
-        cold_edges = (int(stable_prefix_len),)
+    cold_edges = _mandatory_prefill_edges(
+        stable_prefix_len,
+        _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice),
+        limit=body_len,
+    )
     grid = _prefill_spans_with_tail_grid(
         body_len,
         tail_interval=_gdn_boundary_tail_interval(),
@@ -4632,16 +4635,18 @@ def _prefill_restored_prompt_suffix(
     # the fused single-forward cannot capture interior boundaries, so it
     # defers to the chunked path in that case (same tokens, one extra
     # launch; no re-evaluation).
-    _stable_edge_rel: int | None = None
-    if (
-        stable_prefix_len is not None
-        and gdn_boundary_sink is not None
-        and _sink_cuts_forwards(gdn_boundary_sink)
-        and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
-    ):
-        _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    _stable_edges_rel = (
+        _mandatory_prefill_edges(
+            stable_prefix_len,
+            _sink_anchors(gdn_boundary_sink),
+            limit=len(suffix) - 1,
+            offset=int(cached_tokens),
+        )
+        if gdn_boundary_sink is not None and _sink_cuts_forwards(gdn_boundary_sink)
+        else ()
+    )
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _stable_edges_rel:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -4717,9 +4722,7 @@ def _prefill_restored_prompt_suffix(
             capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=(
-                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-            ),
+            mandatory_edges=_stable_edges_rel,
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -5081,6 +5084,7 @@ def _restore_near_prefix_prompt_state(
         return None
     max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
     min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    head_anchors = _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
     block_prefix_enabled = (
         block_prefix_restore_enabled()
         if allow_block_prefix is None
@@ -5319,6 +5323,7 @@ def _restore_near_prefix_prompt_state(
                     entry,
                     restore_point,
                     budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                    head_anchors=head_anchors,
                 ),
             )
             if boundary_hidden is not None
@@ -5405,6 +5410,7 @@ def _restore_near_prefix_prompt_state(
                 entry,
                 restore_point,
                 budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                head_anchors=head_anchors,
             )
             restored = SimpleNamespace(
                 entry=SimpleNamespace(prefix_len=restore_point),
@@ -5468,6 +5474,7 @@ def _restore_near_prefix_prompt_state(
                     restore_point=restore_point,
                     stable_prefix_len=stable_prefix_len,
                     image_spans=checkpoint_image_spans,
+                    head_anchors=head_anchors,
                 )
                 if _gdn_boundary_capture_enabled()
                 else None
@@ -5633,6 +5640,58 @@ def _sink_cuts_forwards(sink: Any) -> bool:
     return bool(getattr(sink, "cuts_forwards", True))
 
 
+def _sink_anchors(sink: Any) -> tuple[int, ...]:
+    """The session-head anchors a sink's plan protects (none for a plain list)."""
+
+    return tuple(getattr(getattr(sink, "plan", None), "head_anchors", ()) or ())
+
+
+def _mandatory_prefill_edges(
+    stable_prefix_len: int | None,
+    anchors: Sequence[int],
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[int, ...]:
+    """Span ends a capturing prefill must hit, relative to ``offset``.
+
+    The caller's stable prompt prefix and the session-head anchors, each kept
+    only strictly inside ``(0, limit)`` of the span being planned.
+    """
+
+    positions = [int(position) for position in anchors]
+    if stable_prefix_len is not None:
+        positions.append(int(stable_prefix_len))
+    return tuple(
+        sorted({p - offset for p in positions if 0 < p - offset < int(limit)})
+    )
+
+
+def _session_head_anchors(
+    rt: Any, prompt_ids: Sequence[int], *, vision_splice: Any = None
+) -> tuple[int, ...]:
+    """Where the prompt's fixed head ends, as checkpoint anchors (switch on).
+
+    Empty when ``MTPLX_SESSION_HEAD_ANCHOR`` is off, for image prompts, for a
+    tokenizer without ChatML turns, and when the head is shorter than the
+    block-restore minimum (no restore could use it).
+    """
+
+    if vision_splice is not None or not session_head_anchor_enabled():
+        return ()
+    from .session_head_anchor import session_head_length, turn_markers
+
+    markers = turn_markers(getattr(rt, "tokenizer", None))
+    if markers is None:
+        return ()
+    head = session_head_length(prompt_ids, markers)
+    if head is None or head < max(
+        1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512)
+    ):
+        return ()
+    return (head,)
+
+
 def _retain_boundary_sink(sink: list) -> None:
     """Trim a checkpoint list to its anchors and byte budget (see
     ``mtplx.checkpoint_anchors``). A plain list, one built outside
@@ -5657,11 +5716,12 @@ def _checkpoint_sink(
     ceiling: int | None = None,
     image_spans: Sequence[tuple[int, int]] = (),
     cuts_forwards: bool = True,
+    head_anchors: Sequence[int] = (),
 ) -> CheckpointSink:
     """The checkpoint list one prefill fills, with everything its retention
     needs known up front: the prompt end, the restore point, the stable edge,
-    the ceiling, an image prompt's image spans and the session bank's byte
-    budget."""
+    the ceiling, an image prompt's image spans, the session-head anchors
+    (``MTPLX_SESSION_HEAD_ANCHOR``) and the session bank's byte budget."""
 
     sink = CheckpointSink(
         records or (),
@@ -5677,6 +5737,7 @@ def _checkpoint_sink(
             image_spans=tuple(
                 (int(start), int(end)) for start, end in (image_spans or ())
             ),
+            head_anchors=tuple(int(position) for position in head_anchors),
         ),
         cuts_forwards=cuts_forwards,
     )
@@ -6132,7 +6193,11 @@ def _bank_inforward_boundaries(
 
 
 def _inherited_gdn_boundaries(
-    entry: Any, restore_point: int, *, budget_bytes: int | None = None
+    entry: Any,
+    restore_point: int,
+    *,
+    budget_bytes: int | None = None,
+    head_anchors: Sequence[int] = (),
 ) -> list:
     """Boundaries carried over from a restored SessionBank entry.
 
@@ -6154,6 +6219,8 @@ def _inherited_gdn_boundaries(
     turn may diverge again, and the grid covers everything before it. A set
     already within the budget is kept whole. Re-thinning here was the second
     site that hollowed out mid-prefix coverage on clone/lease chains.
+    ``head_anchors`` are the new request's session-head anchors: a record
+    there is kept as well.
     """
     records = list(getattr(entry, "gdn_boundaries", None) or [])
     kept = [record for record in records if int(record[0]) <= int(restore_point)]
@@ -6164,6 +6231,7 @@ def _inherited_gdn_boundaries(
             prompt_end=int(restore_point),
             tail_backoff=0,
             restore_point=int(restore_point),
+            head_anchors=tuple(int(position) for position in head_anchors),
         ),
     )
 
@@ -6599,6 +6667,11 @@ def restore_or_prefill_prompt_state(
         and _gdn_boundary_capture_enabled()
         and (vision_splice is None or first_image_start is not None)
     )
+    head_anchors = (
+        _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
+        if keep_checkpoints
+        else ()
+    )
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
@@ -6946,6 +7019,7 @@ def restore_or_prefill_prompt_state(
                 restored.entry,
                 restored.entry.prefix_len,
                 budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                head_anchors=head_anchors,
             )
             # A one-copy lease taken for a suffix prefill goes back to the
             # bank at its restore point if the prefill stops early.
@@ -7059,6 +7133,7 @@ def restore_or_prefill_prompt_state(
                         stable_prefix_len=stable_prefix_len,
                         image_spans=checkpoint_image_spans,
                         cuts_forwards=vision_splice is None,
+                        head_anchors=head_anchors,
                     )
                     if keep_checkpoints
                     else None
@@ -7178,6 +7253,7 @@ def restore_or_prefill_prompt_state(
             stable_prefix_len=stable_prefix_len,
             image_spans=checkpoint_image_spans,
             cuts_forwards=vision_splice is None,
+            head_anchors=head_anchors,
         )
         if keep_checkpoints
         else None
@@ -8350,13 +8426,13 @@ def _prefill(
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
         body_array = mx.array([body])
-        _cold_edges: tuple[int, ...] = ()
-        if (
-            stable_prefix_len is not None
-            and shape_boundaries
-            and 0 < int(stable_prefix_len) < len(body)
-        ):
-            _cold_edges = (int(stable_prefix_len),)
+        _cold_edges = (
+            _mandatory_prefill_edges(
+                stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+            )
+            if shape_boundaries
+            else ()
+        )
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if shape_boundaries
@@ -8499,13 +8575,13 @@ def _prefill_committed_mtp_history_streaming(
             pad_prefix_counts.append(
                 pad_prefix_counts[-1] + (1 if token == pad_id else 0)
             )
-    _cold_edges: tuple[int, ...] = ()
-    if (
-        stable_prefix_len is not None
-        and shape_boundaries
-        and 0 < int(stable_prefix_len) < len(body)
-    ):
-        _cold_edges = (int(stable_prefix_len),)
+    _cold_edges = (
+        _mandatory_prefill_edges(
+            stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+        )
+        if shape_boundaries
+        else ()
+    )
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if shape_boundaries

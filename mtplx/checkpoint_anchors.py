@@ -22,6 +22,8 @@ frontier advances, in this order:
   before its first image, where a turn that changes that image resumes;
 * the restore point this prefill resumed from (the previous prompt's end);
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
+* the session-head anchors (opt-in, ``MTPLX_SESSION_HEAD_ANCHOR``): where
+  the prompt's fixed head (tools and system turn) ends;
 * the newest checkpoint;
 * a fixed absolute grid: the first checkpoint in every ``grid_tokens`` cell,
   thinned by halving its resolution when the budget cannot hold every cell
@@ -97,6 +99,10 @@ class AnchorPlan:
     length minus one; None when unknown, and the newest checkpoint stands in).
     ``restore_point``: where the prefill resumed from a stored entry.
     ``stable_prefix``: the stable prompt-prefix edge, when the prompt has one.
+    ``head_anchors``: positions where the prompt's fixed head ends
+    (``MTPLX_SESSION_HEAD_ANCHOR``): a new session with the same head
+    restores there, however far from the tail it lies, so they are kept
+    whenever a checkpoint was captured at them.
     ``ceiling``: no checkpoint past this position.
     ``image_spans``: ``[start, end)`` of each image's rows in an image prompt;
     no checkpoint strictly inside one. Image prompts kept none past their
@@ -114,6 +120,7 @@ class AnchorPlan:
     stable_prefix: int | None = None
     ceiling: int | None = None
     image_spans: tuple[tuple[int, int], ...] = ()
+    head_anchors: tuple[int, ...] = ()
     grid_tokens: int = GRID_TOKENS
 
     def admits(self, position: int) -> bool:
@@ -216,6 +223,7 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
         pre_image[-1] if pre_image else None,
         plan.restore_point,
         plan.stable_prefix,
+        *plan.head_anchors,
         newest,
     ):
         if position is None:
