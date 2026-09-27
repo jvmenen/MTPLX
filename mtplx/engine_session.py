@@ -980,8 +980,14 @@ class EngineSession:
         self._lock = Lock()
         # Odd while a memory release holds ``_lock`` (begin_release_hold):
         # a request that finds the slot taken by a release waits for it
-        # instead of reporting the session busy.
+        # instead of reporting the session busy. ``_release_guard`` makes
+        # taking or giving back the slot and publishing the sequence one
+        # step: a request that tried the slot in between read an even
+        # sequence with the slot taken and reported busy (the review of
+        # 9c96dd9c).
         self._release_seq = 0
+        self._release_guard = Lock()
+        self.release_held = False
         # The cancel signal of the generation that holds ``_lock`` (or held
         # it last). Written only by the thread that has just taken the lock
         # and never cleared on release, so a waiter that failed to take the
@@ -1470,11 +1476,10 @@ class EngineSession:
         if timeout_s > 0.0:
             acquired = self._lock.acquire(timeout=float(timeout_s))
         else:
-            release_seq = self._release_seq
-            acquired = self._lock.acquire(blocking=False)
-            if not acquired and (
-                release_seq % 2 == 1 or self._release_seq != release_seq
-            ):
+            with self._release_guard:
+                acquired = self._lock.acquire(blocking=False)
+                releasing = not acquired and self._release_seq % 2 == 1
+            if releasing:
                 # A memory release holds the slot for the milliseconds it
                 # takes to evict this session's RAM entries. Wait for it:
                 # reporting the session busy would refuse a named session
@@ -1556,14 +1561,27 @@ class EngineSession:
         (an SSD restore or a prefill), never a busy refusal.
         """
 
-        if not self._lock.acquire(blocking=False):
-            return False
-        self._release_seq += 1
+        with self._release_guard:
+            if not self._lock.acquire(blocking=False):
+                return False
+            self._release_seq += 1
+            # In flight for the hold's duration: stale eviction keeps the
+            # record (it dropped a held session's record, and a request
+            # then created and took a second one under the same id while
+            # the release still evicted the first's entries), and every
+            # other reclamation step spares it.
+            self.release_held = True
+            self.in_flight = True
+            self.in_flight_started_s = time.time()
         return True
 
     def end_release_hold(self) -> None:
-        self._release_seq += 1
-        self._lock.release()
+        with self._release_guard:
+            self.release_held = False
+            self.in_flight = False
+            self.in_flight_started_s = None
+            self._release_seq += 1
+            self._lock.release()
 
     def end_generation(self) -> None:
         self.in_flight = False
