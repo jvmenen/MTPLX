@@ -14879,13 +14879,6 @@ def _chat_turn_segments_allowed() -> bool:
     return GLOBAL_CHAT_SEGMENT_MEMO.enabled()
 
 
-def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
-    if not _chat_turn_segments_allowed():
-        return False
-    with _chat_encode_snapshot(tokenizer) as snapshot:
-        return _chat_turn_segments_proven(tokenizer, snapshot.fingerprint)[0]
-
-
 _CHAT_TURN_SEGMENT_PROOFS: "weakref.WeakKeyDictionary[Any, tuple[str, bool, str]]" = (
     weakref.WeakKeyDictionary()
 )
