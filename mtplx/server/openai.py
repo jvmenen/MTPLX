@@ -3753,6 +3753,11 @@ class ServerState:
                         coalesce_key=getattr(job, "coalesce_key", None),
                     )
                 )
+                # The memory guard's idle-session release cancels a released
+                # session's queued encode by the same key the dispatch used,
+                # so the arrays that job pins are freed with the entries.
+                if callable(getattr(_scheduler, "cancel_idle_persistence", None)):
+                    _bank.cold_enqueue_cancel = _scheduler.cancel_idle_persistence
             else:
                 _bank.cold_enqueue_dispatch = lambda job: (
                     _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")

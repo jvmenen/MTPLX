@@ -2320,6 +2320,81 @@ class EngineSessionManager:
             "reason": "exact_prefix_match" if exact else "prefix_divergence_at_token",
         }
 
+    def in_flight_session_ids(self) -> set[str]:
+        """Sessions whose generation slot is held right now.
+
+        Read without taking any slot: taking one here would turn a request
+        that arrives during a release into a 409 (named session) or a forked
+        session (implicit one). The slot's own flag and lock are the truth.
+        """
+
+        return {
+            session.session_id
+            for session in self._sessions_snapshot()
+            if session.in_flight or session._lock.locked()
+        }
+
+    def release_idle_sessions(
+        self,
+        target_bytes: int | None,
+        *,
+        keep_session_ids: Any = (),
+        protect_tokens: list[int] | tuple[int, ...] | None = None,
+        reason: str = "idle_session_release",
+    ) -> dict[str, Any]:
+        """Give back the memory of conversations that are not generating.
+
+        The bank holds the arrays (snapshots, live caches, leases); this
+        manager holds the per-session metadata and knows which sessions are
+        in flight. A coding agent's compaction arrives as a new session while
+        the conversation it summarizes waits for the answer: that
+        conversation is idle, and its state is exactly the memory the
+        compaction needs (the 2026-09-26 field report: 13 refusals in a row
+        until a restart). ``keep_session_ids`` adds the caller's incoming
+        and in-flight sessions to the ones whose slot is held; the prompt's
+        own restore source is kept by the bank (``restore_source_key``).
+
+        A released session left with no RAM entries is dropped from the
+        registry and its pending postcommit is aborted: its committed tokens
+        would otherwise keep telling the admission estimate that a live
+        prefix exists, and the postcommit would rebuild what was just freed.
+        Its SSD entries stay, so the conversation restores from disk (or
+        prefills) when it comes back.
+        """
+
+        kept = {str(session_id) for session_id in (keep_session_ids or ()) if session_id}
+        kept |= self.in_flight_session_ids()
+        receipt = self.bank.release_sessions(
+            target_bytes,
+            keep_session_ids=kept,
+            protect_tokens=protect_tokens,
+            reason=reason,
+        )
+        dropped: list[EngineSession] = []
+        with self._lock:
+            for row in receipt.get("sessions") or ():
+                session_id = row.get("session_id")
+                if not session_id or session_id in kept:
+                    continue
+                session = self._sessions.get(session_id)
+                if session is None:
+                    continue
+                if session.in_flight or session._lock.locked():
+                    continue
+                if self.bank.has_session_entries(session_id):
+                    continue
+                self._sessions.pop(session_id, None)
+                dropped.append(session)
+        postcommits_aborted = 0
+        for session in dropped:
+            if session.has_pending_postcommit():
+                outcome = session.abort_pending_postcommit(reason)
+                postcommits_aborted += int(bool(outcome.get("aborted")))
+        receipt["session_records_dropped"] = [session.session_id for session in dropped]
+        receipt["postcommits_aborted"] = postcommits_aborted
+        receipt["kept_sessions"] = sorted(kept)
+        return receipt
+
     def evict_stale(self) -> int:
         now = time.time()
         with self._lock:

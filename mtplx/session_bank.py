@@ -394,6 +394,20 @@ def _live_cache_nbytes(cache: list[Any] | None) -> int:
     return total
 
 
+def cold_persistence_key(entry: Any) -> str:
+    """The idle-lane coalesce key of an entry's SSD persistence work.
+
+    One constructor for every dispatch site and for the memory guard's cancel,
+    so a key written one way can never be cancelled under another (newest-wins
+    coalescing keeps at most one pending job per key).
+    """
+
+    session_id = getattr(entry, "session_id", None)
+    if session_id:
+        return f"ssd_cold:{session_id}"
+    return f"ssd_cold:hash:{getattr(entry, 'token_hash', '')}"
+
+
 @dataclass
 class SessionBankEntry:
     token_ids: tuple[int, ...]
@@ -691,6 +705,12 @@ class SessionBank:
         # when unset (tests, CLI paths without a scheduler) the enqueue stays
         # synchronous, preserving legacy behavior.
         self.cold_enqueue_dispatch: Callable[[Callable[[], None]], Any] | None = None
+        # Cancels the PENDING idle-lane persistence job filed under a
+        # coalesce key (cold_persistence_key) and returns how many it dropped.
+        # The server wires it to the model scheduler; the memory guard calls it
+        # when it releases an idle session whose newest entry is not on disk
+        # yet, because the queued job holds that entry's arrays until it runs.
+        self.cold_enqueue_cancel: Callable[[str], int] | None = None
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
@@ -2367,11 +2387,7 @@ class SessionBank:
                 # Per-session, only the newest entry's encode stays queued.
                 # Attribute-carried so legacy dispatch wirings that ignore
                 # it keep their exact behavior.
-                job.coalesce_key = (
-                    f"ssd_cold:{entry.session_id}"
-                    if entry.session_id
-                    else f"ssd_cold:hash:{entry.token_hash}"
-                )
+                job.coalesce_key = cold_persistence_key(entry)
                 dispatch(job)
                 if cold is not None:
                     cold["deferred"] = True
@@ -2480,11 +2496,7 @@ class SessionBank:
                 job = lambda: self._cold_enqueue_job(entry, put_entry)  # noqa: E731
                 # Same key expression as the original dispatch site so the
                 # retry coalesces with (and is superseded by) newer commits.
-                job.coalesce_key = (
-                    f"ssd_cold:{entry.session_id}"
-                    if entry.session_id
-                    else f"ssd_cold:hash:{entry.token_hash}"
-                )
+                job.coalesce_key = cold_persistence_key(entry)
                 try:
                     dispatch(job)
                 except Exception:
@@ -2517,11 +2529,7 @@ class SessionBank:
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
         dispatch = self.cold_enqueue_dispatch
-        coalesce_key = (
-            f"ssd_cold:{entry.session_id}"
-            if entry.session_id
-            else f"ssd_cold:hash:{entry.token_hash}"
-        )
+        coalesce_key = cold_persistence_key(entry)
         if dispatch is None:
             self.eviction_log.append(
                 {
@@ -2617,11 +2625,7 @@ class SessionBank:
                 job = lambda: self.run_live_ref_spill(  # noqa: E731
                     token_ids, snapshot_epoch
                 )
-                job.coalesce_key = (
-                    f"ssd_cold:{entry.session_id}"
-                    if entry.session_id
-                    else f"ssd_cold:hash:{entry.token_hash}"
-                )
+                job.coalesce_key = cold_persistence_key(entry)
                 try:
                     dispatch(job)
                 except Exception:
@@ -3147,6 +3151,188 @@ class SessionBank:
             evicted += 1
         return evicted
 
+    def restore_source_key(
+        self, protect_tokens: list[int] | tuple[int, ...] | None
+    ) -> tuple[int, ...] | None:
+        """The RAM entry a prompt would restore from, or None.
+
+        An entry qualifies when it is an exact prefix of the prompt, or when
+        the prefix it shares rounds down to at least the block restore floor
+        (``DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS`` on
+        ``DEFAULT_PREFIX_BLOCK_SIZE`` blocks), the same reuse the server's
+        admission estimate credits. The longest usable prefix wins. Before
+        this rule the admission walk protected the entry with the greatest
+        common prefix even when that prefix was a single token.
+        """
+
+        if not protect_tokens:
+            return None
+        tokens = tuple(int(token) for token in protect_tokens)
+        best_key: tuple[int, ...] | None = None
+        best_usable = 0
+        for key in list(self._entries):
+            if len(key) <= len(tokens) and tokens[: len(key)] == key:
+                usable = len(key)
+            else:
+                usable = block_aligned_prefix_len(
+                    common_prefix_len(tokens, key),
+                    block_size=DEFAULT_PREFIX_BLOCK_SIZE,
+                )
+                if usable < DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS:
+                    usable = 0
+            if usable > best_usable:
+                best_usable = usable
+                best_key = key
+        return best_key
+
+    def has_session_entries(self, session_id: str | None) -> bool:
+        """Whether any RAM entry belongs to ``session_id``."""
+
+        if not session_id:
+            return False
+        return any(
+            entry.session_id == session_id for entry in list(self._entries.values())
+        )
+
+    def release_sessions(
+        self,
+        target_bytes: int | None,
+        *,
+        keep_session_ids: Any = (),
+        protect_tokens: list[int] | tuple[int, ...] | None = None,
+        reason: str = "idle_session_release",
+    ) -> dict[str, Any]:
+        """Release whole sessions' RAM state until ``target_bytes`` is freed.
+
+        The last reclamation step before the server refuses a prompt that
+        does not fit. A session's entries (durable snapshots, snapshots that
+        also hold a live cache reference, live-reference leases) all go,
+        except for sessions in ``keep_session_ids`` (the caller's in-flight
+        and incoming sessions) and the entry this prompt restores from
+        (``restore_source_key``). Idle sessions go least recently used first
+        and entries already written to SSD before the rest, so a released
+        conversation restores from disk when it comes back. An entry not on
+        disk yet is dropped: its queued SSD encode (which holds the entry's
+        arrays until it runs) is cancelled through ``cold_enqueue_cancel``,
+        and the receipt counts it, because that conversation re-prefills if
+        it is resumed. Writing it out here instead would stage its bytes
+        through the page cache and hash them on the request path, exactly
+        while the Mac is short of memory.
+
+        Bytes are the entries' ``held_nbytes``: what the bank believes it
+        gives back. The caller re-measures the allocator afterwards; only
+        that measurement decides admission. ``target_bytes=None`` releases
+        every idle session (the caller's second round, when the measurement
+        after the first still does not fit).
+        """
+
+        target = None if target_bytes is None else max(0, int(target_bytes))
+        kept = {str(session_id) for session_id in (keep_session_ids or ()) if session_id}
+        protected = self.restore_source_key(protect_tokens)
+
+        def group_of(entry: SessionBankEntry) -> str:
+            return entry.session_id or f"anon:{entry.token_hash}"
+
+        groups: dict[str, list[SessionBankEntry]] = {}
+        for key, entry in list(self._entries.items()):
+            if key == protected:
+                continue
+            if entry.session_id and entry.session_id in kept:
+                continue
+            groups.setdefault(group_of(entry), []).append(entry)
+
+        def last_active(group: str) -> float:
+            return max(float(entry.last_access_s) for entry in groups[group])
+
+        order = sorted(groups, key=last_active)
+        released = 0
+        rows: dict[str, dict[str, Any]] = {}
+        cancelled_keys: set[str] = set()
+        persistence_cancelled = 0
+
+        def release(entry: SessionBankEntry, *, durable: bool) -> None:
+            nonlocal released, persistence_cancelled
+            group = group_of(entry)
+            row = rows.setdefault(
+                group,
+                {
+                    "session_id": entry.session_id,
+                    "entries": 0,
+                    "held_bytes": 0,
+                    "on_ssd_entries": 0,
+                    "dropped_entries": 0,
+                    "leases": 0,
+                    "live_cache_refs": 0,
+                    "longest_prefix_tokens": 0,
+                },
+            )
+            held = int(entry.held_nbytes)
+            row["entries"] += 1
+            row["held_bytes"] += held
+            row["on_ssd_entries" if durable else "dropped_entries"] += 1
+            row["leases"] += int(bool(entry.live_ref_only))
+            row["live_cache_refs"] += int(entry.cache_ref is not None)
+            row["longest_prefix_tokens"] = max(
+                int(row["longest_prefix_tokens"]), int(entry.prefix_len)
+            )
+            if not durable:
+                key = cold_persistence_key(entry)
+                cancel = self.cold_enqueue_cancel
+                if key not in cancelled_keys and callable(cancel):
+                    cancelled_keys.add(key)
+                    try:
+                        persistence_cancelled += int(cancel(key) or 0)
+                    except Exception as exc:
+                        self.eviction_log.append(
+                            {
+                                "reason": "idle_release_cancel_error",
+                                "session_id": entry.session_id,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+            self._evict_entry(entry, reason=reason)
+            released += held
+
+        def satisfied() -> bool:
+            return target is not None and released >= target
+
+        for durable_pass in (True, False):
+            for group in order:
+                if satisfied():
+                    break
+                for entry in sorted(
+                    groups[group], key=lambda item: -int(item.held_nbytes)
+                ):
+                    if satisfied():
+                        break
+                    if self._entries.get(entry.token_ids) is not entry:
+                        continue
+                    on_disk = entry.cold_encode_completed_at is not None
+                    if on_disk != durable_pass:
+                        continue
+                    release(entry, durable=on_disk)
+        for row in rows.values():
+            session_id = row["session_id"]
+            if session_id and not self.has_session_entries(session_id):
+                # A released session must not keep its activity pin: the
+                # pin exists to protect state that is about to be extended.
+                self._session_last_active.pop(str(session_id), None)
+        return {
+            "sessions": sorted(
+                rows.values(), key=lambda row: -int(row["held_bytes"])
+            ),
+            "entries": int(sum(row["entries"] for row in rows.values())),
+            "held_bytes": int(released),
+            "dropped_entries": int(
+                sum(row["dropped_entries"] for row in rows.values())
+            ),
+            "persistence_cancelled": int(persistence_cancelled),
+            "protected_restore_source_tokens": (
+                None if protected is None else len(protected)
+            ),
+            "kept_sessions": sorted(kept),
+        }
+
     def shrink_for_admission(
         self,
         target_bytes: int,
@@ -3170,24 +3356,18 @@ class SessionBank:
         Phase 2, only if the deficit stands, takes remaining entries in the
         take-anything order of real memory pressure (active sessions last).
         Both phases spare the entry the imminent prompt restores from
-        (``protect_tokens``), and every eviction is RAM-only: the SSD cold
-        tier still restores a walked entry, so the worst case is a disk
-        read on some session's next turn, not this request's abort.
+        (``protect_tokens``, validated by ``restore_source_key``: an entry
+        that shares one token with the prompt is not a restore source), and
+        every eviction is RAM-only: the SSD cold tier still restores a walked
+        entry, so the worst case is a disk read on some session's next turn,
+        not this request's abort.
         Returns ``(non_terminal_evicted, terminal_evicted)``.
         """
         target = max(0, int(target_bytes))
         protected_keys: set[tuple[int, ...]] = set()
-        if protect_tokens:
-            tokens = tuple(int(token) for token in protect_tokens)
-            best_key = None
-            best_common = 0
-            for key, entry in self._entries.items():
-                common = common_prefix_len(tokens, entry.token_ids)
-                if common > best_common:
-                    best_common = common
-                    best_key = key
-            if best_key is not None:
-                protected_keys.add(best_key)
+        source_key = self.restore_source_key(protect_tokens)
+        if source_key is not None:
+            protected_keys.add(source_key)
 
         def _walk(candidates_fn, order_key) -> int:
             evicted = 0
