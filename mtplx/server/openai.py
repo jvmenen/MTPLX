@@ -14690,8 +14690,12 @@ def _encode_rendered_chat_turns(
     Scoped reasoning history renders plain chat without seams, so the whole
     transcript was tokenized in one call every request and the segment memo
     never applied. Cutting before each ``<|im_start|>`` gives the single-call
-    ids exactly: an atomic added token is split out before normalization and
-    pre-tokenization, so no merge crosses it.
+    ids when the marker is an atomic added token that no other added token
+    runs into and special tokens are not encoded as text: it is then split
+    out before normalization and pre-tokenization, so no merge crosses it.
+    That is proven on the tokenizer itself before any cut is made (see
+    _chat_turn_segments_proven); without the proof the render is encoded in
+    one call.
     """
     if not _chat_turn_segments_enabled(tokenizer):
         return _encode_rendered_chat_text(tokenizer, rendered)
@@ -14716,7 +14720,148 @@ def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
     """Env MTPLX_CHAT_TURN_SEGMENTS=off disables; only useful with the memo."""
     if not _env_bool_setting("MTPLX_CHAT_TURN_SEGMENTS", default=True):
         return False
-    return GLOBAL_CHAT_SEGMENT_MEMO.enabled() and _chat_turn_open_is_atomic(tokenizer)
+    if not GLOBAL_CHAT_SEGMENT_MEMO.enabled():
+        return False
+    return _chat_turn_segments_proven(tokenizer)[0]
+
+
+_CHAT_TURN_SEGMENT_PROOFS: "weakref.WeakKeyDictionary[Any, tuple[str, bool, str]]" = (
+    weakref.WeakKeyDictionary()
+)
+_CHAT_TURN_SEGMENT_PROOFS_LOCK = threading.Lock()
+
+# Renders on which cutting before every <|im_start|> must give the
+# single-call ids: the ChatML shape of a real agent turn, the marker glued to
+# words, to itself and to the other markers, and scripts, emoji sequences,
+# line ends and invisible characters on both sides of a cut. The second one
+# splits differently when a tokenizer also has the added token
+# "abc<|im_start|>".
+_CHAT_TURN_SEGMENT_PROBES = (
+    "<|im_start|>system\nYou are a coding agent.<|im_end|>\n"
+    "<|im_start|>user\nFix it.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    "Read it first.\n</think>\n\n<tool_call>\n<function=read>\n"
+    "<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    "<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n"
+    "<|im_start|>assistant\n",
+    "<|im_start|>hiabc<|im_start|>hi",
+    "hi<|im_start|><|im_start|>hi<|im_start|>",
+    "<|im_end|><|im_start|>user<|im_end|>\n\n<|im_start|>\n",
+    "a <|im_start|> b\t<|im_start|>\tc  <|im_start|>  ",
+    "partial <|im_sta<|im_start|>rt|> <|<|im_start|>|> <|im_start|<|im_start|>",
+    "日本語<|im_start|>中文句子、テキスト<|im_start|>한국어",
+    "😀👍🏽<|im_start|>👨\u200d👩\u200d👧🇳🇱<|im_start|>🚀",
+    "line\r\n<|im_start|>\r\nline\r<|im_start|>\n",
+    "\ufeffbom<|im_start|>\ufeffbom",
+    "zero\u200b<|im_start|>\u200dwidth\u2060<|im_start|>\u00a0nbsp",
+    "e\u0301<|im_start|>\u0301a\u0308<|im_start|>\u0640",
+)
+
+
+def _chat_turn_segments_proven(tokenizer: Any) -> tuple[bool, str]:
+    """Whether cutting before every ``<|im_start|>`` is proven to give the
+    single-call ids on this tokenizer, and why.
+
+    The metadata check alone admits two counterexamples: a tokenizer that
+    encodes special tokens as plain text (``split_special_tokens``), and an
+    added token that runs into the marker (``abc<|im_start|>``: the single
+    call matches it across the place the cut would go). So the tokenizer
+    has to pass the metadata check, keep special tokens atomic, and give the
+    single-call ids on every probe render when cut.
+
+    Proven on first use per tokenizer object and encoding configuration
+    (the fingerprint the encode caches use), so a tokenizer changed in place
+    is proven again. Each decision is logged once.
+    """
+    fingerprint = _chat_tokenizer_encoding_fingerprint(tokenizer)
+    with _CHAT_TURN_SEGMENT_PROOFS_LOCK:
+        try:
+            cached = _CHAT_TURN_SEGMENT_PROOFS.get(tokenizer)
+        except TypeError:
+            # Not weak-referenceable: the encode caches skip it too, so a
+            # cut would buy nothing.
+            return False, "the tokenizer cannot be weakly referenced"
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1], cached[2]
+        enabled, reason = _prove_chat_turn_segments(tokenizer)
+        _CHAT_TURN_SEGMENT_PROOFS[tokenizer] = (fingerprint, enabled, reason)
+    _safe_stdout_print(
+        "[mtplx] chat turn segmentation "
+        + json.dumps(
+            {
+                "enabled": enabled,
+                "reason": reason,
+                "tokenizer": type(tokenizer).__name__,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return enabled, reason
+
+
+def _prove_chat_turn_segments(tokenizer: Any) -> tuple[bool, str]:
+    if not _chat_turn_open_is_atomic(tokenizer):
+        return False, (
+            f"{_CHAT_TURN_OPEN} is not an added token that matches anywhere "
+            "unchanged"
+        )
+    if _chat_tokenizer_splits_special_tokens(tokenizer):
+        return False, "special tokens are encoded as plain text (split_special_tokens)"
+    probes = _chat_turn_segment_probes(tokenizer)
+    for index, probe in enumerate(probes):
+        try:
+            single_call = _encode_rendered_chat_text(tokenizer, probe)
+            cut: list[int] = []
+            start = 0
+            for boundary in [*_chat_turn_boundaries(probe), len(probe)]:
+                cut.extend(_encode_rendered_chat_text(tokenizer, probe[start:boundary]))
+                start = boundary
+        except Exception as exc:  # noqa: BLE001 - reported as the decision
+            return False, f"probe {index} could not be encoded: {exc!r}"
+        if cut != single_call:
+            return False, (
+                f"probe {index} {probe[:80]!r} gives other ids when cut before "
+                f"{_CHAT_TURN_OPEN}"
+            )
+    return True, f"all {len(probes)} probe renders give the single-call ids when cut"
+
+
+def _chat_turn_segment_probes(tokenizer: Any) -> list[str]:
+    """The fixed probes plus, for every added token that could span a cut,
+    that token's text between two turns, glued to words and set apart by
+    a space and by a newline."""
+    probes = list(_CHAT_TURN_SEGMENT_PROBES)
+    try:
+        added = [
+            str(getattr(token, "content", token))
+            for token in tokenizer.added_tokens_decoder.values()
+        ]
+    except (AttributeError, TypeError):
+        added = []
+    for content in added:
+        for piece in _chat_turn_open_overlaps(content):
+            for pad in ("hi", " ", "\n"):
+                probes.append(f"{_CHAT_TURN_OPEN}{pad}{piece}{pad}{_CHAT_TURN_OPEN}")
+    return probes
+
+
+def _chat_turn_open_overlaps(content: str) -> list[str]:
+    """Texts in which the added token ``content`` would span a cut before
+    ``<|im_start|>``. It has to start before the marker and run into it:
+    some proper suffix of it either starts with the marker or is a prefix
+    of the marker. Each text is the token with the marker completed."""
+    pieces: list[str] = []
+    start = content.find(_CHAT_TURN_OPEN[0], 1)
+    while start > 0:
+        tail = content[start:]
+        piece = None
+        if tail.startswith(_CHAT_TURN_OPEN):
+            piece = content
+        elif _CHAT_TURN_OPEN.startswith(tail):
+            piece = content[:start] + _CHAT_TURN_OPEN
+        if piece is not None and piece not in pieces:
+            pieces.append(piece)
+        start = content.find(_CHAT_TURN_OPEN[0], start + 1)
+    return pieces
 
 
 def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:

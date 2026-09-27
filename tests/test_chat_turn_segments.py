@@ -4,13 +4,15 @@ Scoped reasoning history renders plain chat without generation seams, so the
 segment memo never applied there. Cutting before every ``<|im_start|>`` (an
 atomic added token) must give exactly the single-call ids; these tests pin
 that on the real Qwen3.6 tokenizer and chat template when it is cached
-locally, plus the guards and the off switch.
+locally, the proof that gates the cut (with the two counterexamples the
+marker metadata alone let through), the guards and the off switch.
 """
 
 from __future__ import annotations
 
 import json
 import random
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +69,7 @@ RENDER = (
 def memo(monkeypatch):
     fresh = ChatSegmentEncodeMemo(max_tokens=2_000_000)
     monkeypatch.setattr(oa, "GLOBAL_CHAT_SEGMENT_MEMO", fresh)
+    monkeypatch.setattr(oa, "_CHAT_TURN_SEGMENT_PROOFS", weakref.WeakKeyDictionary())
     monkeypatch.delenv("MTPLX_CHAT_SEGMENT_MEMO", raising=False)
     monkeypatch.delenv("MTPLX_CHAT_TURN_SEGMENTS", raising=False)
     return fresh
@@ -80,6 +83,8 @@ def test_boundaries_sit_before_every_turn_but_the_first():
 
 def test_turns_are_encoded_separately_and_memoized(memo):
     tok = TurnTokenizer(FakeAddedToken("<|im_start|>"))
+    assert oa._chat_turn_segments_enabled(tok)  # the one-time proof
+    tok.encode_calls = 0
     obs: dict = {}
     ids = oa._encode_rendered_chat_turns(tok, RENDER, obs)
     assert ids == [ord(char) for char in RENDER]
@@ -146,6 +151,205 @@ def test_whole_word_turn_marker_keeps_single_call_ids(memo):
 
     assert not oa._chat_turn_open_is_atomic(tok)
     assert oa._encode_rendered_chat_turns(tok, render, {}) == single_call
+
+
+def _chatml_backend(*more_special: str, pattern: str = r"\w+|[^\w\s]|\s"):
+    """A Rust tokenizer with ``<|im_start|>`` as an atomic special token
+    (id 8) and ``more_special`` added after it."""
+    tokenizers = pytest.importorskip("tokenizers")
+    vocab = {"[UNK]": 0}
+    for word in ["abc", "hi", "<", "|", "im_start", ">", "\n"]:
+        vocab[word] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(pattern), behavior="isolated"
+    )
+    backend.add_special_tokens(
+        [
+            tokenizers.AddedToken(content, normalized=False, special=True)
+            for content in ("<|im_start|>", *more_special)
+        ]
+    )
+    return backend
+
+
+def _chatml_fast_tokenizer(*more_special: str, pattern=None, **kwargs):
+    transformers = pytest.importorskip("transformers")
+    backend = (
+        _chatml_backend(*more_special)
+        if pattern is None
+        else _chatml_backend(*more_special, pattern=pattern)
+    )
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", **kwargs
+    )
+
+
+class RustBackedTokenizer:
+    """A thin wrapper that encodes with the Rust tokenizer directly, so the
+    Rust ``encode_special_tokens`` switch is the one that applies."""
+
+    def __init__(self, backend):
+        self._tokenizer = backend
+
+    def encode(self, text, add_special_tokens=False):
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    @property
+    def vocab_size(self):
+        return self._tokenizer.get_vocab_size(with_added_tokens=False)
+
+    @property
+    def added_tokens_decoder(self):
+        return self._tokenizer.get_added_tokens_decoder()
+
+
+def _cut(tok, render):
+    return oa._encode_rendered_chat_text_segmented(
+        tok, render, oa._chat_turn_boundaries(render)
+    )
+
+
+def test_overlapping_added_token_keeps_single_call_ids(memo):
+    """The review's counterexample: ``abc<|im_start|>`` is an added token
+    too, so the single call matches it across the place the cut would go,
+    while the marker's own metadata passes the atomic check."""
+    tok = _chatml_fast_tokenizer("abc<|im_start|>")
+    render = "<|im_start|>hiabc<|im_start|>hi"
+    single_call = oa._encode_rendered_chat_text(tok, render)
+    assert single_call == [8, 2, 9, 2]
+    assert _cut(tok, render) == [8, 0, 8, 2]
+    assert oa._chat_turn_open_is_atomic(tok)
+
+    enabled, reason = oa._chat_turn_segments_proven(tok)
+    assert not enabled
+    assert "gives other ids when cut" in reason
+    obs: dict = {}
+    assert oa._encode_rendered_chat_turns(tok, render, obs) == single_call
+    assert "chat_segment_memo" not in obs
+
+
+@pytest.mark.parametrize(
+    ("token", "render"),
+    [
+        ("zz<|im", "<|im_start|>hi zz<|im_start|>hi"),
+        ("\t\t<|im_start|>", "<|im_start|>hi\t\t<|im_start|>hi"),
+        ("q<|im_start|>q", "<|im_start|>hi q<|im_start|>q hi"),
+    ],
+)
+def test_token_running_into_the_marker_is_probed_from_the_added_tokens(
+    memo, token, render
+):
+    """None of the fixed probes contains these texts; the proof builds a
+    probe from every added token that could span a cut."""
+    assert all(token not in probe for probe in oa._CHAT_TURN_SEGMENT_PROBES)
+    tok = _chatml_fast_tokenizer(token)
+    single_call = oa._encode_rendered_chat_text(tok, render)
+    assert _cut(tok, render) != single_call
+
+    assert not oa._chat_turn_segments_proven(tok)[0]
+    assert oa._encode_rendered_chat_turns(tok, render, {}) == single_call
+
+
+def test_overlaps_are_the_tokens_that_run_into_the_marker():
+    assert oa._chat_turn_open_overlaps("abc<|im_start|>") == ["abc<|im_start|>"]
+    assert oa._chat_turn_open_overlaps("zz<|im") == ["zz<|im_start|>"]
+    assert oa._chat_turn_open_overlaps("<|im_start|>user") == []
+    assert oa._chat_turn_open_overlaps("<|im_start|>") == []
+    assert oa._chat_turn_open_overlaps("<|im_end|>") == []
+    assert oa._chat_turn_open_overlaps("|>x") == []
+    assert oa._chat_turn_open_overlaps("a<|im_start|>b<|im") == [
+        "a<|im_start|>b<|im",
+        "a<|im_start|>b<|im_start|>",
+    ]
+
+
+@pytest.mark.parametrize("layer", ["transformers", "rust"])
+def test_special_tokens_encoded_as_text_keep_the_single_call(memo, layer):
+    """The review's other counterexample: with split_special_tokens the
+    marker is plain text to the encoder, so pre-tokenization can merge
+    across a cut, yet the marker's metadata passes the atomic check. Here
+    punctuation runs are one pre-token, so "|><|" spans the cut."""
+    punctuation_runs = r"\w+|[^\w\s]+|\s+"
+    if layer == "transformers":
+        tok = _chatml_fast_tokenizer(
+            pattern=punctuation_runs, split_special_tokens=True
+        )
+    else:
+        backend = _chatml_backend(pattern=punctuation_runs)
+        backend.encode_special_tokens = True
+        tok = RustBackedTokenizer(backend)
+    render = "<|im_start|>hi<|im_start|><|im_start|>abc"
+    single_call = oa._encode_rendered_chat_text(tok, render)
+    assert 8 not in single_call  # the marker is not atomic here
+    assert _cut(tok, render) != single_call
+    assert oa._chat_turn_open_is_atomic(tok)
+
+    enabled, reason = oa._chat_turn_segments_proven(tok)
+    assert not enabled
+    assert "split_special_tokens" in reason
+    obs: dict = {}
+    assert oa._encode_rendered_chat_turns(tok, render, obs) == single_call
+    assert "chat_segment_memo" not in obs
+
+
+def _decision_lines(capsys):
+    return [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[mtplx] chat turn segmentation ")
+    ]
+
+
+def test_proof_runs_once_per_configuration_and_logs_once(memo, capsys):
+    tokenizers = pytest.importorskip("tokenizers")
+    tok = _chatml_fast_tokenizer()
+    render = "<|im_start|>hi\nabc<|im_start|>hi\n"
+    for _ in range(3):
+        obs: dict = {}
+        assert oa._encode_rendered_chat_turns(tok, render, obs) == (
+            oa._encode_rendered_chat_text(tok, render)
+        )
+        assert "chat_segment_memo" in obs
+    (line,) = _decision_lines(capsys)
+    decision = json.loads(line.removeprefix("[mtplx] chat turn segmentation "))
+    assert decision["enabled"] is True
+
+    # the same tokenizer object gains an added token that runs into the
+    # marker: its fingerprint changes, so it is proven again, and refused
+    tok.add_tokens(
+        [tokenizers.AddedToken("abc<|im_start|>", normalized=False, special=True)]
+    )
+    for _ in range(2):
+        obs = {}
+        assert oa._encode_rendered_chat_turns(tok, render, obs) == (
+            oa._encode_rendered_chat_text(tok, render)
+        )
+        assert "chat_segment_memo" not in obs
+    (line,) = _decision_lines(capsys)
+    decision = json.loads(line.removeprefix("[mtplx] chat turn segmentation "))
+    assert decision["enabled"] is False
+
+
+class BomRefusingTokenizer(TurnTokenizer):
+    def encode(self, text, add_special_tokens=False):
+        if "\ufeff" in text:
+            raise ValueError("no BOM here")
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
+def test_probe_that_cannot_be_encoded_keeps_the_single_call(memo):
+    tok = BomRefusingTokenizer(FakeAddedToken("<|im_start|>"))
+    enabled, reason = oa._chat_turn_segments_proven(tok)
+    assert not enabled
+    assert "ValueError('no BOM here')" in reason
+    obs: dict = {}
+    assert oa._encode_rendered_chat_turns(tok, RENDER, obs) == [
+        ord(char) for char in RENDER
+    ]
+    assert "chat_segment_memo" not in obs
 
 
 def test_atomic_check_reads_through_a_wrapper():
@@ -221,6 +425,14 @@ def real_tok():
 
     config = json.loads((MODEL_DIR / "config.json").read_text())
     return _load_tokenizer_resilient(MODEL_DIR, config)
+
+
+@needs_real_tokenizer
+def test_real_tokenizer_is_proven(real_tok, memo):
+    """The parity tests below compare against the single call; they only
+    exercise the cut while the shipped tokenizer passes the proof."""
+    enabled, reason = oa._chat_turn_segments_proven(real_tok)
+    assert enabled, reason
 
 
 def _encode_scoped(tok, messages, *, thinking, obs=None):
