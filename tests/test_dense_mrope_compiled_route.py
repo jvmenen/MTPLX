@@ -75,6 +75,13 @@ def _clean(monkeypatch):
     # Tests of the compiled route explicitly opt in; the default has its
     # own product-level test below.
     monkeypatch.setenv("MTPLX_DENSE_VISION_COMPILED_VERIFY", "1")
+    # The attention route of the turbo profile, the profile that turns the
+    # compiled verifier on. Without it an image request's parity reference
+    # (containers with no rotary origin) takes mlx-lm's stock attention while
+    # the compiled leg takes MTPLX's route: two lowerings of the gate's
+    # sigmoid that differ in float32, hidden on an M5 by the TF32 o_proj GEMM
+    # and not on the M1 to M4 kernels.
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
     for name in (
         "MTPLX_DENSE_MROPE",
         "MTPLX_DENSE_MROPE_STRICT",
