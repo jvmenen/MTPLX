@@ -50,7 +50,29 @@ class TestReading:
         assert reading is not None
         assert reading.total_bytes >= 8 * GIB
         assert 0 <= reading.available_bytes <= reading.total_bytes
-        assert reading.available_bytes == reading.total_bytes * reading.level_percent // 100
+        # The supply is what the kernel hands out without compressing:
+        # free (speculative included) and purgeable pages plus file cache.
+        assert reading.free_bytes is not None
+        assert reading.file_backed_bytes is not None
+        assert reading.available_bytes == min(
+            reading.total_bytes, reading.free_bytes + reading.file_backed_bytes
+        )
+        assert reading.wired_bytes > 0
+        assert reading.compressor_bytes is not None
+        assert reading.swap_used_bytes is not None
+
+    def test_the_level_is_not_free_memory(self):
+        """kern.memorystatus_level is (total - wired - compressor) / total.
+
+        It counts every app's anonymous pages as available, which is why the
+        guard no longer reads its supply from it (the old test asserted that
+        available == total x level / 100, the defect this replaces).
+        """
+
+        reading = sm._read_kernel()
+        assert reading is not None
+        unwired = reading.total_bytes - reading.wired_bytes - int(reading.compressor_bytes)
+        assert abs(reading.level_percent - unwired * 100 / reading.total_bytes) <= 3
 
     def test_kill_switch_reads_unknown(self, monkeypatch):
         _install(monkeypatch, 40)
@@ -112,6 +134,116 @@ class TestFloorsAndLevel:
             8 * GIB + shed - 10 * GIB
         )
         assert sm.admission_shortfall_bytes(reading, growth_bytes=8 * GIB, reclaimable_bytes=6 * GIB) == 0
+
+
+def _machine(
+    *,
+    free_gib: float,
+    file_gib: float = 0.0,
+    wired_gib: float = 0.0,
+    compressor_gib: float = 0.0,
+    swap_gib: float = 0.0,
+    at_s: float = 0.0,
+    total: int = RAM,
+) -> sm.SystemMemory:
+    free = int(free_gib * GIB)
+    file_backed = int(file_gib * GIB)
+    wired = int(wired_gib * GIB)
+    compressor = int(compressor_gib * GIB)
+    return sm.SystemMemory(
+        available_bytes=free + file_backed,
+        total_bytes=total,
+        level_percent=int((total - wired - compressor) * 100 // total),
+        free_bytes=free,
+        file_backed_bytes=file_backed,
+        wired_bytes=wired,
+        compressor_bytes=compressor,
+        swap_used_bytes=int(swap_gib * GIB),
+        monotonic_s=at_s,
+    )
+
+
+class TestWiredFloorsAndDeathSignature:
+    """The field report (M5 Max 128 GB, Flash-Next, 2026-09-26): compactions
+    that survived sat at 12-17 percent memorystatus_level with free pages at
+    0.1-0.5 GiB and the compressor growing 10 GiB; the ones that froze had
+    the same shape. 83 GiB wired did not recover from 3 GiB free."""
+
+    def test_the_floor_scales_with_what_is_wired(self):
+        shed, abort = sm.system_memory_floors(128 * GIB, wired_bytes=88 * GIB)
+        assert abort == 88 * GIB // 16  # 5.5 GiB
+        assert shed == 2 * abort  # 11 GiB
+        # 83 GiB wired: the abort floor is above the 3 GiB that did not recover.
+        assert sm.system_memory_floors(128 * GIB, wired_bytes=83 * GIB)[1] > 3 * GIB
+        # 48 GB Mac with the 27B wired: barely above the old 2.5 percent line.
+        _shed48, abort48 = sm.system_memory_floors(48 * GIB, wired_bytes=21 * GIB)
+        assert abort48 == 21 * GIB // 16
+        # 16 GB Mac: the 1 GiB minimum still rules, unchanged.
+        assert sm.system_memory_floors(16 * GIB, wired_bytes=10 * GIB) == (2 * GIB, GIB)
+        # No wired reading: the shipped 2.5 percent rule, unchanged.
+        assert sm.system_memory_floors(128 * GIB) == (
+            2 * int(128 * GIB * 0.025),
+            int(128 * GIB * 0.025),
+        )
+
+    def test_seventeen_percent_level_with_no_free_pages_is_critical(self):
+        # The surviving compaction's trough: 92.2 GiB wired, 14.7 GiB
+        # compressed (level 16.5 percent, reported 17), free pages 0.3 GiB.
+        reading = _machine(
+            free_gib=0.3, file_gib=2.0, wired_gib=92.2, compressor_gib=14.7
+        )
+        assert 15 <= reading.level_percent <= 17
+        assert sm.system_pressure_level(reading) == 4
+
+    def test_a_healthy_flash_next_desktop_stays_normal(self):
+        # Julian's ordinary moment plus the n-gram table's file cache:
+        # 88 GiB wired, 3.5 GiB free, 12 GiB of file-backed pages.
+        reading = _machine(free_gib=3.5, file_gib=12.0, wired_gib=88.0, compressor_gib=3.7)
+        assert sm.system_pressure_level(reading) == 1
+
+    def test_death_signature_between_two_readings_is_critical(self):
+        before = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10, at_s=100.0)
+        after = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=11.2, at_s=102.0)
+        # Plenty of file cache: the supply alone reads normal ...
+        assert sm.system_pressure_level(after) == 1
+        # ... but free pages under the floor while the compressor grew
+        # 1.2 GiB in 2 s is the crash receipts' death signature.
+        assert sm.memory_thrashing(after, before)
+        assert sm.system_pressure_level(after, previous=before) == 4
+
+    def test_swap_growth_under_the_floor_is_the_same_signature(self):
+        before = _machine(free_gib=0.1, file_gib=20, wired_gib=88, swap_gib=1.0, at_s=0.0)
+        after = _machine(free_gib=0.1, file_gib=20, wired_gib=88, swap_gib=1.5, at_s=2.0)
+        assert sm.memory_thrashing(after, before)
+
+    def test_compression_with_free_pages_to_spare_is_not_the_signature(self):
+        before = _machine(free_gib=9.0, file_gib=5, wired_gib=88, compressor_gib=4, at_s=0.0)
+        after = _machine(free_gib=9.0, file_gib=5, wired_gib=88, compressor_gib=6, at_s=2.0)
+        assert not sm.memory_thrashing(after, before)
+
+    def test_small_or_slow_growth_is_not_the_signature(self):
+        before = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10, at_s=0.0)
+        small = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10.2, at_s=0.5)
+        slow = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=11, at_s=30.0)
+        assert not sm.memory_thrashing(small, before)
+        assert not sm.memory_thrashing(slow, before)
+        assert not sm.memory_thrashing(small, None)
+
+    def test_admission_counts_the_wired_floor(self):
+        reading = _machine(free_gib=4, file_gib=10, wired_gib=88)
+        shed, _abort = sm.reading_floors(reading)
+        assert shed == 2 * (88 * GIB // 16)
+        assert sm.admission_shortfall_bytes(
+            reading, growth_bytes=8 * GIB, reclaimable_bytes=0
+        ) == 8 * GIB + shed - 14 * GIB
+
+    def test_rehearsal_caps_the_free_pages_too(self, monkeypatch):
+        monkeypatch.setattr(sm, "_reader", lambda: _machine(free_gib=40, file_gib=20, wired_gib=10))
+        monkeypatch.setenv("MTPLX_SYSTEM_MEMORY_REHEARSAL_AVAILABLE_BYTES", "2G")
+        reading = sm.read_system_memory()
+        assert reading.available_bytes == 2 * GIB
+        assert reading.free_bytes == 2 * GIB
+        assert reading.wired_bytes == 10 * GIB
 
 
 class _Bank:
