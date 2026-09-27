@@ -49,6 +49,7 @@ from tests.test_memguard_admission import (
     _install,
     _Machine,
     _manager,
+    _put,
     _state,
 )
 
@@ -304,6 +305,41 @@ class TestGemmaAdmission:
         geometry = srv._admission_geometry(_gemma_state(manager))
         assert geometry.live_bytes_per_token == GEMMA_CHUNKED_ROW
         assert geometry.prefill_fixed_bytes == GEMMA_CHUNK_WINDOWS
+
+    def test_a_rewrite_deeper_than_the_last_chunk_is_priced_cold(self, monkeypatch):
+        """The review of 808a11e2: a banked 24,026-token prompt whose client
+        keeps the first 20,000 tokens and replaces the tail with 600 was
+        priced as a 20,000-token restore, while the restore could not trim
+        the chunked prefill's sliding caches that far and ran all 20,600
+        tokens cold. The bank's plan now knows how far an entry's caches
+        reach (``restore_floor_tokens``), so on a Mac where the cold bill
+        does not fit beside what is resident the admission sheds for it
+        instead of admitting the request at the warm bill."""
+
+        manager = _manager()
+        _roomy(monkeypatch, manager)
+        banked = list(range(24_026))
+        entry = _put(manager.bank, banked, session_id="gemma", row_bytes=GEMMA_CHUNKED_ROW)
+        # What a chunked prefill leaves: 1,023 + 2,048 rows in each sliding
+        # cache, trimmable back until one 1,024-row window remains.
+        entry.restore_floor_tokens = 24_026 - (1023 + 2048 - 1024)
+        _install(monkeypatch, _Machine(manager.bank, base_gib=81.0, cache_gib=0.0, host_gib=1.0))
+        pricing: dict = {}
+        receipt = srv._prefill_admission_shed(
+            _gemma_state(manager),
+            prompt_ids=banked[:20_000] + list(range(10**6, 10**6 + 600)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=None,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        growth = pricing["growth"]
+        assert growth["reused_tokens"] == 0 and growth["miss_tokens"] == 20_600
+        assert growth["live_prefill_bytes"] == 20_600 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        assert growth["scratch_bytes"] == _gemma_scratch(2048, 20_600 - 2048)
+        assert receipt is not None and receipt["reusable_prefix_tokens"] == 0
+        assert not receipt.get("refused")
 
     def test_the_whole_prompt_forward_is_priced_as_one_forward(self, monkeypatch):
         """``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole`` (the 2.12.0 prefill):

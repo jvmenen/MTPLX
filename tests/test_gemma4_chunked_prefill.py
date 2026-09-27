@@ -551,6 +551,45 @@ def test_a_rewritten_tail_restores_within_the_last_chunk(tiny_pair, monkeypatch,
     assert not cold.cache_hit and cold.cached_tokens == 0
 
 
+def test_the_bank_plans_only_the_restores_it_can_land(tiny_pair, monkeypatch, cpu):
+    """The admission prices a request by the bank's restore plan
+    (``SessionBank.restore_plan``). A banked chunked prompt keeps its window
+    plus the last chunk, so the plan offers a near-prefix restore only where
+    the trim can land and prices a deeper rewrite cold, the way the restore
+    runs it. The review of 808a11e2: a banked 24,026-token prompt rewritten
+    after 20,000 tokens was priced as a 20,000-token restore and ran cold."""
+
+    runtime = tiny_pair(16, seed=5)
+    first = _prompt(1200, seed=5)
+    monkeypatch.setenv(CHUNK_ENV, "256")
+    bank = _bank_cold_prompt(runtime, first, monkeypatch)
+    (entry,) = list(bank._entries.values())
+    # 1,200 rows in chunks of 256 (176, then four of 256): each sliding cache
+    # keeps 15 + 256 rows, and the deepest exact trim leaves one window of 16.
+    floor = 1200 - (15 + 256 - 16)
+    identity = {
+        "model_path": str(runtime.model_path),
+        "mtp_enabled": bool(runtime.mtp_enabled),
+        "hidden_variant": "gemma4_pre_norm",
+        "mtp_history_policy": gemma4.GEMMA4_SESSION_STATE_POLICY,
+    }
+    # The restore lands one slot short of the match (the seed slot), so the
+    # shallowest restorable match is one past the floor.
+    for matched, restores in ((1100, True), (floor + 1, True), (floor, False), (700, False)):
+        prompt = first[:matched] + _prompt(600, seed=matched)
+        plan = bank.restore_plan(prompt, **identity)
+        state = _restore(runtime, prompt, bank)
+        assert state.cache_hit is restores, matched
+        if restores:
+            assert (plan["mode"], plan["reuse_tokens"]) == ("near_prefix", matched)
+            assert state.cached_tokens == matched - 1
+        else:
+            assert (plan["mode"], plan["reuse_tokens"]) == ("none", 0), matched
+            assert state.cached_tokens == 0
+    assert list(bank._entries.values()) == [entry]
+    assert entry.restore_floor_tokens == floor
+
+
 # ---------------------------------------------------------------------------
 # The request's abort check and the telemetry see every chunk.
 # ---------------------------------------------------------------------------

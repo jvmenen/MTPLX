@@ -523,6 +523,13 @@ def _near_candidate_serves(
         return False
     if entry.has_recurrent and _recurrent_restore_point(entry, matched) <= int(floor):
         return False
+    # The restore trims the cache to one slot short of the match (the seed
+    # slot); a cache that cannot reach that far fails the trim and the
+    # request runs cold, so the plan must not price it warm.
+    if not entry.has_recurrent and matched - 1 < int(
+        getattr(entry, "restore_floor_tokens", 0) or 0
+    ):
+        return False
     return True
 
 
@@ -605,6 +612,12 @@ class SessionBankEntry:
     # entries — recorded at put() time from the live cache, because only the
     # producer knows the container classes.
     has_recurrent: bool = False
+    # The shortest prefix a near-prefix restore can trim this entry's cache
+    # back to exactly, recorded when the entry is built from live cache
+    # objects (``_cache_restore_floor``). 0 for caches that trim to any
+    # depth; Gemma 4's sliding caches after a chunked prefill keep their
+    # window plus the last chunk, so a deeper rewrite cannot restore.
+    restore_floor_tokens: int = 0
     # kvcache-v2: (token_count, recurrent-only CacheSnapshot, hidden_last)
     # captured at interior prefill boundaries, sorted ascending. Enables exact
     # sub-prefix restores on hybrid (GDN/conv) models: trim KV to boundary
@@ -709,6 +722,20 @@ class SessionBankEntry:
 def _empty_cache_snapshot(cache: list[Any] | None) -> CacheSnapshot:
     size = len(cache or [])
     return CacheSnapshot(states=tuple(None for _ in range(size)), meta_states=tuple(None for _ in range(size)))
+
+
+def _cache_restore_floor(cache: list[Any] | None) -> int:
+    """The shortest prefix every layer of ``cache`` can be trimmed back to
+    exactly. A layer that keeps only part of its history answers for itself
+    (``restore_floor_tokens``: Gemma 4's sliding caches); the rest trim to
+    any depth."""
+
+    floor = 0
+    for layer in cache or ():
+        answer = getattr(layer, "restore_floor_tokens", None)
+        if callable(answer):
+            floor = max(floor, int(answer()))
+    return floor
 
 
 def _trim_cache_ref_to_prefix(cache: list[Any] | None, prefix_len: int) -> bool:
@@ -1032,6 +1059,7 @@ class SessionBank:
         self.last_put_skipped_oversized_snapshot = False
         self._touch_session(session_id)
         cache_has_recurrent = any(not _is_trimmable(entry) for entry in (cache or []))
+        cache_restore_floor = _cache_restore_floor(cache)
         normalized_boundaries = sorted(
             (
                 (int(r[0]), r[1], r[2] if len(r) > 2 else None)
@@ -1149,6 +1177,7 @@ class SessionBank:
                 ),
                 extra_state=_clone_tree(extra_state),
                 has_recurrent=cache_has_recurrent,
+                restore_floor_tokens=cache_restore_floor,
                 gdn_boundaries=list(normalized_boundaries),
             )
             self.eviction_log.append(
@@ -1314,6 +1343,7 @@ class SessionBank:
             extra_state=_clone_tree(extra_state),
             lazy_kv=lazy_kv,
             has_recurrent=cache_has_recurrent,
+            restore_floor_tokens=cache_restore_floor,
             gdn_boundaries=list(normalized_boundaries),
             gdn_boundary_loader=(
                 inherited_loader if not normalized_boundaries else None
@@ -2115,6 +2145,14 @@ class SessionBank:
         if cache_snapshot_prefix_len < required_cache_prefix_len:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return None
+        if cache_snapshot_prefix_len != required_cache_prefix_len and (
+            required_cache_prefix_len < int(getattr(entry, "restore_floor_tokens", 0) or 0)
+        ):
+            # The trim cannot reach the restore point (``restore_plan``
+            # prices this candidate cold for the same reason): refuse before
+            # the restore copies the snapshot or takes the entry's lease.
+            self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+            return None
         if (
             entry.mtp_history_snapshot is not None
             and mtp_snapshot_prefix_len < max(0, restore_point - 1)
@@ -2869,6 +2907,8 @@ class SessionBank:
             return None
         cache = runtime.make_cache()
         restore_cache(cache, entry.cache_snapshot)
+        # Read back from disk, the entry's floor is its restored caches'.
+        entry.restore_floor_tokens = _cache_restore_floor(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
             mtp_history_cache = runtime.make_mtp_cache()

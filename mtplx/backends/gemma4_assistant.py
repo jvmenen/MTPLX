@@ -1498,6 +1498,29 @@ class Gemma4RollbackRotatingKVCache:
     def is_trimmable(self):
         return True
 
+    def restore_floor_tokens(self) -> int:
+        """The shortest offset ``trim`` can take this buffer back to exactly,
+        which is how short a prefix a session-bank restore of it can land
+        on. A buffer holding every row trims to any depth; one holding its
+        window plus the last forward's rows (a chunked prefill, a warm turn)
+        trims back until one full window would remain; a wrapped circular
+        buffer or a kept prefix does not trim past its rollback record."""
+
+        offset = int(self.offset)
+        if self.keys is None or offset <= 0:
+            return 0
+        rows = int(self.keys.shape[2])
+        floor = offset
+        if self.keep == 0 and int(self._idx) == rows:
+            if rows >= offset:
+                floor = 0
+            else:
+                floor = offset - max(0, rows - int(self.max_size))
+        last = self._last_update
+        if last is not None:
+            floor = min(floor, offset - int(last.get("length") or 0))
+        return max(0, floor)
+
     def trim(self, n_tokens: int):
         n_tokens = int(n_tokens)
         if n_tokens <= 0:
