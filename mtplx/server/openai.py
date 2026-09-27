@@ -19108,11 +19108,11 @@ def _prefill_chunk_reserve_bytes(
 
     if isinstance(priced, Mapping) and priced.get("chunk_bytes") is not None:
         return max(0, int(priced["chunk_bytes"]))
-    geometry = _admission_geometry(state)
     prompt_tokens = max(1, int(prompt_tokens))
     width = _admission_prefill_widths(
         getattr(state, "runtime", None), prompt_tokens, chunk_tokens
     )[0]
+    geometry = _admission_geometry(state, prefill_width=width)
     rows = prompt_tokens if width is None else min(prompt_tokens, int(width))
     scratch, _source = _admission_scratch_bytes(
         state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
@@ -19417,7 +19417,10 @@ class _AdmissionGeometry:
     drafter's sliding row) sets the live width instead of the planner's
     every-layer figure, and ``prefill_fixed_bytes`` to what its caches then
     keep whatever the length (the windows). Unset, the live width counts
-    every layer's row, the windows' rows among them.
+    every layer's row, the windows' rows among them. ``prefill_windows``,
+    when the backend answers it, gives those windows for one prefill (the
+    prompt's tokens and the new ones) at the width this geometry was built
+    for (``_admission_geometry(prefill_width=...)``).
     """
 
     live_bytes_per_token: int
@@ -19428,6 +19431,7 @@ class _AdmissionGeometry:
     resident_bytes_per_token: int | None = None
     resident_fixed_bytes: int = 0
     prefill_fixed_bytes: int = 0
+    prefill_windows: Callable[[int, int], int] | None = None
     # The per-token working set outside the KV pages (QSA streams, the MTP
     # head's KV and committed history): what a leased paged cache still
     # grows by per new token when its pages already hold the rows.
@@ -19444,7 +19448,12 @@ class _AdmissionGeometry:
         return int(self.resident_bytes_per_token)
 
 
-def _admission_geometry(state: Any) -> _AdmissionGeometry:
+def _admission_geometry(state: Any, prefill_width: int | None = None) -> _AdmissionGeometry:
+    """The request's per-token and fixed costs from the memory plan and the
+    backend's own answers, for a prefill at ``prefill_width`` rows a forward
+    (the backend's default when None): a backend whose caches keep a window
+    plus the last forward's rows (Gemma 4) holds more at a wider chunk."""
+
     from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
 
     plan = getattr(state, "memory_plan", None)
@@ -19468,13 +19477,21 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
     resident_fn = getattr(runtime, "resident_kv_bytes_per_token", None)
     window_fn = getattr(runtime, "window_cache_bytes", None)
     resident = int(resident_fn()) + aux if callable(resident_fn) else None
-    fixed = int(window_fn()) if callable(window_fn) else 0
+    fixed = 0
+    if callable(window_fn):
+        fixed = int(window_fn() if prefill_width is None else window_fn(prefill_width))
     prefill_fn = getattr(runtime, "prefill_kv_bytes_per_token", None)
     prefill_row = prefill_fn() if callable(prefill_fn) else None
     prefill_fixed = 0
+    prefill_windows = None
     if prefill_row is not None:
         kv_live = int(prefill_row)
         prefill_fixed = fixed
+        windows_fn = getattr(runtime, "prefill_window_bytes", None)
+        if callable(windows_fn):
+
+            def prefill_windows(prompt: int, new: int) -> int:
+                return int(windows_fn(prompt, new, prefill_width) or 0)
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
         paged_bytes_per_token=kv_paged + aux,
@@ -19486,6 +19503,7 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         resident_bytes_per_token=resident,
         resident_fixed_bytes=fixed,
         prefill_fixed_bytes=prefill_fixed,
+        prefill_windows=prefill_windows,
         aux_bytes_per_token=aux,
         kv_quantization=str(getattr(plan, "kv_quantization", "off") or "off"),
     )
@@ -19731,6 +19749,7 @@ def _admission_growth(
     publish: bool,
     scratch_bytes: int,
     lease: Mapping[str, Any] | None = None,
+    restore_fixed_bytes: int | None = None,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -19819,11 +19838,26 @@ def _admission_growth(
         # width), with the part it keeps whatever the length (Gemma 4's
         # windows); the rows this prefill writes are at the live width. A
         # prefill whose live width leaves that part out (Gemma 4's chunked
-        # prefill) builds it in its own caches when nothing is restored.
+        # prefill) builds it in its own caches: the windows it leaves
+        # (``prefill_windows``: its last forward after the kept window, at
+        # this geometry's width). A restore copies the source entry's own
+        # windows (``restore_fixed_bytes``, which a wider chunk left
+        # larger), and the prefill's windows replace them layer by layer, so
+        # the larger of the two is held.
         row_width = geometry.resident_width
-        restore_fixed = int(geometry.resident_fixed_bytes) if restore_rows else 0
-        prefill_fixed = int(geometry.prefill_fixed_bytes) if M and not restore_rows else 0
-        live_prefill = restore_rows * row_width + restore_fixed + prefill_fixed + M * live_w
+        own_windows = geometry.prefill_windows is not None
+        new_fixed = int(geometry.prefill_windows(P, M)) if own_windows and M else 0
+        restore_fixed = 0
+        if restore_rows:
+            restore_fixed = int(geometry.resident_fixed_bytes)
+            if own_windows and restore_fixed_bytes is not None:
+                restore_fixed = int(restore_fixed_bytes)
+            held_fixed = max(restore_fixed, new_fixed)
+        elif own_windows:
+            held_fixed = new_fixed
+        else:
+            held_fixed = int(geometry.prefill_fixed_bytes) if M else 0
+        live_prefill = restore_rows * row_width + held_fixed + M * live_w
     else:
         row_width = paged_w
         restore_fixed = 0
@@ -19851,7 +19885,15 @@ def _admission_growth(
         live_total = (P + out_rows) * paged_w
     else:
         live_decode = live_prefill
-        live_total = P * geometry.resident_width + int(geometry.resident_fixed_bytes)
+        windows_after = int(geometry.resident_fixed_bytes)
+        if contiguous and geometry.prefill_windows is not None:
+            # What the pre-decode clone keeps: the prefill's windows, or the
+            # restored entry's when nothing was prefilled.
+            if M:
+                windows_after = int(geometry.prefill_windows(P, M))
+            elif restore_rows and restore_fixed_bytes is not None:
+                windows_after = int(restore_fixed_bytes)
+        live_total = P * geometry.resident_width + windows_after
     if quantized:
         # The snapshot holds the prompt dequantized (q4), or views of the q8
         # mirror that decode's first write copies: full width either way.
@@ -20344,20 +20386,33 @@ def _run_prefill_admission(
                 return False
         return True
 
+    geometries: dict[Any, _AdmissionGeometry] = {None: geometry}
+
+    def geometry_at(width: int | None) -> _AdmissionGeometry:
+        # The backend's windows follow the chunk each candidate width runs.
+        if width not in geometries:
+            geometries[width] = _admission_geometry(state, prefill_width=width)
+        return geometries[width]
+
     def growth(
         reused: int,
         copies: bool,
         source_layout: str | None,
         width: int | None,
         lease: Mapping[str, Any] | None = None,
+        source: Any | None = None,
     ) -> dict[str, Any]:
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
         rows = miss if width is None else min(miss, width)
+        at_width = geometry_at(width)
         scratch, scratch_source = _admission_scratch_bytes(
-            state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=geometry
+            state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=at_width
         )
+        # What the restore copies of the source entry's windows: the entry's
+        # own, which a wider chunk than this request's left larger.
+        source_windows = getattr(source, "window_nbytes", None) if copies else None
         model = _admission_growth(
-            geometry,
+            at_width,
             prompt_tokens=prompt_tokens,
             reused_tokens=reused,
             restore_copies_prefix=copies,
@@ -20367,6 +20422,9 @@ def _run_prefill_admission(
             publish=publishes(miss),
             scratch_bytes=scratch,
             lease=lease,
+            restore_fixed_bytes=(
+                int(source_windows) if source_windows is not None and int(reused) > 0 else None
+            ),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
@@ -20374,7 +20432,7 @@ def _run_prefill_admission(
             model["scratch_calibration"] = str(calibration)
         model["scratch_rows"] = int(max(1, rows))
         model["prefill_chunk_tokens"] = width
-        model["chunk_bytes"] = _admission_chunk_bytes(geometry, max(1, rows), scratch)
+        model["chunk_bytes"] = _admission_chunk_bytes(at_width, max(1, rows), scratch)
         return model
 
     def settle(model: Mapping[str, Any]) -> None:
@@ -20528,6 +20586,7 @@ def _run_prefill_admission(
                 restore["source_layout"],
                 w,
                 lease=restore["lease"],
+                source=restore["source_entry"],
             )
             for w in widths
         }

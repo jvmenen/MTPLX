@@ -83,6 +83,8 @@ GEMMA_WINDOWS = 50 * 2 * 16 * 256 * 2 * 1024
 GEMMA_DRAFTER_ROW = 2 * 16 * 256 * 2
 GEMMA_CHUNKED_ROW = GEMMA_RESIDENT + GEMMA_DRAFTER_ROW
 GEMMA_CHUNK_WINDOWS = 50 * 2 * 16 * 256 * 2 * (1023 + 2048)
+# One row of all 50 sliding caches: what a window costs a row it keeps.
+GEMMA_WINDOW_ROW = 50 * 2 * 16 * 256 * 2
 GEMMA_WHOLE = "MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS"
 GEMMA_ROW = 2 * (5376 + 3 * 21504)  # the MLP, the widest layer
 GEMMA_WEIGHTS = int(17.5 * GIB)
@@ -400,8 +402,70 @@ class TestGemmaAdmission:
         assert growth["live_prefill_bytes"] == (
             30_000 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS + 600 * GEMMA_CHUNKED_ROW
         )
-        assert growth["publish_copy_bytes"] == 30_600 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        # The pre-decode clone keeps the windows as the 600-row suffix left
+        # them: the kept window and the suffix.
+        assert growth["publish_copy_bytes"] == (
+            30_600 * GEMMA_CHUNKED_ROW + GEMMA_WINDOW_ROW * (1023 + 600)
+        )
         assert growth["growth_bytes"] < 12 * GIB
+
+    def test_a_wider_requested_chunk_is_priced_with_its_wider_windows(self, monkeypatch):
+        """The review of 808a11e2: the geometry read the default width, so a
+        request at 4,096 rows a forward was billed the windows a 2,048-row
+        prefill leaves (1,023 + 2,048 rows a sliding layer) instead of the
+        1,023 + 4,096 its own chunks leave: 1.56 GiB short."""
+
+        manager = _manager()
+        _roomy(monkeypatch, manager)
+        pricing: dict = {}
+        srv._prefill_admission_shed(
+            _gemma_state(manager),
+            prompt_ids=list(range(16_384)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=4096,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        growth = pricing["growth"]
+        assert growth["prefill_chunk_tokens"] == 4096
+        assert growth["scratch_bytes"] == _gemma_scratch(4096, 16_384 - 4096)
+        assert growth["live_prefill_bytes"] == (
+            16_384 * GEMMA_CHUNKED_ROW + GEMMA_WINDOW_ROW * (1023 + 4096)
+        )
+        assert growth["live_prefill_bytes"] - (
+            16_384 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        ) == int(1.5625 * GIB)
+
+    def test_a_restore_copies_the_windows_its_entry_holds(self, monkeypatch):
+        """The restored cache is the banked entry's, whatever this request's
+        width: an entry a 4,096-row chunk left holds 1,023 + 4,096 rows in
+        each sliding cache, and a clone restore copies them all
+        (``SessionBankEntry.window_nbytes``). On a Mac where the cold bill
+        does not fit the admission prices the warm restore it plans."""
+
+        manager = _manager()
+        _roomy(monkeypatch, manager)
+        banked = list(range(30_000))
+        entry = _put(manager.bank, banked, session_id="gemma", row_bytes=GEMMA_CHUNKED_ROW)
+        entry.window_nbytes = GEMMA_WINDOW_ROW * (1023 + 4096)
+        _install(monkeypatch, _Machine(manager.bank, base_gib=78.0, cache_gib=0.0, host_gib=1.0))
+        pricing: dict = {}
+        srv._prefill_admission_shed(
+            _gemma_state(manager),
+            prompt_ids=banked + list(range(10**6, 10**6 + 600)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=None,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        growth = pricing["growth"]
+        assert growth["reused_tokens"] == 30_000
+        assert growth["restore_copy_bytes"] == (
+            30_000 * GEMMA_CHUNKED_ROW + GEMMA_WINDOW_ROW * (1023 + 4096)
+        )
+        assert growth["live_prefill_bytes"] == growth["restore_copy_bytes"] + 600 * GEMMA_CHUNKED_ROW
 
     def test_skipping_store_on_prefill_saves_nothing_here(self, monkeypatch):
         """The clone does not follow store-on-prefill: turning it off must

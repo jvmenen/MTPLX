@@ -1786,18 +1786,41 @@ class Gemma4AssistantRuntime:
             return resident
         return resident + gemma4_drafter_window_kv_bytes_per_token(args)
 
-    def window_cache_bytes(self) -> int:
-        """The sliding caches as a chunked prefill leaves them and the
-        pre-decode clone keeps them: the window before the last chunk plus
-        its rows (sliding_window - 1 + the chunk width each). The window
-        alone for the whole-prompt forward, as it was priced."""
+    def window_cache_bytes(self, width: int | None = None) -> int:
+        """The most the sliding caches hold after a chunked prefill at
+        ``width`` rows a forward (the default width when None): the window
+        before the last chunk plus its rows (sliding_window - 1 + width
+        each). The window alone for the whole-prompt forward, as it was
+        priced."""
 
         args = self.text_args()
-        width = gemma4_prefill_chunk_tokens(0)
-        if width is None:
+        default = gemma4_prefill_chunk_tokens(0)
+        if default is None:
             return gemma4_window_cache_bytes(args)
+        width = default if width is None else max(GEMMA4_MIN_PREFILL_CHUNK, int(width))
         window = _config_int(args, "sliding_window")
         return gemma4_window_cache_bytes(args, max(0, window - 1) + int(width))
+
+    def prefill_window_bytes(
+        self, prompt_tokens: int, new_tokens: int, width: int | None = None
+    ) -> int | None:
+        """The sliding caches as a prefill of ``new_tokens`` rows at ``width``
+        rows a forward leaves them, for a prompt of ``prompt_tokens``: its
+        last forward's rows after the window the caches keep, never more than
+        the prompt. ``None`` for the whole-prompt forward, whose rows the
+        planner's every-layer width already counts."""
+
+        default = gemma4_prefill_chunk_tokens(int(prompt_tokens))
+        if default is None:
+            return None
+        new_tokens = max(0, int(new_tokens))
+        if new_tokens <= 0:
+            return 0
+        width = default if width is None else max(GEMMA4_MIN_PREFILL_CHUNK, int(width))
+        args = self.text_args()
+        window = _config_int(args, "sliding_window")
+        rows = min(int(prompt_tokens), max(0, window - 1) + min(new_tokens, width))
+        return gemma4_window_cache_bytes(args, rows)
 
     def forward_target(
         self,

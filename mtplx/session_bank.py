@@ -618,6 +618,10 @@ class SessionBankEntry:
     # depth; Gemma 4's sliding caches after a chunked prefill keep their
     # window plus the last chunk, so a deeper rewrite cannot restore.
     restore_floor_tokens: int = 0
+    # Bytes held by those same partial-history layers (``_cache_window_nbytes``):
+    # what a restore of this entry copies of its windows, which a chunked
+    # prefill at a wider chunk leaves larger than the admission's default.
+    window_nbytes: int = 0
     # kvcache-v2: (token_count, recurrent-only CacheSnapshot, hidden_last)
     # captured at interior prefill boundaries, sorted ascending. Enables exact
     # sub-prefix restores on hybrid (GDN/conv) models: trim KV to boundary
@@ -736,6 +740,17 @@ def _cache_restore_floor(cache: list[Any] | None) -> int:
         if callable(answer):
             floor = max(floor, int(answer()))
     return floor
+
+
+def _cache_window_nbytes(cache: list[Any] | None) -> int:
+    """Bytes held by the layers of ``cache`` that keep only part of their
+    history (the ones answering ``restore_floor_tokens``)."""
+
+    total = 0
+    for layer in cache or ():
+        if callable(getattr(layer, "restore_floor_tokens", None)):
+            total += int(getattr(layer, "nbytes", 0) or 0)
+    return total
 
 
 def _trim_cache_ref_to_prefix(cache: list[Any] | None, prefix_len: int) -> bool:
@@ -1060,6 +1075,7 @@ class SessionBank:
         self._touch_session(session_id)
         cache_has_recurrent = any(not _is_trimmable(entry) for entry in (cache or []))
         cache_restore_floor = _cache_restore_floor(cache)
+        cache_window_nbytes = _cache_window_nbytes(cache)
         normalized_boundaries = sorted(
             (
                 (int(r[0]), r[1], r[2] if len(r) > 2 else None)
@@ -1178,6 +1194,7 @@ class SessionBank:
                 extra_state=_clone_tree(extra_state),
                 has_recurrent=cache_has_recurrent,
                 restore_floor_tokens=cache_restore_floor,
+                window_nbytes=cache_window_nbytes,
                 gdn_boundaries=list(normalized_boundaries),
             )
             self.eviction_log.append(
@@ -1344,6 +1361,7 @@ class SessionBank:
             lazy_kv=lazy_kv,
             has_recurrent=cache_has_recurrent,
             restore_floor_tokens=cache_restore_floor,
+            window_nbytes=cache_window_nbytes,
             gdn_boundaries=list(normalized_boundaries),
             gdn_boundary_loader=(
                 inherited_loader if not normalized_boundaries else None
@@ -2909,6 +2927,7 @@ class SessionBank:
         restore_cache(cache, entry.cache_snapshot)
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
+        entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
             mtp_history_cache = runtime.make_mtp_cache()
