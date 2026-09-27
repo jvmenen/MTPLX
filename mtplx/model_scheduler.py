@@ -19,6 +19,32 @@ from threading import Condition, Event, Thread, get_ident
 import time
 from typing import Any, Callable
 
+
+def _persistence_max_pending_bytes_from_env() -> int:
+    """Byte budget for pending idle-persistence work; 0 disables it.
+
+    Opt-in (default off on this branch): ``MTPLX_PERSIST_QUEUE_MAX_GB`` sets
+    the cap in GiB (fractions allowed). The upstream name from PR #536,
+    ``MTPLX_PERSISTENCE_MAX_PENDING_BYTES`` ("4G", "off"), is honoured when
+    the GB switch is unset, so a run configured for upstream behaves alike.
+    """
+    raw_gb = os.environ.get("MTPLX_PERSIST_QUEUE_MAX_GB", "").strip()
+    if raw_gb:
+        try:
+            gb = float(raw_gb)
+        except ValueError:
+            return 0
+        if gb != gb or gb <= 0.0 or gb == float("inf"):
+            return 0
+        return max(1, int(gb * 1024**3))
+    raw = os.environ.get("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "").strip()
+    if not raw or raw.lower() in ("0", "off", "false", "no"):
+        return 0
+    from .cache_bank.cold_tier import parse_size_bytes
+
+    return parse_size_bytes(raw, 0)
+
+
 _QOS_CLASSES = {
     "user_interactive": 0x21,
     "user_initiated": 0x19,
@@ -92,6 +118,7 @@ class _WorkItem:
     queued_at_s: float = field(default_factory=time.monotonic)
     earliest_start_s: float = field(default_factory=time.monotonic)
     coalesce_key: str | None = None
+    pinned_bytes: int = 0
 
 
 class _KeepaliveTurn:
@@ -148,8 +175,17 @@ class ModelWorkScheduler:
         idle_grace_s: float | None = None,
         persistence_quiet_grace_s: float = 0.25,
         priority_max_streak: int | None = None,
+        persistence_max_pending_bytes: int | None = None,
     ) -> None:
         self.name = str(name)
+        self.persistence_max_pending_bytes = max(
+            0,
+            int(
+                _persistence_max_pending_bytes_from_env()
+                if persistence_max_pending_bytes is None
+                else persistence_max_pending_bytes
+            ),
+        )
         if idle_grace_s is None:
             # A serve request is not one scheduler item: restore and
             # prefill/generate arrive as separate foreground submissions
@@ -181,6 +217,8 @@ class ModelWorkScheduler:
         self._idle: deque[_WorkItem] = deque()
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
+        self._persistence_pending_bytes = 0
+        self._persistence_budget_dropped = 0
         # Idle-pump budget (issue #290): the persistence band is normally
         # reachable only while the idle deque is COMPLETELY empty, so any
         # self-chaining idle_postcommit occupant (each completion enqueues
@@ -434,6 +472,9 @@ class ModelWorkScheduler:
                 "idle_pending": len(self._idle),
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
+                "persistence_pending_bytes": self._persistence_pending_bytes,
+                "persistence_max_pending_bytes": self.persistence_max_pending_bytes,
+                "persistence_budget_dropped": self._persistence_budget_dropped,
                 "persistence_pump_budget": self._persistence_pump_budget,
                 "persistence_pumped": self._persistence_pumped,
                 "active_kind": self._active_kind,
@@ -565,6 +606,7 @@ class ModelWorkScheduler:
         *args: Any,
         batch_key: str | None = None,
         coalesce_key: str | None = None,
+        pinned_bytes: int = 0,
         **kwargs: Any,
     ) -> Future:
         """Durability work: strictly below idle_postcommit, quiet-grace
@@ -589,6 +631,7 @@ class ModelWorkScheduler:
             batch_key=batch_key,
             earliest_start_s=time.monotonic() + self.idle_grace_s,
             coalesce_key=coalesce_key,
+            pinned_bytes=pinned_bytes,
         )
 
     def shutdown(
@@ -614,9 +657,30 @@ class ModelWorkScheduler:
                     while queue:
                         item = queue.popleft()
                         item.future.cancel()
+                self._persistence_pending_bytes = 0
             self._condition.notify_all()
         if wait and not park and self._thread.is_alive():
             self._thread.join()
+
+    def _enforce_persistence_budget_locked(self, *, keep: _WorkItem) -> None:
+        budget = self.persistence_max_pending_bytes
+        if budget <= 0:
+            return
+        while self._persistence_pending_bytes > budget:
+            victim = next(
+                (
+                    item
+                    for item in self._persistence
+                    if item is not keep and item.pinned_bytes > 0
+                ),
+                None,
+            )
+            if victim is None:
+                return
+            self._persistence.remove(victim)
+            self._persistence_pending_bytes -= victim.pinned_bytes
+            victim.future.cancel()
+            self._persistence_budget_dropped += 1
 
     def _submit(
         self,
@@ -629,6 +693,7 @@ class ModelWorkScheduler:
         earliest_start_s: float,
         coalesce_key: str | None = None,
         priority: bool = False,
+        pinned_bytes: int = 0,
     ) -> Future:
         future: Future = Future()
         with self._condition:
@@ -645,6 +710,7 @@ class ModelWorkScheduler:
                 for stale in list(self._persistence):
                     if stale.coalesce_key == coalesce_key:
                         self._persistence.remove(stale)
+                        self._persistence_pending_bytes -= stale.pinned_bytes
                         stale.future.cancel()
                         self._persistence_coalesced += 1
             self._sequence += 1
@@ -658,6 +724,7 @@ class ModelWorkScheduler:
                 batch_key=batch_key,
                 earliest_start_s=earliest_start_s,
                 coalesce_key=coalesce_key,
+                pinned_bytes=max(0, int(pinned_bytes or 0)),
             )
             if kind == "foreground":
                 # A request is arriving: its tail postcommit is imminent.
@@ -667,6 +734,8 @@ class ModelWorkScheduler:
                 (self._priority if priority else self._foreground).append(item)
             elif kind == "idle_persistence":
                 self._persistence.append(item)
+                self._persistence_pending_bytes += item.pinned_bytes
+                self._enforce_persistence_budget_locked(keep=item)
             else:
                 self._idle.append(item)
             self._condition.notify_all()
@@ -830,7 +899,9 @@ class ModelWorkScheduler:
                             # Pump-bridged pop: consume one armed slot.
                             self._persistence_pump_budget -= 1
                             self._persistence_pumped += 1
-                        return self._persistence.popleft()
+                        item = self._persistence.popleft()
+                        self._persistence_pending_bytes -= item.pinned_bytes
+                        return item
                     if wait_until is None:
                         wait_until = ready_at
                     else:

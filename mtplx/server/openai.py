@@ -3761,6 +3761,7 @@ class ServerState:
                         job,
                         batch_key="ssd.cold_enqueue",
                         coalesce_key=getattr(job, "coalesce_key", None),
+                        pinned_bytes=int(getattr(job, "pinned_bytes", 0) or 0),
                     )
                 )
             else:
