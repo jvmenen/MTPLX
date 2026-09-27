@@ -1309,8 +1309,8 @@ def test_parity_mode_passes_on_a_wide_toy_every_round():
     # Per-call bit-exactness (eager authoritative, abort on the first
     # mismatch) at a width where TF32 rounding on a tensor-unit GPU does not
     # hide a weight that differs between the two legs: with the toy weights
-    # left lazy (regenerated inside the trace, see ToyHybridRuntime) this
-    # toy's compiled logits were off by up to 5.6 on an M5, while the D=4
+    # left lazy (regenerated inside the trace, see ToyHybridRuntime) the
+    # first round's compiled logits were off by 0.3 on an M5, while the D=4
     # toy still matched there.
     rt = WideToyHybridRuntime()
     bank = CompiledVerifyBank(rt, parity=True)
