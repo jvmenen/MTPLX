@@ -120,6 +120,44 @@ def test_rows_reader_is_the_single_row_reader_bit_for_bit(config, vocab, rows, d
         _assert_same_distribution(batched[index], single)
 
 
+
+@pytest.mark.parametrize(
+    "vocab",
+    [4_096, 4_097, 248_320],
+    ids=["block-kernel-max", "looped-kernel-min", "flash-next-vocab"],
+)
+def test_device_normalizer_of_a_row_does_not_depend_on_the_block_height(vocab):
+    """The rows reader's bit equality rests on one device reduction.
+
+    Everything else in ``_device_serial_support_arrays`` is elementwise, a
+    gather, or a candidate superset whose ties the host resolves exactly; the
+    full-vocabulary ``logsumexp`` normalizer is the only float reduction over
+    a row. MLX picks its kernel by row length alone (the block kernel up to
+    4,096 entries, the looped kernel above) and reduces each row in its own
+    threadgroup (``mlx/backend/metal/logsumexp.cpp``), so a row's normalizer
+    must be the same float whether it is reduced alone or inside a copy
+    block. The heights are the copy lanes' block and verify widths.
+    """
+
+    rng = np.random.default_rng(vocab)
+    logits = rng.normal(size=(25, vocab)) * 3.0
+    logits[3, rng.permutation(vocab)[: vocab // 2]] = -np.inf
+    logits[5, int(rng.integers(vocab))] = 40.0
+    rows = mx.array(logits.astype(np.float32))
+    single = []
+    for index in range(25):
+        value = mx.logsumexp(rows[index : index + 1], axis=-1, keepdims=True)
+        mx.eval(value)
+        single.append(np.asarray(value).reshape(-1)[0])
+    single = np.array(single, dtype=np.float32)
+
+    for height in (2, 8, 9, 12, 13, 16, 17, 24, 25):
+        block = mx.logsumexp(rows[:height], axis=-1, keepdims=True)
+        mx.eval(block)
+        batched = np.asarray(block).reshape(-1)
+        assert batched.dtype == np.float32
+        assert np.array_equal(batched.view(np.uint32), single[:height].view(np.uint32)), height
+
 def test_list_reader_keeps_its_contract():
     rng = np.random.default_rng(7)
     block = mx.array(rng.normal(size=(5, 300)).astype(np.float32))
