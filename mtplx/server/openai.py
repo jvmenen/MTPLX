@@ -18784,9 +18784,13 @@ def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
     try:
         bank = getattr(getattr(state, "sessions", None), "bank", None)
         if bank is not None:
+            # The failing request's own conversation is still in flight here;
+            # its entries are what its retry restores from (the pressure trim
+            # spares them for the same reason).
             receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
                 int(bank.effective_max_bytes()) // 2,
                 reason="allocation_failure",
+                protect_session_ids=_in_flight_session_ids(state),
             )
             receipt["bank_bytes_after"] = int(bank.total_nbytes)
     except Exception as exc:
@@ -21458,6 +21462,17 @@ async def _memory_pressure_loop(
                         if level >= 4
                         else min(int(bank.total_nbytes), int(bank.max_bytes)) // 2
                     )
+                    # Never a conversation that is generating, as in every
+                    # other reclamation step: its entries are what its next
+                    # turn restores from, and a lease's entry holds the very
+                    # cache the request is writing, so taking it gives back
+                    # nothing before the request ends and turns the next turn
+                    # into a cold prefill. The review of 23a94abf: after 60 s
+                    # of WARNING during a generation, an 8 GiB conversation
+                    # in a 16 GiB bank was evicted (half of what the bank
+                    # holds), where the old half-the-budget target took
+                    # nothing. The request's own growth is held by its
+                    # admission, the per-chunk check and the sustained abort.
                     evicted = bank.shrink_to_bytes(
                         target,
                         reason=(
@@ -21465,6 +21480,7 @@ async def _memory_pressure_loop(
                             if level >= 4
                             else "memory_pressure_warning"
                         ),
+                        protect_session_ids=_in_flight_session_ids(state),
                     )
                 if level >= 4:
                     # Under CRITICAL, shedding the buffer pool is not enough:

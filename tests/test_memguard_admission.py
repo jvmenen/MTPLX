@@ -1006,9 +1006,14 @@ class _LoopBank:
         self.total_nbytes = total
         self.max_bytes = max_bytes
         self.calls = []
+        self.protected_sessions = []
 
-    def shrink_to_bytes(self, target, *, reason, protect_active=False):
+    def shrink_to_bytes(
+        self, target, *, reason, protect_active=False, protect_session_ids=None
+    ):
+        # The real bank's keywords: the trim names the sessions generating.
         self.calls.append((target, reason))
+        self.protected_sessions.append(set(protect_session_ids or ()))
         self.total_nbytes = min(self.total_nbytes, target)
         return 1
 
