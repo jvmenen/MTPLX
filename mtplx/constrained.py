@@ -470,37 +470,54 @@ class GrammarConstraint:
         self._matcher = matcher
         self._bitmask = _llg_mlx.allocate_token_bitmask(1, n_vocab)
 
-    def mask_logits_row(self, row: Any) -> Any:
-        """Apply the current-step token mask to a 1-D logits row (mx.array)."""
+    def mask_logits_row(
+        self, row: Any, *, prefix: list[int] | tuple[int, ...] = ()
+    ) -> Any:
+        """Return a masked copy of a 1-D logits row (mx.array).
+
+        The mask is the grammar's at the current step or, with ``prefix``, at
+        the step after those tokens (the bonus row that follows accepted
+        drafts). ``row`` itself is left raw: a row that outlives this request
+        (the next cycle's row, the session bank's final state) must never
+        carry its grammar. The matcher ends where it started.
+        """
         if self._matcher is None:
             self._bind(int(row.shape[-1]))
         if self._matcher.is_stopped():
             return row
+        prefix = [int(t) for t in prefix]
+        if prefix and self._matcher.validate_tokens(prefix) != len(prefix):
+            return row
         started = time.perf_counter()
-        _llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask)
+        if prefix and not self._matcher.consume_tokens(prefix):
+            raise RuntimeError(
+                f"constrained decoding desync on a mask prefix: {self._matcher.get_error()}"
+            )
+        try:
+            _llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask)
+        finally:
+            if prefix and not self._matcher.rollback(len(prefix)):
+                raise RuntimeError("constrained decoding could not roll back a mask prefix")
         masked = _llg_mlx.apply_token_bitmask(row.reshape(1, -1), self._bitmask)
         self.mask_time_s += time.perf_counter() - started
         self.masked_steps += 1
         return masked.reshape(row.shape)
 
-    def mask_window_logits(
-        self,
-        logits: Any,
-        window_tokens: list[int],
-        *,
-        prefix: list[int] | tuple[int, ...] = (),
-    ) -> Any:
-        """Mask each row of a speculative window at its own grammar position.
+    def mask_window_logits(self, logits: Any, window_tokens: list[int]) -> Any:
+        """Return a copy of a speculative window's rows, each masked at its own
+        grammar position.
 
         ``logits`` is ``(1, T, V)``: row ``j`` scores the token after the
-        committed stream, then ``prefix``, then ``window_tokens[:j]``. Every
-        row up to the grammar-legal prefix of the window gets exactly the mask
+        committed stream and ``window_tokens[:j]``. Every row up to the
+        grammar-legal prefix of the window gets exactly the mask
         ``mask_logits_row`` computes at that position, so a verify window
-        accepts, corrects and samples its bonus from the same masked law the
-        AR lane samples each step from. Rows past an illegal window token are
-        returned as they are: the row before them gives that token zero
-        probability, so no window commits past it. The matcher ends where it
-        started (llguidance advances through the window and rolls back).
+        accepts, corrects and samples from the same masked law the AR lane
+        samples each step from. Rows past an illegal window token are copied
+        as they are: the row before them gives that token zero probability, so
+        no window commits past it. ``logits`` itself is left raw (see
+        ``mask_logits_row``); use the copy only to verify and sample. The
+        matcher ends where it started (llguidance advances through the window
+        and rolls back).
         """
         import mlx.core as mx
 
@@ -508,26 +525,15 @@ class GrammarConstraint:
             self._bind(int(logits.shape[-1]))
         if self._matcher.is_stopped():
             return logits
-        prefix = [int(t) for t in prefix]
-        if prefix and self._matcher.validate_tokens(prefix) != len(prefix):
-            return logits
         started = time.perf_counter()
         rows = int(logits.shape[1])
         drafts = [int(t) for t in window_tokens[: max(0, rows - 1)]]
         # One mask row per window position; rows llguidance does not reach
         # (past an illegal token, or after the document ends) stay all-legal.
         bitmask = _llg_mlx.allocate_token_bitmask(len(drafts) + 1, int(logits.shape[-1]))
-        if prefix and not self._matcher.consume_tokens(prefix):
-            raise RuntimeError(
-                f"constrained decoding desync on window prefix: {self._matcher.get_error()}"
-            )
-        try:
-            self._matcher.unsafe_compute_mask_ptr_with_draft_token(
-                bitmask.ctypes.data, bitmask.shape[1] * bitmask.itemsize, drafts
-            )
-        finally:
-            if prefix and not self._matcher.rollback(len(prefix)):
-                raise RuntimeError("constrained decoding could not roll back a window")
+        self._matcher.unsafe_compute_mask_ptr_with_draft_token(
+            bitmask.ctypes.data, bitmask.shape[1] * bitmask.itemsize, drafts
+        )
         head = _llg_mlx.apply_token_bitmask(logits[0, : len(drafts) + 1, :], bitmask)
         masked = (
             mx.concatenate([head[None], logits[:, len(drafts) + 1 :, :]], axis=1)

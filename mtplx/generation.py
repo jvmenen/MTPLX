@@ -12265,14 +12265,19 @@ def generate_mtpk(
                             hidden_variant=base_hidden_variant,
                             capture_backend=verify_core_backend,
                         )
-                if constraint is not None:
-                    # Same per-row mask as the MTP verify window (see there).
-                    _cc_logits = constraint.mask_window_logits(_cc_logits, _cc_block)
+                # Masked copy for acceptance only; the raw rows stay in
+                # _cc_logits for the row kept below (see accept_logits in the
+                # MTP verify window).
+                _cc_accept = (
+                    constraint.mask_window_logits(_cc_logits, _cc_block)
+                    if constraint is not None
+                    else _cc_logits
+                )
                 _cc_t_build = time.perf_counter()
                 if sampler.temperature <= 0:
-                    _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
+                    _cc_g = [int(x) for x in mx.argmax(_cc_accept[0], axis=-1).tolist()]
                 else:
-                    mx.eval(_cc_logits)
+                    mx.eval(_cc_accept)
                 _cc_t_eval = time.perf_counter()
                 elapsed_verify = time.perf_counter() - started_forward
                 verify_forward_time += elapsed_verify
@@ -12299,7 +12304,7 @@ def generate_mtpk(
                     _cc_vocab = int(_cc_logits.shape[-1])
                     for _cc_i, _cc_d in enumerate(_cc_block):
                         _cc_target_p = _distribution_from_mlx_logits(
-                            _cc_logits[0, _cc_i],
+                            _cc_accept[0, _cc_i],
                             sampler,
                             token_counts=None,
                         )
@@ -12580,13 +12585,18 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                     )
                 _note_demotion("copy_round_eager", _COPY_ROUND_EAGER_REASON)
-                if constraint is not None:
-                    # Same per-row mask as the MTP verify window (see there).
-                    _cb_logits = constraint.mask_window_logits(_cb_logits, _cb_block)
+                # Masked copy for acceptance only; the raw rows stay in
+                # _cb_logits for the row kept below (see accept_logits in the
+                # MTP verify window).
+                _cb_accept = (
+                    constraint.mask_window_logits(_cb_logits, _cb_block)
+                    if constraint is not None
+                    else _cb_logits
+                )
                 if sampler.temperature <= 0:
-                    _cb_g = [int(x) for x in mx.argmax(_cb_logits[0], axis=-1).tolist()]
+                    _cb_g = [int(x) for x in mx.argmax(_cb_accept[0], axis=-1).tolist()]
                 else:
-                    mx.eval(_cb_logits)
+                    mx.eval(_cb_accept)
                 elapsed_verify = time.perf_counter() - started_forward
                 # Route Tape: the batched-lane copy block is a verify round like any other;
                 # it carries the block width so the census reads the copy lane's rounds.
@@ -12610,7 +12620,7 @@ def generate_mtpk(
                     _cb_vocab = int(_cb_logits.shape[-1])
                     for _cb_i, _cb_d in enumerate(_cb_block):
                         _cb_target_p = _distribution_from_mlx_logits(
-                            _cb_logits[0, _cb_i],
+                            _cb_accept[0, _cb_i],
                             sampler,
                             token_counts=None,
                         )
@@ -14005,15 +14015,19 @@ def generate_mtpk(
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
+        # The rows the window is verified and sampled against. Under a grammar
+        # constraint each is masked at its own grammar position (as the AR lane
+        # masks each step), so acceptance, residual corrections and the
+        # pre-computed bonus distributions draw from the masked target law at
+        # every drafted position. The mask lives only in this copy:
+        # verify_logits stays the model's raw output, because its rows become
+        # the row kept for the next cycle, the repair rows and the final state
+        # the session bank stores, and one request's grammar must never reach
+        # another request that restores that state.
+        accept_logits = verify_logits
         if constraint is not None:
-            # Mask every verify row at its own grammar position before anything
-            # reads it (argmax, distributions, block verifier, bonus, the row
-            # kept for the next primary): acceptance, residual corrections and
-            # the bonus then draw from the masked target law at every drafted
-            # position, exactly as the AR lane samples each step. The legality
-            # clamps below stay as a backstop.
             started_window_mask = time.perf_counter()
-            verify_logits = constraint.mask_window_logits(
+            accept_logits = constraint.mask_window_logits(
                 verify_logits, draft_tokens[: max(0, int(verified_token_count) - 1)]
             )
             _add_timing(
@@ -14032,7 +14046,7 @@ def generate_mtpk(
                 int(verify_logits.shape[1]),
                 target_distribution_rows_needed,
             )
-            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
+            target_distribution_logits = accept_logits[:, :target_distribution_rows, :]
             started_distribution = time.perf_counter()
             if _steer_active:
                 # Steering on the target_prefix lane (Loop Guard + Thinking
@@ -14098,10 +14112,10 @@ def generate_mtpk(
                 }
             elif captures is not None:
                 verify_eval_timings = _eval_verify_outputs(
-                    verify_logits, verify_hidden, captures
+                    accept_logits, verify_hidden, captures
                 )
             else:
-                verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+                verify_eval_timings = _eval_verify_outputs(accept_logits, verify_hidden)
         elif (
             defer_verify_hidden_eval
             and sampler.temperature > 0
@@ -14115,7 +14129,7 @@ def generate_mtpk(
                 int(verify_logits.shape[1]),
                 target_distribution_rows_needed,
             )
-            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
+            target_distribution_logits = accept_logits[:, :target_distribution_rows, :]
             started_distribution = time.perf_counter()
             if _batch_target_arrays_enabled():
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
@@ -14151,10 +14165,10 @@ def generate_mtpk(
             }
         elif captures is not None:
             verify_eval_timings = _eval_verify_outputs(
-                verify_logits, verify_hidden, captures
+                accept_logits, verify_hidden, captures
             )
         else:
-            verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+            verify_eval_timings = _eval_verify_outputs(accept_logits, verify_hidden)
         elapsed_verify_eval = time.perf_counter() - started_eval
         eval_attributed = sum(float(value) for value in verify_eval_timings.values())
         elapsed_verify_eval_unattributed = max(
@@ -14217,7 +14231,7 @@ def generate_mtpk(
                 int(verify_logits.shape[1]),
                 target_distribution_rows_needed,
             )
-            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
+            target_distribution_logits = accept_logits[:, :target_distribution_rows, :]
             if _batch_target_arrays_enabled():
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
@@ -14302,7 +14316,7 @@ def generate_mtpk(
         # collapses them to a single sync. Guard mirrors the stock branch's
         # own preconditions exactly: penalties and steering fall through to
         # the per-row path (they mutate the row before the argmax), and a
-        # grammar constraint needs no guard: verify_logits rows are already
+        # grammar constraint needs no guard: accept_logits rows are already
         # masked, for this argmax and the stock one alike. _row_guard_overlay is
         # provably None here: it is assigned from _steer_overlay only when
         # _steer_active, which this guard excludes. Exactness rests on MLX
@@ -14321,10 +14335,10 @@ def generate_mtpk(
             and _env_enabled_default_on("MTPLX_BATCHED_GREEDY_ACCEPT")
         ):
             _batched_target_tokens = mx.argmax(
-                verify_logits[0, : len(draft_tokens), :], axis=-1
+                accept_logits[0, : len(draft_tokens), :], axis=-1
             ).tolist()
         for depth_index, draft_token in enumerate(_host_accept_drafts):
-            target_logits_for_draft = verify_logits[:, depth_index, :]
+            target_logits_for_draft = accept_logits[:, depth_index, :]
             if _steer_active:
                 _row_guard_overlay = _steer_overlay(
                     [*tokens, *draft_tokens[:depth_index]]
@@ -14800,12 +14814,6 @@ def generate_mtpk(
                     "lazy_bonus_commit_eval",
                     elapsed_bonus_commit_eval,
                 )
-                if constraint is not None:
-                    # The bonus row of a lazily verified window follows every
-                    # accepted draft; mask it there like the in-window rows.
-                    bonus_commit_logits = constraint.mask_window_logits(
-                        bonus_commit_logits, [], prefix=draft_tokens
-                    )
                 logits, hidden = own_live_logits_hidden(
                     bonus_commit_logits[:, -1, :],
                     bonus_commit_hidden[:, -1:, :],
@@ -14857,10 +14865,19 @@ def generate_mtpk(
                     )
                 else:
                     started_bonus_distribution = time.perf_counter()
+                    bonus_row = logits[0]
+                    if constraint is not None:
+                        # The bonus follows every accepted draft. It is masked
+                        # here, at the draw, and never in `logits`: that row is
+                        # kept for the next cycle and the banked final state,
+                        # and a state rebase above may have just replaced it.
+                        bonus_row = constraint.mask_logits_row(
+                            bonus_row, prefix=draft_tokens
+                        )
                     # all-accept bonus: tokens already includes the committed block,
                     # so Counter(tokens) is the correct prefix for this next token.
                     bonus, _ = _sample_from_logits(
-                        logits[0],
+                        bonus_row,
                         sampler,
                         rng,
                         token_counts=Counter(tokens) if _penalties_active else None,

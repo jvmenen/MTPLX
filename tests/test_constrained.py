@@ -204,23 +204,19 @@ class _EvensOnlyConstraint:
     def _legal(self, token_id: int) -> bool:
         return token_id % 2 == 0 and len(self.advanced) < self.limit
 
-    def mask_logits_row(self, row):
+    def mask_logits_row(self, row, *, prefix=()):
         self.masked_steps += 1
         ids = mx.arange(row.shape[-1])
         legal = (ids % 2) == 0
         return mx.where(legal, row, mx.array(-np.inf, dtype=row.dtype))
 
-    def mask_window_logits(self, logits, window_tokens, *, prefix=()):
+    def mask_window_logits(self, logits, window_tokens):
         """GrammarConstraint.mask_window_logits contract: row j follows
-        prefix + window[:j]; rows up to the legal prefix are masked, rows
-        past an illegal window token are returned as they are."""
-        prefix = [int(t) for t in prefix]
+        window[:j]; rows up to the legal prefix are masked, rows past an
+        illegal window token are copied as they are."""
         window = [int(t) for t in window_tokens[: int(logits.shape[1]) - 1]]
-        self.window_calls.append((prefix, window))
-        legal = self.validate_prefix([*prefix, *window]) - len(prefix)
-        if legal < 0:
-            return logits
-        reach = min(legal, len(window)) + 1
+        self.window_calls.append(([], window))
+        reach = min(self.validate_prefix(window), len(window)) + 1
         self.window_rows_masked.append(reach)
         rows = [
             self.mask_logits_row(logits[0, j]) if j < reach else logits[0, j]
@@ -505,6 +501,345 @@ def test_generate_mtpk_samples_the_ar_masked_law_under_top_k(
     assert abs(mtp.count(6) / draws - expected) < 0.08
     assert abs(ar.count(6) / draws - expected) < 0.08
     assert set(mtp) <= {6, 0} and set(ar) <= {6, 0}
+
+
+# --- a grammar whose state moves with every token; kept and banked rows ------
+
+
+class _MarkovConstraint:
+    """Duck-typed grammar whose legal set changes with every token: after t
+    only (t + 3) % vocab and (t + 7) % vocab are legal (after the prompt, the
+    pair that follows ``start``). A mask computed one position off, or at the
+    committed state instead of after the accepted drafts, is the wrong mask."""
+
+    def __init__(self, vocab: int, start: int, limit: int = 1000):
+        self.vocab = vocab
+        self.start = start
+        self.limit = limit
+        self.advanced: list[int] = []
+        self.masked_steps = 0
+        self.mask_time_s = 0.0
+
+    def legal_after(self, token: int) -> set[int]:
+        return {(token + 3) % self.vocab, (token + 7) % self.vocab}
+
+    def _legal_count(self, history, tokens) -> int:
+        history = list(history)
+        for count, token in enumerate(tokens):
+            last = history[-1] if history else self.start
+            if len(history) >= self.limit or int(token) not in self.legal_after(last):
+                return count
+            history.append(int(token))
+        return len(tokens)
+
+    def _masked(self, row, history):
+        keep = np.zeros(int(row.shape[-1]), dtype=bool)
+        keep[sorted(self.legal_after(history[-1] if history else self.start))] = True
+        return mx.where(mx.array(keep), row, mx.array(-np.inf, dtype=row.dtype))
+
+    def validate_prefix(self, token_ids):
+        return self._legal_count(self.advanced, token_ids)
+
+    def mask_logits_row(self, row, *, prefix=()):
+        prefix = [int(t) for t in prefix]
+        if self._legal_count(self.advanced, prefix) != len(prefix):
+            return row
+        self.masked_steps += 1
+        return self._masked(row, [*self.advanced, *prefix])
+
+    def mask_window_logits(self, logits, window_tokens):
+        window = [int(t) for t in window_tokens[: int(logits.shape[1]) - 1]]
+        reach = self._legal_count(self.advanced, window) + 1
+        self.masked_steps += reach
+        rows = [
+            self._masked(logits[0, j], [*self.advanced, *window[:j]])
+            if j < reach
+            else logits[0, j]
+            for j in range(int(logits.shape[1]))
+        ]
+        return mx.stack(rows)[None]
+
+    def advance(self, token_id: int) -> None:
+        self.advanced.append(int(token_id))
+
+    def advance_many(self, token_ids) -> None:
+        for token in token_ids:
+            self.advance(token)
+
+    @property
+    def stopped(self) -> bool:
+        return len(self.advanced) >= self.limit
+
+    @property
+    def completed(self) -> bool:
+        return self.stopped
+
+
+_MARKOV_VOCAB = 16
+# A +3 cycle. Its continuation is exactly the masked greedy stream below, so
+# the context-copy lanes find prompt matches and propose it as copy blocks.
+_MARKOV_PROMPT = [(3 * i) % _MARKOV_VOCAB for i in range(40)]
+
+
+def _markov_trap_model():
+    """After t the target prefers t + 1 (never legal under _MarkovConstraint),
+    then the legal t + 3, then the legal t + 7. The MTP head drafts t + 3."""
+    v = _MARKOV_VOCAB
+    target = {
+        t: {(t + 1) % v: 10.0, (t + 3) % v: 9.0, (t + 7) % v: 8.0} for t in range(v)
+    }
+    draft = {t: {(t + 3) % v: 10.0} for t in range(v)}
+    return _TrapModel(target, draft, vocab=v)
+
+
+def _markov_constraint():
+    return _MarkovConstraint(_MARKOV_VOCAB, start=_MARKOV_PROMPT[-1])
+
+
+def _clear_decode_env(monkeypatch):
+    # Profile runs earlier in the process leave these in os.environ for real
+    # (see tests/test_context_copy_stats.py::_clean_env).
+    for name in (
+        "MTPLX_CONTEXT_COPY",
+        "MTPLX_CONTEXT_COPY_BATCHED",
+        "MTPLX_CONTEXT_COPY_K",
+        "MTPLX_CONTEXT_COPY_NGMIN",
+        "MTPLX_CONTEXT_COPY_NGMAX",
+        "MTPLX_CONTEXT_COPY_MINEXT",
+        "MTPLX_LAZY_BONUS_VERIFY",
+        "MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH",
+        "MTPLX_STATE_REBASE_EVERY",
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_BATCH_TARGET_DISTS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_OMIT_SPECULATIVE_BONUS",
+        "MTPLX_SKIP_VERIFY_SNAPSHOT",
+        "MTPLX_DROP_EVENTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_constrained_mtp_leaves_raw_logits_for_the_bank_and_an_exact_restore(
+    monkeypatch,
+):
+    """The final state a constrained request files in the session bank must
+    hold the model's raw row: an exact-prefix restore reuses it without a
+    forward, so a masked row would carry this request's grammar into the next
+    one. Here the next request is unconstrained and must pick the model's own
+    favourite, which the grammar had forbidden."""
+    from mtplx.generation import generate_ar, generate_mtpk
+
+    _clear_decode_env(monkeypatch)
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
+    model = _markov_trap_model()
+    greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+    # max_tokens = primary + 3 drafts: the request ends on accepted drafts, so
+    # the kept row is the verify row after the last draft (no bonus drawn).
+    out = generate_mtpk(
+        _trap_runtime(model, mtp=True),
+        list(_MARKOV_PROMPT),
+        max_tokens=4,
+        sampler=greedy,
+        speculative_depth=3,
+        seed=0,
+        stop_token_ids=set(),
+        verify_strategy="capture_commit",
+        constraint=_markov_constraint(),
+        capture_final_state=True,
+    )
+    state = out.final_state
+    assert out.tokens == [8, 11, 14, 1]
+    assert state.safe_to_commit and state.generated_token_ids == tuple(out.tokens)
+    raw_row = np.array(model._logits_for([out.tokens[-1]])[0, -1])
+    assert np.array_equal(np.array(state.final_logits).reshape(-1), raw_row)
+
+    banked_ids = [*_MARKOV_PROMPT, *out.tokens]
+
+    class ExactBank:
+        last_miss_reason = None
+
+        def longest_prefix(self, ids):
+            return SimpleNamespace(prefix_len=len(ids)) if list(ids) == banked_ids else None
+
+        def restore(self, _rt, ids, **_kwargs):
+            if list(ids) != banked_ids:
+                return None
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=len(banked_ids)),
+                cache=state.final_trunk_cache,
+                logits=state.final_logits,
+                hidden=state.final_hidden,
+                mtp_history_cache=state.final_committed_mtp_cache,
+                restore_mode="clone",
+            )
+
+    follow = generate_ar(
+        _trap_runtime(model, mtp=False),
+        banked_ids,
+        max_tokens=1,
+        sampler=greedy,
+        seed=0,
+        stop_token_ids=set(),
+        session_bank=ExactBank(),
+        session_id="after-a-constrained-request",
+    )
+    assert follow.stats.cached_tokens == len(banked_ids)  # restored, no forward
+    assert follow.tokens == [(out.tokens[-1] + 1) % _MARKOV_VOCAB]
+
+
+_MARKOV_PATHS = {
+    "eager_bonus": ({"MTPLX_CONTEXT_COPY": "0"}, "capture_commit", None),
+    "eager_bonus_rebased": (
+        {"MTPLX_CONTEXT_COPY": "0", "MTPLX_STATE_REBASE_EVERY": "1"},
+        "capture_commit",
+        None,
+    ),
+    "lazy_bonus_rebased": (
+        {
+            "MTPLX_CONTEXT_COPY": "0",
+            "MTPLX_LAZY_BONUS_VERIFY": "1",
+            "MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH": "1",
+            "MTPLX_STATE_REBASE_EVERY": "1",
+        },
+        "capture_commit",
+        None,
+    ),
+    "copy_capture_lane": ({}, "capture_commit", None),
+    "copy_batched_lane": (
+        {"MTPLX_CONTEXT_COPY_BATCHED": "1"},
+        "batched",
+        "committed",
+    ),
+}
+
+
+@pytest.mark.parametrize("path", sorted(_MARKOV_PATHS))
+def test_every_mtp_path_masks_at_its_own_grammar_position(monkeypatch, path):
+    """Greedy, so the stream alone cannot show a wrong mask (a rejected draft
+    is resampled from the masked primary). What shows it: every window accepts
+    all of its drafts (each is the masked favourite at its own position), no
+    draft, correction or bonus needs the legality backstop, and no row the
+    request keeps (the final state included) carries a mask."""
+    from mtplx.generation import generate_ar, generate_mtpk
+
+    _clear_decode_env(monkeypatch)
+    env, verify_strategy, history_policy = _MARKOV_PATHS[path]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+    extra = {"mtp_history_policy": history_policy} if history_policy else {}
+    out = generate_mtpk(
+        _trap_runtime(_markov_trap_model(), mtp=True),
+        list(_MARKOV_PROMPT),
+        max_tokens=24,
+        sampler=greedy,
+        speculative_depth=3,
+        seed=0,
+        stop_token_ids=set(),
+        verify_strategy=verify_strategy,
+        constraint=_markov_constraint(),
+        capture_final_state=True,
+        **extra,
+    )
+    ar = generate_ar(
+        _trap_runtime(_markov_trap_model(), mtp=False),
+        list(_MARKOV_PROMPT),
+        max_tokens=24,
+        sampler=greedy,
+        seed=0,
+        stop_token_ids=set(),
+        constraint=_markov_constraint(),
+    )
+    expected = [(3 * i) % _MARKOV_VOCAB for i in range(40, 64)]
+    assert ar.tokens == expected
+    assert out.tokens == expected
+    rounds = [event for event in out.stats.events if event.get("drafts")]
+    for event in rounds:
+        assert event["accepted_depths"] == len(event["drafts"]), event
+        assert not any(d.get("constraint_clamped") for d in event["drafts"])
+        assert not event.get("bonus_token_constraint_skipped")
+    if path.startswith("copy_"):
+        assert out.stats.context_copy_rounds > 0
+        assert (
+            out.stats.context_copy_accepted_tokens
+            == out.stats.context_copy_drafted_tokens
+            > 0
+        )
+    else:
+        assert rounds and out.stats.context_copy_rounds == 0
+    # The variants really took the paths they are named after.
+    assert (out.stats.state_rebase_events > 0) == ("rebased" in path)
+    assert (out.stats.lazy_bonus_verify_calls > 0) == path.startswith("lazy_bonus")
+    assert np.isfinite(np.array(out.final_state.final_logits)).all()
+
+
+_BONUS_LAW_PATHS = {
+    "per_row": {},
+    "batched_arrays": {"MTPLX_BATCH_TARGET_ARRAYS": "1"},
+    "batched_dists": {"MTPLX_BATCH_TARGET_DISTS": "1"},
+    "rebased": {"MTPLX_STATE_REBASE_EVERY": "1"},
+    "lazy_bonus_rebased": {
+        "MTPLX_LAZY_BONUS_VERIFY": "1",
+        "MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH": "1",
+        "MTPLX_STATE_REBASE_EVERY": "1",
+    },
+}
+
+
+@pytest.mark.parametrize("path", sorted(_BONUS_LAW_PATHS))
+def test_generate_mtpk_samples_the_bonus_from_the_ar_masked_law(monkeypatch, path):
+    """The top-k trap of the test above, moved to the bonus position and to a
+    grammar state that changed with every token. Prompt ends in 3; the target
+    is certain of 6, then certain of 9 (the MTP head drafts 9, legal after 6).
+    After 9 it weighs 10 (illegal) 0.50, 12 0.49, 0 0.48, and only {12, 0} is
+    legal: the masked law draws 12 with 0.49/0.97 = 0.505, the unmasked row
+    (a stale or rebased raw `logits`) with 0.750."""
+    from mtplx.generation import generate_ar, generate_mtpk
+
+    _clear_decode_env(monkeypatch)
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
+    for name, value in _BONUS_LAW_PATHS[path].items():
+        monkeypatch.setenv(name, value)
+    target = {
+        3: {6: 30.0},
+        6: {9: 30.0},
+        9: {10: math.log(0.50), 12: math.log(0.49), 0: math.log(0.48)},
+    }
+    draft = {6: {9: 30.0}}
+    sampler = SamplerConfig(temperature=1.0, top_p=1.0, top_k=2)
+    draws = 500
+
+    def third_token(generate, mtp, seed):
+        kwargs = dict(
+            max_tokens=3,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=set(),
+            constraint=_MarkovConstraint(_MARKOV_VOCAB, start=3),
+        )
+        if mtp:
+            kwargs.update(speculative_depth=1, verify_strategy="capture_commit")
+        out = generate(
+            _trap_runtime(_TrapModel(target, draft, vocab=_MARKOV_VOCAB), mtp=mtp),
+            [0, 1, 2, 3],
+            **kwargs,
+        )
+        assert out.tokens[:2] == [6, 9] and out.tokens[2] in {12, 0}, out.tokens
+        if mtp:
+            # The third token is the drawn bonus, on the path under test.
+            assert out.stats.bonus_tokens == 1, out.stats.bonus_tokens
+            assert (out.stats.state_rebase_events > 0) == ("rebased" in path)
+            assert (out.stats.lazy_bonus_verify_calls > 0) == path.startswith("lazy")
+        return out.tokens[2]
+
+    mtp = [third_token(generate_mtpk, True, seed) for seed in range(draws)]
+    expected = 0.49 / 0.97
+    # 500 draws: one standard error is 0.022; the unmasked-row law sits 0.245
+    # away.
+    assert abs(mtp.count(12) / draws - expected) < 0.08
+    if path == "per_row":
+        ar = [third_token(generate_ar, False, seed) for seed in range(draws)]
+        assert abs(ar.count(12) / draws - expected) < 0.08
 
 
 # --- strict tool-call constraint spec (phase 2) -----------------------------
@@ -1092,22 +1427,22 @@ def test_mask_window_logits_masks_each_row_at_its_own_grammar_position():
         assert row_allowed == _allowed_ids(fresh(window[:j])), j
     assert _allowed_ids(fresh(window[:3])) == {vocab["u"]}
     for j in (4, 5):
-        assert np.all(masked[0, j] == 0.0), j  # returned as they were
+        assert np.all(masked[0, j] == 0.0), j  # copied as they were
     assert constraint.masked_steps == steps_before + len(window) + 1
+    # The caller's rows stay raw: the mask lives only in the returned copy.
+    assert np.all(np.array(logits) == 0.0)
     # The matcher is back where it started.
     assert constraint.validate_prefix(window) == 3
     assert _allowed_ids(constraint) == _allowed_ids(fresh())
 
-    # prefix=: one row after an accepted window (the lazy bonus row).
-    bonus = np.array(
-        constraint.mask_window_logits(mx.zeros((1, 1, _N_VOCAB)), [], prefix=window[:3])
-    )
-    assert {int(i) for i in np.flatnonzero(np.isfinite(bonus[0, 0]))} == {vocab["u"]}
+    # mask_logits_row(prefix=): the bonus row after accepted drafts.
+    bonus_row = mx.zeros((_N_VOCAB,))
+    bonus = np.array(constraint.mask_logits_row(bonus_row, prefix=window[:3]))
+    assert {int(i) for i in np.flatnonzero(np.isfinite(bonus))} == {vocab["u"]}
+    assert np.all(np.array(bonus_row) == 0.0)
     assert _allowed_ids(constraint) == _allowed_ids(fresh())
     # An illegal prefix leaves the row alone and the matcher untouched.
-    untouched = np.array(
-        constraint.mask_window_logits(mx.zeros((1, 1, _N_VOCAB)), [], prefix=window)
-    )
+    untouched = np.array(constraint.mask_logits_row(bonus_row, prefix=window))
     assert np.all(untouched == 0.0)
     assert constraint.validate_prefix(window) == 3
 
