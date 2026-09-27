@@ -10,6 +10,7 @@ and public-envelope exposure of the constraint counters.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -197,6 +198,8 @@ class _EvensOnlyConstraint:
         self.advanced: list[int] = []
         self.masked_steps = 0
         self.mask_time_s = 0.0
+        self.window_calls: list[tuple[list[int], list[int]]] = []
+        self.window_rows_masked: list[int] = []
 
     def _legal(self, token_id: int) -> bool:
         return token_id % 2 == 0 and len(self.advanced) < self.limit
@@ -206,6 +209,24 @@ class _EvensOnlyConstraint:
         ids = mx.arange(row.shape[-1])
         legal = (ids % 2) == 0
         return mx.where(legal, row, mx.array(-np.inf, dtype=row.dtype))
+
+    def mask_window_logits(self, logits, window_tokens, *, prefix=()):
+        """GrammarConstraint.mask_window_logits contract: row j follows
+        prefix + window[:j]; rows up to the legal prefix are masked, rows
+        past an illegal window token are returned as they are."""
+        prefix = [int(t) for t in prefix]
+        window = [int(t) for t in window_tokens[: int(logits.shape[1]) - 1]]
+        self.window_calls.append((prefix, window))
+        legal = self.validate_prefix([*prefix, *window]) - len(prefix)
+        if legal < 0:
+            return logits
+        reach = min(legal, len(window)) + 1
+        self.window_rows_masked.append(reach)
+        rows = [
+            self.mask_logits_row(logits[0, j]) if j < reach else logits[0, j]
+            for j in range(int(logits.shape[1]))
+        ]
+        return mx.stack(rows)[None]
 
     def validate_prefix(self, token_ids):
         count = 0
@@ -344,6 +365,146 @@ def test_generate_mtpk_unconstrained_reports_inactive(monkeypatch):
     out = _mtpk_constrained(None, max_tokens=6)
     assert out.stats.constraint_active is False
     assert out.stats.constraint_completed is None
+
+
+class _TrapModel(_MTPScriptedModel):
+    """Target and MTP rows are fixed per last token (``target_rows`` /
+    ``draft_rows``: token -> {id: logit}, everything else -30)."""
+
+    def __init__(self, target_rows, draft_rows, default=None, vocab: int = 8):
+        super().__init__(vocab)
+        self.target_rows = target_rows
+        self.draft_rows = draft_rows
+        self.default = default or {0: 30.0}
+
+    def _rows(self, table, last_tokens):
+        rows = []
+        for token in last_tokens:
+            row = [-30.0] * self.vocab
+            for index, logit in table.get(int(token), self.default).items():
+                row[index] = logit
+            rows.append(row)
+        return mx.array([rows], dtype=mx.float32)
+
+    def _logits_for(self, last_tokens):
+        return self._rows(self.target_rows, last_tokens)
+
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        toks = [int(t) for t in np.asarray(next_token_ids).reshape(-1)]
+        logits = self._rows(self.draft_rows, toks)
+        hidden = mx.zeros((1, len(toks), 2), dtype=mx.float32)
+        return (logits, hidden) if kwargs.get("return_hidden") else logits
+
+
+def _trap_runtime(model, *, mtp: bool) -> MTPLXRuntime:
+    return MTPLXRuntime(
+        model=model,
+        tokenizer=_Tokenizer(),
+        model_path=Path("tiny-constrained-trap"),
+        mtp_enabled=mtp,
+        contract=MTPContract(),
+    )
+
+
+def test_generate_mtpk_masks_every_drafted_position_like_ar(monkeypatch):
+    """#547 shape: at every position the target's unmasked favourite is
+    illegal (odd) and the legal runner-up is exactly what the MTP head drafts.
+    Masking each verify row at its own grammar position accepts those drafts;
+    an unmasked row rejects every one of them. Either way the committed
+    stream must equal the AR lane's masked greedy stream."""
+    from mtplx.generation import generate_ar, generate_mtpk
+
+    monkeypatch.delenv("MTPLX_CONTEXT_COPY", raising=False)
+    vocab = 8
+    target = {t: {(t + 1) % vocab: 10.0, (t + 2) % vocab: 9.0} for t in range(vocab)}
+    draft = {t: {(t + 2) % vocab: 10.0} for t in range(vocab)}
+    greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
+    constraint = _EvensOnlyConstraint(limit=9)
+    out = generate_mtpk(
+        _trap_runtime(_TrapModel(target, draft), mtp=True),
+        [0, 1, 2, 3],
+        max_tokens=20,
+        sampler=greedy,
+        speculative_depth=3,
+        seed=0,
+        stop_token_ids=set(),
+        verify_strategy="capture_commit",
+        constraint=constraint,
+    )
+    ar = generate_ar(
+        _trap_runtime(_TrapModel(target, draft), mtp=False),
+        [0, 1, 2, 3],
+        max_tokens=20,
+        sampler=greedy,
+        seed=0,
+        stop_token_ids=set(),
+        constraint=_EvensOnlyConstraint(limit=9),
+    )
+    assert out.tokens == ar.tokens == [4, 6, 0, 2, 4, 6, 0, 2, 4]
+    rounds = [event for event in out.stats.events if event.get("drafts")]
+    assert rounds
+    drafted = [[int(d["token"]) for d in event["drafts"]] for event in rounds]
+    # Every verify window was masked, at every drafted position.
+    assert constraint.window_calls == [([], window) for window in drafted]
+    assert constraint.window_rows_masked == [len(window) + 1 for window in drafted]
+    # ...so the drafts the masked law picks are accepted, not clamped away.
+    for event, window in zip(rounds, drafted):
+        assert event["accepted_depths"] == len(window)
+        assert not any(d.get("constraint_clamped") for d in event["drafts"])
+
+
+@pytest.mark.parametrize(
+    "target_rows_env",
+    [None, "MTPLX_BATCH_TARGET_ARRAYS", "MTPLX_BATCH_TARGET_DISTS"],
+)
+def test_generate_mtpk_samples_the_ar_masked_law_under_top_k(
+    monkeypatch, target_rows_env
+):
+    """Mask-then-shape vs shape-then-mask. After token 4 the target weighs
+    5 (illegal) 0.50, 6 0.49, 0 0.48. Its unmasked top-2 is {5, 6}; the legal
+    top-2 is {6, 0}, so the AR lane (mask, then top-k) commits 6 with
+    0.49/0.97 = 0.505. The MTP head drafts 6. Verifying against the unmasked
+    shaped row commits 6 with 0.49/0.99 + (0.50/0.99) * 0.505 = 0.750;
+    against the masked row, with 0.505."""
+    from mtplx.generation import generate_ar, generate_mtpk
+
+    monkeypatch.delenv("MTPLX_CONTEXT_COPY", raising=False)
+    for name in ("MTPLX_BATCH_TARGET_ARRAYS", "MTPLX_BATCH_TARGET_DISTS"):
+        monkeypatch.delenv(name, raising=False)
+    if target_rows_env is not None:
+        monkeypatch.setenv(target_rows_env, "1")
+    target = {
+        3: {4: 30.0},
+        4: {5: math.log(0.50), 6: math.log(0.49), 0: math.log(0.48)},
+    }
+    draft = {4: {6: 30.0}}
+    sampler = SamplerConfig(temperature=1.0, top_p=1.0, top_k=2)
+    draws = 600
+
+    def second_token(generate, mtp, seed):
+        kwargs = dict(
+            max_tokens=2,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=set(),
+            constraint=_EvensOnlyConstraint(limit=9),
+        )
+        if mtp:
+            kwargs.update(speculative_depth=1, verify_strategy="capture_commit")
+        out = generate(
+            _trap_runtime(_TrapModel(target, draft), mtp=mtp), [0, 1, 2, 3], **kwargs
+        )
+        assert out.tokens[0] == 4 and out.tokens[1] % 2 == 0, out.tokens
+        return out.tokens[1]
+
+    mtp = [second_token(generate_mtpk, True, seed) for seed in range(draws)]
+    ar = [second_token(generate_ar, False, seed) for seed in range(draws)]
+    expected = 0.49 / 0.97
+    # 600 draws: one standard error is 0.020; the unmasked-row law sits 0.245
+    # away, so the 0.08 band separates the two laws by six errors either side.
+    assert abs(mtp.count(6) / draws - expected) < 0.08
+    assert abs(ar.count(6) / draws - expected) < 0.08
+    assert set(mtp) <= {6, 0} and set(ar) <= {6, 0}
 
 
 # --- strict tool-call constraint spec (phase 2) -----------------------------
@@ -904,6 +1065,51 @@ def test_strict_tool_grammar_keeps_each_tools_key_order():
         allowed = _allowed_ids(constraint)
         assert vocab[first] in allowed
         assert vocab[second] not in allowed
+
+
+def test_mask_window_logits_masks_each_row_at_its_own_grammar_position():
+    hf_tok, vocab = _json_ws_tokenizer()
+    spec = _json_schema_spec(_REPORTER_SCHEMA)
+    head = _ids(
+        hf_tok, '{"task": "t", "status": "completed", "files_changed": [], "tests_run":'
+    )
+
+    def fresh(extra=()):
+        constraint = _bound(spec, hf_tok)
+        constraint.advance_many([*head, *extra])
+        return constraint
+
+    constraint = fresh()
+    # " tr" is legal, then CR is not; the row after CR and beyond is unreachable.
+    window = [vocab["Ġ"], vocab["t"], vocab["r"], vocab["č"], vocab["x"]]
+    assert constraint.validate_prefix(window) == 3
+    steps_before = constraint.masked_steps
+    logits = mx.zeros((1, len(window) + 1, _N_VOCAB))
+    masked = np.array(constraint.mask_window_logits(logits, window))
+    assert masked.shape == (1, len(window) + 1, _N_VOCAB)
+    for j in range(4):
+        row_allowed = {int(i) for i in np.flatnonzero(np.isfinite(masked[0, j]))}
+        assert row_allowed == _allowed_ids(fresh(window[:j])), j
+    assert _allowed_ids(fresh(window[:3])) == {vocab["u"]}
+    for j in (4, 5):
+        assert np.all(masked[0, j] == 0.0), j  # returned as they were
+    assert constraint.masked_steps == steps_before + len(window) + 1
+    # The matcher is back where it started.
+    assert constraint.validate_prefix(window) == 3
+    assert _allowed_ids(constraint) == _allowed_ids(fresh())
+
+    # prefix=: one row after an accepted window (the lazy bonus row).
+    bonus = np.array(
+        constraint.mask_window_logits(mx.zeros((1, 1, _N_VOCAB)), [], prefix=window[:3])
+    )
+    assert {int(i) for i in np.flatnonzero(np.isfinite(bonus[0, 0]))} == {vocab["u"]}
+    assert _allowed_ids(constraint) == _allowed_ids(fresh())
+    # An illegal prefix leaves the row alone and the matcher untouched.
+    untouched = np.array(
+        constraint.mask_window_logits(mx.zeros((1, 1, _N_VOCAB)), [], prefix=window)
+    )
+    assert np.all(untouched == 0.0)
+    assert constraint.validate_prefix(window) == 3
 
 
 @pytest.mark.skipif(

@@ -11875,10 +11875,9 @@ def generate_mtpk(
         if pending_primary is None:
             primary_row = logits[0]
             if constraint is not None:
-                # The one guaranteed-progress mask site: every cycle's fresh
-                # position samples from the constrained target distribution.
-                # Speculative windows are handled by the legality clamp below
-                # instead of per-row masks (see #186 phase 3).
+                # Every cycle's fresh position samples from the constrained
+                # target distribution; the verify window below masks each of
+                # its rows the same way (mask_window_logits).
                 primary_row = constraint.mask_logits_row(primary_row)
             primary, _ = _sample_from_logits(
                 primary_row,
@@ -12266,6 +12265,9 @@ def generate_mtpk(
                             hidden_variant=base_hidden_variant,
                             capture_backend=verify_core_backend,
                         )
+                if constraint is not None:
+                    # Same per-row mask as the MTP verify window (see there).
+                    _cc_logits = constraint.mask_window_logits(_cc_logits, _cc_block)
                 _cc_t_build = time.perf_counter()
                 if sampler.temperature <= 0:
                     _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
@@ -12419,9 +12421,9 @@ def generate_mtpk(
                     constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
                     != len(_cc_acc) + 1
                 ):
-                    # Grammar-illegal residual: drop it; the next cycle's
-                    # masked primary resamples the position, which preserves
-                    # the masked target law exactly.
+                    # Backstop (the copy rows are masked, so the residual is
+                    # legal): drop an illegal one; the next cycle's masked
+                    # primary resamples the position.
                     _cc_correction = None
                 if _cc_correction is not None and not _cc_finished:
                     # Exactness requires the rejected position's token to be
@@ -12578,6 +12580,9 @@ def generate_mtpk(
                         hidden_variant=base_hidden_variant,
                     )
                 _note_demotion("copy_round_eager", _COPY_ROUND_EAGER_REASON)
+                if constraint is not None:
+                    # Same per-row mask as the MTP verify window (see there).
+                    _cb_logits = constraint.mask_window_logits(_cb_logits, _cb_block)
                 if sampler.temperature <= 0:
                     _cb_g = [int(x) for x in mx.argmax(_cb_logits[0], axis=-1).tolist()]
                 else:
@@ -14000,6 +14005,22 @@ def generate_mtpk(
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
+        if constraint is not None:
+            # Mask every verify row at its own grammar position before anything
+            # reads it (argmax, distributions, block verifier, bonus, the row
+            # kept for the next primary): acceptance, residual corrections and
+            # the bonus then draw from the masked target law at every drafted
+            # position, exactly as the AR lane samples each step. The legality
+            # clamps below stay as a backstop.
+            started_window_mask = time.perf_counter()
+            verify_logits = constraint.mask_window_logits(
+                verify_logits, draft_tokens[: max(0, int(verified_token_count) - 1)]
+            )
+            _add_timing(
+                event,
+                "constraint_window_mask",
+                time.perf_counter() - started_window_mask,
+            )
         target_distribution_batch = None
         target_distributions = None
         target_prefix_tokens: list[int] | None = None
@@ -14265,9 +14286,11 @@ def generate_mtpk(
                 ),
             )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
-        # committed window must stop at the grammar's legal prefix. One
-        # stateless validate call per cycle; the matcher itself only advances
-        # through committed tokens at the top-of-cycle sync.
+        # committed window must stop at the grammar's legal prefix. The masked
+        # verify rows already give an illegal draft zero target probability;
+        # the clamp is the backstop. One stateless validate call per cycle;
+        # the matcher itself only advances through committed tokens at the
+        # top-of-cycle sync.
         constraint_legal_prefix = (
             constraint.validate_prefix(list(draft_tokens))
             if constraint is not None
@@ -14278,10 +14301,9 @@ def generate_mtpk(
         # argmax(row).item() host syncs; one 2-D argmax over the draft rows
         # collapses them to a single sync. Guard mirrors the stock branch's
         # own preconditions exactly: penalties and steering fall through to
-        # the per-row path (they mutate the row before the argmax), and the
-        # grammar clamp stays unguarded on purpose — stock's accept argmax
-        # also reads the unmasked row (the clamp applies via
-        # constraint_legal_prefix, not the row). _row_guard_overlay is
+        # the per-row path (they mutate the row before the argmax), and a
+        # grammar constraint needs no guard: verify_logits rows are already
+        # masked, for this argmax and the stock one alike. _row_guard_overlay is
         # provably None here: it is assigned from _steer_overlay only when
         # _steer_active, which this guard excludes. Exactness rests on MLX
         # argmax tie-break identity between the 1-D and 2-D dispatches —
@@ -14464,17 +14486,11 @@ def generate_mtpk(
                 and accepted_now
                 and depth_index >= constraint_legal_prefix
             ):
-                # The model accepted a draft the grammar forbids here; reject
+                # Backstop: the grammar forbids this draft here. Its masked
+                # verify row gives it zero probability, so acceptance cannot
+                # reach this line except through a zero uniform draw; reject
                 # it and let the next cycle's masked primary resample the
-                # position from the constrained distribution. Under pure
-                # temperature sampling the committed law is exactly the
-                # masked target law (Leviathan-Chen telescopes through the
-                # drop-and-resample). Under top-k/top-p the two coincide
-                # except in sub-top-k tail mass: draft-path positions commit
-                # from restrict-then-renormalize of the SHAPED unmasked law,
-                # masked-primary positions from shaping of the MASKED row.
-                # Every committed token is grammar-legal either way; a
-                # verify-row-masked variant would close the tail gap.
+                # position from the constrained distribution.
                 accepted_now = False
                 accept_prob = 0.0
                 event["drafts"][depth_index]["constraint_clamped"] = True
@@ -14558,9 +14574,10 @@ def generate_mtpk(
                 )
                 == depth_index + 1
             ):
-                # A grammar-illegal residual correction is dropped, not
-                # committed; the masked primary resamples the position.
-                # Greedy normally defers the correction to the next cycle's
+                # A residual drawn from a masked row is grammar-legal; the
+                # legality check is the backstop (an illegal one is dropped,
+                # not committed, and the masked primary resamples the
+                # position). Greedy normally defers the correction to the next cycle's
                 # argmax over the retained rejection row, but the compiled
                 # K1 route's fixed cycle geometry commits + repair-forwards
                 # the correction in-cycle, so it must be recorded at any
@@ -14783,6 +14800,12 @@ def generate_mtpk(
                     "lazy_bonus_commit_eval",
                     elapsed_bonus_commit_eval,
                 )
+                if constraint is not None:
+                    # The bonus row of a lazily verified window follows every
+                    # accepted draft; mask it there like the in-window rows.
+                    bonus_commit_logits = constraint.mask_window_logits(
+                        bonus_commit_logits, [], prefix=draft_tokens
+                    )
                 logits, hidden = own_live_logits_hidden(
                     bonus_commit_logits[:, -1, :],
                     bonus_commit_hidden[:, -1:, :],
@@ -14892,7 +14915,8 @@ def generate_mtpk(
                     constraint.validate_prefix([*draft_tokens, int(bonus)])
                     != len(draft_tokens) + 1
                 ):
-                    # Grammar-illegal bonus: skip it (same control path as
+                    # Backstop (the bonus row is masked, so its sample is
+                    # legal): skip an illegal bonus (same control path as
                     # omit_speculative_bonus). `logits` already holds the
                     # bonus-position row, so the next cycle's masked primary
                     # resamples this exact position from the constrained

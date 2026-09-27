@@ -1,10 +1,12 @@
-"""Grammar-constrained decoding (structured output) for the serial AR path.
+"""Grammar-constrained decoding (structured output) for the serial lanes.
 
-Phase 1 of the plan in upstream issue #186: ``response_format`` of type
-``json_object`` / ``json_schema`` is enforced with llguidance token bitmasks
-applied to target logits before sampling, on the serial AR lane only.
-Constrained requests never ride the batched AR pump or the MTP lanes; the
-server pins them to ``generation_mode="ar"`` and bypasses the batch scheduler.
+Issue #186: ``response_format`` of type ``json_object`` / ``json_schema`` (and
+opt-in strict tool calls) is enforced with llguidance token bitmasks applied
+to target logits before sampling. Constrained requests run on the serial AR
+lane and the serial MTP lane and bypass the batched AR pump. The AR lane masks
+each step's row; an MTP verify window masks each of its rows at that row's own
+grammar position (``mask_window_logits``), so both lanes commit every token
+from the same masked law.
 
 llguidance is an optional dependency: requests that do not use
 ``response_format`` never touch it, and requests that do get a clear 400 when
@@ -480,6 +482,61 @@ class GrammarConstraint:
         self.mask_time_s += time.perf_counter() - started
         self.masked_steps += 1
         return masked.reshape(row.shape)
+
+    def mask_window_logits(
+        self,
+        logits: Any,
+        window_tokens: list[int],
+        *,
+        prefix: list[int] | tuple[int, ...] = (),
+    ) -> Any:
+        """Mask each row of a speculative window at its own grammar position.
+
+        ``logits`` is ``(1, T, V)``: row ``j`` scores the token after the
+        committed stream, then ``prefix``, then ``window_tokens[:j]``. Every
+        row up to the grammar-legal prefix of the window gets exactly the mask
+        ``mask_logits_row`` computes at that position, so a verify window
+        accepts, corrects and samples its bonus from the same masked law the
+        AR lane samples each step from. Rows past an illegal window token are
+        returned as they are: the row before them gives that token zero
+        probability, so no window commits past it. The matcher ends where it
+        started (llguidance advances through the window and rolls back).
+        """
+        import mlx.core as mx
+
+        if self._matcher is None:
+            self._bind(int(logits.shape[-1]))
+        if self._matcher.is_stopped():
+            return logits
+        prefix = [int(t) for t in prefix]
+        if prefix and self._matcher.validate_tokens(prefix) != len(prefix):
+            return logits
+        started = time.perf_counter()
+        rows = int(logits.shape[1])
+        drafts = [int(t) for t in window_tokens[: max(0, rows - 1)]]
+        # One mask row per window position; rows llguidance does not reach
+        # (past an illegal token, or after the document ends) stay all-legal.
+        bitmask = _llg_mlx.allocate_token_bitmask(len(drafts) + 1, int(logits.shape[-1]))
+        if prefix and not self._matcher.consume_tokens(prefix):
+            raise RuntimeError(
+                f"constrained decoding desync on window prefix: {self._matcher.get_error()}"
+            )
+        try:
+            self._matcher.unsafe_compute_mask_ptr_with_draft_token(
+                bitmask.ctypes.data, bitmask.shape[1] * bitmask.itemsize, drafts
+            )
+        finally:
+            if prefix and not self._matcher.rollback(len(prefix)):
+                raise RuntimeError("constrained decoding could not roll back a window")
+        head = _llg_mlx.apply_token_bitmask(logits[0, : len(drafts) + 1, :], bitmask)
+        masked = (
+            mx.concatenate([head[None], logits[:, len(drafts) + 1 :, :]], axis=1)
+            if len(drafts) + 1 < rows
+            else head[None]
+        )
+        self.mask_time_s += time.perf_counter() - started
+        self.masked_steps += len(drafts) + 1
+        return masked
 
     def advance(self, token_id: int) -> None:
         if self._matcher is None or self._matcher.is_stopped():
