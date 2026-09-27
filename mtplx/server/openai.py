@@ -7338,7 +7338,14 @@ def _tool_fed_retry_is_parsed_call(
     residue. The retry then re-renders the whole transcript with a nudge
     turn, which moves the scoped-reasoning boundary and re-prefills the
     history (measured 2026-09-26, Qwen3.6-35B-A3B: +10 to +65 s TTFT per
-    tool turn). If the tool parser accepts the text, it is a call.
+    tool turn).
+
+    The tool parser accepting the text is not enough: it recovers what it
+    can and drops the rest, so ``read`` with a closed ``offset`` and an
+    unclosed ``path`` parses as ``read(offset=2)``, and a complete call
+    followed by an unfinished second envelope parses as the first call.
+    Those still get the repair. The markup must also be structurally
+    complete (_tool_fed_call_markup_is_complete).
     """
     if retry_reason != "orphan_tool_control_markup":
         return False
@@ -7350,7 +7357,76 @@ def _tool_fed_retry_is_parsed_call(
     extraction = omlx_extract_tool_calls_with_thinking(
         reasoning_text, content_text, state.runtime.tokenizer, tool_specs
     )
-    return bool(extraction.tool_calls)
+    if not extraction.tool_calls:
+        return False
+    return _tool_fed_call_markup_is_complete(
+        reasoning_text, content_text, call_count=len(extraction.tool_calls)
+    )
+
+
+_TOOL_CALL_ENVELOPE_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_TOOL_CALL_FUNCTION_BODY_RE = re.compile(
+    r'\s*<function(?:=[^>\s]+|\s+name="[^"]+")>(.*?)</function>\s*', re.DOTALL
+)
+_TOOL_CALL_INVOKE_BODY_RE = re.compile(
+    r'\s*<invoke\s+name="[^"]+">(.*?)</invoke>\s*', re.DOTALL
+)
+_TOOL_CALL_PARAMETER_RE = re.compile(
+    r'<parameter(?:=[^>\s]+|\s+name="[^"]+")>(.*?)</parameter>', re.DOTALL
+)
+_TOOL_CALL_CONTROL_TAG_RE = re.compile(
+    r"</?\s*(?:tool_call|function|parameter|invoke)\b[^>]*>", re.IGNORECASE
+)
+
+
+def _tool_fed_call_markup_is_complete(
+    reasoning_text: str, content_text: str, *, call_count: int
+) -> bool:
+    """True when the tool markup is whole calls and nothing else.
+
+    The part that holds the calls (the content, or the reasoning when the
+    content is blank) must be nothing but ``<tool_call>`` envelopes, one per
+    parsed call, and each envelope one ``<function=...>`` or
+    ``<invoke name=...>`` block whose parameters are all opened and closed,
+    with no other tool-control tag inside a value, or a JSON object. The
+    other part must hold no tool-control markup. Any other shape (an
+    orphan parameter, an unfinished envelope, a stray tag, text between the
+    envelopes, another tool dialect) is not proven whole, so the repair
+    runs as it did before this check existed.
+    """
+    if content_text.strip():
+        call_text, other_text = content_text, reasoning_text
+    else:
+        call_text, other_text = reasoning_text, content_text
+    if _has_orphan_tool_control_marker(other_text):
+        return False
+    envelopes = [match.group(1) for match in _TOOL_CALL_ENVELOPE_RE.finditer(call_text)]
+    if not envelopes or len(envelopes) != call_count:
+        return False
+    if _TOOL_CALL_ENVELOPE_RE.sub("", call_text).strip():
+        return False
+    return all(_tool_call_payload_is_complete(payload) for payload in envelopes)
+
+
+def _tool_call_payload_is_complete(payload: str) -> bool:
+    stripped = payload.strip()
+    if stripped.startswith("{"):
+        try:
+            return isinstance(json.loads(stripped), dict)
+        except ValueError:
+            return False
+    body = _TOOL_CALL_FUNCTION_BODY_RE.fullmatch(
+        payload
+    ) or _TOOL_CALL_INVOKE_BODY_RE.fullmatch(payload)
+    if body is None:
+        return False
+    parameters = body.group(1)
+    if _TOOL_CALL_PARAMETER_RE.sub("", parameters).strip():
+        return False
+    return not any(
+        _TOOL_CALL_CONTROL_TAG_RE.search(value.group(1))
+        for value in _TOOL_CALL_PARAMETER_RE.finditer(parameters)
+    )
 
 
 def _initial_orphan_tool_control_state(text: str) -> str:
