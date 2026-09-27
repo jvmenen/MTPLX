@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The reasoning-completion repair continues a retried turn from the retry prompt, and the stream stats account for every pass.** After the tool-fed empty retry, the repair spliced the retry's reasoning tokens onto the request's original prompt, so the model finished its thinking under a context it never saw (no steering turn, earlier turns rendered differently). The retry now hands its prompt to the repair; a repair without a retry is unchanged. When a streamed request runs more than one pass, `mtplx_stats` (and `/v1/mtplx/metrics`) gain `stream_attempts`, `stream_attempts_first_ttft_s` and totals for `prompt_eval_time_s`, `new_prefill_tokens` and `completion_tokens`, and keep the `tool_fed_empty_retry_*` fields after a repair; existing fields keep the last pass's values and single-pass envelopes are unchanged. Checked on Apple M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX-Optimized-Balance, profile turbo, fan mode default, 2026-09-27, base 1de2b1c0: over a 10-turn `/v1/messages` agent loop (10K to 77K tokens, no seed), all 11 repairs restored the full retry prompt from the session bank and prefilled only the new tail, the totals matched the per-pass sums exactly, and at `max_tokens` 48 TTFT per turn stayed level with 2.12.0 on the same workload. `MTPLX_REASONING_REPAIR_FOLLOWS_RETRY_PROMPT=0` restores the old splice.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
