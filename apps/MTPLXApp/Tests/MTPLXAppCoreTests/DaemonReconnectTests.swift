@@ -457,6 +457,39 @@ actor FanCallRecorder {
     }
 }
 
+/// Holds the first call through it until the test opens it; later calls
+/// pass straight through. Put in front of the supervisor's first /health
+/// probe, it suspends a start at its first await, where a Stop can overtake
+/// it.
+actor FirstCallGate {
+    private var used = false
+    private var entered = false
+    private var opened = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var release: CheckedContinuation<Void, Never>?
+
+    func pass() async {
+        guard !used else { return }
+        used = true
+        entered = true
+        enteredWaiters.forEach { $0.resume() }
+        enteredWaiters.removeAll()
+        guard !opened else { return }
+        await withCheckedContinuation { release = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        release?.resume()
+        release = nil
+    }
+}
+
 final class DaemonReconnectTests: XCTestCase {
     override func setUp() {
         super.setUp()
@@ -730,6 +763,107 @@ final class DaemonReconnectTests: XCTestCase {
         try await pollUntil("live stats open") { store.connectionState == .open }
         let logged = await logsMention(store, "joining it")
         XCTAssertTrue(logged, "the Logs window records that the second request joined the first")
+    }
+
+    // MARK: Start after Stop
+
+    /// A store whose first start is suspended in the supervisor's first
+    /// /health probe, before it reserves a process.
+    @MainActor
+    private func storeWithAStartSuspendedInItsFirstProbe() async throws -> (
+        daemon: ReconnectFakeDaemon,
+        store: MTPLXBackendStore,
+        gate: FirstCallGate,
+        first: Task<Void, Never>
+    ) {
+        let daemon = try ReconnectFakeDaemon.make()
+        let gate = FirstCallGate()
+        let supervisor = DaemonSupervisor(initialHealthProbe: { url, apiKey in
+            await gate.pass()
+            return await DaemonSupervisor.defaultHealthProbe(url, apiKey)
+        })
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .default),
+            supervisor: supervisor,
+            fans: FanCallRecorder()
+        )
+        let first = Task { @MainActor in await store.startDaemon() }
+        await gate.waitUntilEntered()
+        XCTAssertEqual(daemon.spawns().count, 0)
+        return (daemon, store, gate, first)
+    }
+
+    /// Stop overtakes a start that is still in its first probe, then Start
+    /// is pressed. The second request must launch: joining the cancelled
+    /// start ended it with that start's cancellation and launched nothing.
+    @MainActor
+    func testStartAfterStopDuringASuspendedStartLaunches() async throws {
+        let (daemon, store, gate, first) = try await storeWithAStartSuspendedInItsFirstProbe()
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.stopDaemon()
+        let second = Task { @MainActor in await store.startDaemon() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await gate.open()
+        await first.value
+        await second.value
+
+        XCTAssertEqual(store.daemonState, .running, "Start after Stop must launch")
+        XCTAssertEqual(store.startupPhase, .ready)
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 1)
+        XCTAssertEqual(store.health?.startup?.launchId, spawns.first?.launchID)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    /// The same through Restart, which is Stop then Start on one task.
+    @MainActor
+    func testRestartDuringASuspendedStartLaunches() async throws {
+        let (daemon, store, gate, first) = try await storeWithAStartSuspendedInItsFirstProbe()
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        let restart = Task { @MainActor in
+            await store.stopDaemon()
+            await store.startDaemon()
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await gate.open()
+        await first.value
+        await restart.value
+
+        XCTAssertEqual(store.daemonState, .running, "Restart during a start must end running")
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 1)
+        XCTAssertEqual(store.health?.startup?.launchId, spawns.first?.launchID)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+    }
+
+    /// The first caller is cancelled (its window closed) while a second
+    /// request waits on the same start. Neither cancels the load.
+    @MainActor
+    func testCancellingTheFirstCallerWhileAnotherJoinsKeepsTheLoad() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        try daemon.setHealthDown(true)
+        let first = Task { @MainActor in await store.startDaemon() }
+        try await pollUntil("daemon launched") { daemon.spawns().count == 1 }
+        let second = Task { @MainActor in await store.startDaemon() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        first.cancel()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        try daemon.setHealthDown(false)
+        await second.value
+        await first.value
+
+        XCTAssertEqual(store.daemonState, .running)
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 1)
+        XCTAssertEqual(store.health?.startup?.pid, spawns.first?.pid)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
     }
 
     // MARK: Closing the window during a model load

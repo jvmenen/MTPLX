@@ -442,7 +442,12 @@ public final class MTPLXBackendStore: ObservableObject {
     /// for the supervisor: the loser used to get `alreadyRunning`, publish
     /// Degraded over the daemon the winner launched, and replace the
     /// winner's launch id so the winner could not finish either.
-    private var runningStart: (id: UUID, task: Task<Void, Never>)?
+    /// `stopGeneration` is the count of Stops and reaps when it began.
+    private var runningStart: (id: UUID, task: Task<Void, Never>, stopGeneration: Int)?
+    /// Bumped by Stop and by the reap path. A start that began under an
+    /// older value has been cancelled, however far it still has to unwind,
+    /// and a later request must not settle for its outcome.
+    private var stopGeneration = 0
     /// The Degraded value a failed configuration change left on screen
     /// while the previous daemon kept serving. A reconnect leaves it in
     /// place so the failed change stays visible; an explicit start clears it.
@@ -959,19 +964,33 @@ public final class MTPLXBackendStore: ObservableObject {
         // can be pressed while a model loads, and Hermes or the benchmark
         // ask for a ready daemon. A start already running owns the outcome;
         // a second request waits for it (#528).
-        if let running = runningStart {
-            // Deciding to join and awaiting must not be split by another
-            // await; the log line goes out on its own task.
+        while let running = runningStart {
+            // Deciding and awaiting must not be split by another await; the
+            // log lines go out on their own tasks.
+            if running.stopGeneration == stopGeneration {
+                Task { [supervisor] in
+                    await supervisor.logs.append(
+                        "start requested while another start is in flight; joining it",
+                        stream: .system
+                    )
+                }
+                await running.task.value
+                return
+            }
+            // A Stop cancelled that start after it began (Restart is Stop
+            // then Start). Joining it would end this request with the
+            // cancelled one and launch nothing, so wait for it to unwind
+            // and then start.
             Task { [supervisor] in
                 await supervisor.logs.append(
-                    "start requested while another start is in flight; joining it",
+                    "start requested after a Stop cancelled the start in flight; starting once it has unwound",
                     stream: .system
                 )
             }
             await running.task.value
-            return
         }
         let id = UUID()
+        let generation = stopGeneration
         // Not a child of the caller's task: cancelling the caller (a closed
         // window) must not cancel the launch. Awaiting the value from a
         // cancelled task still waits for it.
@@ -981,7 +1000,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 runningStart = nil
             }
         }
-        runningStart = (id, task)
+        runningStart = (id, task, generation)
         await task.value
     }
 
@@ -1652,6 +1671,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // This path owns its local client/metrics cleanup. Mark the active
         // lifecycle before asking the supervisor to stop so its terminal
         // snapshot cannot run a duplicate passive cleanup afterward.
+        stopGeneration &+= 1
         let stoppingLifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
         if stoppingLifecycleEpoch > 0 {
             lastTerminalCleanupLifecycleEpoch = max(
@@ -3333,6 +3353,9 @@ public final class MTPLXBackendStore: ObservableObject {
         }
 
         let startupPID = health?.startup?.pid.map(pid_t.init)
+        // The reap stops the supervisor like Stop does; a start request
+        // after it must launch rather than join a start the reap ended.
+        stopGeneration &+= 1
         healthWatchTask?.cancel()
         healthWatchTask = nil
         streamTask?.cancel()
