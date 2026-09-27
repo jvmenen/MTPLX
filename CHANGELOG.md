@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_SSD_INCREMENTAL_ENCODE=1` (opt-in): the SSD cold tier re-encodes only what changed.** Every banked turn re-encoded the whole session for the cold tier on the model-owner thread (eval and host copy of every 256-token KV block), and the writer re-hashed every blob, although only the new tail is new on disk. With the switch on, `put_entry` fingerprints each full KV block (and each whole tensor of at least 1 MiB, such as recurrent boundary states) with one GPU reduction per tensor; a block whose content key (dtype, shape, block start, fingerprint) matches the session's newest completed write references that write's blob digest instead of being captured and hashed. The writer claims referenced digests with the rest and skips the write if one has vanished, so the next turn encodes in full. Payload spec, tensor names, digests and blob bytes are identical to a full encode. Stats: `incremental_encode`, `incremental_encodes`, `incremental_reused_blobs`, `incremental_reused_bytes`, `incremental_missing_blobs`. Default off.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
