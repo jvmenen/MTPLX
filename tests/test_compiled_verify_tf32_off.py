@@ -33,6 +33,7 @@ PARITY_TESTS = (
     "tests/test_qwen4_yarn_amplitude.py",
     "tests/test_qwen4_fixed_m4_verify_exactness.py",
     "tests/test_qwen4_fixed_m4_float32_admission.py",
+    "tests/test_qwen4_rows_gather_scale.py",
 )
 
 

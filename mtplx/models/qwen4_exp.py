@@ -4227,7 +4227,10 @@ def _qsa_rows_gather_attention(
     materialized: q is viewed [1, H_kv, rep, S, 1, D] against
     [1, H_kv, 1, S, D, K]. Invalid slots score -inf before the fp32
     softmax, identical math to the dense bool-mask product over the same
-    visible set.
+    visible set. The float32 scores take the softmax scale from memory, not
+    as a 7-digit constant of a fused kernel (mtplx/float32_operand.py): the
+    shipping head size 256 gives 0.0625, exact either way, but 128 or 32 would
+    not.
     """
     B, H, S, D = q.shape
     H_kv = int(k.shape[1])
@@ -4238,16 +4241,17 @@ def _qsa_rows_gather_attention(
         rep = H // H_kv
         q_view = q.reshape(1, H_kv, rep, S, 1, D)
         k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
-        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
+        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * float32_operand(
+            scale
+        )
         scores = mx.where(token_ok[None, None, None], scores, neg)
         probs = mx.softmax(scores, axis=-1).astype(q.dtype)
         v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
         out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
         return out.reshape(1, H, S, D)
-    scores = (
-        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
-        * scale
-    )
+    scores = mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(
+        mx.float32
+    ) * float32_operand(scale)
     scores = mx.where(token_ok[None, None], scores, neg)
     probs = mx.softmax(scores, axis=-1).astype(q.dtype)
     return mx.matmul(probs[..., None, :], v_sel).squeeze(-2)
