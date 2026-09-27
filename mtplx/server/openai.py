@@ -19396,6 +19396,9 @@ def _block_restorable_prefix_tokens(matched_tokens: int) -> int:
 # The admission bill for a family without a QSA indexer is set against it
 # (``_admission_scratch_bytes``).
 _ADMISSION_FLAT_TRANSIENT_ROWS = 2048
+# The chunk the planner's QSA context transient is calibrated to
+# (memory_plan.qsa_prefill_transient_bytes_per_token_from_config).
+_ADMISSION_PLANNER_TRANSIENT_ROWS = 2048
 
 
 @dataclass(frozen=True)
@@ -19645,6 +19648,28 @@ def _admission_scratch_bytes(
     return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
 
 
+def _admission_context_transient_per_token(
+    geometry: _AdmissionGeometry, *, rows: int, scratch_source: str
+) -> int:
+    """The planner's context transient for one forward of ``rows`` rows.
+
+    The planner's term (the QSA indexer's dense-lane chain, per context
+    token) is calibrated at 2,048 rows, and the itemized QSA bill
+    (``generation._qwen4_wide_prefill_need``) already carries the same
+    intermediates for the rows the forward actually runs: the itemized bill
+    is charged alone, and anything else scales the planner's term to its
+    rows (the review of 9c96dd9c: 12.75 GiB of phantom charge at 131K for a
+    195-token suffix on a Mac without the sparse lane)."""
+
+    if scratch_source == "qsa_itemized":
+        return 0
+    return (
+        max(0, int(geometry.context_transient_bytes_per_token))
+        * max(1, int(rows))
+        // _ADMISSION_PLANNER_TRANSIENT_ROWS
+    )
+
+
 def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
     """Whether restoring from ``entry`` puts a second copy of its prefix in memory.
 
@@ -19716,6 +19741,7 @@ def _admission_growth(
     publish: bool,
     scratch_bytes: int,
     lease: Mapping[str, Any] | None = None,
+    context_transient_bytes_per_token: int | None = None,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -19809,9 +19835,12 @@ def _admission_growth(
         row_width = paged_w
         restore_fixed = 0
         live_prefill = (new_rows + out_rows) * paged_w
-    context_transient = (
-        P * max(0, int(geometry.context_transient_bytes_per_token)) if M > 0 else 0
+    transient_per_token = (
+        geometry.context_transient_bytes_per_token
+        if context_transient_bytes_per_token is None
+        else context_transient_bytes_per_token
     )
+    context_transient = P * max(0, int(transient_per_token)) if M > 0 else 0
     scratch = max(0, int(scratch_bytes))
     prefill_end = live_prefill + context_transient + scratch + lease_transient
     paged_copy = (P + out_rows) * paged_w if repages else 0
@@ -20336,6 +20365,9 @@ def _run_prefill_admission(
         scratch, scratch_source = _admission_scratch_bytes(
             state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=geometry
         )
+        transient_per_token = _admission_context_transient_per_token(
+            geometry, rows=max(1, rows), scratch_source=scratch_source
+        )
         model = _admission_growth(
             geometry,
             prompt_tokens=prompt_tokens,
@@ -20347,6 +20379,7 @@ def _run_prefill_admission(
             publish=publishes(miss),
             scratch_bytes=scratch,
             lease=lease,
+            context_transient_bytes_per_token=transient_per_token,
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
