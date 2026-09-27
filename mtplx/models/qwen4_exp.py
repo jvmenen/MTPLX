@@ -1108,6 +1108,17 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
         )
 
 
+@mx.compile
+def _verify_inject(logits: mx.array, hc_count: int) -> mx.array:
+    # The inject gate as the compiled verifier computes it. Inside a verify
+    # trace the divide, the sigmoid and the multiply fuse into one kernel,
+    # and MLX 0.32.2's fused sigmoid (fast exp) differs from its standalone
+    # kernel (precise exp) at some inputs, in bfloat16 at -6.84375 after the
+    # divide. The eager verify forward runs this same fused expression, the
+    # contract mtplx/attention_math.py sets for the attention output gate.
+    return 2.0 * mx.sigmoid(logits / hc_count)
+
+
 class GatedResidual(nn.Module):
     """The Gated Residual read/write mixer (hyper-connections)."""
 
@@ -1215,7 +1226,11 @@ class GatedResidual(nn.Module):
         mixed_input = mx.mean(mix * grouped, axis=-2)
         if "block_inject_weight" not in self:
             return mixed_input
-        inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
+        logits = self.block_inject_weight(normed)
+        if current_attention_phase() == "decode_verify":
+            inject = _verify_inject(logits, self.hc_count)
+        else:
+            inject = 2.0 * mx.sigmoid(logits / self.hc_count)
         return mixed_input, hyper_input, inject
 
 
@@ -1276,7 +1291,7 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if (
             # Fused verify path (MTPLX_FUSED_MOE_VERIFY=1, dark): the M=2..4
@@ -1317,11 +1332,40 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if _moe_prefill_combine_applies(self, x):
             return self._prefill_call(x)
+        if (
+            current_attention_phase() == "decode_verify"
+            and getattr(self, "sharding_group", None) is None
+        ):
+            return self._verify_call(x)
         return super().__call__(x)
+
+    def _verify_call(self, x: mx.array) -> mx.array:
+        """The parent's forward with the shared-expert gate under the verify
+        gate contract.
+
+        mlx_lm's Qwen3NextSparseMoeBlock computes
+        ``sigmoid(shared_expert_gate(x)) * shared_expert(x)``. Inside the
+        compiled verifier's trace that sigmoid fuses with the multiply and the
+        add, and MLX 0.32.2's fused sigmoid differs from its standalone kernel
+        at some inputs (bfloat16 -6.84375), so the eager verify forward takes
+        the same lowering through attention_gate (mtplx/attention_math.py).
+        Routing and experts are the parent's own ops, in its order.
+        """
+
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
+        return y + shared_y
 
     def _prefill_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the combine tail as one kernel.

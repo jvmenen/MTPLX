@@ -11,6 +11,9 @@ kernels part ways:
 * the attention output gate at -6.84375, where the fused bfloat16 sigmoid
   (fast exp) and the standalone one (precise exp) differ, on the dense-mask
   and the rows-gather lanes;
+* the same value at the two other sigmoids the verify trace fuses: the
+  hyper-connection inject gate (after its divide by hc_count) and the
+  shared-expert gate of the MoE block;
 * a static-YaRN amplitude (factor 4: 0.1 * ln 4 + 1 = 1.1386294), which a
   fused kernel would hold as a 7-significant-digit constant.
 
@@ -29,6 +32,7 @@ import os
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import mlx.utils
 import numpy as np
 import pytest
@@ -176,6 +180,21 @@ def _plant_attention_gate(rt, monkeypatch, value):
     assert planted
 
 
+def _constant_projection(in_dims: int, out_dims: int, value: float) -> nn.Linear:
+    """A bfloat16 projection that outputs ``value`` in every row.
+
+    Zero weight and a bias: the value comes out of the projection's own
+    kernel, so the fused sigmoid downstream reads it from memory, as it reads
+    a real projection's output.
+    """
+
+    projection = nn.Linear(in_dims, out_dims, bias=True)
+    projection.weight = mx.zeros((out_dims, in_dims), dtype=mx.bfloat16)
+    projection.bias = mx.full((out_dims,), value, dtype=mx.bfloat16)
+    mx.eval(projection.parameters())
+    return projection
+
+
 @pytest.mark.parametrize("lane", ["dense-mask", "rows-gather"])
 def test_the_attention_gate_matches_eager_every_round(monkeypatch, lane):
     if lane == "rows-gather":
@@ -183,6 +202,35 @@ def test_the_attention_gate_matches_eager_every_round(monkeypatch, lane):
         monkeypatch.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "1")
     rt = _runtime()
     _plant_attention_gate(rt, monkeypatch, GATE)
+    result = _generate(rt, "parity2", monkeypatch)
+    assert result.stats.fixed_m4_admission["reason"] == "admitted"
+    _assert_every_round_exact(result)
+
+
+@pytest.mark.parametrize("site", ["hyper-connection inject", "shared-expert gate"])
+def test_the_inject_and_shared_expert_gates_match_eager_every_round(monkeypatch, site):
+    rt = _runtime()
+    args = rt.model.language_model.args
+    width = args.hc_count * args.hidden_size
+    planted = 0
+    for layer in rt.model.language_model.model.layers:
+        if site == "shared-expert gate":
+            gate = _constant_projection(args.hidden_size, 1, GATE)
+            monkeypatch.setattr(layer.mlp, "shared_expert_gate", gate)
+            # Zero routed experts: the block's output is the gated shared
+            # expert alone, and a moved gate is not rounded away in the sum.
+            down = layer.mlp.switch_mlp.down_proj
+            zero = mx.zeros_like(down.weight)
+            mx.eval(zero)
+            monkeypatch.setattr(down, "weight", zero)
+            planted += 1
+            continue
+        for connection in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+            # inject = 2 * sigmoid(logits / hc_count): the sigmoid reads GATE.
+            inject = _constant_projection(width, args.hc_count, GATE * args.hc_count)
+            monkeypatch.setattr(connection, "block_inject_weight", inject)
+            planted += 1
+    assert planted
     result = _generate(rt, "parity2", monkeypatch)
     assert result.stats.fixed_m4_admission["reason"] == "admitted"
     _assert_every_round_exact(result)
