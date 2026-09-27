@@ -7,6 +7,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from .attention_context import current_attention_phase
 from .attention_math import attention_gate
 from .rope_origin import (
     cache_owns_rotary_origin,
@@ -20,6 +21,173 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# KV attention diagnostic (issue #526: all-NaN logits under q4/q8 KV with no
+# way to tell from the log which attention route produced them).
+#
+#   MTPLX_KV_ATTENTION_TRACE=1          one line per full-attention call here
+#   MTPLX_KV_ATTENTION_TRACE=nonfinite  every call's output is checked; only
+#                                       non-finite ones print
+#   unset                               no device read and no sync: each layer
+#                                       keeps a host-only record of its latest
+#                                       call, and the server prints the first
+#                                       layer's record when the sampler reports
+#                                       non-finite logits (last_kv_attention_line)
+#
+# Checking an output costs a sync per layer, which is why it is opt-in. A
+# compiled verify call runs this Python body at trace time only, so its line
+# says offset=traced and finite=traced.
+_KV_ATTENTION_LAST: dict[int, tuple[Any, ...]] = {}
+
+
+def _kv_attention_trace_mode() -> str:
+    raw = (os.environ.get("MTPLX_KV_ATTENTION_TRACE") or "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return ""
+    if raw in ("nonfinite", "non_finite", "non-finite"):
+        return "nonfinite"
+    return "all"
+
+
+def _kv_cache_bits(cache: Any) -> int | str:
+    if cache is None:
+        return "-"
+    if getattr(cache, "turboquant", False):
+        return "turboquant"
+    bits = getattr(cache, "kv_bits", None)  # promoted quantized adapter
+    if bits is None and getattr(cache, "kv_quant", False):
+        bits = cache.kv_quant_config.bits  # eager quantized pages
+    return 16 if bits is None else int(bits)
+
+
+def _kv_cache_capacity(cache: Any) -> int | None:
+    if cache is None:
+        return None
+    capacity = getattr(cache, "capacity", None)  # paged caches and adapters
+    if isinstance(capacity, int):
+        return capacity
+    # Plain instance attributes only: on some containers ``keys`` is a
+    # property that dequantizes or concatenates the whole cache.
+    fields = getattr(cache, "__dict__", {})
+    keys = fields.get("keys")
+    if keys is None and isinstance(fields.get("cache"), list) and fields["cache"]:
+        keys = fields["cache"][0]  # tensor-offset adapters: [keys, values, offset]
+    shape = getattr(keys, "shape", None)
+    return int(shape[2]) if shape is not None and len(shape) == 4 else None
+
+
+def _kv_mask_kind(mask: Any) -> str:
+    if mask is None:
+        return "none"
+    if isinstance(mask, str):
+        return mask
+    return "array_" + str(getattr(mask, "dtype", "?")).removeprefix("mlx.core.")
+
+
+def _host_value(value: Any) -> Any:
+    """``value.item()`` eagerly; None while ``mx.compile`` traces (ValueError)."""
+    try:
+        return value.item()
+    except ValueError:
+        return None
+
+
+def _format_kv_attention(record: tuple[Any, ...], *, offset: Any, finite: str) -> str:
+    (layer, phase, cache_name, bits, route, q_dtype, _recorded_offset, capacity,
+     q_len, mask_kind, fallback) = record
+    return (
+        f"mtplx_kv_attention layer={layer} phase={phase} cache={cache_name} "
+        f"bits={bits} route={route} "
+        f"q_dtype={str(q_dtype).removeprefix('mlx.core.')} offset={offset} "
+        f"capacity={'-' if capacity is None else capacity} q_len={q_len} "
+        f"mask={mask_kind} fallback={fallback or '-'} finite={finite}"
+    )
+
+
+def _note_kv_attention(
+    attn: Any,
+    cache: Any,
+    queries: Any,
+    output: Any,
+    mask: Any,
+    route: str,
+    fallback: str,
+) -> None:
+    layer = int(getattr(attn, "_mtplx_full_attention_index", -1))
+    offset = getattr(cache, "offset", None) if cache is not None else None
+    record = (
+        layer,
+        current_attention_phase(),
+        "none" if cache is None else type(cache).__name__,
+        _kv_cache_bits(cache),
+        route,
+        queries.dtype,
+        offset
+        if isinstance(offset, int)
+        else ("array" if isinstance(offset, mx.array) else "-"),
+        _kv_cache_capacity(cache),
+        int(queries.shape[2]),
+        _kv_mask_kind(mask),
+        fallback,
+    )
+    mode = _kv_attention_trace_mode()
+    if not mode:
+        _KV_ATTENTION_LAST[layer] = record
+        return
+    finite = _host_value(mx.all(mx.isfinite(output)))
+    if mode == "nonfinite" and finite is not False:
+        return
+    shown_offset: Any = record[6]
+    if isinstance(offset, mx.array):
+        shown_offset = _host_value(offset)
+        shown_offset = "traced" if shown_offset is None else int(shown_offset)
+    import sys as _sys
+
+    print(
+        _format_kv_attention(
+            record,
+            offset=shown_offset,
+            finite="traced" if finite is None else str(int(bool(finite))),
+        ),
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+def last_kv_attention_line() -> str | None:
+    """The first full-attention layer's latest call, from host data only.
+
+    For the non-finite-logits failure path: no device read, so it is safe
+    after the generation that produced the NaN has unwound. Offsets held in
+    an array (tensor-offset adapters) print as ``array``; rerun with
+    ``MTPLX_KV_ATTENTION_TRACE=nonfinite`` for per-layer values and verdicts.
+    """
+
+    if not _KV_ATTENTION_LAST:
+        return None
+    record = _KV_ATTENTION_LAST[min(_KV_ATTENTION_LAST)]
+    return _format_kv_attention(record, offset=record[6], finite="unchecked")
+
+
+def _paged_route_label(cache: Any) -> str:
+    """Route label for a call the cache's own ``paged_attention`` served."""
+    if getattr(cache, "kv_quant", False):
+        # Eager quantized pages latch one numerics route per request.
+        return "paged_kv_quant_" + str(getattr(cache, "_kv_quant_route", None) or "unlatched")
+    return "paged_kernel"
+
+
+def _paged_decline_label(cache: Any, mask: Any) -> str:
+    """Why ``paged_attention`` returned None (host data only)."""
+    if isinstance(mask, mx.array) and hasattr(cache, "rollback_state"):
+        # Tensor-offset paged adapters build capacity-wide array masks and
+        # their kernels take only causal/None masks.
+        return "array_mask"
+    bailout = getattr(cache, "paged_attention_last_bailout", None)
+    if isinstance(bailout, dict) and bailout.get("reason"):
+        return "last_bailout_" + str(bailout["reason"])
+    return "paged_declined"
 
 
 # F23b (2026-08-16): packed-GQA route declines. Counted only when the lane
@@ -399,6 +567,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and int(queries.shape[2]) > max(1, chunk_size)
             and can_slice_mask
         )
+        route = "sdpa"
+        fallback = ""
         if should_use_vllm_metal_paged:
             impl_override = (
                 "fast_sdpa_gather"
@@ -411,7 +581,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 mask=mask,
                 impl_override=impl_override,
             )
+            route = _paged_route_label(cache)
             if output is None:
+                route = "dense_state_sdpa"
+                fallback = _paged_decline_label(cache, mask)
                 if hasattr(cache, "record_dense_fallback"):
                     cache.record_dense_fallback()
                 elif hasattr(cache, "dense_fallback_calls"):
@@ -470,6 +643,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                         scale=self.scale,
                     )
                 if output is not None:
+                    route = "nax_flash"
                     self._mtplx_nax_flash_calls = (
                         int(getattr(self, "_mtplx_nax_flash_calls", 0)) + 1
                     )
@@ -507,6 +681,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     scale=self.scale,
                 )
                 if output is not None:
+                    route = "nax_tile"
                     self._mtplx_nax_tile_calls = (
                         int(getattr(self, "_mtplx_nax_tile_calls", 0)) + 1
                     )
@@ -517,6 +692,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # from QL7 (QL8 68.6 vs stock 83.7; QL9 with the mixed 4+5 v3
             # tail 61.1 vs stock 83.6, -27%).
             elif gqa_packed_wide and int(queries.shape[2]) >= 7:
+                route = "gqa_packed_grouped"
                 output = sdpa_gqa_packed_tail_grouped(
                     queries=queries,
                     keys=cache.keys,
@@ -525,6 +701,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     scale=self.scale,
                 )
             else:
+                route = "gqa_packed"
                 output = sdpa_gqa_packed_tail(
                     queries=queries,
                     keys=cache.keys,
@@ -563,6 +740,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
                         file=_sys.stderr,
                         flush=True,
                     )
+                route = "sdpa"
+                fallback = "gqa_packed_declined"
                 output = scaled_dot_product_attention(
                     queries,
                     keys,
@@ -582,7 +761,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 mask=mask if isinstance(mask, mx.array) else None,
                 max_q_len=sdpa_2pass_max_q,
             )
+            route = "sdpa_2pass"
             if output is None:
+                route = "sdpa"
+                fallback = "sdpa_2pass_declined"
                 output = scaled_dot_product_attention(
                     queries,
                     keys,
@@ -594,6 +776,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
         elif blockwise_enabled and can_slice_mask:
             from .block_attention import blockwise_attention
 
+            route = "blockwise"
             output = blockwise_attention(
                 queries=queries,
                 cache=cache,
@@ -604,6 +787,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             self._mtplx_split_full_attention_calls = int(
                 getattr(self, "_mtplx_split_full_attention_calls", 0)
             ) + 1
+            route = "split_sdpa"
             output = split_sdpa_output(
                 queries=queries,
                 keys=keys,
@@ -623,6 +807,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 scale=self.scale,
                 mask=mask,
             )
+        _note_kv_attention(self, cache, queries, output, mask, route, fallback)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(attention_gate(output, gate))
 

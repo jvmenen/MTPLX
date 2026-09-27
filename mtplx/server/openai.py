@@ -18627,6 +18627,15 @@ def _non_finite_logits_failure(
         session_id or "-",
         exc,
     )
+    # Which attention route and KV cache served the last full-attention call
+    # (host data recorded at the call site; no device read here).
+    from mtplx.attention_split import last_kv_attention_line
+
+    kv_attention = last_kv_attention_line()
+    if kv_attention is not None:
+        logging.getLogger("mtplx.server").error(
+            "non-finite logits request_id=%s %s", request_id, kv_attention
+        )
     dropped = 0
     if session_id:
         try:
@@ -18642,6 +18651,7 @@ def _non_finite_logits_failure(
             "request_id": request_id,
             "session_id": session_id,
             "detail": str(exc),
+            "kv_attention": kv_attention,
             "bank_entries_dropped": dropped,
         },
     )
