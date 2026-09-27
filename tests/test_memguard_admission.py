@@ -1573,3 +1573,43 @@ class TestValidationTurn:
         )
         override = src.index("prefill_chunk_size_override(prefill_chunk_tokens)")
         assert admitted < narrowed < override
+
+
+class TestRepeatedWarnings:
+    """The review of 9c96dd9c: repeated WARNINGs halve the bank again and
+    again, with no test of when that stops. It stops when the Mac does: one
+    trim per re-arm period (120 s) while the level stays elevated, none once
+    it reads normal, so the bank empties only if the Mac stays short for
+    that many periods."""
+
+    def test_one_trim_per_period_while_short_and_none_after(self):
+        guard = srv._MemoryPressureGuard()
+        trims = [t for t in range(0, 600, 10) if guard.decide(2, float(t), False)]
+        assert trims == [0, 120, 240, 360, 480]
+        # The Mac recovers: no trim, however long it stays normal.
+        assert not any(guard.decide(1, float(t), False) for t in range(600, 1200, 10))
+
+    def test_the_bank_halves_once_per_trim_and_stops_with_the_mac(self, monkeypatch):
+        bank = _LoopBank(total=8 * GIB, max_bytes=16 * GIB)
+        short = [True]
+
+        def reading():
+            available = 5 if short[0] else 40
+            return TestPerChunkSupplyCheck._reading(
+                None,
+                available_gib=available,
+                free_gib=2,
+                compressor_gib=4,
+                at_s=0.0,
+                wired_gib=0,
+            )
+
+        monkeypatch.setattr(sm, "_reader", reading)
+        state = _loop_state(bank)
+        _run_loop(state, monkeypatch, seconds=0.05)
+        assert bank.calls == [(4 * GIB, "memory_pressure_warning")]
+        short[0] = False
+        _run_loop(state, monkeypatch, seconds=0.05)
+        # A fresh loop on a Mac with room trims nothing.
+        assert bank.calls == [(4 * GIB, "memory_pressure_warning")]
+        assert bank.total_nbytes == 4 * GIB
