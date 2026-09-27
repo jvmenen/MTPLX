@@ -1581,6 +1581,56 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.daemonState, .running)
     }
 
+    // MARK: Codex final review, finding 6: the key of the daemon that keeps serving
+
+    /// A change of the API key fails before its restart (the OpenCode
+    /// config write fails), so the running daemon keeps the key it started
+    /// with; the scripted daemon, like `mtplx serve`, read it once and
+    /// requires it on every request. `configuration` holds the new key for
+    /// the next launch. Requests to the running daemon used the new key and
+    /// got 401 under a Running badge; they now carry the daemon's own key.
+    @MainActor
+    func testAFailedKeyChangeKeepsUsingTheKeyTheServingDaemonHas() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let blockedConfig = daemon.root.appendingPathComponent("opencode-blocked", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockedConfig, withIntermediateDirectories: true)
+        var configuration = daemon.configuration(fanMode: .default)
+        configuration.apiKey = "key-the-daemon-started-with"
+        let store = daemon.makeStore(
+            configuration: configuration,
+            fans: FanCallRecorder(),
+            openCodeConfigURL: blockedConfig
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let launched = try XCTUnwrap(store.health?.startup)
+
+        var next = store.configuration
+        next.apiKey = "a-new-key"
+        next.lastLaunchTarget = LaunchTarget.openCode.rawValue
+        do {
+            try await store.applyConfiguration(next, restartIfRunning: true)
+            XCTFail("the OpenCode config write was expected to fail")
+        } catch {
+            // Settings shows "Apply failed" with this error.
+        }
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertNotNil(store.configurationChangeFailure)
+        XCTAssertEqual(store.configuration.apiKey, "a-new-key", "the saved change is kept for the next launch")
+        XCTAssertEqual(store.activeAPIKey, "key-the-daemon-started-with")
+        let answer = try await store.apiClient.health()
+        XCTAssertEqual(answer.startup?.launchId, launched.launchId, "requests still reach the serving daemon")
+        await store.refresh()
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(store.health?.startup?.launchId, launched.launchId)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+        XCTAssertEqual(daemon.spawns().count, 1)
+    }
+
     // MARK: Closing the window during a model load
 
     /// Closing the main window cancels its launch task. The start runs on a

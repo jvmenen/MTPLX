@@ -1707,7 +1707,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the API key in browser history, so the open path below asks the
     /// daemon for a one-time ticket first and uses this when it cannot.
     private func authenticatedBrowserURL(nextPath: String, fallback: URL) -> URL {
-        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+        guard let apiKey = activeAPIKey, !apiKey.isEmpty else {
             return fallback
         }
         let authURL = baseURL
@@ -1732,7 +1732,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the button never goes dead.
     func browserURL(nextPath: String, plain: URL) async -> URL {
         let fallback = authenticatedBrowserURL(nextPath: nextPath, fallback: plain)
-        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+        guard let apiKey = activeAPIKey, !apiKey.isEmpty else {
             return plain
         }
         let client = browserAuthSession.map { MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: $0) }
@@ -3368,7 +3368,7 @@ public final class MTPLXBackendStore: ObservableObject {
         guard stateBefore != .stopping else { return }
         let probeClient = MTPLXAPIClient.livenessProbe(
             baseURL: held.baseURL,
-            apiKey: configuration.apiKey
+            apiKey: activeAPIKey
         )
         let answer = await probeClient.livenessWithinDeadline(
             seconds: Self.watchdogProbeDeadlineSeconds
@@ -3509,7 +3509,7 @@ public final class MTPLXBackendStore: ObservableObject {
         let watchdogTransportGeneration = daemonTransportGeneration
         let probeClient = MTPLXAPIClient.livenessProbe(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: activeAPIKey
         )
         healthWatchTask = Task { @MainActor [weak self] in
             defer { probeClient.session.finishTasksAndInvalidate() }
@@ -4837,7 +4837,20 @@ public final class MTPLXBackendStore: ObservableObject {
     /// can stay in sync with port / API-key changes without holding a
     /// stale reference.
     public var apiClient: MTPLXAPIClient {
-        MTPLXAPIClient(baseURL: baseURL, apiKey: configuration.apiKey)
+        MTPLXAPIClient(baseURL: baseURL, apiKey: activeAPIKey)
+    }
+
+    /// The API key requests to the running daemon carry: the one it was
+    /// launched or adopted with while a daemon is held, else the configured
+    /// one (#528). A configuration change that failed before its restart
+    /// left the new key in `configuration` while the old daemon kept the
+    /// old one, and every request, the chat included, got 401 under a
+    /// Running badge.
+    public var activeAPIKey: String? {
+        if let connection = supervisor.activeConnection() {
+            return connection.apiKey
+        }
+        return configuration.apiKey
     }
 
     /// Connectable daemon base URL. The configured host is a BIND address;

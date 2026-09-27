@@ -180,6 +180,10 @@ public final class DaemonSupervisor: @unchecked Sendable {
     /// Where the held daemon's health was verified: the owned launch's
     /// health URL or the adopted daemon's. Read only while a daemon is held.
     private var heldBaseURL: URL?
+    /// The API key the held daemon was launched or adopted with (#528). A
+    /// daemon reads its key once at startup, so a key changed in settings
+    /// since then is not the key it accepts.
+    private var heldAPIKey: String?
     private let logStore: BoundedLogStore
     /// Where a failed start's output is written (#504). `nil` writes nothing:
     /// the default, so a test that fails a launch never touches the real home.
@@ -428,11 +432,19 @@ public final class DaemonSupervisor: @unchecked Sendable {
     /// (#503) or settings reloaded from disk change where the next launch
     /// listens, not where the running one does.
     public func activeBaseURL() -> URL? {
+        activeConnection()?.baseURL
+    }
+
+    /// Where the held daemon listens and the API key it was launched or
+    /// adopted with, or `nil` when the supervisor holds none (#528). Both
+    /// belong to the daemon, not to the settings: the settings describe the
+    /// next launch, and the running daemon read its key once at startup.
+    public func activeConnection() -> (baseURL: URL, apiKey: String?)? {
         lock.withLock {
-            guard process != nil || adoptedProcessID != nil || launchInProgress else {
-                return nil
-            }
-            return heldBaseURL
+            guard process != nil || adoptedProcessID != nil || launchInProgress,
+                  let heldBaseURL
+            else { return nil }
+            return (heldBaseURL, heldAPIKey)
         }
     }
 
@@ -585,6 +597,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 guard adoptCurrentLaunch(
                     existing,
                     healthBaseURL: healthBaseURL,
+                    apiKey: apiKey,
                     generation: launchGeneration,
                     lifecycleEpoch: launchLifecycleEpoch,
                     automaticAttempt: automaticAttempt
@@ -648,6 +661,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             adoptedLaunchID = nil
             ownedLaunchID = launchIdentifier(from: command)
             heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             launchInProgress = true
             // A Process has been reserved but does not have a usable PID until
             // run() returns. Keep the public phase at .starting through that
@@ -1129,6 +1143,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private func adoptCurrentLaunch(
         _ health: HealthPayload,
         healthBaseURL: URL,
+        apiKey: String?,
         generation: Int,
         lifecycleEpoch: Int,
         automaticAttempt: Int?
@@ -1144,6 +1159,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             adoptedProcessID = pid
             adoptedLaunchID = health.startup?.launchId
             heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             lastOwnedLaunch = nil
             automaticRestartEligible = false
             restartStatus = .idle
@@ -1222,6 +1238,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         guard adoptCurrentLaunch(
             existing,
             healthBaseURL: healthBaseURL,
+            apiKey: apiKey,
             generation: adoptionGeneration,
             lifecycleEpoch: adoptionLifecycleEpoch,
             automaticAttempt: nil
