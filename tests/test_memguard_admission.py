@@ -103,17 +103,47 @@ def _served_profile(monkeypatch):
 
 class _Machine:
     """MLX's allocator account and the process footprint, as the guard reads
-    them: active = a fixed base plus what the bank holds; clearing the cache
-    empties the allocator pool; the footprint adds host memory outside MLX."""
+    them: active = a fixed base, plus what the bank holds, plus what queued
+    idle-lane jobs still hold (``lane``); clearing the cache empties the
+    allocator pool; the footprint adds host memory outside MLX.
 
-    def __init__(self, bank, *, base_gib: float, cache_gib: float, host_gib: float):
+    The queued part is the review of 9c96dd9c: a queued settle or SSD encode
+    keeps its entry's arrays until the job runs or is cancelled, so an entry
+    evicted from the bank with its job still queued frees nothing. Counting
+    only the bank's entries hid that."""
+
+    def __init__(
+        self,
+        bank,
+        *,
+        base_gib: float,
+        cache_gib: float,
+        host_gib: float,
+        lane=None,
+    ):
         self.bank = bank
         self.base = int(base_gib * GIB)
         self.cache = int(cache_gib * GIB)
         self.host = int(host_gib * GIB)
+        self.lane = lane
+
+    def queued(self) -> int:
+        """Snapshots out of the bank that a queued job still holds."""
+
+        if self.lane is None:
+            return 0
+        held: dict[int, int] = {}
+        for key, ref in list(getattr(self.bank, "_persistence_pending", {}).items()):
+            entry = ref()
+            if entry is None or key not in self.lane.pending:
+                continue
+            if self.bank._entries.get(entry.token_ids) is entry:
+                continue
+            held[id(entry)] = int(entry.nbytes)
+        return sum(held.values())
 
     def active(self) -> int:
-        return self.base + int(self.bank.total_nbytes)
+        return self.base + int(self.bank.total_nbytes) + self.queued()
 
     def stats(self) -> dict:
         return {
@@ -275,7 +305,10 @@ class TestJulianCompaction:
     def test_a_host_leak_is_named_in_the_refusal(self, monkeypatch):
         """14.8 GiB outside MLX (the report's #546 figure): 6.8 GiB past the
         allowance is charged. The conversation is released and the prompt
-        still does not fit; the refusal says a restart is what frees it."""
+        still does not fit; the refusal says that memory has to come down
+        (queued writes finishing, or a restart), not that only a restart
+        frees it (the review of 9c96dd9c: queued encodes hold host memory
+        too)."""
 
         manager, incoming, machine = self._setup(monkeypatch, host_gib=14.8)
         state = _flash_next_state(manager)
@@ -292,7 +325,7 @@ class TestJulianCompaction:
         assert receipt["refusal_reason"] == "projected_over_limit_after_reclamation"
         assert receipt["host_overhang_charged_bytes_after"] == int(6.8 * GIB)
         assert receipt["retry_can_succeed"] is False
-        assert receipt["retry_when"] == "after_engine_restart"
+        assert receipt["retry_when"] == "after_host_memory_returns"
         assert not manager.bank.has_session_entries("anon-conv")
 
     def test_a_conversation_in_flight_is_kept_and_the_507_says_so(self, monkeypatch):

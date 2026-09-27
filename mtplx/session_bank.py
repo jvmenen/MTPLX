@@ -2440,18 +2440,19 @@ class SessionBank:
                     }
                 )
 
-        job = _settle_job
         # Newest-wins per session: settling a superseded entry's snapshot
         # is pure waste, and the key namespace is disjoint from the SSD
         # encode's so a settle never coalesces away a persist (or vice
-        # versa).
-        job.coalesce_key = (
+        # versa). Filed through the pending map like the encode: a queued
+        # settle holds its entry's arrays too, and an eviction under memory
+        # pressure must be able to find and cancel it.
+        settle_key = (
             f"snapshot_settle:{entry.session_id}"
             if entry.session_id
             else f"snapshot_settle:hash:{entry.token_hash}"
         )
         try:
-            dispatch(job)
+            self._dispatch_persistence(entry, _settle_job, key=settle_key)
             if timing_out is not None:
                 timing_out["snapshot_settle"] = {"dispatched": True}
         except BaseException as exc:
@@ -3218,6 +3219,7 @@ class SessionBank:
         protect_active: bool = False,
         protect_keys: Any = None,
         protect_session_ids: Any = None,
+        cancel_queued_persistence: bool = True,
     ) -> int:
         """Evict least-recently-used entries until the bank fits the target.
 
@@ -3241,6 +3243,12 @@ class SessionBank:
         pin only the incoming session, and evicted another idle session's
         entry that was this prompt's restore source (the review of
         9c96dd9c).
+
+        Every caller shrinks to give memory back (the pressure loop's trims,
+        the dynamic ceiling, the allocation-failure shed, the admission), so
+        each evicted entry's own queued settle and SSD encode are cancelled
+        with it (``_evict_entry``); ``cancel_queued_persistence=False`` keeps
+        them.
         """
 
         evicted = 0
@@ -3278,7 +3286,11 @@ class SessionBank:
                 ),
             )
             before = len(self._entries)
-            self._evict_entry(victim, reason=reason)
+            self._evict_entry(
+                victim,
+                reason=reason,
+                cancel_queued_persistence=cancel_queued_persistence,
+            )
             if len(self._entries) >= before:
                 # Defensive: an entry whose dict key drifted from its
                 # token_ids would make this loop spin forever while
@@ -3477,14 +3489,19 @@ class SessionBank:
         return sorted(rows.values(), key=lambda row: -int(row["held_bytes"]))
 
     def _dispatch_persistence(
-        self, entry: SessionBankEntry, body: Callable[[], Any]
+        self,
+        entry: SessionBankEntry,
+        body: Callable[[], Any],
+        *,
+        key: str | None = None,
     ) -> None:
-        """File one idle-lane persistence job for ``entry`` (raises what the
-        dispatcher raises). The job is keyed by ``cold_persistence_key``, so
-        the dispatcher keeps only the newest per session, and the pending
-        map records which entry that newest job is for."""
+        """File one idle-lane job for ``entry`` (raises what the dispatcher
+        raises): its SSD encode, keyed by ``cold_persistence_key``, or its
+        snapshot settle (``key``). The dispatcher keeps only the newest per
+        key, and the pending map records which entry that newest job is
+        for: every queued job holds its entry's arrays until it runs."""
 
-        key = cold_persistence_key(entry)
+        key = cold_persistence_key(entry) if key is None else str(key)
         # A weak reference: the map must not pin what the job itself does
         # not (a lease spill job carries only token ids and an epoch).
         entry_ref = weakref.ref(entry)
@@ -3540,19 +3557,102 @@ class SessionBank:
         return cancelled, keys
 
     def cancel_session_persistence(self, session_id: str | None) -> int:
-        """Cancel the queued SSD encode filed under ``session_id``'s key when
-        that session's entries are gone from RAM (the superseded clear): a
-        queued job holds its entry's arrays until it runs."""
+        """Cancel the queued jobs (settle and SSD encode) of ``session_id``'s
+        entries that are gone from RAM (the superseded clear): a queued job
+        holds its entry's arrays until it runs."""
 
         if not session_id:
             return 0
-        key = f"ssd_cold:{session_id}"
-        entry_ref = self._persistence_pending.get(key)
-        entry = entry_ref() if entry_ref is not None else None
-        if entry is None or self._entries.get(entry.token_ids) is entry:
+        released = {
+            id(row["entry"])
+            for row in self._queued_holders()
+            if row["entry"].session_id == session_id
+        }
+        if not released:
             return 0
-        cancelled, _keys = self._cancel_queued_persistence({id(entry)})
+        cancelled, _keys = self._cancel_queued_persistence(released)
         return cancelled
+
+    def _queued_holders(self) -> list[dict[str, Any]]:
+        """Entries out of RAM that a queued job still holds, one row each."""
+
+        rows: dict[int, dict[str, Any]] = {}
+        for key, entry_ref in list(self._persistence_pending.items()):
+            entry = entry_ref()
+            if entry is None or self._entries.get(entry.token_ids) is entry:
+                continue
+            row = rows.setdefault(id(entry), {"entry": entry, "keys": []})
+            row["keys"].append(key)
+        return list(rows.values())
+
+    def queued_persistence(self) -> list[dict[str, Any]]:
+        """What queued jobs hold for entries no longer in RAM: an entry an
+        eviction kept the SSD encode of (budget, supersede), until the idle
+        lane runs it. The snapshot's own bytes; a lazy view can pin a larger
+        live buffer, which the admission's measurement sees."""
+
+        return [
+            {
+                "session_id": row["entry"].session_id,
+                "prefix_len": int(row["entry"].prefix_len),
+                "nbytes": int(row["entry"].nbytes),
+                "keys": sorted(row["keys"]),
+                "last_access_s": float(row["entry"].last_access_s),
+            }
+            for row in self._queued_holders()
+        ]
+
+    @property
+    def queued_persistence_bytes(self) -> int:
+        return int(sum(row["nbytes"] for row in self.queued_persistence()))
+
+    def cancel_queued_persistence(
+        self,
+        target_bytes: int | None = None,
+        *,
+        keep_session_ids: Any = (),
+        reason: str = "queued_persistence_release",
+    ) -> dict[str, Any]:
+        """Cancel queued jobs that hold entries already out of RAM, least
+        recently used first, until ``target_bytes`` of snapshots are let go
+        (all of them for None), never a session in ``keep_session_ids``.
+        Each costs that entry's SSD copy: it was no longer in RAM, and its
+        encode had not run. Returns what was cancelled."""
+
+        kept = {str(sid) for sid in (keep_session_ids or ()) if sid}
+        target = None if target_bytes is None else max(0, int(target_bytes))
+        rows = [
+            row
+            for row in self._queued_holders()
+            if not (row["entry"].session_id and row["entry"].session_id in kept)
+        ]
+        rows.sort(key=lambda row: float(row["entry"].last_access_s))
+        released: set[int] = set()
+        freed = 0
+        sessions: list[str | None] = []
+        for row in rows:
+            if target is not None and freed >= target:
+                break
+            released.add(id(row["entry"]))
+            freed += int(row["entry"].nbytes)
+            sessions.append(row["entry"].session_id)
+        cancelled, keys = self._cancel_queued_persistence(released)
+        if released:
+            self.eviction_log.append(
+                {
+                    "reason": reason,
+                    "entries": len(released),
+                    "held_bytes": int(freed),
+                    "persistence_cancelled": int(cancelled),
+                }
+            )
+        return {
+            "entries": len(released),
+            "held_bytes": int(freed),
+            "persistence_cancelled": int(cancelled),
+            "keys": sorted(keys),
+            "sessions": sessions[:16],
+        }
 
     def entry_is_durable(self, entry: SessionBankEntry) -> bool:
         """Whether the cold tier has PUBLISHED this entry (its manifest row
@@ -3630,6 +3730,19 @@ class SessionBank:
             if only is not None and entry.session_id not in only:
                 continue
             groups.setdefault(group_of(entry), []).append(entry)
+        # A session's entries out of RAM whose queued settle or SSD encode
+        # still holds their arrays: found by the queue, not by the bank's
+        # entries (the review of 9c96dd9c: after a chain walk the bank was
+        # empty, the encode stayed queued and its snapshot resident).
+        queued: dict[str, list[SessionBankEntry]] = {}
+        for row in self._queued_holders():
+            entry = row["entry"]
+            if entry.session_id and entry.session_id in kept:
+                continue
+            if only is not None and entry.session_id not in only:
+                continue
+            queued.setdefault(group_of(entry), []).append(entry)
+            groups.setdefault(group_of(entry), [])
         durable = {
             id(entry): self.entry_is_durable(entry)
             for members in groups.values()
@@ -3638,8 +3751,14 @@ class SessionBank:
 
         def order_key(group: str) -> tuple[bool, float]:
             members = [e for e in groups[group] if e.token_ids not in protected_keys]
-            all_durable = all(durable[id(e)] for e in members)
-            last = max(float(e.last_access_s) for e in groups[group])
+            all_durable = bool(members) and all(durable[id(e)] for e in members)
+            if queued.get(group):
+                # Its queued writes have not run: nothing of it is on disk yet.
+                all_durable = False
+            last = max(
+                float(e.last_access_s)
+                for e in list(groups[group]) + list(queued.get(group, ()))
+            )
             return (not all_durable, last)
 
         released_bytes = 0
@@ -3656,9 +3775,10 @@ class SessionBank:
                 if entry.token_ids not in protected_keys
                 and self._entries.get(entry.token_ids) is entry
             ]
-            if not members:
+            held_by_queue = list(queued.get(group, ()))
+            if not members and not held_by_queue:
                 continue
-            session_id = members[0].session_id
+            session_id = (members or held_by_queue)[0].session_id
             releaser = None
             if hold_session is not None and session_id:
                 releaser = hold_session(str(session_id))
@@ -3678,7 +3798,15 @@ class SessionBank:
                     "kept_restore_sources": sum(
                         1 for entry in groups[group] if entry.token_ids in protected_keys
                     ),
+                    "queued_persistence_entries": len(held_by_queue),
+                    "queued_persistence_bytes": 0,
                 }
+                for entry in held_by_queue:
+                    # Out of RAM already; cancelling its queued jobs (below,
+                    # with the released entries') is what frees its arrays.
+                    released_ids.add(id(entry))
+                    row["queued_persistence_bytes"] += int(entry.nbytes)
+                    released_bytes += int(entry.nbytes)
                 for entry in members:
                     if self._entries.get(entry.token_ids) is not entry:
                         continue
@@ -3749,6 +3877,12 @@ class SessionBank:
         return {
             "sessions": sorted(rows, key=lambda row: -int(row["held_bytes"])),
             "entries": int(sum(row["entries"] for row in rows)),
+            "queued_persistence_entries": int(
+                sum(row["queued_persistence_entries"] for row in rows)
+            ),
+            "queued_persistence_bytes": int(
+                sum(row["queued_persistence_bytes"] for row in rows)
+            ),
             "held_bytes": int(released_bytes),
             "dropped_entries": int(sum(row["dropped_entries"] for row in rows)),
             "persistence_cancelled": int(persistence_cancelled),
@@ -3810,7 +3944,7 @@ class SessionBank:
                     break
                 victim = min(candidates, key=order_key)
                 before = len(self._entries)
-                self._evict_entry(victim, reason=reason)
+                self._evict_entry(victim, reason=reason, cancel_queued_persistence=True)
                 if len(self._entries) >= before:
                     break
                 evicted += 1
@@ -3880,7 +4014,22 @@ class SessionBank:
         )
         return non_terminal, terminal_evicted
 
-    def _evict_entry(self, entry: SessionBankEntry, *, reason: str) -> None:
+    def _evict_entry(
+        self,
+        entry: SessionBankEntry,
+        *,
+        reason: str,
+        cancel_queued_persistence: bool = False,
+    ) -> None:
+        """Take ``entry`` out of RAM. With ``cancel_queued_persistence`` (the
+        memory-pressure paths) its own queued settle and SSD encode go too:
+        a queued job holds the entry's arrays until the idle lane runs it,
+        which it does not while the engine is busy, so an eviction that
+        leaves the job frees nothing (the review of 9c96dd9c: after a chain
+        walk the bank was empty and the snapshot still resident). Budget and
+        supersede evictions keep the job so the SSD tier still gets the
+        entry; ``queued_persistence`` accounts for what those jobs hold."""
+
         entry.eviction_reason = reason
         # Read before the references go: this is what the eviction gives back.
         held_nbytes = int(entry.held_nbytes)
@@ -3893,6 +4042,9 @@ class SessionBank:
         # object can outlive the dict (a finished request's outcome points at
         # it). Without this an "evicted" lease kept its paged KV allocated.
         entry.release_live_refs()
+        persistence_cancelled = 0
+        if cancel_queued_persistence:
+            persistence_cancelled, _keys = self._cancel_queued_persistence({id(entry)})
         self.eviction_log.append(
             {
                 "reason": reason,
@@ -3903,6 +4055,7 @@ class SessionBank:
                 "held_nbytes": held_nbytes,
                 "live_ref_only": bool(entry.live_ref_only),
                 "last_access_s": entry.last_access_s,
+                "persistence_cancelled": int(persistence_cancelled),
                 "session_active": bool(
                     entry.session_id
                     and entry.session_id in self._active_session_ids()

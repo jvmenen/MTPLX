@@ -253,7 +253,10 @@ def test_a_leak_on_a_48gb_seat_is_charged_not_forgiven(monkeypatch):
     assert receipt is not None
     assert receipt["host_overhang_charged_bytes"] == 7 * GIB
     assert receipt["refused"] is True
-    assert receipt["retry_when"] == "after_engine_restart"
+    # Memory outside MLX shrinks as queued writes finish and all of it
+    # returns with a restart; the refusal no longer says only a restart does.
+    assert receipt["retry_when"] == "after_host_memory_returns"
+    assert receipt["retry_can_succeed"] is False
 
 
 def test_the_admission_receipt_explains_what_it_charged(monkeypatch):

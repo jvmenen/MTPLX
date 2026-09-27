@@ -18751,9 +18751,14 @@ _RETRY_SENTENCES = {
         "A retry can succeed once the requests in flight finish and give "
         "their memory back."
     ),
-    "after_engine_restart": (
-        "A retry will not succeed until the engine restarts: host memory "
-        "outside MLX is past its allowance, and only a restart gives it back."
+    "after_background_work_finishes": (
+        "A retry can succeed once the requests in flight finish and the "
+        "engine's queued SSD writes run, which gives their memory back."
+    ),
+    "after_host_memory_returns": (
+        "A retry is unlikely to succeed until the engine's memory outside MLX "
+        "comes down: it is past its allowance. It shrinks as queued SSD "
+        "writes finish, and restarting the engine returns all of it."
     ),
     "never_at_this_limit": (
         "A retry cannot succeed at this memory limit: the model's weights plus "
@@ -18761,9 +18766,11 @@ _RETRY_SENTENCES = {
         "conversation."
     ),
     "not_without_a_shorter_prompt": (
-        "A retry cannot succeed as is: nothing else the engine holds can be "
-        "released. Shorten the prompt, start a new conversation, or use q8 KV "
-        "quantization."
+        "A retry cannot succeed as is: what the engine still holds is the "
+        "model, the cached state this prompt restores from, and requests in "
+        "flight, and none of it can go without making this prompt larger or "
+        "stopping another request. Shorten the prompt, start a new "
+        "conversation, or use q8 KV quantization."
     ),
     "after_other_apps_free_memory": (
         "A retry can succeed once other apps give memory back: close some "
@@ -18798,6 +18805,9 @@ def _admission_holders_text(receipt: Mapping[str, Any]) -> str:
         if sessions:
             text += ": " + ", ".join(sessions)
         parts.append(text)
+    queued = int(holders.get("queued_persistence_bytes") or 0)
+    if queued > 0:
+        parts.append(f"queued SSD writes {_gib_text(queued)} (requests in flight)")
     parts.append(f"allocator pool {_gib_text(holders.get('allocator_pool_bytes'))}")
     overhang = holders.get("host_overhang_bytes")
     if overhang is not None:
@@ -18926,7 +18936,20 @@ def _prefill_admission_refusal(
     if isinstance(released_receipt, Mapping):
         memory["idle_release"] = {
             key: released_receipt.get(key)
-            for key in ("entries", "held_bytes", "dropped_entries", "persistence_cancelled")
+            for key in (
+                "entries",
+                "held_bytes",
+                "dropped_entries",
+                "persistence_cancelled",
+                "queued_persistence_entries",
+                "queued_persistence_bytes",
+            )
+        }
+    queued_release = receipt.get("queued_persistence_release")
+    if isinstance(queued_release, Mapping):
+        memory["queued_persistence_release"] = {
+            key: queued_release.get(key)
+            for key in ("entries", "held_bytes", "persistence_cancelled")
         }
     return HTTPException(
         status_code=507,
@@ -19926,6 +19949,8 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
         "held_bytes": 0,
         "dropped_entries": 0,
         "persistence_cancelled": 0,
+        "queued_persistence_entries": 0,
+        "queued_persistence_bytes": 0,
         "session_records_dropped": [],
         "postcommits_aborted": 0,
     }
@@ -19936,6 +19961,8 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
             "held_bytes",
             "dropped_entries",
             "persistence_cancelled",
+            "queued_persistence_entries",
+            "queued_persistence_bytes",
             "postcommits_aborted",
         ):
             merged[key] += int(receipt.get(key) or 0)
@@ -19972,11 +19999,18 @@ def _admission_holders(
         "bank_bytes": None,
         "sessions": [],
         "in_flight_bytes": 0,
+        "queued_persistence_bytes": 0,
     }
     if bank is None:
         return holders
     try:
         holders["bank_bytes"] = int(bank.total_nbytes)
+        # Entries out of RAM a queued settle or SSD encode still holds (an
+        # in-flight session's, which reclamation spares): they go when the
+        # idle lane runs after the requests in flight finish.
+        holders["queued_persistence_bytes"] = int(
+            getattr(bank, "queued_persistence_bytes", 0) or 0
+        )
         rows_fn = getattr(bank, "held_by_session", None)
         rows = list(rows_fn()) if callable(rows_fn) else []
     except Exception as exc:
@@ -20007,27 +20041,36 @@ def _admission_retry_verdict(
     """Whether the same request can succeed later, and when.
 
     Engine line: the weights plus this prompt's growth past the limit can
-    never fit; in-flight requests give their memory back when they finish;
-    host memory outside MLX past its allowance only goes with a restart;
-    otherwise nothing the engine holds can be released and only a shorter
-    prompt fits. Whole-Mac line: in-flight work finishing, or other apps
-    giving memory back.
+    never fit; in-flight requests give their memory back when they finish,
+    and the queued SSD writes reclamation spared (an in-flight session's)
+    when the idle lane runs after them; host memory outside MLX past its
+    allowance shrinks as queued writes finish and all of it returns with a
+    restart, which a retry cannot count on; otherwise what is left is the
+    model, the prompt's own restore sources and requests in flight, and only
+    a shorter prompt fits. Whole-Mac line: in-flight work and queued writes
+    finishing, or other apps giving memory back.
     """
 
     in_flight = int(holders.get("in_flight_bytes") or 0)
+    queued = int(holders.get("queued_persistence_bytes") or 0)
+    later = in_flight + queued
     if receipt.get("refusal_reason") == "projected_over_limit_after_reclamation":
         over = int(receipt.get("projected_bytes_after") or 0) - int(limit)
         if weights > 0 and weights + growth > limit:
             return False, "never_at_this_limit"
         if in_flight >= over:
             return True, "after_in_flight_requests_finish"
+        if queued > 0 and later >= over:
+            return True, "after_background_work_finishes"
         charged = int(holders.get("host_overhang_charged_bytes") or 0)
-        if charged > 0 and in_flight + charged >= over:
-            return False, "after_engine_restart"
+        if charged > 0 and later + charged >= over:
+            return False, "after_host_memory_returns"
         return False, "not_without_a_shorter_prompt"
     short = int(receipt.get("system_shortfall_bytes_after") or 0)
     if in_flight >= short > 0:
         return True, "after_in_flight_requests_finish"
+    if queued > 0 and later >= short > 0:
+        return True, "after_background_work_finishes"
     return True, "after_other_apps_free_memory"
 
 
@@ -20073,11 +20116,15 @@ def _prefill_admission_shed(
     bank for its real reuse, and only a real deficit frees anything, in this
     order, measuring again after each step:
 
+      0. a narrower prefill chunk, when the request's wide one is what
+         crosses the line;
       1. the allocator pool;
       2. this request's banked copy of its prompt, when that copy is what
          crosses the line (the generation-final commit still banks the
          conversation; the prompt-prefix commit is skipped, never replaced
          by a live reference to a cache decode is about to mutate);
+         then the queued settles and SSD encodes of entries already out of
+         RAM (their arrays stay held until the idle lane runs them);
       3. the session's own entries when a cold miss of at least
          ``MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS`` shows its client
          rewrote the prefix (agent compaction), with their queued SSD encode;
@@ -20090,7 +20137,9 @@ def _prefill_admission_shed(
       7. only when the request would otherwise be refused: the incoming
          conversation's own entries other than its restore sources.
 
-    Never an in-flight session, never an entry the prompt restores from.
+    Never an in-flight session, never an entry the prompt restores from;
+    every step that evicts cancels the evicted entries' own queued jobs, and
+    the restore is priced again after it.
     A projection still over the limit, or a Mac still short of its floor,
     is refused before prefill with a structured 507 that names what holds
     the memory and whether a retry can succeed (``--allow-swap`` admits it
@@ -20580,6 +20629,31 @@ def _run_prefill_admission(
                 steps.append("prompt_publish")
             else:
                 flags["skip_publish"] = False
+
+        # 2b. Queued settles and SSD encodes of entries already out of RAM
+        # (a budget or supersede eviction keeps the encode so the SSD tier
+        # still gets the entry): each holds its snapshot until the idle lane
+        # runs it, and the lane does not run while this engine is busy.
+        # Cancelling one costs only that entry's SSD copy, before anyone's
+        # RAM state is touched.
+        queued_fn = getattr(session_bank, "cancel_queued_persistence", None)
+        if (
+            session_bank is not None
+            and callable(queued_fn)
+            and deficit(now) > 0
+            and int(getattr(session_bank, "queued_persistence_bytes", 0) or 0) > 0
+        ):
+            try:
+                receipt["queued_persistence_release"] = queued_fn(
+                    deficit(now),
+                    keep_session_ids=in_flight_ids,
+                    reason="prefill_admission_queued_persistence",
+                )
+                clear_pool()
+                now = measure()
+                steps.append("queued_persistence")
+            except Exception as exc:
+                receipt["queued_persistence_error"] = repr(exc)
 
         if session_bank is not None and deficit(now) > 0:
             try:
