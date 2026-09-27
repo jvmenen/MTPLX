@@ -1978,13 +1978,23 @@ def _forward_ar_optional_hidden(
     )
 
 
-def _prefill_chunk_size() -> int:
+def _prefill_chunk_size(context_tokens: int | None = None) -> int:
+    """Rows per prefill forward.
+
+    ``context_tokens`` resolves the ``auto`` width for a prompt of that length
+    instead of the one being prefilled now (the admission guard prices a
+    request before its prefill sets ``MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS``).
+    """
     override = _PREFILL_CHUNK_SIZE_OVERRIDE.get()
     if override is not None:
         return max(1, int(override))
     raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
     if raw == "auto":
-        layout = _sustained_prefill_layout()
+        layout = (
+            _sustained_prefill_layout()
+            if context_tokens is None
+            else _sustained_prefill_layout(context_tokens)
+        )
         if layout == "contiguous_dense_decode":
             return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
         return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
@@ -2073,7 +2083,13 @@ def _iter_prefill_chunk_spans(
     )
 
 
-def _sustained_prefill_layout() -> str:
+def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
+    """The prefill cache layout for the prompt being prefilled.
+
+    ``context_tokens`` asks for a prompt of that length instead (the
+    admission guard prices the layout a request will get before its prefill
+    runs); unset, the length is the one the running prefill published.
+    """
     layout = (
         os.environ.get("MTPLX_SUSTAINED_PREFILL_LAYOUT", "")
         .strip()
@@ -2090,7 +2106,8 @@ def _sustained_prefill_layout() -> str:
 
     if paged_kv_quant_mode_from_env() != "off":
         return "contiguous_then_repage"
-    context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    if context_tokens is None:
+        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
     dense_max = _dense_decode_max_context()
     if context_tokens > 0 and context_tokens <= dense_max:
         return "contiguous_dense_decode"

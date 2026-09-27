@@ -159,8 +159,9 @@ from mtplx.mlx_process_env import (
 )
 from mtplx.system_memory import (
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
+    memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
-    system_memory_floors as _system_memory_floors,
+    reading_floors as _system_reading_floors,
     system_pressure_level as _system_pressure_level,
 )
 from mtplx.fan_mode import (
@@ -18732,14 +18733,100 @@ def _allocation_failure_http_exception(
     )
 
 
+_RETRY_SENTENCES = {
+    "after_in_flight_requests_finish": (
+        "A retry can succeed once the requests in flight finish and give "
+        "their memory back."
+    ),
+    "after_engine_restart": (
+        "A retry will not succeed until the engine restarts: host memory "
+        "outside MLX is past its allowance, and only a restart gives it back."
+    ),
+    "never_at_this_limit": (
+        "A retry cannot succeed at this memory limit: the model's weights plus "
+        "this prompt alone exceed it. Shorten the prompt or start a new "
+        "conversation."
+    ),
+    "not_without_a_shorter_prompt": (
+        "A retry cannot succeed as is: nothing else the engine holds can be "
+        "released. Shorten the prompt, start a new conversation, or use q8 KV "
+        "quantization."
+    ),
+    "after_other_apps_free_memory": (
+        "A retry can succeed once other apps give memory back: close some "
+        "apps and try again, or shorten the prompt."
+    ),
+}
+
+
+def _gib_text(value: Any) -> str:
+    try:
+        return f"{int(value) / float(1024**3):.1f} GiB"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _admission_holders_text(receipt: Mapping[str, Any]) -> str:
+    holders = receipt.get("holders")
+    if not isinstance(holders, Mapping):
+        return ""
+    parts = []
+    if holders.get("weights_bytes"):
+        parts.append(f"model weights {_gib_text(holders['weights_bytes'])}")
+    bank = holders.get("bank_bytes")
+    if bank is not None:
+        sessions = [
+            f"{row.get('session_id') or 'an unnamed session'} "
+            f"{_gib_text(row.get('held_bytes'))} ({row.get('held_because')})"
+            for row in (holders.get("sessions") or ())[:3]
+            if int(row.get("held_bytes") or 0) > 0
+        ]
+        text = f"cached conversations {_gib_text(bank)}"
+        if sessions:
+            text += ": " + ", ".join(sessions)
+        parts.append(text)
+    parts.append(f"allocator pool {_gib_text(holders.get('allocator_pool_bytes'))}")
+    overhang = holders.get("host_overhang_bytes")
+    if overhang is not None:
+        text = f"{_gib_text(overhang)} outside MLX"
+        charged = int(holders.get("host_overhang_charged_bytes") or 0)
+        if charged > 0:
+            text += (
+                f" ({_gib_text(charged)} past the "
+                f"{_gib_text(holders.get('host_allowance_bytes'))} allowance)"
+            )
+        parts.append(text)
+    return "Held after reclamation: " + "; ".join(parts) + "."
+
+
+def _admission_released_text(receipt: Mapping[str, Any]) -> str:
+    released = receipt.get("idle_release")
+    if not isinstance(released, Mapping) or not released.get("entries"):
+        return ""
+    sessions = len(
+        {row.get("session_id") for row in (released.get("sessions") or ())}
+    )
+    text = (
+        f"It released {_gib_text(released.get('held_bytes'))} of idle "
+        f"conversations first ({sessions} session(s)"
+    )
+    dropped = int(released.get("dropped_entries") or 0)
+    if dropped:
+        text += f", {dropped} entries not yet on SSD dropped"
+    return text + ")."
+
+
 def _prefill_admission_refusal(
     state: "ServerState", receipt: Mapping[str, Any]
 ) -> HTTPException:
     """The structured 507 for a prompt the shed could not make fit (#450).
 
     Raised before prefill, so the engine keeps every resident session and
-    the client gets a real answer instead of a swap spiral or a kernel panic.
+    the client gets a real answer instead of a swap spiral or a kernel
+    panic. ``error.detail.memory`` carries the numbers, what still holds the
+    memory, and whether a retry can succeed and when.
     """
+
     gib = float(1024**3)
     limit = int(receipt.get("limit_bytes") or 0)
     projected = int(
@@ -18748,43 +18835,245 @@ def _prefill_admission_refusal(
     over = max(0, projected - limit)
     prompt_tokens = int(receipt.get("prompt_tokens") or 0)
     miss_tokens = int(receipt.get("miss_tokens") or 0)
+    when = receipt.get("retry_when")
+    retry = _RETRY_SENTENCES.get(str(when), "") if when else ""
+    holders = _admission_holders_text(receipt)
+    released = _admission_released_text(receipt)
     if receipt.get("refusal_reason") == "system_memory_short_after_reclamation":
-        available = int(
-            receipt.get("system_available_bytes_after")
-            or receipt.get("system_available_bytes")
-            or 0
-        )
+        available = receipt.get("system_available_bytes_after")
+        if available is None:
+            available = receipt.get("system_available_bytes")
+        available = int(available or 0)
         short = int(
             receipt.get("system_shortfall_bytes_after")
             or receipt.get("system_shortfall_bytes")
             or 0
         )
-        return HTTPException(
-            status_code=507,
-            detail=(
+        message = " ".join(
+            part
+            for part in (
                 "insufficient memory: the other apps on this Mac leave "
                 f"{available / gib:.1f} GiB free, and this prompt needs about "
                 f"{short / gib:.1f} GiB more than that ({prompt_tokens} prompt "
                 f"tokens, {miss_tokens} not cached). The engine gave back its "
-                "own caches first. The request was refused before prefill "
-                "instead of pushing the Mac into swap, which can freeze the "
-                "whole desktop. Close some apps and try again, or shorten the "
-                "prompt; --allow-swap admits it anyway."
-            ),
+                "own caches first.",
+                released,
+                holders,
+                retry
+                or "Close some apps and try again, or shorten the prompt.",
+                "The request was refused before prefill instead of pushing the "
+                "Mac into swap, which can freeze the whole desktop; "
+                "--allow-swap admits it anyway.",
+            )
+            if part
         )
+    else:
+        message = " ".join(
+            part
+            for part in (
+                "insufficient memory: this prompt projects "
+                f"{projected / gib:.1f} GiB against the engine's "
+                f"{limit / gib:.1f} GiB limit ({over / gib:.1f} GiB over) after "
+                "the allocator cache and the idle session state were reclaimed "
+                f"({prompt_tokens} prompt tokens, {miss_tokens} not cached).",
+                released,
+                holders,
+                retry
+                or "Reduce the prompt, start a new conversation, close other "
+                "apps, or use q8 KV quantization.",
+                "The engine stays up and keeps its in-flight sessions; this "
+                "request was refused before prefill instead of pushing the Mac "
+                "into swap; --allow-swap admits it anyway.",
+            )
+            if part
+        )
+    memory = {
+        key: receipt.get(key)
+        for key in (
+            "refusal_reason",
+            "retry_can_succeed",
+            "retry_when",
+            "limit_bytes",
+            "projected_bytes_after",
+            "growth_bytes_after",
+            "prompt_tokens",
+            "miss_tokens",
+            "reusable_prefix_tokens",
+            "reusable_prefix_mode",
+            "system_available_bytes_after",
+            "system_shortfall_bytes_after",
+            "system_abort_floor_bytes",
+            "system_shed_floor_bytes",
+            "holders",
+            "reclamation_steps",
+        )
+        if receipt.get(key) is not None
+    }
+    released_receipt = receipt.get("idle_release")
+    if isinstance(released_receipt, Mapping):
+        memory["idle_release"] = {
+            key: released_receipt.get(key)
+            for key in ("entries", "held_bytes", "dropped_entries", "persistence_cancelled")
+        }
     return HTTPException(
         status_code=507,
-        detail=(
-            "insufficient memory: this prompt projects "
-            f"{projected / gib:.1f} GiB against the engine's {limit / gib:.1f} GiB "
-            f"limit ({over / gib:.1f} GiB over) after the allocator cache and the "
-            f"session bank were reclaimed ({prompt_tokens} prompt tokens, "
-            f"{miss_tokens} not cached). The engine stays up and keeps its "
-            "sessions; this request was refused before prefill instead of "
-            "pushing the Mac into swap. Reduce the prompt, start a new "
-            "conversation, close other apps, or use q8 KV quantization; "
-            "--allow-swap admits it anyway."
-        ),
+        detail={
+            "message": message,
+            "code": "insufficient_memory",
+            "memory": _json_safe(memory),
+        },
+    )
+
+
+def _http_exception_message(exc: HTTPException) -> str:
+    """The client-facing text of an HTTPException (a structured detail's
+    ``message``, else the detail itself)."""
+
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return str(detail)
+
+
+def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
+    return exc.detail if isinstance(exc.detail, dict) else None
+
+
+# Seconds between two per-chunk reads of the Mac's memory during a prefill.
+_PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
+
+
+class _PrefillSystemGuard:
+    """What the Mac has left, read at the prefill's own abort site.
+
+    The guard loop reads the machine every 10 s (every 2 s under the shed
+    floor) and aborts a prefill only after three critical ticks. A cold
+    chunk adds 0.1 to 0.5 GiB a second, and the 2026-09-26 report's third
+    freeze went from 5.7 GiB free to a stopped machine in about two seconds.
+    So the prefill asks before each chunk allocates (at most every 0.2 s):
+    the supply plus the engine's allocator pool under the abort floor, or
+    free pages under that floor while the compressor or swap grew since the
+    previous chunk (``memory_thrashing``), stops the request with a 507
+    before the next chunk. An unreadable machine never trips it, and the
+    trip belongs to this request only.
+    """
+
+    def __init__(self, state: Any) -> None:
+        self.state = state
+        self.previous: Any = None
+        self.last_read_s: float | None = None
+        self.tripped: dict[str, Any] | None = None
+        self.checks = 0
+
+    def __call__(self) -> bool:
+        if self.tripped is not None:
+            return True
+        now_s = time.monotonic()
+        if (
+            self.last_read_s is not None
+            and now_s - self.last_read_s < _PREFILL_SYSTEM_CHECK_INTERVAL_S
+        ):
+            return False
+        self.last_read_s = now_s
+        reading = _read_system_memory()
+        if reading is None:
+            return False
+        self.checks += 1
+        previous, self.previous = self.previous, reading
+        _shed_floor, abort_floor = _system_reading_floors(reading)
+        stats = _mlx_memory_stats_live()
+        pool = int(stats.get("cache_memory_bytes") or 0)
+        thrashing = _system_memory_thrashing(reading, previous)
+        if int(reading.available_bytes) + pool >= abort_floor and not thrashing:
+            return False
+        self.tripped = {
+            "action": "prefill_system_abort",
+            "reason": "death_signature" if thrashing else "under_abort_floor",
+            "system_available_bytes": int(reading.available_bytes),
+            "system_free_bytes": reading.free_bytes,
+            "allocator_pool_bytes": pool,
+            "abort_floor_bytes": int(abort_floor),
+            "system_memory": reading.to_dict(),
+            "previous_system_memory": (
+                previous.to_dict() if previous is not None else None
+            ),
+            "interval_s": (
+                round(float(reading.monotonic_s) - float(previous.monotonic_s), 3)
+                if previous is not None
+                else None
+            ),
+            "checks": int(self.checks),
+        }
+        return True
+
+
+def _prefill_system_abort_exception(
+    state: "ServerState", tripped: Mapping[str, Any]
+) -> HTTPException:
+    """The 507 for a prefill the per-chunk supply check stopped."""
+
+    _shed_after_allocation_failure(state)
+    _record_guard_event(state, dict(tripped))
+    try:
+        print(
+            "[mtplx] memory guard " + json.dumps(dict(tripped), default=str),
+            flush=True,
+        )
+    except Exception:
+        pass
+    available = int(tripped.get("system_available_bytes") or 0)
+    pool = int(tripped.get("allocator_pool_bytes") or 0)
+    floor = int(tripped.get("abort_floor_bytes") or 0)
+    if tripped.get("reason") == "death_signature":
+        current = tripped.get("system_memory") or {}
+        before = tripped.get("previous_system_memory") or {}
+        grew = []
+        if current.get("compressor_bytes") is not None and before.get(
+            "compressor_bytes"
+        ) is not None:
+            grew.append(
+                "the compressor grew "
+                + _gib_text(int(current["compressor_bytes"]) - int(before["compressor_bytes"]))
+            )
+        if current.get("swap_used_bytes") is not None and before.get(
+            "swap_used_bytes"
+        ) is not None:
+            swap = int(current["swap_used_bytes"]) - int(before["swap_used_bytes"])
+            if swap > 0:
+                grew.append("swap grew " + _gib_text(swap))
+        cause = (
+            f"free pages fell to {_gib_text(tripped.get('system_free_bytes'))} "
+            f"under the {_gib_text(floor)} floor while "
+            + (" and ".join(grew) or "the Mac started compressing")
+            + f" in {tripped.get('interval_s')} s"
+        )
+    else:
+        cause = (
+            f"{_gib_text(available + pool)} was left free and reclaimable, "
+            f"under the {_gib_text(floor)} floor"
+        )
+    message = (
+        "insufficient memory: the Mac ran out of memory it can hand out "
+        f"without compressing during this prefill ({cause}). The prefill "
+        "stopped before its next chunk; the engine shed its caches and stays "
+        "up. A retry can succeed once other apps give memory back: close some "
+        "apps and try again, or shorten the prompt."
+    )
+    return HTTPException(
+        status_code=507,
+        detail={
+            "message": message,
+            "code": "insufficient_memory",
+            "memory": _json_safe(
+                {
+                    **dict(tripped),
+                    "retry_can_succeed": True,
+                    "retry_when": "after_other_apps_free_memory",
+                }
+            ),
+        },
     )
 
 
@@ -18914,6 +19203,17 @@ def _prefill_admission_shed_enabled() -> bool:
 
 
 def _prefill_admission_min_miss_tokens() -> int:
+    """Uncached tokens that read as a rewritten prefix (agent compaction).
+
+    Every request is projected; this threshold gates only the superseded
+    inference. A prompt that restores nothing from its own session is taken
+    as a rewrite, and that session's banked entries cleared, only when at
+    least this many of its tokens are uncached: a short side request under
+    the same session (a title, a summary) must not clear the conversation it
+    rides on. The threshold used to skip the whole projection, so a warm turn
+    under 4,096 new tokens was admitted blind while its restore copied the
+    reused prefix (#499, 48 GB: 38.5 GiB active against a 36 GiB limit).
+    """
     raw = os.environ.get("MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS", "4096")
     try:
         return max(1, int(raw))
@@ -18957,6 +19257,498 @@ def _block_restorable_prefix_tokens(matched_tokens: int) -> int:
     return int(aligned)
 
 
+# The flat runtime reserve (the plan's RUNTIME_TRANSIENTS_BYTES) was measured
+# over prefill forwards of this many rows, the default chunk: Bonsai 2 27B on
+# 2026-09-21 peaked 3.06 to 3.08 GiB over weights + KV at 4K to 16K prompts.
+# The admission bill for a family without a QSA indexer is set against it
+# (``_admission_scratch_bytes``).
+_ADMISSION_FLAT_TRANSIENT_ROWS = 2048
+
+
+@dataclass(frozen=True)
+class _AdmissionGeometry:
+    """Per-token costs of one request's KV, read from the memory plan.
+
+    ``live_bytes_per_token`` is what a prefill writes and a dense decode
+    keeps: full width, because the contiguous prefill cache holds bf16 KV
+    even when the paged layout quantizes it at the repage.
+    ``paged_bytes_per_token`` is the paged layout's width (quantized when KV
+    quantization is on). Both carry the family's per-token working set that
+    the KV term misses (QSA streams, the MTP head's KV).
+    """
+
+    live_bytes_per_token: int
+    paged_bytes_per_token: int
+    context_transient_bytes_per_token: int
+    flat_transient_bytes: int
+    weights_bytes: int
+
+
+def _admission_geometry(state: Any) -> _AdmissionGeometry:
+    from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+    plan = getattr(state, "memory_plan", None)
+    flat = int(getattr(plan, "runtime_transients_bytes", 0) or 0) or int(
+        RUNTIME_TRANSIENTS_BYTES
+    )
+    if plan is None:
+        return _AdmissionGeometry(0, 0, 0, flat, 0)
+    kv_paged = int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
+    kv_live = max(kv_paged, int(getattr(plan, "kv_bytes_per_token", 0) or 0))
+    aux = int(getattr(plan, "aux_bytes_per_token", 0) or 0)
+    return _AdmissionGeometry(
+        live_bytes_per_token=kv_live + aux,
+        paged_bytes_per_token=kv_paged + aux,
+        context_transient_bytes_per_token=int(
+            getattr(plan, "prefill_transient_bytes_per_token", 0) or 0
+        ),
+        flat_transient_bytes=flat,
+        weights_bytes=int(getattr(plan, "model_weights_bytes", 0) or 0),
+    )
+
+
+def _runtime_text_args(runtime: Any) -> Any:
+    model = getattr(runtime, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None)
+    if args is None:
+        args = getattr(getattr(text, "model", None), "args", None)
+    return args
+
+
+def _runtime_has_qsa_indexer(runtime: Any) -> bool:
+    """Flash-Next's QSA hybrids carry an indexer; the 27B's hybrids do not."""
+
+    args = _runtime_text_args(runtime)
+    try:
+        return int(getattr(args, "indexer_n_heads", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+# Layers whose intermediates a chunk forward holds at once under lazy
+# evaluation: the count the QSA indexer transient uses
+# (memory_plan.QSA_TRANSIENT_LIVE_LAYERS), which reproduced #393's measured
+# peak. On the 27B geometry it gives 0.53 MiB a row, next to the 0.44 MB a
+# row read off Flash-Next's chunk trace (generation._WIDE_PREFILL_FORWARD_BYTES_PER_ROW).
+_ADMISSION_LIVE_LAYERS = 4
+# The least the part that does not grow with the rows is charged: the
+# per-request recurrent boundary snapshots and allocator slack, 1 GiB on
+# Flash-Next (generation._WIDE_PREFILL_FIXED_BYTES).
+_ADMISSION_FIXED_FLOOR_BYTES = 1 * 1024**3
+
+
+def _forward_row_bytes(args: Any) -> int | None:
+    """Bytes one row holds at the peak of one layer's forward, for the
+    largest of the layer kinds the geometry has (bf16 activations, float32
+    inside the gated delta rule):
+
+      MLP            input, gate and up projections, the activated product;
+      full attention input, query and output gate (the Qwen3-Next attention
+                     projects both; charged for every family, a few KiB a
+                     row), keys and values, the attention output, the output
+                     projection;
+      gated delta    input, the q/k/v and z projections, the convolved
+                     q/k/v, float32 q, k, v and output, the output
+                     projection.
+
+    Attention runs fused kernels, so no score matrix is charged: on the 27B
+    geometry the working memory does not grow with the keys (Bonsai 2 27B,
+    2026-09-21: 3.06 GiB over weights and KV at a 4K prompt, 3.08 GiB at
+    16K). None when the config does not describe the layers."""
+
+    def value(name: str) -> int:
+        try:
+            return int(getattr(args, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    hidden = value("hidden_size")
+    heads = value("num_attention_heads")
+    if hidden <= 0 or heads <= 0:
+        return None
+    kv_heads = value("num_key_value_heads") or heads
+    head_dim = value("head_dim") or hidden // heads
+    queries = heads * head_dim
+    rows = [2 * (hidden + 2 * queries + 2 * kv_heads * head_dim + queries + hidden)]
+    intermediate = value("intermediate_size")
+    if intermediate > 0:
+        rows.append(2 * (hidden + 3 * intermediate))
+    qk = 2 * value("linear_num_key_heads") * value("linear_key_head_dim")
+    v = value("linear_num_value_heads") * value("linear_value_head_dim")
+    if qk > 0 and v > 0:
+        rows.append(2 * (hidden + qk + 2 * v + qk + v + hidden) + 4 * (qk + 2 * v))
+    return max(rows)
+
+
+def _admission_scratch_bytes(
+    state: Any, *, rows: int, prompt_tokens: int, geometry: _AdmissionGeometry
+) -> tuple[int, str]:
+    """The prefill's working memory beyond the KV it writes; never zero.
+
+    QSA hybrids (Flash-Next) are charged the bill the wide-chunk gate uses
+    (``generation._qwen4_wide_prefill_need``): forward intermediates, the
+    recurrent layers' pre-conv streams, the score matrix the dense lane
+    materializes below the sparse crossover, and a fixed part; about 3.5 GiB
+    at 2,048 rows for a 74K prompt.
+
+    Every other family is charged from its geometry: the rows the forward
+    runs times what a row holds across the live layers
+    (``_forward_row_bytes``), plus a fixed part. The one measurement on the
+    27B geometry is the runtime reserve at the default 2,048-row chunk
+    (Bonsai 2 27B, 2026-09-21: 3.06 to 3.08 GiB over weights and KV from 4K
+    to 16K prompts, docs/BONSAI-2-MEMORY.md). The geometry explains 1.06 GiB
+    of it, and nothing measured says whether the rest is fixed or grows with
+    the rows, so the bill is the larger of the two readings: the rest as a
+    fixed part (never under 1 GiB), which prices a narrow forward, and the
+    reserve per 2,048 rows, which prices a wide one. On the 27B: 2.04 GiB for
+    a 195-token turn, 3.0 GiB at 2,048 rows, 6.0 GiB at 4,096. What #525 saw
+    growing with the context on that family is copies of the KV (the full
+    width contiguous prefill before a quantized repage, a copying restore,
+    the banked snapshot), which ``_admission_growth`` counts as KV. A config
+    the geometry cannot read is charged the reserve per 2,048 rows.
+    """
+
+    rows = max(1, int(rows))
+    runtime = getattr(state, "runtime", None)
+    if runtime is not None and _runtime_has_qsa_indexer(runtime):
+        from mtplx.generation import _qwen4_wide_prefill_need
+
+        bill = _qwen4_wide_prefill_need(
+            runtime,
+            rows=rows,
+            prompt_tokens=max(1, int(prompt_tokens)),
+            per_token=geometry.live_bytes_per_token,
+        )
+        source = "qsa_itemized" if "forward_bytes" in bill else "qsa_flat_bill"
+        return max(1, int(bill["transient_bytes"])), source
+    flat = int(geometry.flat_transient_bytes)
+    flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
+    row_bytes = (
+        _forward_row_bytes(_runtime_text_args(runtime)) if runtime is not None else None
+    )
+    if not row_bytes:
+        return flat_share, "flat_per_row"
+    per_row = _ADMISSION_LIVE_LAYERS * int(row_bytes)
+    fixed = max(
+        _ADMISSION_FIXED_FLOOR_BYTES,
+        flat - per_row * _ADMISSION_FLAT_TRANSIENT_ROWS,
+    )
+    return max(fixed + per_row * rows, flat_share), "geometry"
+
+
+def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
+    """Whether restoring from ``entry`` puts a second copy of its prefix in memory.
+
+    A clone restore installs views of the banked arrays (or copies them
+    outright), and the first write into the restored cache copies every
+    buffer a view still aliases (MLX copy-on-write): the reused prefix
+    becomes new memory next to the banked copy. A lease hands the entry's
+    live cache over and costs nothing only when no snapshot view aliases
+    that cache: a lease-only entry (its snapshot was over the per-session
+    cap), or an entry whose snapshot owns its buffers (not lazy, or
+    settled). A lazy snapshot beside a live cache, which every
+    generation-final commit of a coding-agent turn leaves, copies on the
+    first write like a clone. (#499, 48 GB: 38.5 GiB active = 19.85 GiB of
+    weights + three copies of a 96K conversation at 64 KiB a token.)
+    """
+
+    if entry is None:
+        return True
+    if str(restore_mode or "clone") != "reference":
+        return True
+    if getattr(entry, "cache_ref", None) is None:
+        # Nothing to lease: the restore clones the snapshot, or misses.
+        return True
+    if getattr(entry, "live_ref_only", False):
+        return False
+    if not getattr(entry, "lazy_kv", False):
+        return False
+    return getattr(entry, "snapshot_settled_at", None) is None
+
+
+def _admission_growth(
+    geometry: _AdmissionGeometry,
+    *,
+    prompt_tokens: int,
+    reused_tokens: int,
+    restore_copies_prefix: bool,
+    layout: str,
+    source_layout: str | None,
+    output_tokens: int,
+    publish: bool,
+    scratch_bytes: int,
+) -> dict[str, Any]:
+    """New memory one request needs at its peak, on top of what is measured.
+
+    Three moments, and the largest is the request's growth. They do not
+    overlap: the prefill's scratch is freed before the repage, and the
+    contiguous copy before decode.
+
+      prefill end   the rows the prefill writes (the reused prefix too, when
+                    the restore copies it), the QSA dense-lane transient that
+                    grows with the context, and the family scratch;
+      repage        those rows plus the paged copy the repage fills
+                    (quantized KV, or a prompt past the dense ceiling), with
+                    the paged output reservation;
+      decode start  the decode cache, plus the copy decode's first write
+                    makes of every buffer a banked snapshot of the prompt
+                    still aliases (store-on-prefill, the prompt-prefix
+                    commit).
+
+    Nothing already resident is added again: the restore source's own
+    snapshot is inside the measured bytes, and a pure lease writes into the
+    rows it already holds.
+    """
+
+    P = max(0, int(prompt_tokens))
+    R = min(max(0, int(reused_tokens)), P)
+    M = P - R
+    live_w = max(0, int(geometry.live_bytes_per_token))
+    paged_w = max(0, int(geometry.paged_bytes_per_token))
+    restore_rows = R if restore_copies_prefix else 0
+    new_rows = restore_rows + M
+    contiguous = layout in {"contiguous_dense_decode", "contiguous_then_repage"}
+    # A lease of a cache that was already repaged extends it in place.
+    leased_paged = (
+        R > 0
+        and not restore_copies_prefix
+        and source_layout == "contiguous_then_repage"
+    )
+    repages = layout == "contiguous_then_repage" and not leased_paged
+    paged_live = repages or leased_paged or not contiguous
+    out_rows = max(0, int(output_tokens)) if paged_live else 0
+    if contiguous and not leased_paged:
+        row_width = live_w
+        live_prefill = new_rows * live_w
+    else:
+        row_width = paged_w
+        live_prefill = (new_rows + out_rows) * paged_w
+    context_transient = (
+        P * max(0, int(geometry.context_transient_bytes_per_token)) if M > 0 else 0
+    )
+    scratch = max(0, int(scratch_bytes))
+    prefill_end = live_prefill + context_transient + scratch
+    paged_copy = (P + out_rows) * paged_w if repages else 0
+    repage = live_prefill + paged_copy if repages else 0
+    if repages:
+        live_decode = paged_copy
+        live_total = paged_copy
+    elif paged_live:
+        live_decode = live_prefill
+        live_total = (P + out_rows) * paged_w
+    else:
+        live_decode = live_prefill
+        live_total = P * live_w
+    publish_copy = live_total if publish else 0
+    decode_start = live_decode + publish_copy
+    return {
+        "layout": layout,
+        "reused_tokens": int(R),
+        "miss_tokens": int(M),
+        "restore_copy_bytes": int(restore_rows * row_width),
+        "live_prefill_bytes": int(live_prefill),
+        "context_transient_bytes": int(context_transient),
+        "scratch_bytes": int(scratch),
+        "repage_copy_bytes": int(paged_copy),
+        "output_reserve_bytes": int(out_rows * paged_w),
+        "publish_copy_bytes": int(publish_copy),
+        "prefill_end_bytes": int(prefill_end),
+        "repage_bytes": int(repage),
+        "decode_start_bytes": int(decode_start),
+        "growth_bytes": int(max(prefill_end, repage, decode_start)),
+    }
+
+
+def _live_session_prefix_tokens(
+    state: Any, prompt_ids: list[int], bank: Any
+) -> int:
+    """Reusable tokens the engine's live sessions serve for this prompt.
+
+    Asks the ladder session resolution asks (exact, then pending-postcommit
+    near prefix, then best common prefix), the non-exact answers rewound to
+    the block floor the bank estimate uses, so the reuse a request achieves
+    is never more optimistic than resolution's own match. A session is
+    credited only what the bank still holds for this prompt
+    (``SessionBank.session_coverage_tokens``), or its whole match while a
+    pending postcommit is about to put it: a session record keeps its
+    committed tokens after the bank lets go of the state behind them, and
+    those tokens alone would make a cold prefill look warm.
+    """
+
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return 0
+    coverage_fn = getattr(bank, "session_coverage_tokens", None)
+
+    def credit(session: Any, matched_tokens: int) -> int:
+        session_id = getattr(session, "session_id", None)
+        if not callable(coverage_fn) or not session_id:
+            return int(matched_tokens)
+        pending = getattr(session, "has_pending_postcommit", None)
+        if callable(pending) and pending():
+            return int(matched_tokens)
+        return min(int(matched_tokens), int(coverage_fn(session_id, prompt_ids)))
+
+    live_tokens = 0
+    try:
+        exact_fn = getattr(sessions, "longest_prefix_session", None)
+        live = exact_fn(prompt_ids) if callable(exact_fn) else None
+        if live is not None:
+            live_tokens = credit(
+                live, len(getattr(live, "committed_token_ids", ()) or ())
+            )
+        if live_tokens <= 0:
+            near_fn = getattr(sessions, "pending_near_prefix_session", None)
+            if callable(near_fn):
+                near, matched = near_fn(prompt_ids)
+                if near is not None:
+                    live_tokens = credit(
+                        near, _block_restorable_prefix_tokens(int(matched))
+                    )
+        if live_tokens <= 0:
+            common_fn = getattr(sessions, "best_common_prefix_session", None)
+            if callable(common_fn):
+                shared, matched = common_fn(prompt_ids)
+                if shared is not None:
+                    live_tokens = credit(
+                        shared, _block_restorable_prefix_tokens(int(matched))
+                    )
+    except Exception:
+        live_tokens = 0
+    return int(live_tokens)
+
+
+def _in_flight_session_ids(state: Any) -> set[str]:
+    ids: set[str] = set()
+    try:
+        in_flight = getattr(getattr(state, "dashboard", None), "in_flight", None)
+        if in_flight is not None:
+            ids |= {str(sid) for sid in in_flight.session_ids() if sid}
+    except Exception:
+        pass
+    try:
+        fn = getattr(getattr(state, "sessions", None), "in_flight_session_ids", None)
+        if callable(fn):
+            ids |= {str(sid) for sid in fn() if sid}
+    except Exception:
+        pass
+    return ids
+
+
+def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "rounds": len(rounds),
+        "sessions": [],
+        "entries": 0,
+        "held_bytes": 0,
+        "dropped_entries": 0,
+        "persistence_cancelled": 0,
+        "session_records_dropped": [],
+        "postcommits_aborted": 0,
+    }
+    for receipt in rounds:
+        merged["sessions"].extend(receipt.get("sessions") or ())
+        for key in (
+            "entries",
+            "held_bytes",
+            "dropped_entries",
+            "persistence_cancelled",
+            "postcommits_aborted",
+        ):
+            merged[key] += int(receipt.get(key) or 0)
+        merged["session_records_dropped"].extend(
+            receipt.get("session_records_dropped") or ()
+        )
+        for key in ("protected_restore_source_tokens", "kept_sessions"):
+            if receipt.get(key) is not None:
+                merged[key] = receipt.get(key)
+    merged["sessions"] = merged["sessions"][:16]
+    return merged
+
+
+def _admission_holders(
+    *,
+    bank: Any,
+    after: Mapping[str, Any],
+    geometry: _AdmissionGeometry,
+    session_id: str | None,
+    in_flight_ids: set[str],
+) -> dict[str, Any]:
+    """What holds the engine's memory once reclamation is done (the 507)."""
+
+    fields = after.get("fields") or {}
+    holders: dict[str, Any] = {
+        "weights_bytes": int(geometry.weights_bytes),
+        "allocator_active_bytes": int(after.get("active") or 0),
+        "allocator_pool_bytes": int(after.get("cache") or 0),
+        "host_overhang_bytes": fields.get("host_overhang_bytes"),
+        "host_allowance_bytes": fields.get("host_allowance_bytes"),
+        "host_overhang_charged_bytes": int(
+            fields.get("host_overhang_charged_bytes") or 0
+        ),
+        "bank_bytes": None,
+        "sessions": [],
+        "in_flight_bytes": 0,
+    }
+    if bank is None:
+        return holders
+    try:
+        holders["bank_bytes"] = int(bank.total_nbytes)
+        rows_fn = getattr(bank, "held_by_session", None)
+        rows = list(rows_fn()) if callable(rows_fn) else []
+    except Exception as exc:
+        holders["bank_error"] = repr(exc)
+        return holders
+    for row in rows:
+        sid = row.get("session_id")
+        if sid and sid == session_id:
+            why = "this_request"
+        elif sid and sid in in_flight_ids:
+            why = "in_flight"
+            holders["in_flight_bytes"] += int(row.get("held_bytes") or 0)
+        else:
+            why = "restore_source_or_not_reached"
+        holders["sessions"].append({**row, "held_because": why})
+    holders["sessions"] = holders["sessions"][:8]
+    return holders
+
+
+def _admission_retry_verdict(
+    receipt: Mapping[str, Any],
+    holders: Mapping[str, Any],
+    *,
+    limit: int,
+    growth: int,
+    weights: int,
+) -> tuple[bool, str]:
+    """Whether the same request can succeed later, and when.
+
+    Engine line: the weights plus this prompt's growth past the limit can
+    never fit; in-flight requests give their memory back when they finish;
+    host memory outside MLX past its allowance only goes with a restart;
+    otherwise nothing the engine holds can be released and only a shorter
+    prompt fits. Whole-Mac line: in-flight work finishing, or other apps
+    giving memory back.
+    """
+
+    in_flight = int(holders.get("in_flight_bytes") or 0)
+    if receipt.get("refusal_reason") == "projected_over_limit_after_reclamation":
+        over = int(receipt.get("projected_bytes_after") or 0) - int(limit)
+        if weights > 0 and weights + growth > limit:
+            return False, "never_at_this_limit"
+        if in_flight >= over:
+            return True, "after_in_flight_requests_finish"
+        charged = int(holders.get("host_overhang_charged_bytes") or 0)
+        if charged > 0 and in_flight + charged >= over:
+            return False, "after_engine_restart"
+        return False, "not_without_a_shorter_prompt"
+    short = int(receipt.get("system_shortfall_bytes_after") or 0)
+    if in_flight >= short > 0:
+        return True, "after_in_flight_requests_finish"
+    return True, "after_other_apps_free_memory"
+
+
 def _prefill_admission_shed(
     state: "ServerState",
     *,
@@ -18964,387 +19756,573 @@ def _prefill_admission_shed(
     session_bank: Any | None,
     session_id: str | None,
     vision_splice: Any | None = None,
+    max_new_tokens: int = 0,
+    mtp_depth: int = 0,
+    prefill_chunk_tokens: int | None = None,
+    restore_mode: str = "reference",
+    commit_prompt_prefix: bool = False,
+    restore_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Release idle memory BEFORE a tight cache-miss prefill (#415).
+    """Price a request before its prefill; give back idle memory, or refuse.
 
-    The shipped failure: a Pi agent hit its compaction threshold at 248k,
-    the compaction rewrote the whole prefix, and the replacement prefill —
-    a guaranteed cache miss — started while the superseded 6.09 GiB
-    SessionBank snapshot of the pre-compaction transcript sat resident on
-    a memory plan that admits 262K with zero headroom. The footprint
-    crossed the Metal cap mid-prefill and the sustained-pressure guard
-    killed the request (structured 507) ~30 s later. Shedding first is
-    cheap and reversible; the abort is neither.
+    #415: a Pi compaction's replacement prefill (a guaranteed cache miss)
+    started while the superseded 6.09 GiB snapshot of the old transcript sat
+    resident, crossed the Metal cap mid-prefill and died on the
+    sustained-pressure 507 half a minute later. #447: a warm 212K session
+    read as a full miss and a deep session's sibling snapshots were out of
+    reach. #450: admitting past the hard limit after a cache clear panicked
+    a 128 GB Mac four times. 2026-09-26 field report (128 GB, Flash-Next,
+    pi): the compaction arrives as a new session while the 114K conversation
+    it summarizes waits, nothing here could release that conversation, and
+    13 refusals in a row ended only with a restart; the projection counted
+    one copy of the new tokens and the whole-Mac check read a level figure
+    that counts every app's memory as available.
 
-    Projects the miss-prefill footprint against the live allocator state
-    and, only when the projection crosses the guard's WARNING line, frees
-    in escalation order: unused allocator cache, superseded same-session
-    bank entries (the prefix
-    was rewritten, so they can never be restored by this lineage again),
-    then LRU idle entries with every active session protected, then sibling
-    and terminal snapshots while protecting the incoming restore source.
-    Never raises; returns the receipt when it acted.
+    Every request is projected (a few kernel reads and arithmetic): the
+    growth model (``_admission_growth``) counts what the prefill writes, the
+    copy of the reused prefix a clone or aliased-lease restore makes, the
+    family's scratch, the repage copy, the paged output reservation and the
+    copy decode makes of a banked prompt snapshot, and takes the largest of
+    its three moments. The projection meets two lines: 0.97 of the Metal
+    limit for the engine (the process footprint past its allowance counts,
+    ``_footprint_floor``) and the whole Mac's floor
+    (``mtplx/system_memory.py``). Only a request that crosses one probes the
+    bank for its real reuse, and only a real deficit frees anything, in this
+    order, measuring again after each step:
+
+      1. the allocator pool;
+      2. this request's banked copy of its prompt, when that copy is what
+         crosses the line (the generation-final commit still banks the
+         conversation; the prompt-prefix commit is skipped, never replaced
+         by a live reference to a cache decode is about to mutate);
+      3. the session's own entries when a cold miss of at least
+         ``MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS`` shows its client
+         rewrote the prefix (agent compaction), with their queued SSD encode;
+      4. idle entries of inactive sessions, least recently used first;
+      5. chain prefixes and sibling snapshots (``shrink_for_admission``);
+      6. whole idle conversations, leases and live caches included, least
+         recently used first, entries already on SSD first, the rest dropped
+         with their queued SSD encode cancelled
+         (``EngineSessionManager.release_idle_sessions``);
+      7. only when the request would otherwise be refused: the incoming
+         conversation's own entries other than its restore sources.
+
+    Never an in-flight session, never an entry the prompt restores from.
+    A projection still over the limit, or a Mac still short of its floor,
+    is refused before prefill with a structured 507 that names what holds
+    the memory and whether a retry can succeed (``--allow-swap`` admits it
+    anyway). Returns the receipt when it acted, else None.
     """
 
     if not _prefill_admission_shed_enabled():
         return None
     try:
-        prompt_tokens = len(prompt_ids)
-        if prompt_tokens < _prefill_admission_min_miss_tokens():
-            return None
-        if vision_splice is not None:
-            # Admission must ask the same content-keyed question as restore.
-            # Raw image pads only match the text before the first image;
-            # that false miss can evict the very snapshot we need and refuse
-            # a warm request. Surrogates never reach the model input.
-            from mtplx.vision.splice import vision_bank_key_ids
-
-            keyed_ids = vision_bank_key_ids(prompt_ids, vision_splice)
-            if keyed_ids is None:
-                session_bank = None
-            else:
-                prompt_ids = keyed_ids
-        caps = getattr(state, "metal_memory_caps", None)
-        limit = 0
-        if isinstance(caps, dict):
-            value = caps.get("memory_limit_bytes")
-            if isinstance(value, int):
-                limit = value
-        if limit <= 0:
-            return None
-        stats = _mlx_memory_stats_live()
-        active = int(stats.get("active_memory_bytes") or 0)
-        cache = int(stats.get("cache_memory_bytes") or 0)
-        if active <= 0:
-            return None
-        # #456 / two independently reported kernel panics: active+cache is
-        # MLX's own account of what it allocated through Metal, and it can
-        # drift below what the kernel actually holds resident for this
-        # process. live_bytes floors every projection below at the real
-        # phys_footprint when that reads higher, so a request already
-        # dangerous in reality is never judged safe by allocator bookkeeping
-        # alone. A missing/failed probe (non-Darwin, no libproc) leaves
-        # live_bytes identical to active+cache — byte-identical to before.
-        #
-        # Re-based after review: the floor charges only the footprint beyond
-        # what this seat normally holds outside Metal (_footprint_floor).
-        live_bytes, footprint_fields = _footprint_floor(
-            state, limit=limit, allocator_bytes=active + cache
-        )
-        plan = getattr(state, "memory_plan", None)
-        per_token = 0
-        transients = 0
-        if plan is not None:
-            per_token = (
-                int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
-                + int(getattr(plan, "aux_bytes_per_token", 0) or 0)
-                + int(getattr(plan, "prefill_transient_bytes_per_token", 0) or 0)
-            )
-            try:
-                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
-
-                transients = int(RUNTIME_TRANSIENTS_BYTES)
-            except Exception:
-                transients = 0
-        threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
-        # The second line a prefill must clear is the desktop's, not the
-        # engine's: what the kernel can still hand out after the other apps
-        # took theirs (mtplx/system_memory.py). A banked copy of the new
-        # prefix doubles the per-token growth while a session bank is on.
-        bank_copies = 2 if session_bank is not None else 1
-        system_memory = _read_system_memory()
-
-        def system_shortfall(tokens: int, pool_bytes: int) -> int:
-            return _system_admission_shortfall_bytes(
-                system_memory,
-                growth_bytes=tokens * per_token * bank_copies + transients,
-                reclaimable_bytes=pool_bytes,
-            )
-
-        # Cheap worst-case gate first (miss == full prompt): skip the bank
-        # probe entirely when even a fully cold prefill projects under both
-        # lines — the common, memory-healthy case.
-        if (
-            live_bytes + prompt_tokens * per_token + transients <= threshold
-            and system_shortfall(prompt_tokens, cache) <= 0
-        ):
-            return None
-        reused_tokens = 0
-        reused_mode = "none"
-        if session_bank is not None:
-            try:
-                entry = session_bank.longest_prefix(prompt_ids)
-            except Exception:
-                entry = None
-            if entry is not None:
-                reused_tokens = len(entry.token_ids)
-                reused_mode = "exact"
-            # The restore path also serves prompts no entry is an exact
-            # prefix of: a block-prefix restore rewinds to the last safe
-            # boundary under the common prefix (the turn after a forced
-            # tool round, whose banked entry ends in the transient
-            # sentinel; a retokenized tail). Ask the bank the question the
-            # restore asks, or the estimate reads 0 here and the session's
-            # own restorable entry is evicted below as "superseded" (2.11
-            # release gate, tool_result_forced: 41,901 tokens re-prefilled
-            # cold, 54 s, with a 41,391-token block restore available).
-            shared_fn = getattr(session_bank, "longest_shared_prefix_tokens", None)
-            if callable(shared_fn):
-                try:
-                    block_tokens = _block_restorable_prefix_tokens(
-                        shared_fn(prompt_ids)
-                    )
-                except Exception:
-                    block_tokens = 0
-                if block_tokens > reused_tokens:
-                    reused_tokens = block_tokens
-                    reused_mode = "block_prefix"
-        # The bank is not the only holder of reusable state: the engine's
-        # live sessions serve a committed prefix directly (that is what a
-        # warm turn's cached_tokens reads), and a live frontier can be
-        # unbanked — a refused snapshot (retokenized-history mismatch)
-        # banks nothing while the live KV still serves. Estimating from
-        # the bank alone read a warm 212k-token session as a full miss,
-        # cleared its snapshots as "superseded", and every client retry
-        # was then a 211,807-token cold miss that could never be admitted
-        # until a server restart (#447).
-        if vision_splice is None and _prefill_admission_live_prefix_enabled():
-            sessions = getattr(state, "sessions", None)
-            live_tokens = 0
-            if sessions is not None:
-                # Ask the same ladder session resolution asks (exact, then
-                # pending-postcommit near prefix, then best common prefix),
-                # with the non-exact answers rewound to the block floor the
-                # bank estimate above uses — the reuse a request achieves
-                # is never more optimistic than resolution's own match.
-                try:
-                    exact_fn = getattr(sessions, "longest_prefix_session", None)
-                    live = exact_fn(prompt_ids) if callable(exact_fn) else None
-                    if live is not None:
-                        live_tokens = len(
-                            getattr(live, "committed_token_ids", ()) or ()
-                        )
-                    if live_tokens <= 0:
-                        near_fn = getattr(
-                            sessions, "pending_near_prefix_session", None
-                        )
-                        if callable(near_fn):
-                            near, matched = near_fn(prompt_ids)
-                            if near is not None:
-                                live_tokens = _block_restorable_prefix_tokens(
-                                    int(matched)
-                                )
-                    if live_tokens <= 0:
-                        common_fn = getattr(
-                            sessions, "best_common_prefix_session", None
-                        )
-                        if callable(common_fn):
-                            shared, matched = common_fn(prompt_ids)
-                            if shared is not None:
-                                live_tokens = _block_restorable_prefix_tokens(
-                                    int(matched)
-                                )
-                except Exception:
-                    live_tokens = 0
-            if live_tokens > reused_tokens:
-                reused_tokens = int(live_tokens)
-                reused_mode = "live_session"
-        miss_tokens = max(0, prompt_tokens - reused_tokens)
-        if miss_tokens < _prefill_admission_min_miss_tokens():
-            return None
-        projected = live_bytes + miss_tokens * per_token + transients
-        system_short = system_shortfall(miss_tokens, cache)
-        if projected <= threshold and system_short <= 0:
-            return None
-        receipt: dict[str, Any] = {
-            "action": "prefill_admission_shed",
-            "prompt_tokens": int(prompt_tokens),
-            "reusable_prefix_tokens": int(reused_tokens),
-            "reusable_prefix_mode": reused_mode,
-            "miss_tokens": int(miss_tokens),
-            "active_bytes": int(active),
-            "cache_bytes": int(cache),
-            **footprint_fields,
-            "projected_bytes": int(projected),
-            "threshold_bytes": int(threshold),
-            "limit_bytes": int(limit),
-        }
-        if system_memory is not None:
-            receipt["system_available_bytes"] = int(system_memory.available_bytes)
-            receipt["system_shed_floor_bytes"] = int(
-                _system_memory_floors(system_memory.total_bytes)[0]
-            )
-            receipt["system_shortfall_bytes"] = int(system_short)
-        # The allocator pool is free storage, whereas session snapshots
-        # avoid real re-prefill/SSD work. Reclaim the pool and remeasure
-        # before choosing any snapshot victims. Counting it as an admission
-        # deficit evicted useful conversations even when active KV fitted.
-        try:
-            import mlx.core as _mx
-
-            _mx.clear_cache()
-            receipt["cache_cleared"] = True
-        except Exception as exc:
-            receipt["cache_cleared"] = False
-            receipt["cache_clear_error"] = repr(exc)
-        after_cache = _mlx_memory_stats_live()
-        if int(after_cache.get("active_memory_bytes") or 0) > 0:
-            live_after_cache, _ = _footprint_floor(
-                state,
-                limit=limit,
-                allocator_bytes=int(after_cache["active_memory_bytes"])
-                + int(after_cache.get("cache_memory_bytes") or 0),
-            )
-            projected = live_after_cache + miss_tokens * per_token + transients
-        receipt["projected_bytes_after_cache_clear"] = int(projected)
-        # The allocator pool was already counted as reclaimable, so clearing
-        # it does not change the desktop's shortfall; bank evictions do.
-        deficit = max(0, projected - threshold, system_short)
-        if session_bank is not None and deficit > 0:
-            try:
-                bank_bytes_before = int(session_bank.total_nbytes)
-                receipt["bank_bytes_before"] = bank_bytes_before
-                if session_id and reused_tokens == 0:
-                    # Nothing restorable, exact or by block prefix: the
-                    # client rewrote this session's prefix (agent
-                    # compaction), so its banked snapshots are superseded
-                    # and can never be restored by this lineage again.
-                    receipt["superseded_session_entries_evicted"] = int(
-                        session_bank.clear(session_id=session_id)
-                    )
-                elif session_id:
-                    # A restorable prefix exists — pin this session so the
-                    # LRU pass below cannot evict the entry the imminent
-                    # restore depends on.
-                    session_bank.touch_sessions([session_id])
-                bank_bytes_now = int(session_bank.total_nbytes)
-                remaining = deficit - max(0, bank_bytes_before - bank_bytes_now)
-                if remaining > 0 and bank_bytes_now > 0:
-                    receipt["lru_entries_evicted"] = int(
-                        session_bank.shrink_to_bytes(
-                            max(0, bank_bytes_now - remaining),
-                            reason="prefill_admission",
-                            protect_active=True,
-                        )
-                    )
-                # Escalation between the protected LRU pass and giving up
-                # (#447): a deep session's sibling snapshots — forked
-                # generations of the same conversation that no put()-time
-                # supersede collapses — are active-protected above, so a
-                # 12.6 GiB bank served a 7 GiB deficit with zero evictions
-                # and the request died on the sustained-pressure 507. Walk
-                # those chain prefixes (never a session's terminal entry,
-                # never the entry this prompt restores from; the SSD cold
-                # tier keeps every eviction restorable) before letting the
-                # prefill start into a projection that crosses the line.
-                if _prefill_admission_chain_shed_enabled():
-                    bank_bytes_now = int(session_bank.total_nbytes)
-                    remaining = deficit - max(
-                        0, bank_bytes_before - bank_bytes_now
-                    )
-                    chain_fn = getattr(
-                        session_bank, "shrink_for_admission", None
-                    )
-                    if (
-                        remaining > 0
-                        and bank_bytes_now > 0
-                        and callable(chain_fn)
-                    ):
-                        chain_evicted, terminal_evicted = chain_fn(
-                            max(0, bank_bytes_now - remaining),
-                            protect_tokens=prompt_ids,
-                            reason="prefill_admission_chain",
-                        )
-                        receipt["chain_entries_evicted"] = int(chain_evicted)
-                        receipt["terminal_entries_evicted"] = int(
-                            terminal_evicted
-                        )
-                receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
-            except Exception as exc:
-                receipt["bank_error"] = repr(exc)
-        if deficit > 0:
-            # Evicted leaves may now sit in the allocator pool. Return that
-            # storage before the final physical-memory receipt as well.
-            try:
-                import mlx.core as _mx
-
-                _mx.clear_cache()
-                receipt["cache_cleared"] = True
-            except Exception as exc:
-                receipt["cache_clear_error"] = repr(exc)
-        after = _mlx_memory_stats_live()
-        receipt["active_bytes_after"] = int(after.get("active_memory_bytes") or 0)
-        receipt["cache_bytes_after"] = int(after.get("cache_memory_bytes") or 0)
-        # #450: admission past the hard limit is not "shed and hope". On a
-        # 128 GB Mac the shed admitted a 136k prompt at a projected 105.4 GB
-        # against a 103.1 GB limit once the allocator cache was cleared, and
-        # nothing downstream stops such a request safely: MLX's limit is
-        # soft, macOS compresses and swaps for minutes, and that machine
-        # kernel-panicked four times before any 507 could fire. When the
-        # projection still crosses the limit after every reclamation step,
-        # mark the receipt refused; the caller answers with the structured
-        # 507 before prefill. --allow-swap (#427) keeps the operator's
-        # explicit past-the-fit choice.
-        #
-        # This final check is the one #450 added and the one that still
-        # missed both later kernel panics: active+cache after reclamation
-        # read under the limit while the OS-reported footprint did not.
-        # Float the same phys_footprint floor in here too, or the refusal
-        # this comment describes never actually fires for that failure
-        # shape.
-        live_after, footprint_fields_after = _footprint_floor(
+        return _run_prefill_admission(
             state,
-            limit=limit,
-            allocator_bytes=int(after.get("active_memory_bytes") or 0)
-            + int(after.get("cache_memory_bytes") or 0),
+            prompt_ids=prompt_ids,
+            session_bank=session_bank,
+            session_id=session_id,
+            vision_splice=vision_splice,
+            max_new_tokens=max_new_tokens,
+            mtp_depth=mtp_depth,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            restore_mode=restore_mode,
+            commit_prompt_prefix=commit_prompt_prefix,
+            restore_identity=restore_identity,
         )
-        projected_after = live_after + miss_tokens * per_token + transients
-        receipt["phys_footprint_bytes_after"] = footprint_fields_after.get(
-            "phys_footprint_bytes"
-        )
-        receipt["host_overhang_charged_bytes_after"] = footprint_fields_after.get(
-            "host_overhang_charged_bytes", 0
-        )
-        receipt["projected_bytes_after"] = int(projected_after)
-        if projected_after > limit and not bool(getattr(state, "allow_swap", False)):
-            receipt["refused"] = True
-            receipt["refusal_reason"] = "projected_over_limit_after_reclamation"
-        elif system_short > 0:
-            # Same rule for the desktop's line, measured again now that the
-            # pool and the bank have given back what they could. A request
-            # that still does not fit would push the other apps into swap.
-            system_memory = _read_system_memory()
-            system_short_after = system_shortfall(
-                miss_tokens, int(after.get("cache_memory_bytes") or 0)
-            )
-            receipt["system_available_bytes_after"] = (
-                int(system_memory.available_bytes)
-                if system_memory is not None
-                else None
-            )
-            receipt["system_shortfall_bytes_after"] = int(system_short_after)
-            if system_short_after > 0 and not bool(
-                getattr(state, "allow_swap", False)
-            ):
-                receipt["refused"] = True
-                receipt["refusal_reason"] = "system_memory_short_after_reclamation"
+    except Exception as exc:  # noqa: BLE001
+        # An admission guard that raises must not cost the request (the
+        # runtime backstops still apply: the per-chunk supply check, the
+        # sustained-pressure abort, the allocation-failure shed), but it must
+        # not pass silently either: the receipt rides the request log and
+        # the guard events, and the console names it.
+        receipt = {
+            "action": "prefill_admission_shed_error",
+            "error": repr(exc),
+            "admitted_unchecked": True,
+        }
         _record_guard_event(state, receipt)
         try:
             print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
         except Exception:
             pass
         return receipt
-    except Exception as exc:  # noqa: BLE001 — an admission guard must never
-        # cost a request; generation proceeds and the runtime backstops
-        # (#393 pressure abort, allocation-failure shed) still apply.
-        try:
-            _record_guard_event(
-                state,
-                {"action": "prefill_admission_shed_error", "error": repr(exc)},
-            )
-        except Exception:
-            pass
+
+
+def _run_prefill_admission(
+    state: "ServerState",
+    *,
+    prompt_ids: list[int],
+    session_bank: Any | None,
+    session_id: str | None,
+    vision_splice: Any | None,
+    max_new_tokens: int,
+    mtp_depth: int,
+    prefill_chunk_tokens: int | None,
+    restore_mode: str,
+    commit_prompt_prefix: bool,
+    restore_identity: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    from mtplx.generation import (
+        _prefill_chunk_size,
+        _store_on_prefill_env_enabled,
+        _store_on_prefill_min_suffix,
+        _sustained_prefill_enabled,
+        _sustained_prefill_layout,
+    )
+
+    prompt_tokens = len(prompt_ids)
+    if prompt_tokens <= 0:
         return None
+    probe_ids = list(prompt_ids)
+    if vision_splice is not None:
+        # Admission must ask the same content-keyed question as restore.
+        # Raw image pads only match the text before the first image; that
+        # false miss can evict the very snapshot we need and refuse a warm
+        # request. Surrogates never reach the model input.
+        from mtplx.vision.splice import vision_bank_key_ids
+
+        keyed_ids = vision_bank_key_ids(prompt_ids, vision_splice)
+        if keyed_ids is None:
+            session_bank = None
+        else:
+            probe_ids = list(keyed_ids)
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = 0
+    if isinstance(caps, dict):
+        value = caps.get("memory_limit_bytes")
+        if isinstance(value, int):
+            limit = value
+    if limit <= 0:
+        return None
+    allow_swap = bool(getattr(state, "allow_swap", False))
+
+    def measure() -> dict[str, Any]:
+        # #456 / two kernel panics: active + cache is MLX's own account and
+        # can sit below what the kernel holds for this process, so every
+        # projection is floored at the real footprint past the host
+        # allowance (_footprint_floor). The Mac is read again as well: what
+        # the engine gives back lands in the free pages.
+        stats = _mlx_memory_stats_live()
+        active = int(stats.get("active_memory_bytes") or 0)
+        cache = int(stats.get("cache_memory_bytes") or 0)
+        live, fields = _footprint_floor(
+            state, limit=limit, allocator_bytes=active + cache
+        )
+        return {
+            "active": active,
+            "cache": cache,
+            "live": int(live),
+            "fields": fields,
+            "system": _read_system_memory(),
+        }
+
+    now = measure()
+    if now["active"] <= 0:
+        return None
+    geometry = _admission_geometry(state)
+    threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
+    layout = _sustained_prefill_layout(prompt_tokens)
+    chunk_rows = max(
+        1, int(prefill_chunk_tokens or _prefill_chunk_size(prompt_tokens))
+    )
+    chunked = _sustained_prefill_enabled()
+    output_tokens = int(
+        _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
+    ) + max(0, int(mtp_depth or 0))
+    store_on_prefill = _store_on_prefill_env_enabled()
+    store_min_suffix = _store_on_prefill_min_suffix()
+    per_session_cap = getattr(session_bank, "per_session_max_bytes", None)
+    flags = {"skip_publish": False}
+
+    def publishes(miss: int) -> bool:
+        if session_bank is None or flags["skip_publish"]:
+            return False
+        stored = store_on_prefill and miss >= store_min_suffix
+        committed = bool(commit_prompt_prefix and session_id) and miss > 0
+        if not (stored or committed):
+            return False
+        if isinstance(per_session_cap, int) and per_session_cap > 0:
+            width = (
+                geometry.live_bytes_per_token
+                if layout == "contiguous_dense_decode"
+                else geometry.paged_bytes_per_token
+            )
+            # The put refuses a snapshot over the per-session cap, and both
+            # prompt commits pass keep_live_ref=False, so nothing is banked
+            # and nothing is copied.
+            if prompt_tokens * width > per_session_cap:
+                return False
+        return True
+
+    def growth(reused: int, copies: bool, source_layout: str | None) -> dict[str, Any]:
+        miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
+        rows = min(miss, chunk_rows) if chunked else miss
+        scratch, scratch_source = _admission_scratch_bytes(
+            state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=geometry
+        )
+        model = _admission_growth(
+            geometry,
+            prompt_tokens=prompt_tokens,
+            reused_tokens=reused,
+            restore_copies_prefix=copies,
+            layout=layout,
+            source_layout=source_layout,
+            output_tokens=output_tokens,
+            publish=publishes(miss),
+            scratch_bytes=scratch,
+        )
+        model["scratch_source"] = scratch_source
+        model["scratch_rows"] = int(max(1, rows))
+        return model
+
+    def system_short(growth_bytes: int, snapshot: Mapping[str, Any]) -> int:
+        return _system_admission_shortfall_bytes(
+            snapshot["system"],
+            growth_bytes=growth_bytes,
+            reclaimable_bytes=int(snapshot["cache"]),
+        )
+
+    # Cheap worst case first: nothing reused, the whole prompt new, a copy
+    # banked. It bounds every split of this prompt, so when it clears both
+    # lines the request is admitted without probing the bank.
+    worst = growth(0, True, None)
+    if (
+        now["live"] + worst["growth_bytes"] <= threshold
+        and system_short(worst["growth_bytes"], now) <= 0
+    ):
+        return None
+
+    reused_tokens = 0
+    reused_mode = "none"
+    source_entry = None
+    identity = dict(restore_identity or {})
+    plan_fn = getattr(session_bank, "restore_plan", None)
+    if session_bank is not None and callable(plan_fn):
+        # The bank answers with the restore's own lanes and gates (exact
+        # prefix; near prefix with recurrent boundaries, identity, epochs,
+        # lease usability), the same selection reclamation protects.
+        try:
+            plan = plan_fn(probe_ids, near_prefix=vision_splice is None, **identity)
+        except Exception:
+            plan = None
+        if plan and int(plan.get("reuse_tokens") or 0) > 0:
+            reused_tokens = int(plan["reuse_tokens"])
+            reused_mode = str(plan.get("mode") or "exact")
+            source_entry = plan.get("source")
+    elif session_bank is not None:
+        try:
+            entry = session_bank.longest_prefix(probe_ids)
+        except Exception:
+            entry = None
+        if entry is not None:
+            reused_tokens = len(entry.token_ids)
+            reused_mode = "exact"
+            source_entry = entry
+        # The restore path also serves prompts no entry is an exact prefix
+        # of: a block-prefix restore rewinds to the last safe boundary under
+        # the common prefix (the turn after a forced tool round, whose banked
+        # entry ends in the transient sentinel; a retokenized tail). Ask the
+        # bank the question the restore asks, or the estimate reads 0 and
+        # the session's own restorable entry is cleared as "superseded" (2.11
+        # release gate, tool_result_forced: 41,901 tokens re-prefilled cold,
+        # 54 s, with a 41,391-token block restore available).
+        shared_fn = getattr(session_bank, "longest_shared_prefix_tokens", None)
+        if callable(shared_fn):
+            try:
+                block_tokens = _block_restorable_prefix_tokens(shared_fn(probe_ids))
+            except Exception:
+                block_tokens = 0
+            if block_tokens > reused_tokens:
+                reused_tokens = block_tokens
+                reused_mode = "block_prefix"
+                source_entry = None
+    if session_bank is not None:
+        # The engine's live sessions serve a committed prefix too (a pending
+        # postcommit is about to bank one; #447: a warm 212K session read as
+        # a full miss, was cleared as "superseded", and every retry was a
+        # cold 211,807-token miss until a restart).
+        if vision_splice is None and _prefill_admission_live_prefix_enabled():
+            live_tokens = _live_session_prefix_tokens(state, prompt_ids, session_bank)
+            if live_tokens > reused_tokens:
+                reused_tokens = live_tokens
+                reused_mode = "live_session"
+                source_entry = None
+    copies = (
+        _admission_restore_copies_prefix(
+            source_entry,
+            # The near-prefix lane tries a lease first whenever the entry
+            # still owns its live cache.
+            restore_mode if reused_mode == "exact" else "reference",
+        )
+        if reused_mode in {"exact", "near_prefix"}
+        else True
+    )
+    source_layout = (
+        _sustained_prefill_layout(reused_tokens)
+        if reused_tokens > 0 and not copies
+        else None
+    )
+    miss_tokens = max(0, prompt_tokens - reused_tokens)
+    current = growth(reused_tokens, copies, source_layout)
+    projected = now["live"] + current["growth_bytes"]
+    short = system_short(current["growth_bytes"], now)
+    if projected <= threshold and short <= 0:
+        return None
+    receipt: dict[str, Any] = {
+        "action": "prefill_admission_shed",
+        "prompt_tokens": int(prompt_tokens),
+        "reusable_prefix_tokens": int(reused_tokens),
+        "reusable_prefix_mode": reused_mode,
+        "restore_copies_prefix": bool(copies) if reused_tokens > 0 else None,
+        "miss_tokens": int(miss_tokens),
+        "active_bytes": int(now["active"]),
+        "cache_bytes": int(now["cache"]),
+        **now["fields"],
+        "growth": dict(current),
+        "projected_bytes": int(projected),
+        "threshold_bytes": int(threshold),
+        "limit_bytes": int(limit),
+    }
+    if now["system"] is not None:
+        shed_floor, abort_floor = _system_reading_floors(now["system"])
+        receipt["system_available_bytes"] = int(now["system"].available_bytes)
+        receipt["system_shed_floor_bytes"] = int(shed_floor)
+        receipt["system_abort_floor_bytes"] = int(abort_floor)
+        receipt["system_shortfall_bytes"] = int(short)
+        receipt["system_memory"] = now["system"].to_dict()
+    steps: list[str] = []
+
+    def clear_pool() -> None:
+        # Freed buffers sit in the allocator pool until it is cleared; only
+        # then do they reach the free pages the next measurement reads.
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+            receipt.setdefault("cache_cleared", True)
+        except Exception as exc:
+            receipt["cache_cleared"] = False
+            receipt["cache_clear_error"] = repr(exc)
+
+    def deficit(snapshot: Mapping[str, Any]) -> int:
+        g = int(current["growth_bytes"])
+        return max(0, int(snapshot["live"]) + g - threshold, system_short(g, snapshot))
+
+    def refusal_deficit(snapshot: Mapping[str, Any]) -> int:
+        if allow_swap:
+            return 0
+        g = int(current["growth_bytes"])
+        return max(0, int(snapshot["live"]) + g - limit, system_short(g, snapshot))
+
+    # 1. The allocator pool is free storage the allocator holds; session
+    # state avoids real re-prefill and SSD work. Reclaim the pool first.
+    clear_pool()
+    now = measure()
+    steps.append("allocator_pool")
+    receipt["projected_bytes_after_cache_clear"] = int(
+        now["live"] + current["growth_bytes"]
+    )
+
+    # 2. The banked copy of this prompt, when it is what crosses the line.
+    if deficit(now) > 0 and current["publish_copy_bytes"] > 0:
+        flags["skip_publish"] = True
+        unpublished = growth(reused_tokens, copies, source_layout)
+        if unpublished["growth_bytes"] < current["growth_bytes"]:
+            current = unpublished
+            receipt["prompt_publish_skipped"] = True
+            receipt["growth"] = dict(current)
+            steps.append("prompt_publish")
+        else:
+            flags["skip_publish"] = False
+
+    if session_bank is not None and deficit(now) > 0:
+        try:
+            receipt["bank_bytes_before"] = int(session_bank.total_nbytes)
+            # 3. Nothing restorable, exact or by block prefix, and a large
+            # cold miss: the client rewrote this session's prefix (agent
+            # compaction), so its banked entries can never be restored by
+            # this lineage again. A short side request that shares nothing
+            # with its session (a title, a summary) is not that evidence.
+            if (
+                session_id
+                and reused_tokens == 0
+                and miss_tokens >= _prefill_admission_min_miss_tokens()
+            ):
+                receipt["superseded_session_entries_evicted"] = int(
+                    session_bank.clear(session_id=session_id)
+                )
+                cancel = getattr(session_bank, "cancel_session_persistence", None)
+                if callable(cancel):
+                    receipt["superseded_persistence_cancelled"] = int(
+                        cancel(session_id)
+                    )
+                clear_pool()
+                now = measure()
+                steps.append("superseded_session")
+            elif session_id and reused_tokens > 0:
+                # A restorable prefix exists: pin this session so the LRU
+                # pass below cannot evict the entry the restore depends on.
+                session_bank.touch_sessions([session_id])
+            # 4. Idle entries of inactive sessions.
+            remaining = deficit(now)
+            bank_bytes_now = int(session_bank.total_nbytes)
+            if remaining > 0 and bank_bytes_now > 0:
+                receipt["lru_entries_evicted"] = int(
+                    session_bank.shrink_to_bytes(
+                        max(0, bank_bytes_now - remaining),
+                        reason="prefill_admission",
+                        protect_active=True,
+                    )
+                )
+                clear_pool()
+                now = measure()
+                steps.append("lru_idle_entries")
+            # 5. #447: a deep session's sibling snapshots (forked
+            # generations no put-time supersede collapses) are
+            # active-protected above; walk the chain prefixes, never an
+            # entry this prompt restores from.
+            if _prefill_admission_chain_shed_enabled():
+                remaining = deficit(now)
+                bank_bytes_now = int(session_bank.total_nbytes)
+                chain_fn = getattr(session_bank, "shrink_for_admission", None)
+                if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
+                    chain_evicted, terminal_evicted = chain_fn(
+                        max(0, bank_bytes_now - remaining),
+                        protect_tokens=probe_ids,
+                        reason="prefill_admission_chain",
+                    )
+                    receipt["chain_entries_evicted"] = int(chain_evicted)
+                    receipt["terminal_entries_evicted"] = int(terminal_evicted)
+                    clear_pool()
+                    now = measure()
+                    steps.append("chain_walk")
+        except Exception as exc:
+            receipt["bank_error"] = repr(exc)
+
+    # 6. Whole idle conversations (the 2026-09-26 report: pi's compaction is
+    # a new session and the conversation it summarizes is idle, holding a
+    # generation-final and a postcommit entry with a live cache each).
+    in_flight_ids = _in_flight_session_ids(state)
+    keep_ids = set(in_flight_ids)
+    if session_id:
+        keep_ids.add(str(session_id))
+    sessions = getattr(state, "sessions", None)
+    release_fn = getattr(sessions, "release_idle_sessions", None)
+    if callable(release_fn) and deficit(now) > 0:
+        rounds: list[dict[str, Any]] = []
+        try:
+            # First round sized to the deficit (the bank's own byte count);
+            # the second, only if the measurement still does not fit,
+            # takes every idle session: shared buffers make a bank byte
+            # count an upper bound on what an eviction frees.
+            for target in (deficit(now), None):
+                if target is not None and target <= 0:
+                    continue
+                rounds.append(
+                    release_fn(
+                        target,
+                        keep_session_ids=keep_ids,
+                        protect_tokens=probe_ids,
+                        restore_identity=identity,
+                        reason="prefill_admission_idle_release",
+                    )
+                )
+                clear_pool()
+                now = measure()
+                if deficit(now) <= 0 or not rounds[-1].get("entries"):
+                    break
+            steps.append("idle_sessions")
+        except Exception as exc:
+            receipt["idle_release_error"] = repr(exc)
+        if rounds:
+            receipt["idle_release"] = _merge_release_receipts(rounds)
+
+    # 7. Before refusing: the incoming conversation's own entries other
+    # than its restore sources (a sibling branch with a live cache, the
+    # other half of a generation-final/postcommit pair).
+    own_bank = session_bank
+    if own_bank is None:
+        own_bank = getattr(sessions, "bank", None)
+    own_fn = getattr(own_bank, "release_sessions", None)
+    if session_id and callable(own_fn) and refusal_deficit(now) > 0:
+        try:
+            # No ownership hold: this request holds the session's slot.
+            receipt["own_session_release"] = own_fn(
+                None,
+                only_session_ids={str(session_id)},
+                protect_tokens=probe_ids,
+                restore_identity=identity,
+                reason="prefill_admission_own_session",
+            )
+            clear_pool()
+            now = measure()
+            steps.append("own_session_siblings")
+        except Exception as exc:
+            receipt["own_session_release_error"] = repr(exc)
+
+    receipt["reclamation_steps"] = steps
+    if session_bank is not None:
+        try:
+            receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
+        except Exception as exc:
+            receipt.setdefault("bank_error", repr(exc))
+    growth_after = int(current["growth_bytes"])
+    projected_after = int(now["live"]) + growth_after
+    short_after = system_short(growth_after, now)
+    receipt["active_bytes_after"] = int(now["active"])
+    receipt["cache_bytes_after"] = int(now["cache"])
+    receipt["phys_footprint_bytes_after"] = now["fields"].get("phys_footprint_bytes")
+    receipt["host_overhang_charged_bytes_after"] = now["fields"].get(
+        "host_overhang_charged_bytes", 0
+    )
+    receipt["growth_bytes_after"] = growth_after
+    receipt["projected_bytes_after"] = int(projected_after)
+    system_after = now["system"]
+    receipt["system_available_bytes_after"] = (
+        int(system_after.available_bytes) if system_after is not None else None
+    )
+    receipt["system_free_bytes_after"] = (
+        system_after.free_bytes if system_after is not None else None
+    )
+    receipt["system_shortfall_bytes_after"] = int(short_after)
+    refusal_reason = None
+    if not allow_swap and projected_after > limit:
+        # #450: admission past the hard limit is not "shed and hope". MLX's
+        # limit is soft, macOS compresses and swaps for minutes, and the
+        # reporter's Mac kernel-panicked four times before any 507 fired.
+        refusal_reason = "projected_over_limit_after_reclamation"
+    elif not allow_swap and short_after > 0:
+        # The same rule for the whole Mac's line, measured again after the
+        # engine gave back what it could: the rest would push the other apps
+        # into compression and swap.
+        refusal_reason = "system_memory_short_after_reclamation"
+    if refusal_reason is not None:
+        receipt["refused"] = True
+        receipt["refusal_reason"] = refusal_reason
+        holders = _admission_holders(
+            bank=own_bank,
+            after=now,
+            geometry=geometry,
+            session_id=session_id,
+            in_flight_ids=in_flight_ids - ({str(session_id)} if session_id else set()),
+        )
+        receipt["holders"] = holders
+        can_succeed, when = _admission_retry_verdict(
+            receipt,
+            holders,
+            limit=limit,
+            growth=growth_after,
+            weights=geometry.weights_bytes,
+        )
+        receipt["retry_can_succeed"] = bool(can_succeed)
+        receipt["retry_when"] = when
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt, default=str), flush=True)
+    except Exception:
+        pass
+    return receipt
 
 
 def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
@@ -21293,7 +22271,12 @@ def _stream_error_kind(error: BaseException) -> tuple[str, int | None]:
 
 def _stream_error_detail(error: BaseException) -> str:
     detail = getattr(error, "detail", None)
-    text = str(detail) if detail is not None else str(error)
+    if isinstance(error, HTTPException):
+        # A structured detail logs its message; the numbers ride the
+        # request row's own fields (prefill_admission_shed and friends).
+        text = _http_exception_message(error)
+    else:
+        text = str(detail) if detail is not None else str(error)
     return text[:400]
 
 
@@ -25970,26 +26953,11 @@ def _run_generation(
                         key: _keepalive.get(key)
                         for key in ("armed", "attentive", "warm", "beats", "last_beat_age_s")
                     }
-            admission_shed = _prefill_admission_shed(
-                state,
-                prompt_ids=prompt_ids,
-                session_bank=session_bank,
-                session_id=session_id,
-                vision_splice=vision_splice,
-            )
-            if admission_shed is not None and request_observability is not None:
-                request_observability["prefill_admission_shed"] = admission_shed
-            if admission_shed is not None and admission_shed.get("refused"):
-                raise _prefill_admission_refusal(state, admission_shed)
-            dynamic_kv_reservation = _dynamic_paged_kv_reservation(
-                prompt_tokens=len(prompt_ids),
-                max_new_tokens=response_max,
-                mtp_depth=effective_depth,
-            )
             # Callers may tighten the prefill chunk for this generation
             # (warming runs use a small chunk so their foreground-yield
             # abort — checked once per chunk — fires fast); the serve-wide
-            # setting stays the default for real requests.
+            # setting stays the default for real requests. Resolved before
+            # the admission guard, which prices the rows each forward runs.
             if prefill_chunk_tokens is None:
                 prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
             if prefill_chunk_tokens is None:
@@ -26006,6 +26974,60 @@ def _run_generation(
                 )
                 if _wide_chunk_receipt and request_observability is not None:
                     request_observability["prefill_wide_chunk"] = _wide_chunk_receipt
+            admission_shed = _prefill_admission_shed(
+                state,
+                prompt_ids=prompt_ids,
+                session_bank=session_bank,
+                session_id=session_id,
+                vision_splice=vision_splice,
+                max_new_tokens=response_max,
+                mtp_depth=effective_depth,
+                prefill_chunk_tokens=prefill_chunk_tokens,
+                restore_mode=_session_bank_restore_mode(session_restore_mode),
+                commit_prompt_prefix=bool(
+                    commit_prompt_prefix_to_bank and effective_mode != "ar"
+                ),
+                restore_identity={
+                    "model_path": (
+                        str(getattr(state.runtime, "model_path", "") or "") or None
+                    ),
+                    "mtp_enabled": getattr(state.runtime, "mtp_enabled", None),
+                    "template_hash": session_template_hash,
+                    "mtp_history_policy": (
+                        "cycle" if effective_mode == "ar" else _bank_history_policy(state)
+                    ),
+                    "draft_head_identity": session_draft_head_identity,
+                    "policy_fingerprint": session_policy_fingerprint,
+                },
+            )
+            if admission_shed is not None and request_observability is not None:
+                request_observability["prefill_admission_shed"] = admission_shed
+            if admission_shed is not None and admission_shed.get("refused"):
+                raise _prefill_admission_refusal(state, admission_shed)
+            # The admission may have dropped this request's banked copy of
+            # its prompt (the copy decode's first write makes is what crossed
+            # the line): no store-on-prefill snapshot, no prompt-prefix
+            # commit. The generation-final commit still banks the turn.
+            prompt_publish_skipped = bool(
+                admission_shed is not None
+                and admission_shed.get("prompt_publish_skipped")
+            )
+            dynamic_kv_reservation = _dynamic_paged_kv_reservation(
+                prompt_tokens=len(prompt_ids),
+                max_new_tokens=response_max,
+                mtp_depth=effective_depth,
+            )
+            request_env = dict(dynamic_kv_reservation["env"])
+            if prompt_publish_skipped:
+                request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
+            prefill_system_guard = _PrefillSystemGuard(state)
+
+            def _prefill_abort_check() -> bool:
+                if cancel_event is not None and cancel_event.is_set():
+                    return True
+                if _pressure_abort_requested(state):
+                    return True
+                return prefill_system_guard()
             # Install the per-request live decode sink (flight recorder) so
             # _DecodeTrace publishes by-depth acceptance at 1 Hz mid-request.
             # Owner-thread module slot; cleared in the lock-release finally.
@@ -26038,7 +27060,7 @@ def _run_generation(
 
             set_route_tape_sink(_emit_route_tape)
             with (
-                _temporary_env(dynamic_kv_reservation["env"]),
+                _temporary_env(request_env),
                 prefill_chunk_size_override(prefill_chunk_tokens),
             ):
                 constraint = (
@@ -26082,16 +27104,7 @@ def _run_generation(
                         session_draft_head_identity=session_draft_head_identity,
                         session_policy_fingerprint=session_policy_fingerprint,
                         capture_final_state=session_bank is not None,
-                        abort_check=(
-                            (
-                                lambda: bool(
-                                    cancel_event.is_set()
-                                    or _pressure_abort_requested(state)
-                                )
-                            )
-                            if cancel_event is not None
-                            else (lambda: _pressure_abort_requested(state))
-                        ),
+                        abort_check=_prefill_abort_check,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -26106,16 +27119,7 @@ def _run_generation(
                         prompt_ids,
                         constraint=constraint,
                         vision_splice=vision_splice,
-                        abort_check=(
-                            (
-                                lambda: bool(
-                                    cancel_event.is_set()
-                                    or _pressure_abort_requested(state)
-                                )
-                            )
-                            if cancel_event is not None
-                            else (lambda: _pressure_abort_requested(state))
-                        ),
+                        abort_check=_prefill_abort_check,
                         max_tokens=response_max,
                         sampler=sampler,
                         draft_sampler=effective_draft_sampler,
@@ -26143,6 +27147,7 @@ def _run_generation(
                             commit_prompt_prefix_to_bank
                             and session_bank is not None
                             and session_id is not None
+                            and not prompt_publish_skipped
                         ),
                         # Prompt-prefix commits happen before decode mutates
                         # the same KV/MTP cache objects. They must snapshot or
@@ -26187,15 +27192,22 @@ def _run_generation(
                         ),
                     )
         except PostcommitAbort:
-            # abort_check tripped inside the prefill. Two arms share it: a
+            # abort_check tripped inside the prefill. Three arms share it: a
             # client disconnect reuses the exact cancellation path decode
-            # disconnects take, while the guard loop's sustained-critical
-            # pressure abort (#393) is an engine-health refusal the client
-            # must SEE — that one maps to the honest 507 (which also sheds
-            # caches) instead of a silent cancel.
-            if _pressure_abort_requested(state) and not (
-                cancel_event is not None and cancel_event.is_set()
-            ):
+            # disconnects take, while the per-chunk supply check and the
+            # guard loop's sustained-critical pressure abort (#393) are
+            # engine-health refusals the client must SEE — those map to the
+            # honest 507 (which also sheds caches) instead of a silent cancel.
+            client_cancelled = cancel_event is not None and cancel_event.is_set()
+            if prefill_system_guard.tripped is not None and not client_cancelled:
+                if request_observability is not None:
+                    request_observability["prefill_system_abort"] = dict(
+                        prefill_system_guard.tripped
+                    )
+                raise _prefill_system_abort_exception(
+                    state, prefill_system_guard.tripped
+                )
+            if _pressure_abort_requested(state) and not client_cancelled:
                 desktop_short = (
                     getattr(state.dashboard, "last_memory_pressure_source", None)
                     == "system_available"
@@ -34793,8 +35805,10 @@ def create_app(state: ServerState) -> FastAPI:
                         # Shed caches + honest 507 instead of an anonymous
                         # RuntimeError 500; the daemon stays up (#348).
                         exc = _allocation_failure_http_exception(state, exc)
+                    error_detail_payload = None
                     if isinstance(exc, HTTPException):
-                        message = str(exc.detail)
+                        message = _http_exception_message(exc)
+                        error_detail_payload = _http_exception_detail_payload(exc)
                         status_code = exc.status_code
                         error_code = (
                             "insufficient_memory"
@@ -34830,6 +35844,7 @@ def create_app(state: ServerState) -> FastAPI:
                             message,
                             status_code=status_code,
                             code=error_code,
+                            detail=error_detail_payload,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -37335,8 +38350,10 @@ def create_app(state: ServerState) -> FastAPI:
                         # Shed caches + honest 507 instead of an anonymous
                         # RuntimeError 500; the daemon stays up (#348).
                         exc = _allocation_failure_http_exception(state, exc)
+                    error_detail_payload = None
                     if isinstance(exc, HTTPException):
-                        message = str(exc.detail)
+                        message = _http_exception_message(exc)
+                        error_detail_payload = _http_exception_detail_payload(exc)
                         status_code = exc.status_code
                         error_code = (
                             "insufficient_memory"
@@ -37357,6 +38374,7 @@ def create_app(state: ServerState) -> FastAPI:
                             message,
                             status_code=status_code,
                             code=error_code,
+                            detail=error_detail_payload,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -37773,9 +38791,10 @@ def create_app(state: ServerState) -> FastAPI:
             return JSONResponse(
                 status_code=http_exc.status_code,
                 content=_openai_error_content(
-                    str(http_exc.detail),
+                    _http_exception_message(http_exc),
                     status_code=http_exc.status_code,
                     code="insufficient_memory",
+                    detail=_http_exception_detail_payload(http_exc),
                 ),
             )
         request_id = uuid.uuid4().hex[:12]

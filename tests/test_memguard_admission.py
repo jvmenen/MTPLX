@@ -1,0 +1,897 @@
+"""The admission guard, priced honestly and able to make room.
+
+Scenarios from the field, on the real SessionBank and EngineSessionManager
+with MLX's allocator and the process footprint mocked (no model, no GPU):
+
+* the 2026-09-26 report (M5 Max 128 GB, Flash-Next, pi): the compaction is a
+  74K-token full miss on a new session while the 114K conversation it
+  summarizes sits in the bank twice (a generation-final and a postcommit
+  entry, each holding a live cache), the engine at its 96 GiB limit. The old
+  shed could not reach that conversation and refused 13 times in a row;
+* #499 (M5 Pro 48 GB, 27B Optimized Speed, OpenCode): a 3,185-token turn on a
+  96,170-token conversation, under the old 4,096-token floor, was admitted
+  unexamined while its restore and its banked prompt copied the conversation
+  twice more (38.5 GiB active, 39.5 GiB peak, against a 36 GiB limit);
+* the warm 114K turn with a clone restore in the same report (94.9 to 100.2
+  GiB during ordinary turns).
+
+Plus the per-chunk supply check and #525's points A and B.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import mtplx.server.openai as srv
+import mtplx.system_memory as sm
+from mtplx.engine_session import EngineSessionManager, per_session_play_ceiling_bytes
+from mtplx.session_bank import SessionBank
+
+GIB = 1024**3
+
+# Flash-Next (Qwen3.8-Flash-Next config.json): 12 QSA layers x 2 KV heads x
+# 256 x K+V x bf16 = 24,576 B a token of KV, 7,872 of QSA streams and MTP KV.
+FN_KV = 24_576
+FN_AUX = 7_872
+FN_ROW = FN_KV + FN_AUX
+FN_WEIGHTS = int(77.3 * GIB)
+# Qwen3.8-27B: 16 full-attention layers x 4 KV heads x 256 x K+V x bf16.
+Q27_KV = 65_536
+Q27_WEIGHTS = 21_313_949_792  # the Speed pack fixture in test_memory_plan
+# Qwen3.8-27B text_config (the Speed pack's config.json), read through the
+# args class the runtime builds, so the fields the guard reads are the ones
+# production has.
+Q27_TEXT_CONFIG = dict(
+    model_type="qwen3_5_text",
+    hidden_size=5120,
+    intermediate_size=17408,
+    num_hidden_layers=64,
+    num_attention_heads=24,
+    num_key_value_heads=4,
+    head_dim=256,
+    linear_num_key_heads=16,
+    linear_key_head_dim=128,
+    linear_num_value_heads=48,
+    linear_value_head_dim=128,
+    linear_conv_kernel_dim=4,
+    full_attention_interval=4,
+    max_position_embeddings=262_144,
+    vocab_size=248_320,
+    rms_norm_eps=1e-6,
+)
+
+
+def _q27_text_args():
+    from mlx_lm.models.qwen3_5 import TextModelArgs
+
+    return TextModelArgs.from_dict(Q27_TEXT_CONFIG)
+
+
+def _q27_runtime():
+    return SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace(args=_q27_text_args())),
+        mtp_enabled=True,
+        model_path=Path("models/qwen3.8-27b"),
+    )
+
+RUNTIME = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+
+
+@pytest.fixture(autouse=True)
+def _served_profile(monkeypatch):
+    # What the sustained and turbo profiles stamp: chunked prefill, the auto
+    # layout (dense decode up to the ceiling, repaged past it or with
+    # quantized KV), the shared 2,048-row chunk.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_HOST_MEMORY_ALLOWANCE_BYTES", raising=False)
+    # The sparse prefill lane serves Flash-Next on an M5 (tensor units).
+    import mtplx.models.qwen4_exp as qwen4
+
+    monkeypatch.setattr(qwen4, "_qsa_prefill_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
+
+
+class _Machine:
+    """MLX's allocator account and the process footprint, as the guard reads
+    them: active = a fixed base plus what the bank holds; clearing the cache
+    empties the allocator pool; the footprint adds host memory outside MLX."""
+
+    def __init__(self, bank, *, base_gib: float, cache_gib: float, host_gib: float):
+        self.bank = bank
+        self.base = int(base_gib * GIB)
+        self.cache = int(cache_gib * GIB)
+        self.host = int(host_gib * GIB)
+
+    def active(self) -> int:
+        return self.base + int(self.bank.total_nbytes)
+
+    def stats(self) -> dict:
+        return {
+            "ok": True,
+            "active_memory_bytes": self.active(),
+            "cache_memory_bytes": self.cache,
+        }
+
+    def clear_cache(self) -> None:
+        self.cache = 0
+
+    def footprint(self, *args, **kwargs) -> int:
+        return self.active() + self.cache + self.host
+
+
+def _install(monkeypatch, machine: _Machine) -> None:
+    import mlx.core as mx
+
+    monkeypatch.setattr(srv, "_mlx_memory_stats_live", machine.stats)
+    monkeypatch.setattr(mx, "clear_cache", machine.clear_cache)
+    monkeypatch.setattr(srv, "phys_footprint_bytes", machine.footprint)
+
+
+def _flash_next_runtime():
+    args = SimpleNamespace(
+        layer_types=["linear_attention"] * 36 + ["full_attention"] * 12,
+        num_attention_heads=24,
+        linear_num_key_heads=16,
+        linear_key_head_dim=128,
+        linear_num_value_heads=48,
+        linear_value_head_dim=128,
+        hidden_size=2560,
+        hc_count=4,
+        ple_layer_ids=[2],
+        indexer_n_heads=4,
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(args=args),
+        mtp_enabled=True,
+        model_path=Path("models/flash-next"),
+    )
+
+
+def _state(manager, *, plan, runtime, limit_gib: float, total_gib: float):
+    return SimpleNamespace(
+        metal_memory_caps={
+            "memory_limit_bytes": int(limit_gib * GIB),
+            "total_ram_bytes": int(total_gib * GIB),
+        },
+        memory_plan=plan,
+        runtime=runtime,
+        sessions=manager,
+        dashboard=SimpleNamespace(),
+        allow_swap=False,
+        memory_budget_bytes=None,
+    )
+
+
+def _flash_next_state(manager, *, limit_gib: float = 96):
+    plan = SimpleNamespace(
+        available=True,
+        kv_bytes_per_token=FN_KV,
+        kv_bytes_per_token_effective=FN_KV,
+        aux_bytes_per_token=FN_AUX,
+        prefill_transient_bytes_per_token=0,
+        runtime_transients_bytes=3 * GIB,
+        model_weights_bytes=FN_WEIGHTS,
+    )
+    return _state(
+        manager, plan=plan, runtime=_flash_next_runtime(), limit_gib=limit_gib, total_gib=128
+    )
+
+
+def _manager(**bank_kwargs) -> EngineSessionManager:
+    defaults = dict(max_entries=64, max_bytes=60 * GIB, per_session_max_bytes=30 * GIB)
+    defaults.update(bank_kwargs)
+    return EngineSessionManager(bank=SessionBank(**defaults), idle_ttl_s=3600)
+
+
+def _put(bank, tokens, *, session_id, row_bytes, live_cache=False):
+    tokens = tuple(tokens)
+    entry = bank.put(
+        runtime=RUNTIME,
+        token_ids=list(tokens),
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id=session_id,
+        nbytes_override=len(tokens) * row_bytes,
+    )
+    assert entry is not None
+    if live_cache:
+        # keep_live_ref: the generation-final commit of a coding-agent turn
+        # keeps the live cache, and its lazy snapshot aliases it.
+        entry.cache_ref = object()
+        entry.lazy_kv = True
+    return entry
+
+
+CONV = tuple(range(114_191))
+
+
+def _julian_conversation(bank):
+    """The 114K conversation resident twice: generation-final and postcommit
+    entries diverging at the last token, each holding a live cache."""
+
+    final = _put(bank, CONV, session_id="anon-conv", row_bytes=FN_ROW, live_cache=True)
+    post = _put(
+        bank, CONV[:-1] + (999_999,), session_id="anon-conv", row_bytes=FN_ROW, live_cache=True
+    )
+    return final, post
+
+
+COMPACTION = list(range(1_000_000, 1_073_663))  # 73,663 tokens, nothing shared
+
+
+class TestJulianCompaction:
+    def _setup(self, monkeypatch, *, host_gib: float):
+        manager = _manager()
+        _julian_conversation(manager.bank)
+        # The compaction request holds its own session's slot.
+        incoming = manager.get_or_create("anon-compaction")
+        assert incoming.try_begin_generation()
+        # 96.0 GiB in MLX's account: weights and the rest of the process's
+        # Metal allocations (88.6 GiB) plus the conversation twice (6.9).
+        machine = _Machine(manager.bank, base_gib=88.6, cache_gib=0.5, host_gib=host_gib)
+        _install(monkeypatch, machine)
+        return manager, incoming, machine
+
+    def test_the_idle_conversation_is_released_and_the_compaction_admitted(
+        self, monkeypatch
+    ):
+        """At the base commit this returns refused=True: projected 100.7 GiB
+        after the pool clear, nothing reachable (the conversation is another
+        session, active-pinned, and both its entries hold a live cache)."""
+
+        manager, incoming, machine = self._setup(monkeypatch, host_gib=6.0)
+        state = _flash_next_state(manager)
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=COMPACTION,
+                session_bank=manager.bank,
+                session_id="anon-compaction",
+            )
+        finally:
+            incoming.end_generation()
+        assert receipt is not None
+        assert receipt.get("refused") is not True
+        released = receipt["idle_release"]
+        assert [row["session_id"] for row in released["sessions"]] == ["anon-conv"]
+        assert released["held_bytes"] == 2 * len(CONV) * FN_ROW
+        assert not manager.bank.has_session_entries("anon-conv")
+        # The growth counts the Flash-Next prefill scratch, never zero.
+        assert receipt["growth"]["scratch_source"] == "qsa_itemized"
+        assert receipt["growth"]["scratch_bytes"] > 3 * GIB
+        assert receipt["projected_bytes_after"] <= 96 * GIB
+
+    def test_a_host_leak_is_named_in_the_refusal(self, monkeypatch):
+        """14.8 GiB outside MLX (the report's #546 figure): 6.8 GiB past the
+        allowance is charged. The conversation is released and the prompt
+        still does not fit; the refusal says a restart is what frees it."""
+
+        manager, incoming, machine = self._setup(monkeypatch, host_gib=14.8)
+        state = _flash_next_state(manager)
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=COMPACTION,
+                session_bank=manager.bank,
+                session_id="anon-compaction",
+            )
+        finally:
+            incoming.end_generation()
+        assert receipt["refused"] is True
+        assert receipt["refusal_reason"] == "projected_over_limit_after_reclamation"
+        assert receipt["host_overhang_charged_bytes_after"] == int(6.8 * GIB)
+        assert receipt["retry_can_succeed"] is False
+        assert receipt["retry_when"] == "after_engine_restart"
+        assert not manager.bank.has_session_entries("anon-conv")
+
+    def test_a_conversation_in_flight_is_kept_and_the_507_says_so(self, monkeypatch):
+        manager, incoming, machine = self._setup(monkeypatch, host_gib=6.0)
+        conversation = manager.get_or_create("anon-conv")
+        assert conversation.try_begin_generation()
+        state = _flash_next_state(manager)
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=COMPACTION,
+                session_bank=manager.bank,
+                session_id="anon-compaction",
+            )
+        finally:
+            incoming.end_generation()
+            conversation.end_generation()
+        assert receipt["refused"] is True
+        assert manager.bank.has_session_entries("anon-conv")
+        holders = receipt["holders"]
+        [row] = [r for r in holders["sessions"] if r["session_id"] == "anon-conv"]
+        assert row["held_because"] == "in_flight"
+        assert holders["in_flight_bytes"] == 2 * len(CONV) * FN_ROW
+        assert receipt["retry_can_succeed"] is True
+        assert receipt["retry_when"] == "after_in_flight_requests_finish"
+
+        error = srv._prefill_admission_refusal(state, receipt)
+        assert error.status_code == 507
+        detail = error.detail
+        assert detail["code"] == "insufficient_memory"
+        assert "refused before prefill" in detail["message"]
+        assert "requests in flight finish" in detail["message"]
+        memory = detail["memory"]
+        assert memory["retry_can_succeed"] is True
+        assert memory["retry_when"] == "after_in_flight_requests_finish"
+        assert memory["holders"]["sessions"][0]["held_because"] == "in_flight"
+        assert srv._http_exception_message(error) == detail["message"]
+
+
+class TestWarmTurns:
+    """Warm turns used to skip the projection under 4,096 new tokens."""
+
+    def test_a_warm_114k_clone_restore_projects_its_copy_and_sheds_first(
+        self, monkeypatch
+    ):
+        manager = _manager()
+        final, post = _julian_conversation(manager.bank)
+        # An idle subagent holds a live cache too; nothing but the idle
+        # release reaches it.
+        sub = _put(
+            manager.bank,
+            range(500_000, 500_000 + 92_450),
+            session_id="sub",
+            row_bytes=FN_ROW,
+            live_cache=True,
+        )
+        conversation = manager.get_or_create("anon-conv")
+        assert conversation.try_begin_generation()
+        machine = _Machine(manager.bank, base_gib=81.5, cache_gib=0.5, host_gib=6.0)
+        _install(monkeypatch, machine)
+        state = _flash_next_state(manager)
+        prompt = list(CONV) + list(range(2_000_000, 2_000_195))
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="anon-conv",
+                restore_mode="clone",
+            )
+        finally:
+            conversation.end_generation()
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == len(CONV)
+        assert receipt["miss_tokens"] == 195
+        assert receipt["restore_copies_prefix"] is True
+        assert receipt["growth"]["restore_copy_bytes"] == len(CONV) * FN_ROW
+        # Without the shed the turn crosses the limit itself.
+        assert receipt["projected_bytes"] > 96 * GIB
+        assert [row["session_id"] for row in receipt["idle_release"]["sessions"]] == ["sub"]
+        assert "refused" not in receipt
+        assert receipt["projected_bytes_after"] <= int(96 * GIB * 0.97)
+        assert final.token_ids in manager.bank._entries
+        assert post.token_ids in manager.bank._entries
+        assert sub.token_ids not in manager.bank._entries
+
+    def test_the_conversations_own_sibling_goes_only_to_avoid_a_refusal(
+        self, monkeypatch
+    ):
+        manager = _manager()
+        final, post = _julian_conversation(manager.bank)
+        conversation = manager.get_or_create("anon-conv")
+        assert conversation.try_begin_generation()
+        # 9 GiB outside MLX: 1 GiB past the allowance is charged.
+        machine = _Machine(manager.bank, base_gib=84.2, cache_gib=0.5, host_gib=9.0)
+        _install(monkeypatch, machine)
+        state = _flash_next_state(manager)
+        prompt = list(CONV) + list(range(2_000_000, 2_000_195))
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="anon-conv",
+                restore_mode="clone",
+            )
+        finally:
+            conversation.end_generation()
+        assert receipt.get("refused") is not True
+        own = receipt["own_session_release"]
+        assert own["entries"] == 1
+        assert final.token_ids in manager.bank._entries  # the restore source
+        assert post.token_ids not in manager.bank._entries
+
+
+class Test499FortyEightGigSeat:
+    """M5 Pro 48 GB, 27B Optimized Speed, OpenCode: a 99,355-token prompt on
+    a committed 96,170-token conversation (3,185 new). Measured active 38.5
+    GiB and peak 39.5 GiB against the plan's 36 GiB limit. By mechanism: the
+    lease restore of a generation-final entry whose lazy snapshot aliases the
+    live cache copies the conversation on the first write, and the banked
+    prompt copies it again at decode."""
+
+    def _plan(self):
+        return SimpleNamespace(
+            available=True,
+            usable_bytes=36 * GIB,
+            kv_bytes_per_token=Q27_KV,
+            kv_bytes_per_token_effective=Q27_KV,
+            aux_bytes_per_token=0,
+            prefill_transient_bytes_per_token=0,
+            runtime_transients_bytes=3 * GIB,
+            model_weights_bytes=Q27_WEIGHTS,
+        )
+
+    def test_the_turn_is_priced_with_both_copies_and_made_to_fit(self, monkeypatch):
+        plan = self._plan()
+        # The two-copy cap the engine sizes its per-session budget with:
+        # (36 - 19.85 - 3) / 2 = 6.6 GiB, one 96K snapshot (5.9 GiB) per
+        # session. The generation-final entry is that snapshot, and its
+        # lazy views alias the live cache it keeps.
+        cap = per_session_play_ceiling_bytes(plan)
+        manager = _manager(max_bytes=14 * GIB, per_session_max_bytes=cap)
+        conversation = tuple(range(96_170))
+        final = _put(
+            manager.bank, conversation, session_id="opencode", row_bytes=Q27_KV, live_cache=True
+        )
+        session = manager.get_or_create("opencode")
+        assert session.try_begin_generation()
+        machine = _Machine(
+            manager.bank, base_gib=Q27_WEIGHTS / GIB + 0.5, cache_gib=0.3, host_gib=3.0
+        )
+        _install(monkeypatch, machine)
+        runtime = SimpleNamespace(model=SimpleNamespace(args=SimpleNamespace()), mtp_enabled=True)
+        state = _state(manager, plan=plan, runtime=runtime, limit_gib=36, total_gib=48)
+        prompt = list(conversation) + list(range(3_000_000, 3_003_185))
+        assert len(prompt) == 99_355
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="opencode",
+                commit_prompt_prefix=True,
+            )
+        finally:
+            session.end_generation()
+        # The old 4,096-token floor returned None here: admitted unexamined.
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == 96_170
+        assert receipt["restore_copies_prefix"] is True
+        # Before the shed, both copies were priced: the restore's (the
+        # conversation again, next to its banked snapshot) and decode's copy
+        # of the banked prompt. That is 38.7 GiB: the report measured 38.5
+        # GiB active and a 39.5 GiB peak.
+        live_before = machine.base + 96_170 * Q27_KV + int(0.3 * GIB)
+        assert receipt["projected_bytes"] == live_before + 2 * 99_355 * Q27_KV
+        assert 38 * GIB < receipt["projected_bytes"] < 40 * GIB
+        # The banked prompt copy is what crossed the line: it is skipped
+        # (never replaced by a live reference to a cache decode mutates),
+        # and the turn fits the 36 GiB limit with the restore's copy alone.
+        assert receipt["prompt_publish_skipped"] is True
+        assert receipt["growth"]["publish_copy_bytes"] == 0
+        assert receipt["growth"]["restore_copy_bytes"] == 96_170 * Q27_KV
+        assert final.token_ids in manager.bank._entries
+        assert receipt.get("refused") is not True
+        assert receipt["projected_bytes_after"] <= 36 * GIB
+
+    def test_the_banked_prompt_copy_is_priced_while_it_fits_the_cap(self, monkeypatch):
+        plan = self._plan()
+        cap = per_session_play_ceiling_bytes(plan)
+        geometry = srv._admission_geometry(SimpleNamespace(memory_plan=plan))
+        growth = srv._admission_growth(
+            geometry,
+            prompt_tokens=99_355,
+            reused_tokens=96_170,
+            restore_copies_prefix=True,
+            layout="contiguous_dense_decode",
+            source_layout=None,
+            output_tokens=0,
+            publish=True,
+            scratch_bytes=3 * GIB,
+        )
+        # Rows written: the restore's copy and the new tokens.
+        assert growth["live_prefill_bytes"] == 99_355 * Q27_KV
+        # Decode start: the live cache and decode's copy of the banked prompt.
+        assert growth["decode_start_bytes"] == 2 * 99_355 * Q27_KV
+        assert growth["growth_bytes"] == growth["decode_start_bytes"]
+        # 99,355 x 64 KiB = 6.06 GiB fits the seat's two-copy cap, so the
+        # snapshot is banked and its copy is real.
+        assert 99_355 * Q27_KV <= cap
+
+
+class TestGrowthModel:
+    def _geometry(self, **overrides):
+        values = dict(
+            live_bytes_per_token=FN_ROW,
+            paged_bytes_per_token=FN_ROW,
+            context_transient_bytes_per_token=0,
+            flat_transient_bytes=3 * GIB,
+            weights_bytes=FN_WEIGHTS,
+        )
+        values.update(overrides)
+        return srv._AdmissionGeometry(**values)
+
+    def test_the_largest_moment_not_the_sum(self):
+        growth = srv._admission_growth(
+            self._geometry(),
+            prompt_tokens=60_000,
+            reused_tokens=0,
+            restore_copies_prefix=True,
+            layout="contiguous_dense_decode",
+            source_layout=None,
+            output_tokens=0,
+            publish=True,
+            scratch_bytes=3 * GIB,
+        )
+        rows = 60_000 * FN_ROW
+        assert growth["prefill_end_bytes"] == rows + 3 * GIB
+        assert growth["decode_start_bytes"] == 2 * rows
+        assert growth["growth_bytes"] == max(rows + 3 * GIB, 2 * rows)
+
+    def test_a_pure_lease_adds_only_the_new_rows(self):
+        growth = srv._admission_growth(
+            self._geometry(),
+            prompt_tokens=100_000,
+            reused_tokens=97_000,
+            restore_copies_prefix=False,
+            layout="contiguous_dense_decode",
+            source_layout="contiguous_dense_decode",
+            output_tokens=0,
+            publish=False,
+            scratch_bytes=GIB,
+        )
+        assert growth["restore_copy_bytes"] == 0
+        assert growth["live_prefill_bytes"] == 3_000 * FN_ROW
+
+    def test_the_scratch_is_never_zero(self):
+        state = SimpleNamespace(runtime=None)
+        geometry = self._geometry()
+        scratch, source = srv._admission_scratch_bytes(
+            state, rows=1, prompt_tokens=10, geometry=geometry
+        )
+        assert scratch > 0 and source == "flat_per_row"
+        state = SimpleNamespace(runtime=_flash_next_runtime())
+        scratch, source = srv._admission_scratch_bytes(
+            state, rows=2048, prompt_tokens=73_663, geometry=geometry
+        )
+        assert source == "qsa_itemized"
+        # The itemized bill at 2,048 rows for a 74K prompt: forward 1 GiB,
+        # dense scores to the 32K crossover, the fixed part.
+        assert 3 * GIB < scratch < 5 * GIB
+
+    def test_the_27b_is_priced_from_its_geometry(self):
+        """#525 point A: a family without a QSA indexer is billed rows times
+        what a row holds plus a fixed part, never 0 and never a flat figure
+        that ignores the rows. The 27B's GDN layer is its widest (136 KiB a
+        row); at the default 2,048-row chunk the bill is the measured 3 GiB
+        reserve, a 195-token turn still pays the fixed part (the old share
+        was 0.29 GiB), and a 4,096-row chunk pays the reserve per 2,048
+        rows."""
+
+        args = _q27_text_args()
+        per_row = srv._ADMISSION_LIVE_LAYERS * srv._forward_row_bytes(args)
+        assert srv._forward_row_bytes(args) == 139_264
+        state = SimpleNamespace(runtime=_q27_runtime())
+        geometry = self._geometry(live_bytes_per_token=Q27_KV)
+
+        def bill(rows, prompt_tokens=99_355):
+            scratch, source = srv._admission_scratch_bytes(
+                state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
+            )
+            assert source == "geometry"
+            return scratch
+
+        fixed = 3 * GIB - 2048 * per_row
+        assert bill(2048) == 3 * GIB
+        assert bill(195) == fixed + 195 * per_row
+        assert 2.0 * GIB < bill(195) < 2.1 * GIB
+        assert bill(4096) == 6 * GIB
+        # Fused attention: no term grows with the keys (the QSA bill would
+        # charge 11 GB of scores at 99K keys).
+        assert bill(2048, prompt_tokens=1_000) == bill(2048, prompt_tokens=262_144)
+
+    def test_an_unreadable_config_is_charged_the_reserve_per_row(self):
+        scratch, source = srv._admission_scratch_bytes(
+            SimpleNamespace(runtime=SimpleNamespace(model=SimpleNamespace())),
+            rows=1024,
+            prompt_tokens=50_000,
+            geometry=self._geometry(),
+        )
+        assert source == "flat_per_row"
+        assert scratch == 3 * GIB // 2
+
+    def test_quantized_kv_is_priced_at_full_width_through_the_repage(self):
+        """#525 point A on q8: the prefill writes bf16 rows into the
+        contiguous cache and the repage fills the quantized pages while
+        those rows are still live. The old projection charged the q8 width
+        alone: 150K x 36,044 + 3 GiB = 8.0 GiB."""
+
+        q8 = int(Q27_KV * 0.55)
+        growth = srv._admission_growth(
+            self._geometry(live_bytes_per_token=Q27_KV, paged_bytes_per_token=q8),
+            prompt_tokens=150_000,
+            reused_tokens=0,
+            restore_copies_prefix=True,
+            layout="contiguous_then_repage",
+            source_layout=None,
+            output_tokens=16_384,
+            publish=False,
+            scratch_bytes=3 * GIB,
+        )
+        assert growth["repage_bytes"] == 150_000 * Q27_KV + (150_000 + 16_384) * q8
+        assert growth["growth_bytes"] == growth["repage_bytes"]
+        assert growth["growth_bytes"] > 150_000 * q8 + 3 * GIB
+
+
+class TestTheLimitIsTheLimit:
+    def test_lowering_the_limit_lowers_what_is_admitted(self, monkeypatch):
+        """80 GiB in MLX's account and 14 GiB of host memory. At 90 GiB the
+        old allowance (22 GiB there) charged none of it and admitted; the
+        seat's 8 GiB allowance charges 6 and refuses."""
+
+        manager = _manager()
+        machine = _Machine(manager.bank, base_gib=80, cache_gib=0, host_gib=14)
+        _install(monkeypatch, machine)
+        prompt = list(range(40_000))
+        at_96 = srv._prefill_admission_shed(
+            _flash_next_state(manager, limit_gib=96),
+            prompt_ids=prompt,
+            session_bank=manager.bank,
+            session_id="s",
+        )
+        at_90 = srv._prefill_admission_shed(
+            _flash_next_state(manager, limit_gib=90),
+            prompt_ids=prompt,
+            session_bank=manager.bank,
+            session_id="s",
+        )
+        assert at_96 is None or at_96.get("refused") is not True
+        assert at_90["refused"] is True
+
+
+class TestPerChunkSupplyCheck:
+    def _reading(self, *, available_gib, free_gib, compressor_gib, at_s, wired_gib=88):
+        return sm.SystemMemory(
+            available_bytes=int(available_gib * GIB),
+            total_bytes=128 * GIB,
+            level_percent=20,
+            free_bytes=int(free_gib * GIB),
+            file_backed_bytes=int((available_gib - free_gib) * GIB),
+            wired_bytes=int(wired_gib * GIB),
+            compressor_bytes=int(compressor_gib * GIB),
+            swap_used_bytes=0,
+            monotonic_s=at_s,
+        )
+
+    def _guard(self, monkeypatch, readings, *, pool_gib=0.0):
+        sequence = iter(readings)
+        last = [None]
+
+        def reader():
+            try:
+                last[0] = next(sequence)
+            except StopIteration:
+                pass
+            return last[0]
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(
+            srv,
+            "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": 80 * GIB,
+                     "cache_memory_bytes": int(pool_gib * GIB)},
+        )
+        return srv._PrefillSystemGuard(SimpleNamespace(dashboard=SimpleNamespace()))
+
+    def test_a_supply_drop_stops_the_prefill_before_the_next_chunk(self, monkeypatch):
+        guard = self._guard(
+            monkeypatch,
+            [
+                self._reading(available_gib=20, free_gib=6, compressor_gib=4, at_s=0.0),
+                self._reading(available_gib=3, free_gib=2, compressor_gib=4, at_s=1.0),
+            ],
+        )
+        assert guard() is False
+        assert guard() is True
+        assert guard.tripped["reason"] == "under_abort_floor"
+        assert guard.tripped["abort_floor_bytes"] == 88 * GIB // 16
+        # The trip belongs to this request and stays tripped.
+        assert guard() is True
+
+    def test_the_engines_own_pool_counts_as_supply(self, monkeypatch):
+        guard = self._guard(
+            monkeypatch,
+            [self._reading(available_gib=3, free_gib=2, compressor_gib=4, at_s=0.0)],
+            pool_gib=3.0,
+        )
+        assert guard() is False
+
+    def test_the_death_signature_stops_it_with_file_cache_to_spare(self, monkeypatch):
+        guard = self._guard(
+            monkeypatch,
+            [
+                self._reading(available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0),
+                self._reading(available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0),
+            ],
+        )
+        assert guard() is False
+        assert guard() is True
+        assert guard.tripped["reason"] == "death_signature"
+
+    def test_an_unreadable_machine_never_trips(self, monkeypatch):
+        monkeypatch.setattr(sm, "_reader", lambda: None)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        guard = srv._PrefillSystemGuard(SimpleNamespace())
+        assert guard() is False
+
+    def test_it_plugs_into_the_prefills_abort_site(self, monkeypatch):
+        from mtplx.generation import PostcommitAbort, _check_postcommit_abort
+
+        guard = self._guard(
+            monkeypatch,
+            [self._reading(available_gib=1, free_gib=0.5, compressor_gib=4, at_s=0.0)],
+        )
+        with pytest.raises(PostcommitAbort):
+            _check_postcommit_abort(guard)
+
+    def test_the_abort_is_a_structured_507(self, monkeypatch):
+        guard = self._guard(
+            monkeypatch,
+            [
+                self._reading(available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0),
+                self._reading(available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0),
+            ],
+        )
+        guard()
+        guard()
+        monkeypatch.setattr(srv, "_shed_after_allocation_failure", lambda state: {})
+        error = srv._prefill_system_abort_exception(SimpleNamespace(), guard.tripped)
+        assert error.status_code == 507
+        assert error.detail["code"] == "insufficient_memory"
+        assert "stopped before its next chunk" in error.detail["message"]
+        assert "compressor grew 2.0 GiB" in error.detail["message"]
+        assert error.detail["memory"]["reason"] == "death_signature"
+
+
+class TestPlannerReserve:
+    def test_the_steady_reserve_covers_the_committed_window_with_aux(self):
+        """#525 point B: the reserve stopped at the dense ceiling and counted
+        KV alone."""
+
+        from mtplx.memory_plan import plan_memory
+
+        plan = plan_memory(
+            total_ram_bytes=128 * GIB,
+            model_weights_bytes=FN_WEIGHTS,
+            kv_bytes_per_token=FN_KV,
+            aux_bytes_per_token=FN_AUX,
+            model_max_context=262_144,
+            requested_context=262_144,
+            dense_decode_ceiling=131_072,
+            usable_bytes_override=96 * GIB,
+        )
+        assert plan.kv_reserve_tokens == 262_144
+        assert plan.kv_reserve_bytes == 262_144 * (FN_KV + FN_AUX)
+
+
+# #525 (M5 Max 64 GiB, Qwen3.8-27B family, --context-window 262144,
+# --paged-kv-quantization q4): 65,536 B a token of KV at full width, the
+# lighter 14.9 GiB pack, a 14.2 GiB bank the WARNING trims never touched.
+R525_RAM = 64 * GIB
+R525_WINDOW = 262_144
+R525_WEIGHTS = int(14.9 * GIB)
+R525_BANK = int(14.2 * GIB)
+R525_Q4 = int(Q27_KV * 0.30)
+
+
+def _r525_plan():
+    from mtplx.memory_plan import plan_memory
+
+    return plan_memory(
+        total_ram_bytes=R525_RAM,
+        model_weights_bytes=R525_WEIGHTS,
+        kv_bytes_per_token=Q27_KV,
+        kv_quantization="q4",
+        model_max_context=R525_WINDOW,
+        requested_context=R525_WINDOW,
+        dense_decode_ceiling=157_286,
+    )
+
+
+class Test525SixtyFourGigSeat:
+    def test_the_plan_is_the_reporters(self):
+        plan = _r525_plan()
+        assert plan.usable_bytes == 48 * GIB
+        assert plan.kv_bytes_per_token_effective == R525_Q4 == 19_660
+        # "session bank up to 30.1G" for the 14.9 G pack.
+        assert round(plan.bank_idle_max_bytes / GIB, 1) == 30.1
+
+    def test_a_deep_cold_prompt_is_priced_at_full_width_through_the_q4_repage(
+        self, monkeypatch
+    ):
+        """Point A. At the base commit this returns None: the projection
+        priced the q4 width and the flat 3 GiB (33.55 + 4.58 + 3 = 41.1 GiB
+        against the 46.6 GiB line), and the prefill wrote 250K bf16 rows
+        into the contiguous cache (15.3 GiB) and filled the q4 pages (4.9
+        GiB) while they were live, with the 14.2 GiB bank still resident:
+        53.7 GiB against a 48 GiB limit."""
+
+        monkeypatch.setenv("MTPLX_PAGED_KV_QUANT", "q4")
+        plan = _r525_plan()
+        manager = _manager(
+            max_bytes=plan.bank_idle_max_bytes, per_session_max_bytes=16 * GIB
+        )
+        # Two idle conversations, 14.2 GiB between them.
+        _put(manager.bank, range(0, 1_000), session_id="idle-a", row_bytes=R525_BANK // 2000)
+        _put(
+            manager.bank, range(5_000, 6_000), session_id="idle-b", row_bytes=R525_BANK // 2000
+        )
+        incoming = manager.get_or_create("deep")
+        assert incoming.try_begin_generation()
+        # Weights and the rest of the process's Metal allocations, the bank,
+        # and the 3.45 GiB pool of the report's steady-decode receipt.
+        machine = _Machine(
+            manager.bank, base_gib=R525_WEIGHTS / GIB + 1.0, cache_gib=3.45, host_gib=2.0
+        )
+        _install(monkeypatch, machine)
+        state = _state(
+            manager, plan=plan, runtime=_q27_runtime(), limit_gib=48, total_gib=64
+        )
+        prompt = list(range(10_000_000, 10_250_000))
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="deep",
+                max_new_tokens=16_384,
+                mtp_depth=2,
+            )
+        finally:
+            incoming.end_generation()
+        assert receipt is not None
+        growth = receipt["growth"]
+        assert growth["layout"] == "contiguous_then_repage"
+        assert growth["live_prefill_bytes"] == 250_000 * Q27_KV
+        assert growth["repage_copy_bytes"] == (250_000 + 16_386) * R525_Q4
+        assert growth["growth_bytes"] == growth["repage_bytes"]
+        assert growth["scratch_source"] == "geometry"
+        assert growth["scratch_bytes"] == 3 * GIB
+        # The old projection, the q4 width and the flat reserve (7.6 GiB),
+        # missed 12.6 GiB of it.
+        old_growth = 250_000 * R525_Q4 + 3 * GIB
+        assert growth["growth_bytes"] - old_growth > 12.5 * GIB
+        # Without a shed the prefill crosses the limit itself.
+        assert receipt["projected_bytes"] > 48 * GIB
+        # The oldest idle conversation makes room; nothing is refused.
+        assert receipt.get("refused") is not True
+        assert not manager.bank.has_session_entries("idle-a")
+        assert manager.bank.has_session_entries("idle-b")
+        assert receipt["projected_bytes_after"] <= int(48 * GIB * 0.97)
+
+    def test_the_steady_reserve_covers_the_committed_window(self, monkeypatch):
+        """Point B. At the base commit the reserve stopped at the dense
+        ceiling: 157,286 tokens (15% of 64 GiB over 65,536 B a token), 2.9
+        GiB of q4 KV, and the last 105K committed tokens rode the paged lane
+        unpriced."""
+
+        from mtplx.generation import _dense_decode_max_context
+
+        monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "auto")
+        monkeypatch.setenv("MTPLX_MEMORY_BUDGET", str(R525_RAM))
+        monkeypatch.delenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN", raising=False)
+        monkeypatch.delenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", raising=False)
+        monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+        assert _dense_decode_max_context() == 157_286
+        plan = _r525_plan()
+        assert plan.kv_reserve_tokens == R525_WINDOW
+        assert plan.kv_reserve_bytes == R525_WINDOW * R525_Q4
+        assert plan.bank_steady_bytes == (
+            48 * GIB - R525_WEIGHTS - 3 * GIB - R525_WINDOW * R525_Q4
+        )

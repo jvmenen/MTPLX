@@ -18,12 +18,22 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import mtplx.server.openai as srv
 
 GIB = 1024**3
 LIMIT = 96 * GIB
 KV_PER_TOKEN = 24576
 AUX_PER_TOKEN = 7872
+
+
+@pytest.fixture(autouse=True)
+def _served_prefill_is_chunked(monkeypatch):
+    # The admission prices the rows each prefill forward runs. The served
+    # profiles (sustained, turbo) prefill in chunks; without the flag a
+    # prompt is one forward and is priced as one.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
 
 
 class _Entry:
@@ -131,12 +141,19 @@ def _vision_prompt(digest=123):
 
 
 def test_warm_vision_admission_does_not_evict_its_keyed_snapshot(monkeypatch):
+    """The keyed probe finds the warm snapshot: 100 new tokens and the
+    restore's copy of the 63,300 cached ones fit under the line. A raw probe
+    would read a 10,400-token miss past the first image and shed.
+
+    The engine sits at 90 GiB here; it sat at 95 of 96 GiB before the
+    projection counted the restore's own copy, which no longer fits there."""
+
     from mtplx.vision.splice import vision_bank_key_ids
 
     prompt, splice = _vision_prompt()
     entry = _Entry(vision_bank_key_ids(prompt, splice), "images", 3 * GIB)
     bank = _Bank([entry])
-    _pin_live_stats(monkeypatch, active=93 * GIB, cache=2 * GIB)
+    _pin_live_stats(monkeypatch, active=88 * GIB, cache=2 * GIB)
     assert srv._prefill_admission_shed(
         _state(), prompt_ids=prompt + [3] * 100,
         session_bank=bank, session_id="images", vision_splice=splice,
@@ -184,10 +201,31 @@ class TestInertWhenHealthy:
         assert bank.cleared_sessions == []
         assert bank.shrink_calls == []
 
-    def test_short_prompt_never_triggers(self, monkeypatch):
+    def test_a_short_prompt_is_projected_like_any_other(self, monkeypatch):
+        """This test used to pin that a prompt under 4,096 uncached tokens
+        was never looked at. The threshold now gates only the superseded
+        inference: a short prompt at the limit is projected and shed like
+        any other, and never clears its own session."""
+
         _pin_live_stats(monkeypatch, active=95 * GIB, cache=1 * GIB)
         bank = _Bank([_Entry(range(100), "pi", 6 * GIB)])
-        assert _shed(_state(), list(range(1024)), bank, "pi") is None
+        receipt = _shed(_state(), list(range(1024)), bank, "pi")
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == 100
+        assert receipt["miss_tokens"] == 924
+        assert bank.cleared_sessions == []
+        assert "superseded_session_entries_evicted" not in receipt
+
+    def test_a_short_cold_side_request_never_clears_its_session(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=95 * GIB, cache=1 * GIB)
+        conversation = _Entry(range(100_000, 150_000), "pi", 6 * GIB)
+        bank = _Bank([conversation])
+        # A title request under the conversation's session id: 1,024 tokens
+        # that share nothing with it. Not evidence of a rewritten prefix.
+        receipt = _shed(_state(), list(range(1024)), bank, "pi")
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == 0
+        assert bank.cleared_sessions == []
 
     def test_kill_switch(self, monkeypatch):
         monkeypatch.setenv("MTPLX_PREFILL_ADMISSION_SHED", "0")
@@ -317,20 +355,34 @@ class TestBlockPrefixRestorableEntries:
     as "superseded" and the turn re-prefills cold (54 s measured).
     """
 
-    def test_block_restorable_follow_up_leaves_the_guard_inert(self, monkeypatch):
-        _pin_live_stats(monkeypatch, active=95 * GIB, cache=1 * GIB)
+    def test_block_restorable_follow_up_is_never_superseded(self, monkeypatch):
+        import mlx.core as mx
+
+        live = {"ok": True, "active_memory_bytes": 91 * GIB,
+                "cache_memory_bytes": GIB}
+        monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: dict(live))
+        monkeypatch.setattr(mx, "clear_cache", lambda: live.update(cache_memory_bytes=0))
         shared = list(range(41_000))
         banked = shared + [999_001, 999_002] + list(range(70_000, 70_020))
         prompt = shared + list(range(80_000, 80_900))
         entry = _Entry(banked, "gate", 2 * GIB)
-        bank = _Bank([entry])
+        bank = _ChainBank([entry])
         # The gate's exact shape: 41k shared, a 900-token tail. Under the
         # old exact-only estimate this read as a 41,900-token miss and the
-        # entry was cleared; the block-aware miss is 940 tokens, under the
-        # guard's own floor, so it does not act at all.
-        assert _shed(_state(), prompt, bank, "gate") is None
+        # entry was cleared. The block-aware miss is 940 tokens; the block
+        # restore copies the 40,960 reused tokens next to the banked entry,
+        # so the turn is projected (under the old 4,096-token floor it was
+        # admitted unexamined, which this test used to assert) and fits.
+        receipt = _shed(_state(), prompt, bank, "gate")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "block_prefix"
+        assert receipt["reusable_prefix_tokens"] == 40_960
+        assert receipt["miss_tokens"] == 940
+        assert receipt["growth"]["restore_copy_bytes"] == 40_960 * (
+            KV_PER_TOKEN + AUX_PER_TOKEN
+        )
+        assert "refused" not in receipt
         assert bank.cleared_sessions == []
-        assert bank.shrink_calls == []
         assert entry in bank.entries
 
     def test_block_restorable_entry_is_pinned_not_cleared(self, monkeypatch):
@@ -429,17 +481,31 @@ class TestLiveSessionPrefix:
     a 211,807-token cold miss. The engine's live sessions are the state the
     request actually reuses; the shed must ask them too."""
 
-    def test_live_prefix_under_the_miss_floor_leaves_the_guard_inert(
+    def test_a_warm_live_prefix_is_projected_with_its_restore_copy(
         self, monkeypatch
     ):
-        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        """A 3,000-token turn on a 97,000-token live prefix used to leave the
+        guard inert (under the 4,096-token floor). The restore copies the
+        reused prefix, so it is projected; it is never cleared as
+        superseded, and the banked copy of the prompt is what gives way."""
+
+        _pin_live_stats(monkeypatch, active=88 * GIB, cache=GIB // 2)
         prompt = list(range(100_000))
         state = _state_with_live(prompt[:97_000])
         entry = _Entry(list(range(500_000, 500_040)), "warm", 4 * GIB)
         bank = _Bank([entry])
-        assert _shed(state, prompt, bank, "warm") is None
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "live_session"
+        assert receipt["reusable_prefix_tokens"] == 97_000
+        assert receipt["miss_tokens"] == 3_000
+        assert receipt["growth"]["restore_copy_bytes"] == 97_000 * (
+            KV_PER_TOKEN + AUX_PER_TOKEN
+        )
+        assert receipt["prompt_publish_skipped"] is True
+        assert receipt["growth"]["publish_copy_bytes"] == 0
+        assert "refused" not in receipt
         assert bank.cleared_sessions == []
-        assert entry in bank.entries
 
     def test_live_prefix_pins_instead_of_clearing(self, monkeypatch):
         _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)

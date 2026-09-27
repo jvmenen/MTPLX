@@ -26,6 +26,14 @@ AUX_PER_TOKEN = 7872
 PER_TOKEN = KV_PER_TOKEN + AUX_PER_TOKEN
 
 
+@pytest.fixture(autouse=True)
+def _served_prefill_is_chunked(monkeypatch):
+    # The admission prices the rows each prefill forward runs. The served
+    # profiles (sustained, turbo) prefill in chunks; without the flag a
+    # prompt is one forward and is priced as one.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+
+
 def _reading(available_gib: float, total: int = RAM) -> sm.SystemMemory:
     available = int(available_gib * GIB)
     return sm.SystemMemory(
@@ -431,11 +439,21 @@ class TestAdmission:
         assert receipt is not None
         assert receipt["refused"] is True
         assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
-        growth = len(PROMPT) * PER_TOKEN * 2 + srv_transients()
+        # The request's growth is its largest moment: prefill end (the rows
+        # and one chunk's scratch) or decode start (the rows and the copy of
+        # the banked prompt snapshot). This test used to add both copies and
+        # the scratch, as if all three were resident at once.
+        rows = len(PROMPT) * PER_TOKEN
+        growth = max(rows + srv_transients(), 2 * rows)
         shed_floor, _ = sm.system_memory_floors(RAM)
         assert receipt["system_shortfall_bytes"] == growth + shed_floor - (9 + 1) * GIB
         detail = srv._prefill_admission_refusal(_state(), receipt).detail
-        assert "other apps" in detail and "9.0 GiB free" in detail and "--allow-swap" in detail
+        message = detail["message"]
+        assert "other apps" in message and "9.0 GiB free" in message
+        assert "--allow-swap" in message
+        assert detail["code"] == "insufficient_memory"
+        assert detail["memory"]["retry_can_succeed"] is True
+        assert detail["memory"]["retry_when"] == "after_other_apps_free_memory"
 
     def test_the_bank_is_shed_for_the_desktop_too(self, monkeypatch):
         _pin_engine(monkeypatch, active_gib=78, cache_gib=1)
@@ -477,12 +495,42 @@ class TestAdmission:
         assert receipt is not None
         assert receipt.get("refused") is not True
 
-    def test_a_short_prompt_is_never_refused_by_a_full_desktop(self, monkeypatch):
+    def test_the_receipt_reports_the_floors_it_enforced(self, monkeypatch):
+        """The review's defect 7: the receipt printed the 2.5 percent floor
+        (6.4 GiB on 128 GB) while the wired-aware one (11 GiB at 88 GiB
+        wired) decided the refusal."""
+
         _pin_engine(monkeypatch, active_gib=78, cache_gib=1)
-        _install(monkeypatch, 1)
+        monkeypatch.setattr(
+            sm, "_reader", lambda: _machine(free_gib=2, file_gib=4, wired_gib=88)
+        )
+        receipt = srv._prefill_admission_shed(
+            _state(), prompt_ids=PROMPT, session_bank=_Bank(0), session_id="pi"
+        )
+        assert receipt["system_shed_floor_bytes"] == 2 * (88 * GIB // 16)
+        assert receipt["system_abort_floor_bytes"] == 88 * GIB // 16
+        assert receipt["system_memory"]["wired_bytes"] == 88 * GIB
+
+    def test_a_short_prompt_keeps_a_margin_its_own_size(self, monkeypatch):
+        """This test used to pin that a prompt under 4,096 tokens was never
+        refused, however little the Mac had left. Every request is projected
+        now; a short one must leave the abort floor plus its own growth, not
+        the whole shed floor, so it is refused only near the abort floor."""
+
+        _pin_engine(monkeypatch, active_gib=78, cache_gib=1)
+        prompt = list(range(512))
+        # 5 GiB free: between the 3.2 GiB abort floor and the 6.4 GiB shed
+        # floor of a 128 GB Mac with nothing wired in this reading.
+        _install(monkeypatch, 5)
         assert srv._prefill_admission_shed(
-            _state(), prompt_ids=list(range(1024)), session_bank=_Bank(0), session_id="pi"
+            _state(), prompt_ids=prompt, session_bank=_Bank(0), session_id="pi"
         ) is None
+        _install(monkeypatch, 1)
+        receipt = srv._prefill_admission_shed(
+            _state(), prompt_ids=prompt, session_bank=_Bank(0), session_id="pi"
+        )
+        assert receipt["refused"] is True
+        assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
 
 
 def srv_transients() -> int:

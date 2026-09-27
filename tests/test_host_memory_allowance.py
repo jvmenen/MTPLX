@@ -74,6 +74,14 @@ def _no_inherited_override(monkeypatch):
     monkeypatch.delenv("MTPLX_HOST_MEMORY_ALLOWANCE_BYTES", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _served_prefill_is_chunked(monkeypatch):
+    # The admission prices the rows each prefill forward runs. The served
+    # profiles (sustained, turbo) prefill in chunks; without the flag a
+    # prompt is one forward and is priced as one.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+
+
 # --------------------------------------------------------------------------
 # The allowance is sized to the seat
 # --------------------------------------------------------------------------
@@ -245,6 +253,7 @@ def test_a_leak_on_a_48gb_seat_is_charged_not_forgiven(monkeypatch):
     assert receipt is not None
     assert receipt["host_overhang_charged_bytes"] == 7 * GIB
     assert receipt["refused"] is True
+    assert receipt["retry_when"] == "after_engine_restart"
 
 
 def test_the_admission_receipt_explains_what_it_charged(monkeypatch):
