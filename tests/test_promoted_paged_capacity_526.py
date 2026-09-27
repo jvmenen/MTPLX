@@ -621,18 +621,29 @@ def test_direct_forward_with_growth_off_refuses_before_any_row(mode, monkeypatch
     _assert_same(_rows(adapter, 0, 32), committed, "refused forward")
 
 
+def _spec_decode_bank(rt, cache, promoted_by: str) -> SpecDecodeGraphBank:
+    if promoted_by == "this_bank":
+        return SpecDecodeGraphBank(rt, max_verify_len=4)
+    # A caller that hands the bank adapters it promoted itself.
+    graphbank_module.promote_kv_cache_offsets(cache, reserve_tokens=4, preserve_paged=True)
+    return SpecDecodeGraphBank(rt, max_verify_len=4, promote_tensor_offsets=False)
+
+
+@pytest.mark.parametrize("promoted_by", ["this_bank", "caller"])
 @pytest.mark.parametrize("mode", MODES)
-def test_spec_decode_graph_bank_reserves_before_its_compiled_replay(mode, monkeypatch):
+def test_spec_decode_graph_bank_reserves_before_its_compiled_replay(mode, promoted_by, monkeypatch):
     """SpecDecodeGraphBank (graphbank selection with preserved paged KV)
     replays a traced graph that writes the adapters at their traced offset;
     no Python runs on that path. Old code: the second call replayed the
-    31-row graph into 32 rows and head 0's rows landed on head 1's."""
+    31-row graph into 32 rows and head 0's rows landed on head 1's. The
+    reservation used to sit inside the bank's own promotion, so adapters a
+    caller promoted (promote_tensor_offsets=False) were not reserved at all."""
 
     monkeypatch.setenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", "1")
     rt = TwoHeadPagedRuntime(mode)
-    bank = SpecDecodeGraphBank(rt, max_verify_len=4)
     cache = rt.make_cache()
     _prefill(rt, cache, 27)
+    bank = _spec_decode_bank(rt, cache, promoted_by)
 
     bank.forward_ar(mx.array([[1, 2, 3, 4]]), cache=cache)
     adapter = cache[1]
@@ -650,9 +661,9 @@ def test_spec_decode_graph_bank_reserves_before_its_compiled_replay(mode, monkey
 
     # The same two calls on buffers that were 48 rows from the start.
     ref_rt = TwoHeadPagedRuntime(mode, blocks=3)
-    ref_bank = SpecDecodeGraphBank(ref_rt, max_verify_len=4)
     ref = ref_rt.make_cache()
     _prefill(ref_rt, ref, 27)
+    ref_bank = _spec_decode_bank(ref_rt, ref, promoted_by)
     ref_bank.forward_ar(mx.array([[1, 2, 3, 4]]), cache=ref)
     ref_logits, _hidden = ref_bank.forward_ar(mx.array([[4, 3, 2, 1]]), cache=ref)
     assert ref_bank.stats.compiled_calls == 2

@@ -277,9 +277,7 @@ class SpecDecodeGraphBank:
             return "length_outside_graphbank"
         if cache is None:
             return None
-        if self.allow_python_cache_capture:
-            return None
-        if self.promote_tensor_offsets:
+        if self.promote_tensor_offsets and not self.allow_python_cache_capture:
             promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=length)
             self.stats.promoted_cache_entries += promoted
             for reason, count in failures.items():
@@ -287,13 +285,17 @@ class SpecDecodeGraphBank:
                     self.stats.promotion_failures.get(reason, 0) + count
                 )
             stamp_rope_delta(cache, self._rope_delta)
-            # A compiled replay writes the promoted paged adapters at their
-            # traced offset with no Python on the path, and MLX does not
-            # clamp that write: reserve the window here, before the dispatch
-            # (the dense adapters were topped up by the promotion above).
-            from .cache_state import reserve_paged_window
+        # A compiled replay writes promoted paged adapters at their traced
+        # offset with no Python on the path, and MLX does not clamp that
+        # write. Reserve the window here, before the dispatch, for every
+        # promoted paged adapter in the list, whether this dispatcher promoted
+        # it or received it promoted (the dense adapters are topped up by the
+        # promotion above).
+        from .cache_state import reserve_paged_window
 
-            reserve_paged_window(cache, length)
+        reserve_paged_window(cache, length)
+        if self.allow_python_cache_capture:
+            return None
         if cache_has_python_offsets(cache):
             return "python_cache_offsets"
         return None
@@ -1117,7 +1119,6 @@ def promote_kv_cache_offsets(
     densify paged KV (e.g. ``CompiledVerifyBank``) pass ``True`` explicitly.
     """
     promoted = 0
-    paged_promoted = False
     failures: dict[str, int] = {}
     if cache is None:
         return promoted, failures
@@ -1202,11 +1203,9 @@ def promote_kv_cache_offsets(
                         entry
                     )
                     promoted += 1
-                    paged_promoted = True
                     continue
                 cache[idx] = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(entry)
                 promoted += 1
-                paged_promoted = True
                 continue
         offset = getattr(entry, "offset", None)
         if not isinstance(offset, int):
@@ -1240,10 +1239,9 @@ def promote_kv_cache_offsets(
             ),
         )
         promoted += 1
-    if paged_promoted:
-        from .cache_state import link_paged_window_group
+    from .cache_state import link_paged_window_group
 
-        link_paged_window_group(cache)
+    link_paged_window_group(cache)
     return promoted, failures
 
 

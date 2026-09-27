@@ -2897,7 +2897,10 @@ def link_paged_window_group(cache: Any) -> None:
     layer's cache, and every full-attention layer then writes the same window.
     ``make_mask`` therefore reserves the window for all of them, and this is
     how it finds them: each adapter holds weak references to its siblings, so
-    the group never keeps a demoted cache's buffers alive.
+    the group never keeps a demoted cache's buffers alive. Idempotent and
+    cheap when the list's adapters already form one group, so the promotion
+    calls it on every pass: a list rebuilt from already-promoted adapters, or
+    one mixing them with new ones, is relinked as it stands.
     """
 
     import weakref
@@ -2905,6 +2908,15 @@ def link_paged_window_group(cache: Any) -> None:
     members = [
         entry for entry in cache or [] if isinstance(entry, TensorOffsetVllmMetalPagedKVCache)
     ]
+    if not members:
+        return
+    group = members[0]._window_group
+    if (
+        len(group) == len(members)
+        and all(entry._window_group is group for entry in members)
+        and all(ref() is entry for ref, entry in zip(group, members))
+    ):
+        return  # already exactly this list's adapters
     group = tuple(weakref.ref(entry) for entry in members)
     for entry in members:
         entry._window_group = group
