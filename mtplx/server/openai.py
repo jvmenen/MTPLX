@@ -19590,6 +19590,11 @@ def _admission_scratch_bytes(
         _ADMISSION_FIXED_FLOOR_BYTES,
         flat - per_row * _ADMISSION_FLAT_TRANSIENT_ROWS,
     )
+    if getattr(runtime, "prefill_scratch_calibration", None) == "pending":
+        # A backend whose one forward covers the whole prompt (Gemma 4): the
+        # chunked families' per-2,048-row reserve does not describe it, so
+        # its own geometry prices it until its peak is measured.
+        return fixed + per_row * rows + mask, "geometry_pending_calibration" + suffix
     return max(fixed + per_row * rows, flat_share) + mask, "geometry" + suffix
 
 
@@ -20170,6 +20175,8 @@ def _run_prefill_admission(
             scratch_bytes=scratch,
         )
         model["scratch_source"] = scratch_source
+        if scratch_source.startswith("geometry_pending_calibration"):
+            model["scratch_calibration_pending"] = True
         model["scratch_rows"] = int(max(1, rows))
         model["prefill_chunk_tokens"] = width
         model["chunk_bytes"] = _admission_chunk_bytes(geometry, max(1, rows), scratch)

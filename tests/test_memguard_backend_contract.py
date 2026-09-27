@@ -157,12 +157,15 @@ def _roomy(monkeypatch, manager):
 
 
 def _gemma_scratch(rows: int, cached: int) -> int:
+    """Its own geometry, the mask twice and the fixed part: the chunked
+    families' 3 GiB per 2,048 rows does not describe one whole-prompt
+    forward, and stays out until Gemma's peak is measured."""
+
     per_row = srv._ADMISSION_LIVE_LAYERS * GEMMA_ROW
     fixed = max(srv._ADMISSION_FIXED_FLOOR_BYTES, 3 * GIB - per_row * 2048)
-    flat_share = 3 * GIB * rows // 2048
     window = min(1023, cached)
     mask = rows * (window + rows) if window + rows > 1024 else 0
-    return max(fixed + per_row * rows, flat_share) + 2 * mask
+    return fixed + per_row * rows + 2 * mask
 
 
 class TestGemmaGeometry:
@@ -217,8 +220,11 @@ class TestGemmaAdmission:
         growth = pricing["growth"]
         assert growth["prefill_chunk_tokens"] is None
         assert growth["scratch_rows"] == 16_384
-        assert growth["scratch_source"] == "geometry+mask"
+        assert growth["scratch_source"] == "geometry_pending_calibration+mask"
+        assert growth["scratch_calibration_pending"] is True
         assert growth["scratch_bytes"] == _gemma_scratch(16_384, 0)
+        # 11.8 GB, where the flat share would have charged 26.3 GB.
+        assert growth["scratch_bytes"] < 3 * GIB * 16_384 // 2048
         assert growth["layout"] == "contiguous_dense_decode"
         assert growth["repage_copy_bytes"] == 0
         assert growth["chunk_bytes"] == 16_384 * GEMMA_PLANNED_KV + _gemma_scratch(16_384, 0)

@@ -1556,6 +1556,13 @@ class Gemma4AssistantRuntime:
     # decode (_clone_gemma4_prompt_cache), whatever store-on-prefill says.
     keeps_prompt_snapshot_with_bank = True
 
+    # The reserve the chunked families are held to (3 GiB a 2,048-row chunk,
+    # measured on the 27B) does not describe one forward over the whole
+    # prompt. This backend's scratch is priced from its own geometry (the
+    # layers' activations, the mask twice, a fixed part) until its cold
+    # prefill peak is measured; receipts say so.
+    prefill_scratch_calibration = "pending"
+
     def text_args(self) -> Any:
         """The target's text config, for the admission's geometry."""
 
