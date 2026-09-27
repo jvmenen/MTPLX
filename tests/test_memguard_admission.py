@@ -344,7 +344,7 @@ class TestWarmTurns:
         # release reaches it.
         sub = _put(
             manager.bank,
-            range(500_000, 500_000 + 92_450),
+            range(500_000, 500_000 + 110_000),
             session_id="sub",
             row_bytes=FN_ROW,
             live_cache=True,
@@ -466,10 +466,12 @@ class Test499FortyEightGigSeat:
         assert receipt["restore_copies_prefix"] is True
         # Before the shed, both copies were priced: the restore's (the
         # conversation again, next to its banked snapshot) and decode's copy
-        # of the banked prompt. That is 38.7 GiB: the report measured 38.5
-        # GiB active and a 39.5 GiB peak.
-        live_before = machine.base + 96_170 * Q27_KV + int(0.3 * GIB)
-        assert receipt["projected_bytes"] == live_before + 2 * 99_355 * Q27_KV
+        # of the banked prompt, on what is in use (the 0.3 GiB allocator
+        # pool is left out: MLX releases it before it passes its own
+        # limit). That is 38.4 GiB: the report measured 38.5 GiB active and
+        # a 39.5 GiB peak.
+        in_use = machine.base + 96_170 * Q27_KV
+        assert receipt["projected_bytes"] == in_use + 2 * 99_355 * Q27_KV
         assert 38 * GIB < receipt["projected_bytes"] < 40 * GIB
         # The banked prompt copy is what crossed the line: it is skipped
         # (never replaced by a live reference to a cache decode mutates),
@@ -847,19 +849,28 @@ class TestPressureLoop:
         _run_loop(state, monkeypatch, seconds=0.05)
         assert bank.calls == [(3 * GIB // 2, "memory_pressure_warning")]
 
-    def test_the_macs_own_warning_does_not_wait_for_an_idle_engine(self, monkeypatch):
-        monkeypatch.setattr(
-            sm,
-            "_reader",
-            lambda: TestPerChunkSupplyCheck._reading(
-                None, available_gib=5, free_gib=2, compressor_gib=4, at_s=0.0, wired_gib=0
-            ),
-        )
+    def test_a_warning_waits_for_an_idle_engine_and_critical_does_not(self, monkeypatch):
+        """The Mac's own WARNING used to act at once on a busy engine. The
+        admission already priced the running request to stay above the
+        abort floor, so a dip under the shed floor while it runs is
+        expected; trimming then only disturbs the request. Under the abort
+        floor it acts at once."""
+
         monkeypatch.setattr(srv, "_engine_busy_signal", lambda state: True)
+        warning = TestPerChunkSupplyCheck._reading(
+            None, available_gib=5, free_gib=2, compressor_gib=4, at_s=0.0, wired_gib=0
+        )
+        monkeypatch.setattr(sm, "_reader", lambda: warning)
         bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
-        state = _loop_state(bank)
-        _run_loop(state, monkeypatch, seconds=0.05)
-        assert bank.calls == [(4 * GIB, "memory_pressure_warning")]
+        _run_loop(_loop_state(bank), monkeypatch, seconds=0.05)
+        assert bank.calls == []
+        critical = TestPerChunkSupplyCheck._reading(
+            None, available_gib=2, free_gib=1, compressor_gib=4, at_s=0.0, wired_gib=0
+        )
+        monkeypatch.setattr(sm, "_reader", lambda: critical)
+        bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
+        _run_loop(_loop_state(bank), monkeypatch, seconds=0.05)
+        assert bank.calls == [(0, "memory_pressure_critical")]
 
 
 class TestPlannerReserve:
@@ -1053,3 +1064,138 @@ class Test525SixtyFourGigSeat:
         assert trim["bank_entries_evicted"] == 2
         assert trim["bank_bytes_after"] <= R525_BANK // 2
 
+
+
+# 2026-09-27 validation of c7c3c6f2 (M5 Max 128 GB, Flash-Next Optimized
+# Speed, 96 GiB limit, a 12 GB desktop load): the third turn of the session
+# build-up, 18,113 prompt tokens with 6,022 uncached, was refused by the
+# whole-Mac rule alone. The receipt, in bytes as the guard printed them.
+V_WIRED = 95_520_000_000
+V_FREE = 4_040_000_000
+V_FILE_BACKED = 12_150_000_000
+V_COMPRESSOR = 2_740_000_000
+V_SCRATCH_WIDE = 6_230_000_000  # the itemized bill at 4,096 rows
+V_SCRATCH_NARROW = 3_500_000_000  # the 2,048-row bill's class
+V_PROMPT = 18_113
+V_CACHED = 12_091
+V_ROWS = V_PROMPT * FN_ROW  # the rows the prefill writes, with the copy
+V_ABORT = V_WIRED // 16
+
+
+def _v_reading(*, free: int, file_backed: int) -> sm.SystemMemory:
+    total = 128 * GIB
+    return sm.SystemMemory(
+        available_bytes=free + file_backed,
+        total_bytes=total,
+        level_percent=int((total - V_WIRED - V_COMPRESSOR) * 100 // total),
+        free_bytes=free,
+        file_backed_bytes=file_backed,
+        wired_bytes=V_WIRED,
+        compressor_bytes=V_COMPRESSOR,
+        swap_used_bytes=0,
+        monotonic_s=0.0,
+    )
+
+
+class TestValidationTurn:
+    """The rule the refusal broke: admit when the supply after the growth
+    stays over the abort floor; reclaim first when it would fall under the
+    shed floor; refuse only when it still falls under the abort floor after
+    that. The chunk width is the first lever: a narrower forward is cheaper
+    than anyone's state."""
+
+    def _admit(self, monkeypatch, *, free: int, file_backed: int):
+        monkeypatch.setattr(
+            srv,
+            "_admission_scratch_bytes",
+            lambda state, *, rows, prompt_tokens, geometry: (
+                V_SCRATCH_WIDE if rows > 2048 else V_SCRATCH_NARROW,
+                "qsa_itemized",
+            ),
+        )
+        monkeypatch.setattr(sm, "_reader", lambda: _v_reading(free=free, file_backed=file_backed))
+        manager = _manager()
+        prompt = list(range(V_PROMPT))
+        source = _put(manager.bank, prompt[:V_CACHED], session_id="anon-julian", row_bytes=FN_ROW)
+        session = manager.get_or_create("anon-julian")
+        assert session.try_begin_generation()
+        # The engine line is fine throughout (projected 92 GB of a 100 GB line).
+        machine = _Machine(manager.bank, base_gib=84.0, cache_gib=1.0, host_gib=6.0)
+        _install(monkeypatch, machine)
+        try:
+            receipt = srv._prefill_admission_shed(
+                _flash_next_state(manager),
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="anon-julian",
+                prefill_chunk_tokens=4096,
+                restore_mode="clone",
+            )
+        finally:
+            session.end_generation()
+        return receipt, manager, source
+
+    def test_the_refused_turn_runs_at_the_narrower_chunk(self, monkeypatch):
+        """At c7c3c6f2 this is refused: 6.82 GB of growth plus the 5.97 GB
+        abort floor plus a 5.97 GB request-sized margin against 16.19 GB.
+        At 4,096 rows it would leave 9.37 GB, under the 11.94 GB shed floor;
+        at 2,048 rows it leaves 12.10 GB, so it runs there and nothing is
+        taken from anyone."""
+
+        receipt, manager, source = self._admit(
+            monkeypatch, free=V_FREE, file_backed=V_FILE_BACKED
+        )
+        assert receipt.get("refused") is not True
+        assert receipt["prefill_chunk_requested"] == 4096
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert receipt["reclamation_steps"] == ["narrower_prefill_chunk"]
+        assert receipt["growth_by_chunk"] == {
+            "4096": V_ROWS + V_SCRATCH_WIDE,
+            "2048": V_ROWS + V_SCRATCH_NARROW,
+        }
+        assert receipt["growth"]["restore_copy_bytes"] == V_CACHED * FN_ROW
+        assert "cache_cleared" not in receipt
+        assert source.token_ids in manager.bank._entries
+
+    def test_between_the_floors_it_runs_narrow_after_reclamation(self, monkeypatch):
+        """11 GB of supply: the 2,048-row chunk leaves 6.9 GB, over the
+        abort floor and under the shed floor. The engine gives back its
+        pool first, then runs the request at the narrower chunk."""
+
+        receipt, _manager_, _source = self._admit(
+            monkeypatch, free=2_000_000_000, file_backed=9_000_000_000
+        )
+        assert receipt.get("refused") is not True
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert receipt["reclamation_steps"][0] == "allocator_pool"
+        assert receipt["system_shortfall_bytes_after"] == 0
+
+    def test_under_the_abort_floor_after_reclamation_it_is_refused(self, monkeypatch):
+        """0.1 GB under the abort floor at the narrowest chunk, with nothing
+        left to give back: refused, and the shortfall is the request's own
+        growth against the abort floor (c7c3c6f2 reported 8.8 GB: the wide
+        chunk, the floor and a margin the size of the request)."""
+
+        supply = V_ROWS + V_SCRATCH_NARROW + V_ABORT - 100_000_000
+        receipt, _manager_, _source = self._admit(
+            monkeypatch, free=2_000_000_000, file_backed=supply - 2_000_000_000
+        )
+        assert receipt["refused"] is True
+        assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
+        assert receipt["system_shortfall_bytes_after"] == 100_000_000
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert receipt["system_abort_floor_bytes_after"] == V_ABORT
+
+    def test_the_chosen_width_reaches_the_prefill(self):
+        """The admission's width is the one the prefill runs: generation
+        reads it back before it enters the chunk override."""
+
+        import inspect
+
+        src = inspect.getsource(srv._run_generation)
+        admitted = src.index("admission_shed = _prefill_admission_shed(")
+        narrowed = src.index(
+            'prefill_chunk_tokens = int(admission_shed["prefill_chunk_tokens"])'
+        )
+        override = src.index("prefill_chunk_size_override(prefill_chunk_tokens)")
+        assert admitted < narrowed < override

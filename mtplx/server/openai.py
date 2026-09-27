@@ -19849,6 +19849,31 @@ def _prefill_admission_shed(
         return receipt
 
 
+_ADMISSION_NO_FIT = object()
+
+
+def _admission_prefill_widths(
+    prompt_tokens: int, requested: int | None
+) -> list[int | None]:
+    """The rows one prefill forward may run for this request, widest first.
+
+    ``None`` is a prompt forwarded whole: without chunked prefill the
+    generation loop runs one forward over every uncached token, and no chunk
+    override reaches it. Chunked, the request's own width comes first (the
+    Flash-Next wide chunk, a caller's override, ``--prefill-chunk-tokens``)
+    and then the profile's chunk when it is narrower: the width is a lever
+    the admission pulls before it evicts anyone's state or refuses.
+    """
+
+    from mtplx.generation import _prefill_chunk_size, _sustained_prefill_enabled
+
+    if not _sustained_prefill_enabled():
+        return [None]
+    default = max(1, int(_prefill_chunk_size(prompt_tokens)))
+    first = max(1, int(requested)) if requested else default
+    return [first, default] if default < first else [first]
+
+
 def _run_prefill_admission(
     state: "ServerState",
     *,
@@ -19864,10 +19889,8 @@ def _run_prefill_admission(
     restore_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
-        _prefill_chunk_size,
         _store_on_prefill_env_enabled,
         _store_on_prefill_min_suffix,
-        _sustained_prefill_enabled,
         _sustained_prefill_layout,
     )
 
@@ -19899,9 +19922,12 @@ def _run_prefill_admission(
 
     def measure() -> dict[str, Any]:
         # #456 / two kernel panics: active + cache is MLX's own account and
-        # can sit below what the kernel holds for this process, so every
-        # projection is floored at the real footprint past the host
-        # allowance (_footprint_floor). The Mac is read again as well: what
+        # can sit below what the kernel holds for this process, so the
+        # footprint past the host allowance is charged (_footprint_floor).
+        # The engine line leaves the allocator pool out: MLX releases pooled
+        # buffers before an allocation takes it past its own limit, and the
+        # growth reuses them, so counting the pool as a need only cleared a
+        # warm allocator for nothing. The Mac is read again as well: what
         # the engine gives back lands in the free pages.
         stats = _mlx_memory_stats_live()
         active = int(stats.get("active_memory_bytes") or 0)
@@ -19913,6 +19939,7 @@ def _run_prefill_admission(
             "active": active,
             "cache": cache,
             "live": int(live),
+            "engine": int(live) - cache,
             "fields": fields,
             "system": _read_system_memory(),
         }
@@ -19923,10 +19950,7 @@ def _run_prefill_admission(
     geometry = _admission_geometry(state)
     threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
     layout = _sustained_prefill_layout(prompt_tokens)
-    chunk_rows = max(
-        1, int(prefill_chunk_tokens or _prefill_chunk_size(prompt_tokens))
-    )
-    chunked = _sustained_prefill_enabled()
+    widths = _admission_prefill_widths(prompt_tokens, prefill_chunk_tokens)
     output_tokens = int(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
@@ -19955,9 +19979,11 @@ def _run_prefill_admission(
                 return False
         return True
 
-    def growth(reused: int, copies: bool, source_layout: str | None) -> dict[str, Any]:
+    def growth(
+        reused: int, copies: bool, source_layout: str | None, width: int | None
+    ) -> dict[str, Any]:
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
-        rows = min(miss, chunk_rows) if chunked else miss
+        rows = miss if width is None else min(miss, width)
         scratch, scratch_source = _admission_scratch_bytes(
             state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=geometry
         )
@@ -19974,23 +20000,41 @@ def _run_prefill_admission(
         )
         model["scratch_source"] = scratch_source
         model["scratch_rows"] = int(max(1, rows))
+        model["prefill_chunk_tokens"] = width
         return model
 
-    def system_short(growth_bytes: int, snapshot: Mapping[str, Any]) -> int:
+    def system_short(snapshot: Mapping[str, Any], growth_bytes: int, floor: str) -> int:
         return _system_admission_shortfall_bytes(
-            snapshot["system"],
-            growth_bytes=growth_bytes,
-            reclaimable_bytes=int(snapshot["cache"]),
+            snapshot["system"], growth_bytes=growth_bytes, floor=floor
+        )
+
+    def shed_deficit(snapshot: Mapping[str, Any], model: Mapping[str, Any]) -> int:
+        # Under 0.97 of the limit and above the Mac's shed floor after the
+        # growth, the request runs as it is.
+        g = int(model["growth_bytes"])
+        return max(
+            0,
+            int(snapshot["engine"]) + g - threshold,
+            system_short(snapshot, g, "shed"),
+        )
+
+    def refusal_deficit(snapshot: Mapping[str, Any], model: Mapping[str, Any]) -> int:
+        # Over the limit, or under the Mac's abort floor after the growth,
+        # once reclamation is done: refused (unless the operator chose swap).
+        if allow_swap:
+            return 0
+        g = int(model["growth_bytes"])
+        return max(
+            0,
+            int(snapshot["engine"]) + g - limit,
+            system_short(snapshot, g, "abort"),
         )
 
     # Cheap worst case first: nothing reused, the whole prompt new, a copy
-    # banked. It bounds every split of this prompt, so when it clears both
-    # lines the request is admitted without probing the bank.
-    worst = growth(0, True, None)
-    if (
-        now["live"] + worst["growth_bytes"] <= threshold
-        and system_short(worst["growth_bytes"], now) <= 0
-    ):
+    # banked, at the request's own width. It bounds every split of this
+    # prompt, so when it clears both lines the request is admitted without
+    # probing the bank.
+    if shed_deficit(now, growth(0, True, None, widths[0])) <= 0:
         return None
 
     reused_tokens = 0
@@ -20064,11 +20108,22 @@ def _run_prefill_admission(
         else None
     )
     miss_tokens = max(0, prompt_tokens - reused_tokens)
-    current = growth(reused_tokens, copies, source_layout)
-    projected = now["live"] + current["growth_bytes"]
-    short = system_short(current["growth_bytes"], now)
-    if projected <= threshold and short <= 0:
+
+    def price() -> dict[Any, dict[str, Any]]:
+        return {w: growth(reused_tokens, copies, source_layout, w) for w in widths}
+
+    def widest_fit(snapshot: Mapping[str, Any], models: Mapping[Any, Any]) -> Any:
+        for w in widths:
+            if shed_deficit(snapshot, models[w]) <= 0:
+                return w
+        return _ADMISSION_NO_FIT
+
+    models = price()
+    chosen = widest_fit(now, models)
+    if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         return None
+    narrow = widths[-1]
+    current = models[narrow if chosen is _ADMISSION_NO_FIT else chosen]
     receipt: dict[str, Any] = {
         "action": "prefill_admission_shed",
         "prompt_tokens": int(prompt_tokens),
@@ -20079,8 +20134,10 @@ def _run_prefill_admission(
         "active_bytes": int(now["active"]),
         "cache_bytes": int(now["cache"]),
         **now["fields"],
-        "growth": dict(current),
-        "projected_bytes": int(projected),
+        "prefill_chunk_requested": widths[0],
+        "growth_by_chunk": {str(w): int(m["growth_bytes"]) for w, m in models.items()},
+        "growth": dict(models[widths[0]]),
+        "projected_bytes": int(now["engine"] + models[widths[0]]["growth_bytes"]),
         "threshold_bytes": int(threshold),
         "limit_bytes": int(limit),
     }
@@ -20089,7 +20146,9 @@ def _run_prefill_admission(
         receipt["system_available_bytes"] = int(now["system"].available_bytes)
         receipt["system_shed_floor_bytes"] = int(shed_floor)
         receipt["system_abort_floor_bytes"] = int(abort_floor)
-        receipt["system_shortfall_bytes"] = int(short)
+        receipt["system_shortfall_bytes"] = int(
+            system_short(now, int(models[widths[0]]["growth_bytes"]), "shed")
+        )
         receipt["system_memory"] = now["system"].to_dict()
     steps: list[str] = []
 
@@ -20106,99 +20165,102 @@ def _run_prefill_admission(
             receipt["cache_clear_error"] = repr(exc)
 
     def deficit(snapshot: Mapping[str, Any]) -> int:
-        g = int(current["growth_bytes"])
-        return max(0, int(snapshot["live"]) + g - threshold, system_short(g, snapshot))
+        # Reclamation prices the narrowest width: a request gives up its
+        # chunk width before anyone's state is taken.
+        return shed_deficit(snapshot, current)
 
-    def refusal_deficit(snapshot: Mapping[str, Any]) -> int:
-        if allow_swap:
-            return 0
-        g = int(current["growth_bytes"])
-        return max(0, int(snapshot["live"]) + g - limit, system_short(g, snapshot))
+    if chosen is not _ADMISSION_NO_FIT:
+        # A narrower chunk fits without taking anything from anyone: its
+        # smaller forward is the cheapest way to make room (2026-09-27
+        # validation, 128 GB, Flash-Next, 12 GB of apps open: the 4,096-row
+        # chunk of an 18K turn needed 6.8 GB, the 2,048-row one about 4 GB).
+        steps.append("narrower_prefill_chunk")
+    else:
+        # 1. The allocator pool, when the Mac's line needs its pages (the
+        # engine line already leaves the pool out).
+        if now["cache"] > 0 and system_short(now, int(current["growth_bytes"]), "shed") > 0:
+            clear_pool()
+            now = measure()
+            steps.append("allocator_pool")
+            receipt["projected_bytes_after_cache_clear"] = int(
+                now["engine"] + current["growth_bytes"]
+            )
 
-    # 1. The allocator pool is free storage the allocator holds; session
-    # state avoids real re-prefill and SSD work. Reclaim the pool first.
-    clear_pool()
-    now = measure()
-    steps.append("allocator_pool")
-    receipt["projected_bytes_after_cache_clear"] = int(
-        now["live"] + current["growth_bytes"]
-    )
+        # 2. The banked copy of this prompt, when it is what crosses the line.
+        if deficit(now) > 0 and current["publish_copy_bytes"] > 0:
+            flags["skip_publish"] = True
+            unpublished = price()
+            if unpublished[narrow]["growth_bytes"] < current["growth_bytes"]:
+                models = unpublished
+                current = models[narrow]
+                receipt["prompt_publish_skipped"] = True
+                steps.append("prompt_publish")
+            else:
+                flags["skip_publish"] = False
 
-    # 2. The banked copy of this prompt, when it is what crosses the line.
-    if deficit(now) > 0 and current["publish_copy_bytes"] > 0:
-        flags["skip_publish"] = True
-        unpublished = growth(reused_tokens, copies, source_layout)
-        if unpublished["growth_bytes"] < current["growth_bytes"]:
-            current = unpublished
-            receipt["prompt_publish_skipped"] = True
-            receipt["growth"] = dict(current)
-            steps.append("prompt_publish")
-        else:
-            flags["skip_publish"] = False
-
-    if session_bank is not None and deficit(now) > 0:
-        try:
-            receipt["bank_bytes_before"] = int(session_bank.total_nbytes)
-            # 3. Nothing restorable, exact or by block prefix, and a large
-            # cold miss: the client rewrote this session's prefix (agent
-            # compaction), so its banked entries can never be restored by
-            # this lineage again. A short side request that shares nothing
-            # with its session (a title, a summary) is not that evidence.
-            if (
-                session_id
-                and reused_tokens == 0
-                and miss_tokens >= _prefill_admission_min_miss_tokens()
-            ):
-                receipt["superseded_session_entries_evicted"] = int(
-                    session_bank.clear(session_id=session_id)
-                )
-                cancel = getattr(session_bank, "cancel_session_persistence", None)
-                if callable(cancel):
-                    receipt["superseded_persistence_cancelled"] = int(
-                        cancel(session_id)
+        if session_bank is not None and deficit(now) > 0:
+            try:
+                receipt["bank_bytes_before"] = int(session_bank.total_nbytes)
+                # 3. Nothing restorable, exact or by block prefix, and a large
+                # cold miss: the client rewrote this session's prefix (agent
+                # compaction), so its banked entries can never be restored by
+                # this lineage again. A short side request that shares nothing
+                # with its session (a title, a summary) is not that evidence.
+                if (
+                    session_id
+                    and reused_tokens == 0
+                    and miss_tokens >= _prefill_admission_min_miss_tokens()
+                ):
+                    receipt["superseded_session_entries_evicted"] = int(
+                        session_bank.clear(session_id=session_id)
                     )
-                clear_pool()
-                now = measure()
-                steps.append("superseded_session")
-            elif session_id and reused_tokens > 0:
-                # A restorable prefix exists: pin this session so the LRU
-                # pass below cannot evict the entry the restore depends on.
-                session_bank.touch_sessions([session_id])
-            # 4. Idle entries of inactive sessions.
-            remaining = deficit(now)
-            bank_bytes_now = int(session_bank.total_nbytes)
-            if remaining > 0 and bank_bytes_now > 0:
-                receipt["lru_entries_evicted"] = int(
-                    session_bank.shrink_to_bytes(
-                        max(0, bank_bytes_now - remaining),
-                        reason="prefill_admission",
-                        protect_active=True,
-                    )
-                )
-                clear_pool()
-                now = measure()
-                steps.append("lru_idle_entries")
-            # 5. #447: a deep session's sibling snapshots (forked
-            # generations no put-time supersede collapses) are
-            # active-protected above; walk the chain prefixes, never an
-            # entry this prompt restores from.
-            if _prefill_admission_chain_shed_enabled():
-                remaining = deficit(now)
-                bank_bytes_now = int(session_bank.total_nbytes)
-                chain_fn = getattr(session_bank, "shrink_for_admission", None)
-                if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
-                    chain_evicted, terminal_evicted = chain_fn(
-                        max(0, bank_bytes_now - remaining),
-                        protect_tokens=probe_ids,
-                        reason="prefill_admission_chain",
-                    )
-                    receipt["chain_entries_evicted"] = int(chain_evicted)
-                    receipt["terminal_entries_evicted"] = int(terminal_evicted)
+                    cancel = getattr(session_bank, "cancel_session_persistence", None)
+                    if callable(cancel):
+                        receipt["superseded_persistence_cancelled"] = int(
+                            cancel(session_id)
+                        )
                     clear_pool()
                     now = measure()
-                    steps.append("chain_walk")
-        except Exception as exc:
-            receipt["bank_error"] = repr(exc)
+                    steps.append("superseded_session")
+                elif session_id and reused_tokens > 0:
+                    # A restorable prefix exists: pin this session so the LRU
+                    # pass below cannot evict the entry the restore depends on.
+                    session_bank.touch_sessions([session_id])
+                # 4. Idle entries of inactive sessions.
+                remaining = deficit(now)
+                bank_bytes_now = int(session_bank.total_nbytes)
+                if remaining > 0 and bank_bytes_now > 0:
+                    receipt["lru_entries_evicted"] = int(
+                        session_bank.shrink_to_bytes(
+                            max(0, bank_bytes_now - remaining),
+                            reason="prefill_admission",
+                            protect_active=True,
+                        )
+                    )
+                    clear_pool()
+                    now = measure()
+                    steps.append("lru_idle_entries")
+                # 5. #447: a deep session's sibling snapshots (forked
+                # generations no put-time supersede collapses) are
+                # active-protected above; walk the chain prefixes, never an
+                # entry this prompt restores from.
+                if _prefill_admission_chain_shed_enabled():
+                    remaining = deficit(now)
+                    bank_bytes_now = int(session_bank.total_nbytes)
+                    chain_fn = getattr(session_bank, "shrink_for_admission", None)
+                    if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
+                        chain_evicted, terminal_evicted = chain_fn(
+                            max(0, bank_bytes_now - remaining),
+                            protect_tokens=probe_ids,
+                            reason="prefill_admission_chain",
+                        )
+                        receipt["chain_entries_evicted"] = int(chain_evicted)
+                        receipt["terminal_entries_evicted"] = int(terminal_evicted)
+                        clear_pool()
+                        now = measure()
+                        steps.append("chain_walk")
+            except Exception as exc:
+                receipt["bank_error"] = repr(exc)
 
     # 6. Whole idle conversations (the 2026-09-26 report: pi's compaction is
     # a new session and the conversation it summarizes is idle, holding a
@@ -20209,7 +20271,7 @@ def _run_prefill_admission(
         keep_ids.add(str(session_id))
     sessions = getattr(state, "sessions", None)
     release_fn = getattr(sessions, "release_idle_sessions", None)
-    if callable(release_fn) and deficit(now) > 0:
+    if chosen is _ADMISSION_NO_FIT and callable(release_fn) and deficit(now) > 0:
         rounds: list[dict[str, Any]] = []
         try:
             # First round sized to the deficit (the bank's own byte count);
@@ -20245,7 +20307,12 @@ def _run_prefill_admission(
     if own_bank is None:
         own_bank = getattr(sessions, "bank", None)
     own_fn = getattr(own_bank, "release_sessions", None)
-    if session_id and callable(own_fn) and refusal_deficit(now) > 0:
+    if (
+        chosen is _ADMISSION_NO_FIT
+        and session_id
+        and callable(own_fn)
+        and refusal_deficit(now, current) > 0
+    ):
         try:
             # No ownership hold: this request holds the session's slot.
             receipt["own_session_release"] = own_fn(
@@ -20261,6 +20328,16 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["own_session_release_error"] = repr(exc)
 
+    if chosen is _ADMISSION_NO_FIT:
+        # Re-priced on what reclamation left: the widest chunk that now fits
+        # clear of both shed lines, else the narrowest one if it stays above
+        # the abort lines.
+        chosen = widest_fit(now, models)
+        if chosen is _ADMISSION_NO_FIT:
+            chosen = narrow
+    current = models[chosen]
+    receipt["prefill_chunk_tokens"] = chosen
+    receipt["growth"] = dict(current)
     receipt["reclamation_steps"] = steps
     if session_bank is not None:
         try:
@@ -20268,8 +20345,7 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt.setdefault("bank_error", repr(exc))
     growth_after = int(current["growth_bytes"])
-    projected_after = int(now["live"]) + growth_after
-    short_after = system_short(growth_after, now)
+    projected_after = int(now["engine"]) + growth_after
     receipt["active_bytes_after"] = int(now["active"])
     receipt["cache_bytes_after"] = int(now["cache"])
     receipt["phys_footprint_bytes_after"] = now["fields"].get("phys_footprint_bytes")
@@ -20279,12 +20355,17 @@ def _run_prefill_admission(
     receipt["growth_bytes_after"] = growth_after
     receipt["projected_bytes_after"] = int(projected_after)
     system_after = now["system"]
+    short_after = system_short(now, growth_after, "abort")
     receipt["system_available_bytes_after"] = (
         int(system_after.available_bytes) if system_after is not None else None
     )
     receipt["system_free_bytes_after"] = (
         system_after.free_bytes if system_after is not None else None
     )
+    if system_after is not None:
+        shed_after, abort_after = _system_reading_floors(system_after)
+        receipt["system_shed_floor_bytes_after"] = int(shed_after)
+        receipt["system_abort_floor_bytes_after"] = int(abort_after)
     receipt["system_shortfall_bytes_after"] = int(short_after)
     refusal_reason = None
     if not allow_swap and projected_after > limit:
@@ -20573,12 +20654,15 @@ async def _memory_pressure_loop(
     that supply is under its shed floor, and keeps the previous reading so
     free pages under the abort floor while the compressor or swap grew in
     between (the death signature of the crash receipts) reads CRITICAL. A
-    WARNING from that supply does not wait for the engine to go idle: a busy
-    prefill is what drains it. A WARNING trim halves what the bank holds, not
-    its budget, so it cannot be a no-op when the bank already sits under half
-    (#525: 421 WARNING trims in a row evicted nothing). The sustained abort
-    still needs three CRITICAL ticks; within a request, the prefill reads the
-    supply itself before every chunk (_PrefillSystemGuard) and stops at once.
+    WARNING from that supply waits for an idle engine like the others: the
+    admission already priced the running request to stay above the abort
+    floor, so a dip under the shed floor while it runs is expected, and
+    trimming then only disturbs the request. A WARNING trim halves what the
+    bank holds, not its budget, so it cannot be a no-op when the bank already
+    sits under half (#525: 421 WARNING trims in a row evicted nothing). The
+    sustained abort still needs three CRITICAL ticks; within a request, the
+    prefill reads the supply itself before every chunk (_PrefillSystemGuard)
+    and stops at once.
     """
 
     guard = _MemoryPressureGuard()
@@ -20688,11 +20772,7 @@ async def _memory_pressure_loop(
                 state, level, critical_busy, abort_streak
             )
             deferred_s = guard.deferred_for_s(time.monotonic())
-            # A WARNING read from the Mac's own supply acts at once: a busy
-            # prefill is what drains it. The allocator's and macOS's WARNING
-            # still wait for an idle engine, up to warning_defer_max_s.
-            defer_busy = busy and level_source != "system_available"
-            if guard.decide(level, time.monotonic(), defer_busy):
+            if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
                 if bank is not None:
@@ -27036,6 +27116,12 @@ def _run_generation(
                 request_observability["prefill_admission_shed"] = admission_shed
             if admission_shed is not None and admission_shed.get("refused"):
                 raise _prefill_admission_refusal(state, admission_shed)
+            if admission_shed is not None and admission_shed.get(
+                "prefill_chunk_tokens"
+            ) != admission_shed.get("prefill_chunk_requested"):
+                # The admission narrowed the chunk to fit this request (a
+                # smaller forward instead of evicting state or refusing).
+                prefill_chunk_tokens = int(admission_shed["prefill_chunk_tokens"])
             # The admission may have dropped this request's banked copy of
             # its prompt (the copy decode's first write makes is what crossed
             # the line): no store-on-prefill snapshot, no prompt-prefix

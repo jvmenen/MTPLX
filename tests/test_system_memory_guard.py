@@ -144,7 +144,7 @@ class TestReading:
         )
         assert sm.system_pressure_level(reading) == 2
         assert sm.admission_shortfall_bytes(
-            reading, growth_bytes=8 * GIB, reclaimable_bytes=0
+            reading, growth_bytes=8 * GIB, floor="shed"
         ) == 8 * GIB + 11 * GIB - 9 * GIB
 
     def test_purgeable_pages_are_free(self):
@@ -201,15 +201,27 @@ class TestFloorsAndLevel:
         assert sm.system_pressure_level(_reading(3.1)) == 4
 
     def test_unknown_never_reports_a_shortfall(self):
-        assert sm.admission_shortfall_bytes(None, growth_bytes=50 * GIB, reclaimable_bytes=0) == 0
+        for floor in ("shed", "abort"):
+            assert sm.admission_shortfall_bytes(None, growth_bytes=50 * GIB, floor=floor) == 0
 
-    def test_shortfall_counts_the_engines_own_pool(self):
-        shed, _abort = sm.system_memory_floors(RAM)
+    def test_the_request_is_charged_once_against_each_floor(self):
+        """The shed line says when the engine gives back its own memory
+        first, the abort line when the request is refused. The request is
+        counted once: the old rule also held a margin as large as the
+        request, and refused an 18K turn that would have left 9.4 GB
+        free over a 6.0 GB abort floor (2026-09-27 validation)."""
+
+        shed, abort = sm.system_memory_floors(RAM)
         reading = _reading(10)
-        assert sm.admission_shortfall_bytes(reading, growth_bytes=8 * GIB, reclaimable_bytes=0) == (
+        assert sm.admission_shortfall_bytes(reading, growth_bytes=8 * GIB, floor="shed") == (
             8 * GIB + shed - 10 * GIB
         )
-        assert sm.admission_shortfall_bytes(reading, growth_bytes=8 * GIB, reclaimable_bytes=6 * GIB) == 0
+        assert sm.admission_shortfall_bytes(reading, growth_bytes=8 * GIB, floor="abort") == (
+            8 * GIB + abort - 10 * GIB
+        )
+        assert sm.admission_shortfall_bytes(reading, growth_bytes=5 * GIB, floor="abort") == 0
+        with pytest.raises(ValueError):
+            sm.admission_shortfall_bytes(reading, growth_bytes=GIB, floor="margin")
 
 
 def _machine(
@@ -324,23 +336,27 @@ class TestWiredFloorsAndDeathSignature:
             25 * GIB,
         )
 
-    def test_a_short_request_keeps_a_margin_its_own_size(self):
+    def test_a_request_between_the_floors_is_short_of_the_shed_line_only(self):
         reading = _machine(free_gib=4, file_gib=2, wired_gib=88)  # 6 GiB supply
-        _shed, abort = sm.reading_floors(reading)
-        # 0.25 GiB of growth needs the 5.5 GiB abort floor plus itself.
+        shed, abort = sm.reading_floors(reading)
+        # 0.25 GiB of growth leaves 5.75 GiB: over the 5.5 GiB abort floor,
+        # under the 11 GiB shed floor.
+        assert sm.admission_shortfall_bytes(reading, growth_bytes=GIB // 4, floor="abort") == 0
         assert sm.admission_shortfall_bytes(
-            reading, growth_bytes=GIB // 4, reclaimable_bytes=0
-        ) == 0
+            reading, growth_bytes=GIB // 4, floor="shed"
+        ) == GIB // 4 + shed - 6 * GIB
+        # 1 GiB leaves 5 GiB: 0.5 GiB under the abort floor (the old margin
+        # rule said 1.5).
         assert sm.admission_shortfall_bytes(
-            reading, growth_bytes=GIB, reclaimable_bytes=0
-        ) == GIB + abort + GIB - 6 * GIB
+            reading, growth_bytes=GIB, floor="abort"
+        ) == GIB + abort - 6 * GIB
 
     def test_admission_counts_the_wired_floor(self):
         reading = _machine(free_gib=4, file_gib=10, wired_gib=88)
         shed, _abort = sm.reading_floors(reading)
         assert shed == 2 * (88 * GIB // 16)
         assert sm.admission_shortfall_bytes(
-            reading, growth_bytes=8 * GIB, reclaimable_bytes=0
+            reading, growth_bytes=8 * GIB, floor="shed"
         ) == 8 * GIB + shed - 14 * GIB
 
     def test_rehearsal_caps_the_free_pages_too(self, monkeypatch):
@@ -445,8 +461,19 @@ class TestAdmission:
         # the scratch, as if all three were resident at once.
         rows = len(PROMPT) * PER_TOKEN
         growth = max(rows + srv_transients(), 2 * rows)
-        shed_floor, _ = sm.system_memory_floors(RAM)
-        assert receipt["system_shortfall_bytes"] == growth + shed_floor - (9 + 1) * GIB
+        shed_floor, abort_floor = sm.system_memory_floors(RAM)
+        # The shed line starts reclamation; the abort line refuses. The
+        # allocator pool is not credited: it is cleared first, and what it
+        # gives back is in the next reading.
+        assert receipt["system_shortfall_bytes"] == growth + shed_floor - 9 * GIB
+        assert receipt["cache_cleared"] is True
+        # The banked copy of the prompt gave way (it was what made decode
+        # start the largest moment); the prefill end is still short of the
+        # abort floor.
+        assert receipt["prompt_publish_skipped"] is True
+        after = rows + srv_transients()
+        assert receipt["growth_bytes_after"] == after
+        assert receipt["system_shortfall_bytes_after"] == after + abort_floor - 9 * GIB
         detail = srv._prefill_admission_refusal(_state(), receipt).detail
         message = detail["message"]
         assert "other apps" in message and "9.0 GiB free" in message
@@ -511,26 +538,48 @@ class TestAdmission:
         assert receipt["system_abort_floor_bytes"] == 88 * GIB // 16
         assert receipt["system_memory"]["wired_bytes"] == 88 * GIB
 
-    def test_a_short_prompt_keeps_a_margin_its_own_size(self, monkeypatch):
+    def test_a_short_prompt_between_the_floors_runs_after_reclamation(self, monkeypatch):
         """This test used to pin that a prompt under 4,096 tokens was never
         refused, however little the Mac had left. Every request is projected
-        now; a short one must leave the abort floor plus its own growth, not
-        the whole shed floor, so it is refused only near the abort floor."""
+        now. One that would leave the Mac between its floors runs after the
+        engine gives back what it can; one that would take it under the
+        abort floor is refused."""
 
         _pin_engine(monkeypatch, active_gib=78, cache_gib=1)
         prompt = list(range(512))
         # 5 GiB free: between the 3.2 GiB abort floor and the 6.4 GiB shed
         # floor of a 128 GB Mac with nothing wired in this reading.
         _install(monkeypatch, 5)
-        assert srv._prefill_admission_shed(
+        receipt = srv._prefill_admission_shed(
             _state(), prompt_ids=prompt, session_bank=_Bank(0), session_id="pi"
-        ) is None
+        )
+        assert receipt["reclamation_steps"][0] == "allocator_pool"
+        assert receipt.get("refused") is not True
         _install(monkeypatch, 1)
         receipt = srv._prefill_admission_shed(
             _state(), prompt_ids=prompt, session_bank=_Bank(0), session_id="pi"
         )
         assert receipt["refused"] is True
         assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
+
+    def test_the_pool_is_cleared_only_when_the_macs_line_needs_it(self, monkeypatch):
+        """The engine line leaves the allocator pool out (MLX releases pooled
+        buffers before it passes its own limit), so a request the Mac has
+        room for is admitted without clearing a warm allocator."""
+
+        import mlx.core as mx
+
+        cleared = []
+        monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(True))
+        # 85 GiB in use and 4 GiB pooled: with the pool, the 40K prompt's
+        # 4.2 GiB of growth crosses the 93.1 GiB line; without it, it does
+        # not, and the Mac has 40 GiB to give.
+        _pin_engine(monkeypatch, active_gib=85, cache_gib=4)
+        _install(monkeypatch, 40)
+        assert srv._prefill_admission_shed(
+            _state(), prompt_ids=list(range(40_000)), session_bank=_Bank(0), session_id="pi"
+        ) is None
+        assert cleared == []
 
 
 def srv_transients() -> int:

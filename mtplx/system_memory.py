@@ -419,27 +419,30 @@ def system_pressure_level(
 
 
 def admission_shortfall_bytes(
-    reading: SystemMemory | None, *, growth_bytes: int, reclaimable_bytes: int
+    reading: SystemMemory | None, *, growth_bytes: int, floor: str
 ) -> int:
-    """How far a request's growth would push the Mac under its floor.
+    """How far a request's growth would take the Mac's supply under a floor.
 
-    ``growth_bytes`` is what the request will add; ``reclaimable_bytes`` is the
-    engine's own allocator pool, which the growth reuses before it asks the
-    system for anything. The request must leave the abort floor plus a margin
-    as large as itself, up to the shed floor: a large prefill keeps the whole
-    shed floor free (its estimate and the other apps' growth during a minute
-    of prefill need the room), while a small one is not refused merely
-    because the Mac already sits between the two floors. Zero means the
-    request fits, and an unreadable machine never reports a shortfall.
+    ``floor="shed"``: a request that would leave less than the shed floor
+    runs only after the engine gives back its own reusable memory (the
+    allocator pool, then idle session state) and the Mac is read again.
+    ``floor="abort"``: one that would still leave less than the abort floor
+    after that is refused. The request is charged once, for its own growth:
+    the per-chunk supply check and the death signature are what catch an
+    estimate that was wrong, not a second copy of the request held in
+    reserve (2026-09-27 validation, 128 GB, Flash-Next, 12 GB of apps open:
+    a request-sized margin refused an 18K turn that left 9.4 GB free after
+    its growth, over a 6.0 GB abort floor). Zero means it fits, and an
+    unreadable machine never reports a shortfall.
     """
 
+    if floor not in {"shed", "abort"}:
+        raise ValueError(f"floor must be 'shed' or 'abort', not {floor!r}")
     if reading is None:
         return 0
     shed_floor, abort_floor = reading_floors(reading)
-    growth = max(0, int(growth_bytes))
-    margin = min(growth, max(0, shed_floor - abort_floor))
-    have = int(reading.available_bytes) + max(0, int(reclaimable_bytes))
-    return max(0, growth + abort_floor + margin - have)
+    line = shed_floor if floor == "shed" else abort_floor
+    return max(0, max(0, int(growth_bytes)) + int(line) - int(reading.available_bytes))
 
 
 __all__ = [

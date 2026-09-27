@@ -243,16 +243,23 @@ class TestInertWhenHealthy:
 class TestIncidentShape:
     """The #415 timeline: cache-miss prefill + superseded resident snapshot."""
 
-    def test_allocator_cache_reclaims_without_evicting_useful_sessions(self, monkeypatch):
+    def test_the_allocator_pool_is_not_a_deficit(self, monkeypatch):
+        """8 GiB pooled next to 85 GiB in use. This test used to expect the
+        pool cleared before the prefill: the engine line counted it as a
+        need. MLX releases pooled buffers before an allocation takes it past
+        its own limit, and the growth reuses them, so the request is
+        admitted untouched and the warm allocator is kept."""
+
         import mlx.core as mx
 
+        cleared = []
         live = {"ok": True, "active_memory_bytes": 85 * GIB,
                 "cache_memory_bytes": 8 * GIB}
         monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: dict(live))
-        monkeypatch.setattr(mx, "clear_cache", lambda: live.update(cache_memory_bytes=0))
+        monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(True))
         bank = _Bank([_Entry(range(900, 1000), "pi", 6 * GIB)])
-        receipt = _shed(_state(), list(range(40_000)), bank, "pi")
-        assert receipt["cache_cleared"] is True
+        assert _shed(_state(), list(range(40_000)), bank, "pi") is None
+        assert cleared == []
         assert bank.cleared_sessions == []
         assert bank.shrink_calls == []
         assert bank.total_nbytes == 6 * GIB
@@ -317,11 +324,17 @@ class TestIncidentShape:
         assert bank.touched == ["pi"]
         assert "superseded_session_entries_evicted" not in receipt
 
-    def test_no_bank_still_sheds_allocator_cache(self, monkeypatch):
+    def test_no_bank_and_no_room_is_refused_without_touching_the_pool(self, monkeypatch):
+        """95 GiB in use, 1 GiB pooled, nothing banked: a 40K cold prompt
+        cannot fit the 96 GiB limit. This test used to expect the pool
+        cleared first; the pool is not part of the engine's need, so
+        clearing it could not change the answer."""
+
         _pin_live_stats(monkeypatch, active=95 * GIB, cache=1 * GIB)
         receipt = _shed(_state(), list(range(40_000)), None, None)
         assert receipt is not None
-        assert receipt["cache_cleared"] is True
+        assert receipt["refused"] is True
+        assert "cache_cleared" not in receipt
         assert "bank_bytes_before" not in receipt
 
     def test_never_raises(self, monkeypatch):
@@ -339,9 +352,8 @@ class TestIncidentShape:
             _state(), list(range(40_000)), _ExplodingBank([]), "pi"
         )
         # Probe failure degrades to miss==prompt; bank steps report the
-        # error but the shed still completes with the cache clear.
+        # error and the shed still completes.
         assert receipt is not None
-        assert receipt["cache_cleared"] is True
         assert "bank_error" in receipt
 
 
