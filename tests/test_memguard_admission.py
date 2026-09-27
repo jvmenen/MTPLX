@@ -1642,11 +1642,15 @@ class TestValidationTurn:
             'prefill_chunk_tokens = int(admission_shed["prefill_chunk_tokens"])'
         )
         reserved = src.index('priced=admission_pricing.get("growth"),')
+        # What it reserves once the forwards are done comes off the same bill.
+        after = src.index("prefill_after_forward = _prefill_after_forward_plan(")
         armed = src.index(
             "prefill_system_guard = _PrefillSystemGuard(\n"
-            "                state, chunk_reserve_bytes=prefill_chunk_reserve"
+            "                state,\n"
+            "                chunk_reserve_bytes=prefill_chunk_reserve,\n"
+            "                **prefill_after_forward,"
         )
-        assert admitted < handed < narrowed < reserved < armed
+        assert admitted < handed < narrowed < reserved < after < armed
 
     def test_the_chosen_width_reaches_the_prefill(self):
         """The admission's width is the one the prefill runs: generation

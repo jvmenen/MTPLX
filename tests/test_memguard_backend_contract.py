@@ -448,6 +448,158 @@ class TestGemmaAbortSite:
         assert seen == {"ar": check, "mtp": check}
 
 
+class _Resident(_Machine):
+    """The allocator double with what the request's own arrays hold
+    (``rows``): a Gemma forward leaves every prompt row resident."""
+
+    rows = 0
+
+    def active(self) -> int:
+        return super().active() + int(self.rows)
+
+
+class TestGemmaAfterItsForward:
+    """The review of 23a94abf (finding 2): the per-chunk check Gemma asks
+    after its one forward reserved that forward again. 24,026 cold tokens
+    are billed 79.45 GiB beside 16.5 GiB of weights, which fits a 96 GiB
+    limit; after the forward the rows it wrote (22 GiB) are resident, and
+    38.5 + 79.45 GiB over the limit refused a prefill that had fit. After
+    the forward only decode start's clone is still to come."""
+
+    PROMPT = 24_026
+
+    def _setup(self, monkeypatch, *, base_gib: float):
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        manager = _manager()
+        supply = [90 * GIB]
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: sm.SystemMemory(
+                available_bytes=int(supply[0]),
+                total_bytes=128 * GIB,
+                level_percent=70,
+                free_bytes=int(supply[0]) - 10 * GIB,
+                file_backed_bytes=10 * GIB,
+                wired_bytes=20 * GIB,
+                compressor_bytes=GIB,
+                swap_used_bytes=0,
+            ),
+        )
+        machine = _Resident(manager.bank, base_gib=base_gib, cache_gib=0.0, host_gib=1.0)
+        _install(monkeypatch, machine)
+        state = _gemma_state(manager)
+        pricing: dict = {}
+        receipt = srv._prefill_admission_shed(
+            state,
+            prompt_ids=list(range(self.PROMPT)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=None,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        # The check as _run_generation arms it.
+        priced = pricing.get("growth")
+        reserve = srv._prefill_chunk_reserve_bytes(
+            state, prompt_tokens=self.PROMPT, chunk_tokens=None, priced=priced
+        )
+        plan_fn = getattr(srv, "_prefill_after_forward_plan", None)
+        plan = (
+            plan_fn(state, prompt_tokens=self.PROMPT, chunk_tokens=None, priced=priced)
+            if callable(plan_fn)
+            else {}
+        )
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=reserve, **plan)
+        return machine, supply, receipt, pricing, guard
+
+    def _prefill(self, monkeypatch, machine, supply, guard):
+        rows = self.PROMPT * GEMMA_PLANNED_KV
+        forwards = []
+
+        class _Rows:
+            def __getitem__(self, _key):
+                return self
+
+        def forward(_runtime, prompt_ids, *, cache, phase):
+            # Every layer keeps every row until decode trims the windows;
+            # the forward's scratch is back in the pool or the Mac by now.
+            forwards.append(len(prompt_ids))
+            machine.rows = rows
+            supply[0] -= rows
+            return (
+                SimpleNamespace(
+                    logits=_Rows(), hidden=_Rows(), shared_kv_states={},
+                    cache_offset=len(prompt_ids),
+                ),
+                0.0,
+            )
+
+        monkeypatch.setattr(gemma4, "_gemma4_prefill_prompt", forward)
+        runtime = SimpleNamespace(
+            model_path=Path("models/gemma4"),
+            mtp_enabled=True,
+            make_cache=lambda: [SimpleNamespace(offset=0)],
+        )
+        return forwards, lambda: gemma4._restore_or_prefill_gemma4_prompt(
+            runtime,
+            list(range(self.PROMPT)),
+            require_shared_kv=True,
+            abort_check=guard,
+        )
+
+    def test_a_forward_that_fit_is_not_refused_after_it_ran(self, monkeypatch):
+        machine, supply, receipt, pricing, guard = self._setup(monkeypatch, base_gib=16.5)
+        growth = pricing["growth"]
+        assert round((16.5 * GIB + growth["growth_bytes"]) / GIB, 2) == 95.95
+        assert receipt is None or receipt.get("refused") is not True
+        forwards, prefill = self._prefill(monkeypatch, machine, supply, guard)
+        state = prefill()
+        assert forwards == [self.PROMPT]
+        assert guard.tripped is None
+        assert state.suffix_tokens == self.PROMPT
+        # After the forward it reserved decode start's clone, not the forward.
+        assert guard.prefill_done_by == "forward_rows_resident"
+        assert guard.after_prefill_reserve_bytes == growth["publish_copy_bytes"]
+        assert guard.after_prefill_reserve_bytes < 3 * GIB
+
+    def test_the_forward_is_still_reserved_before_it_runs(self, monkeypatch):
+        """Half a GiB more of anything else and the same forward no longer
+        fits: the check before it stops the request, nothing allocated."""
+
+        machine, supply, _receipt, _pricing, guard = self._setup(monkeypatch, base_gib=17.0)
+        forwards, prefill = self._prefill(monkeypatch, machine, supply, guard)
+        with pytest.raises(generation.PostcommitAbort):
+            prefill()
+        assert forwards == []
+        assert guard.tripped["reason"] == "engine_limit"
+        assert guard.tripped["reserve_after_prefill"] is False
+
+
+class TestTheGenericLoopsProgress:
+    def test_the_last_chunk_releases_the_forward_reservation(self, monkeypatch):
+        """The generic loop reports each chunk before its post-chunk check;
+        after the last one the check reserves what is still to come."""
+
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(sm, "_reader", lambda: None)
+        manager = _manager()
+        _install(monkeypatch, _Machine(manager.bank, base_gib=90.0, cache_gib=0.0, host_gib=1.0))
+        state = _gemma_state(manager)
+        guard = srv._PrefillSystemGuard(
+            state, chunk_reserve_bytes=10 * GIB, after_prefill_reserve_bytes=GIB
+        )
+        guard.note_prefill_progress({"phase": "chunk", "tokens_done": 4_096, "tokens_total": 8_192})
+        assert guard() is True
+        assert guard.tripped["chunk_reserve_bytes"] == 10 * GIB
+        guard = srv._PrefillSystemGuard(
+            state, chunk_reserve_bytes=10 * GIB, after_prefill_reserve_bytes=GIB
+        )
+        guard.note_prefill_progress({"phase": "chunk", "tokens_done": 8_192, "tokens_total": 8_192})
+        assert guard() is False
+        assert guard.prefill_done_by == "prefill_progress"
+
+
 class TestTheGenericLoop:
     def test_it_forwards_the_whole_prompt_without_sustained_prefill(self, monkeypatch):
         monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)

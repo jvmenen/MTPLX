@@ -19121,11 +19121,43 @@ class _PrefillSystemGuard:
     Any of them stops the request with a 507 before the chunk. An unreadable
     machine skips the Mac's lines, ``--allow-swap`` skips all of them, and
     the trip belongs to this request only.
+
+    Once the prefill's forwards are done, the check reserves only what the
+    request still allocates (``after_prefill_reserve_bytes``: the repage's
+    paged copy and decode start's copies beyond the rows the prefill left),
+    never a forward again (the review of 23a94abf: Gemma 4's check after its
+    one forward reserved that forward a second time, 79.45 GiB beside the
+    38.5 GiB it left resident, and refused a 24K prompt that had fit). The
+    generation's prefill progress says when the forwards are done
+    (``note_prefill_progress``). A backend that runs its own prefill as one
+    forward reports that only after its post-forward check, so there the
+    forward's rows are the witness (``forward_rows_bytes``): the check
+    counts the forward done once what the request holds (MLX's active
+    memory less the bank's and its queued jobs') has grown by the restore's
+    copy plus half the rows that forward leaves.
     """
 
-    def __init__(self, state: Any, *, chunk_reserve_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        state: Any,
+        *,
+        chunk_reserve_bytes: int = 0,
+        after_prefill_reserve_bytes: int | None = None,
+        forward_rows_bytes: int | None = None,
+        restore_bytes: int = 0,
+    ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        self.after_prefill_reserve_bytes = (
+            self.chunk_reserve_bytes
+            if after_prefill_reserve_bytes is None
+            else max(0, int(after_prefill_reserve_bytes))
+        )
+        self.forward_rows_bytes = (
+            None if forward_rows_bytes is None else max(0, int(forward_rows_bytes))
+        )
+        self.restore_bytes = max(0, int(restore_bytes))
+        self.prefill_done_by: str | None = None
         self.window = _SystemReadingWindow()
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
@@ -19134,6 +19166,36 @@ class _PrefillSystemGuard:
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
         self.limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
         self.allow_swap = bool(getattr(state, "allow_swap", False))
+        self.base_held: int | None = None
+        if self.forward_rows_bytes and not self.allow_swap:
+            stats = _mlx_memory_stats_live()
+            if _allocator_reading_failure(stats) is None:
+                self.base_held = self._request_held(stats)
+
+    def _request_held(self, stats: Mapping[str, Any]) -> int:
+        """MLX's active memory less what the bank and its queued jobs hold:
+        a bank trim during the forward must not read as the forward undone."""
+
+        bank = getattr(getattr(self.state, "sessions", None), "bank", None)
+        held = 0
+        if bank is not None:
+            held = int(getattr(bank, "total_nbytes", 0) or 0) + int(
+                getattr(bank, "queued_persistence_bytes", 0) or 0
+            )
+        return int(stats.get("active_memory_bytes") or 0) - held
+
+    def note_prefill_progress(self, payload: Mapping[str, Any]) -> None:
+        """The generation's prefill progress: its last chunk, or its end."""
+
+        try:
+            phase = payload.get("phase")
+            total = int(payload.get("tokens_total") or 0)
+            done = int(payload.get("tokens_done") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total):
+            if self.prefill_done_by is None:
+                self.prefill_done_by = "prefill_progress"
 
     def __call__(self) -> bool:
         if self.tripped is not None:
@@ -19161,6 +19223,17 @@ class _PrefillSystemGuard:
         )
         active = 0 if failure is not None else int(stats.get("active_memory_bytes") or 0)
         pool = 0 if failure is not None else int(stats.get("cache_memory_bytes") or 0)
+        if (
+            self.prefill_done_by is None
+            and self.forward_rows_bytes
+            and self.base_held is not None
+            and failure is None
+        ):
+            grown = self._request_held(stats) - self.base_held
+            if grown >= self.restore_bytes + self.forward_rows_bytes // 2:
+                self.prefill_done_by = "forward_rows_resident"
+        if self.prefill_done_by is not None:
+            reserve = self.after_prefill_reserve_bytes
         reason = None
         engine = None
         fields: dict[str, Any] = {}
@@ -19190,6 +19263,8 @@ class _PrefillSystemGuard:
             "action": "prefill_system_abort",
             "reason": reason,
             "chunk_reserve_bytes": int(reserve),
+            "reserve_after_prefill": self.prefill_done_by is not None,
+            "prefill_done_by": self.prefill_done_by,
             "engine_bytes": engine,
             "limit_bytes": int(self.limit) or None,
             **fields,
@@ -19245,6 +19320,56 @@ def _prefill_chunk_reserve_bytes(
         state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
     )
     return _admission_chunk_bytes(geometry, rows, scratch)
+
+
+def _prefill_after_forward_plan(
+    state: Any,
+    *,
+    prompt_tokens: int,
+    chunk_tokens: int | None,
+    priced: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What the per-chunk check reserves once the prefill's forwards are
+    done, and, for a backend that runs its own prefill as one forward, the
+    rows that forward leaves (``_PrefillSystemGuard``'s witness).
+
+    From the admission's bill when there is one: the larger of the repage
+    and decode start, less the rows the prefill leaves (its restore copy and
+    the rows it writes). Without one, a full-width copy of the prompt, and
+    its paged copy when the layout repages: more than any bill charges."""
+
+    runtime = getattr(state, "runtime", None)
+    prompt_tokens = max(1, int(prompt_tokens))
+    widths = _admission_prefill_widths(runtime, prompt_tokens, chunk_tokens)
+    own_one_forward = widths[0] is None and callable(
+        getattr(runtime, "prefill_forward_widths", None)
+    )
+    if isinstance(priced, Mapping) and priced.get("live_prefill_bytes") is not None:
+        left = int(priced["live_prefill_bytes"])
+        after = max(
+            0,
+            max(
+                int(priced.get("repage_bytes") or 0),
+                int(priced.get("decode_start_bytes") or 0),
+            )
+            - left,
+        )
+        restore = int(priced.get("restore_copy_bytes") or 0)
+        rows = max(0, left - restore)
+    else:
+        from mtplx.generation import prefill_cache_layout
+
+        geometry = _admission_geometry(state)
+        rows = prompt_tokens * int(geometry.live_bytes_per_token)
+        restore = 0
+        after = rows
+        if prefill_cache_layout(runtime, prompt_tokens) == "contiguous_then_repage":
+            after += prompt_tokens * int(geometry.paged_bytes_per_token)
+    return {
+        "after_prefill_reserve_bytes": int(after),
+        "forward_rows_bytes": int(rows) if own_one_forward else None,
+        "restore_bytes": int(restore) if own_one_forward else 0,
+    }
 
 
 def _prefill_system_abort_exception(
@@ -28112,8 +28237,15 @@ def _run_generation(
             request_env = dict(dynamic_kv_reservation["env"])
             if prompt_publish_skipped:
                 request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
+            prefill_after_forward: dict[str, Any] = {}
             try:
                 prefill_chunk_reserve = _prefill_chunk_reserve_bytes(
+                    state,
+                    prompt_tokens=len(prompt_ids),
+                    chunk_tokens=prefill_chunk_tokens,
+                    priced=admission_pricing.get("growth"),
+                )
+                prefill_after_forward = _prefill_after_forward_plan(
                     state,
                     prompt_tokens=len(prompt_ids),
                     chunk_tokens=prefill_chunk_tokens,
@@ -28147,7 +28279,9 @@ def _run_generation(
             else:
                 _note_guard_health(state, where="prefill_chunk_reserve", error=None)
             prefill_system_guard = _PrefillSystemGuard(
-                state, chunk_reserve_bytes=prefill_chunk_reserve
+                state,
+                chunk_reserve_bytes=prefill_chunk_reserve,
+                **prefill_after_forward,
             )
 
             def _prefill_abort_check() -> bool:
@@ -28156,6 +28290,15 @@ def _run_generation(
                 if _pressure_abort_requested(state):
                     return True
                 return prefill_system_guard()
+
+            # The generation's prefill progress also tells the per-chunk
+            # check when the forwards are done.
+            _outer_prefill_callback = prefill_callback
+
+            def _guarded_prefill_callback(payload: dict[str, Any]) -> None:
+                prefill_system_guard.note_prefill_progress(payload)
+                if _outer_prefill_callback is not None:
+                    _outer_prefill_callback(payload)
             # Install the per-request live decode sink (flight recorder) so
             # _DecodeTrace publishes by-depth acceptance at 1 Hz mid-request.
             # Owner-thread module slot; cleared in the lock-release finally.
@@ -28208,7 +28351,7 @@ def _run_generation(
                         token_callback=record_tokens,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
+                        prefill_callback=_guarded_prefill_callback,
                         # The repetition trimmer retracts already-committed
                         # tokens, which would desync the grammar matcher;
                         # constrained output is schema-shaped, not freeform.
@@ -28283,7 +28426,7 @@ def _run_generation(
                         commit_prompt_state_keep_live_ref=False,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
+                        prefill_callback=_guarded_prefill_callback,
                         adaptive_policy=adaptive_policy,
                         repetition_stop=uncapped_repetition_stop,
                         loop_guard=_loop_guard_enabled(),
