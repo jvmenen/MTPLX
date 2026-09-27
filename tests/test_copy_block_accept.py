@@ -121,10 +121,16 @@ def _special_rows(vocab: int, rng: np.random.Generator) -> list[np.ndarray]:
 @pytest.mark.parametrize("config", CONFIGS, ids=lambda c: f"t{c.temperature}-p{c.top_p}-k{c.top_k}")
 @pytest.mark.parametrize(
     ("vocab", "rows", "dtype"),
-    [(248_320, 6, mx.bfloat16), (1_000, 24, mx.float32), (1_000, 9, mx.bfloat16)],
-    ids=["flash-next-vocab-bf16", "small-f32", "small-bf16"],
+    [
+        (QWEN_VOCAB, 16, mx.bfloat16),
+        (QWEN_VOCAB, 24, mx.float32),
+        (QWEN_VOCAB, 12, mx.float16),
+        (1_000, 24, mx.float32),
+        (1_000, 9, mx.bfloat16),
+    ],
+    ids=["qwen-vocab-16-bf16", "qwen-vocab-24-f32", "qwen-vocab-12-f16", "small-f32", "small-bf16"],
 )
-def test_rows_reader_is_the_single_row_reader_bit_for_bit(config, vocab, rows, dtype):
+def test_rows_reader_is_the_single_row_reader_bit_for_bit(metal, config, vocab, rows, dtype):
     rng = np.random.default_rng(vocab + rows)
     logits = rng.normal(size=(rows, vocab)) * 3.0
     logits[: len(_special_rows(vocab, rng))] = np.stack(_special_rows(vocab, rng))
@@ -144,7 +150,7 @@ def test_rows_reader_is_the_single_row_reader_bit_for_bit(config, vocab, rows, d
     [4_096, 4_097, 248_320],
     ids=["block-kernel-max", "looped-kernel-min", "flash-next-vocab"],
 )
-def test_device_normalizer_of_a_row_does_not_depend_on_the_block_height(vocab):
+def test_device_normalizer_of_a_row_does_not_depend_on_the_block_height(metal, vocab):
     """The rows reader's bit equality rests on one device reduction.
 
     Everything else in ``_device_serial_support_arrays`` is elementwise, a
@@ -335,6 +341,40 @@ def test_reads_are_one_per_chunk_at_the_qwen_vocabulary(metal, monkeypatch):
         assert (stock_n, new_n) == (stock_reads, chunk_reads), rejected_at
 
 
+@pytest.mark.parametrize("config", [FAMILY, CONFIGS[1]], ids=["t1.0", "t0.6"])
+def test_qwen_vocabulary_blocks_match_the_per_row_loop_through_rejection(metal, config):
+    """Production-width blocks that reject in every chunk position, with the
+    correction and the generator state after it, and the next draw."""
+
+    draws = np.random.default_rng(7)
+    seen = set()
+    for trial, (width, rejected_at) in enumerate(
+        ((8, 0), (8, 7), (12, 8), (16, 13), (24, 3), (24, 17), (24, None), (16, None))
+    ):
+        logits = draws.normal(size=(width + 1, QWEN_VOCAB)).astype(np.float32)
+        block = []
+        for row in range(width):
+            favourite = int(np.argmax(logits[row]))
+            logits[row, favourite] += 9.0
+            block.append(favourite)
+        if rejected_at is not None:
+            outsider = int(np.argmin(logits[rejected_at]))  # never in the top-k
+            block[rejected_at] = outsider
+        block_logits = mx.array(logits).astype(mx.bfloat16)
+        seed = int(draws.integers(1 << 31))
+        stock_rng = np.random.default_rng(seed)
+        new_rng = np.random.default_rng(seed)
+
+        stock = _per_row_block_accept(block_logits, block, config, stock_rng)
+        new = _point_mass_block_accept(block_logits, block, config, new_rng)
+
+        assert new == stock, trial
+        assert new_rng.bit_generator.state == stock_rng.bit_generator.state, trial
+        assert new_rng.random() == stock_rng.random(), trial
+        seen.add("full" if stock[1] is None else "rejected")
+    assert seen == {"full", "rejected"}
+
+
 def _accept_block(rng: np.random.Generator, vocab: int, width: int):
     """A copy block scored by uncertain target rows.
 
@@ -364,7 +404,7 @@ def _accept_block(rng: np.random.Generator, vocab: int, width: int):
 
 
 @pytest.mark.parametrize("config", CONFIGS, ids=lambda c: f"t{c.temperature}-p{c.top_p}-k{c.top_k}")
-def test_block_accept_is_the_per_row_loop_draw_for_draw(config):
+def test_block_accept_is_the_per_row_loop_draw_for_draw(metal, config):
     trials = np.random.default_rng(2026)
     outcomes = set()
     for trial in range(60):
