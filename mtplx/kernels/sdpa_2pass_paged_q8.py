@@ -131,7 +131,7 @@ def _paged_partials_kernel_q8():
             maxs[0] = max_score;
         }
         // PartT, not InT: o[] is not yet divided by sum_exp_score
-        // (see sdpa_2pass_paged.unnormalized_partials_dtype).
+        // (see sdpa_2pass.unnormalized_partials_dtype).
         for (int i = 0; i < v_per_thread; ++i) {
             partials[i] = static_cast<PartT>(o[i]);
         }

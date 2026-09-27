@@ -354,7 +354,7 @@ def _quant_partials_kernel():
         for (int j = 0; j < QL; ++j) {
             const int o_offset = q_head_idx * QL + j;
             // PartT, not InT: the numerator is not yet divided by sum_exp
-            // (see sdpa_2pass_paged.unnormalized_partials_dtype).
+            // (see sdpa_2pass.unnormalized_partials_dtype).
             device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
