@@ -3592,6 +3592,9 @@ class ServerState:
                 _plan_metal_limit = _cap_value
                 _plan_metal_explicit = _caps.get("memory_limit_source") == "env"
         from mtplx.memory_plan import (
+            mtp_history_bytes_per_token_from_config as _plan_mtp_history_from_config,
+        )
+        from mtplx.memory_plan import (
             qsa_aux_bytes_per_token_from_config as _plan_aux_from_config,
         )
         from mtplx.memory_plan import (
@@ -3631,6 +3634,13 @@ class ServerState:
             # without them a 262K window was admitted on 128 GB with 2.4x
             # phantom headroom and died at 119 GB with no 507.
             "aux_bytes_per_token": _plan_aux_from_config(_plan_model_config),
+            # The MTP head's committed history of a non-QSA MTP family: the
+            # admission prices it; the fit does not count it yet.
+            "mtp_history_bytes_per_token": (
+                _plan_mtp_history_from_config(_plan_model_config)
+                if bool(getattr(self.runtime, "mtp_enabled", False))
+                else 0
+            ),
             "prefill_transient_bytes_per_token": _plan_transient_per_token,
             # The family's wired floor (Flash-Next, Laguna): above the 75%
             # rule it defines the envelope, so the plan, the Metal limit and
@@ -19390,9 +19400,13 @@ class _AdmissionGeometry:
     resident_bytes_per_token: int | None = None
     resident_fixed_bytes: int = 0
     # The per-token working set outside the KV pages (QSA streams, the MTP
-    # head's KV): what a leased paged cache still grows by per new token
-    # when its pages already hold the rows.
+    # head's KV and committed history): what a leased paged cache still
+    # grows by per new token when its pages already hold the rows.
     aux_bytes_per_token: int = 0
+    # "q8" / "q4" when the paged layout quantizes the KV: a snapshot of such
+    # a cache holds it dequantized, and decode keeps a working copy beside
+    # the pages (the q8 bf16 mirror, the q4 head-major bank).
+    kv_quantization: str = "off"
 
     @property
     def resident_width(self) -> int:
@@ -19412,7 +19426,12 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         return _AdmissionGeometry(0, 0, 0, flat, 0)
     kv_paged = int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
     kv_live = max(kv_paged, int(getattr(plan, "kv_bytes_per_token", 0) or 0))
-    aux = int(getattr(plan, "aux_bytes_per_token", 0) or 0)
+    # The QSA streams and the MTP head's KV (Flash-Next), or the MTP head's
+    # committed history (the 27B, the 4B: 4,096 B a token), which the plan's
+    # aux term leaves out.
+    aux = int(getattr(plan, "aux_bytes_per_token", 0) or 0) + int(
+        getattr(plan, "mtp_history_bytes_per_token", 0) or 0
+    )
     # A backend that builds its own caches says what they keep once decode
     # runs (Gemma 4: the full-attention layers per token, the sliding
     # windows as a fixed part); the planner's figure counts every layer.
@@ -19431,6 +19450,7 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         resident_bytes_per_token=resident,
         resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
         aux_bytes_per_token=aux,
+        kv_quantization=str(getattr(plan, "kv_quantization", "off") or "off"),
     )
 
 
@@ -19689,7 +19709,13 @@ def _admission_growth(
       decode start  the decode cache, plus the copy decode's first write
                     makes of every buffer a banked snapshot of the prompt
                     still aliases (store-on-prefill, the prompt-prefix
-                    commit).
+                    commit). With quantized KV, decode also keeps a working
+                    copy beside the pages (q8: a bf16 mirror at full width;
+                    q4: a head-major copy of the quantized pages), and the
+                    snapshot reads the cache's ``state``, which dequantizes
+                    to full width: 15.3 GiB for a 250K-token 27B prompt,
+                    not the 4.9 GiB of its q4 pages (the review of
+                    9c96dd9c).
 
     Nothing already resident is added again: the restore source's own
     snapshot is inside the measured bytes, and a pure lease writes into the
@@ -19767,15 +19793,27 @@ def _admission_growth(
     prefill_end = live_prefill + context_transient + scratch + lease_transient
     paged_copy = (P + out_rows) * paged_w if repages else 0
     repage = live_prefill + paged_copy if repages else 0
+    quant = str(geometry.kv_quantization or "off").lower()
+    quantized = paged_live and quant in {"q4", "q8"}
+    aux_w = max(0, int(geometry.aux_bytes_per_token))
+    quant_working = 0
+    if quantized:
+        kv_live_w = max(0, live_w - aux_w)
+        kv_paged_w = max(0, paged_w - aux_w)
+        quant_working = P * (kv_live_w if quant == "q8" else kv_paged_w)
     if repages:
-        live_decode = paged_copy
+        live_decode = paged_copy + quant_working
         live_total = paged_copy
     elif paged_live:
-        live_decode = live_prefill
+        live_decode = live_prefill + quant_working
         live_total = (P + out_rows) * paged_w
     else:
         live_decode = live_prefill
         live_total = P * geometry.resident_width + int(geometry.resident_fixed_bytes)
+    if quantized:
+        # The snapshot holds the prompt dequantized (q4), or views of the q8
+        # mirror that decode's first write copies: full width either way.
+        live_total = P * live_w
     publish_copy = live_total if publish else 0
     decode_start = live_decode + publish_copy
     return {
@@ -19788,6 +19826,7 @@ def _admission_growth(
         "scratch_bytes": int(scratch),
         "repage_copy_bytes": int(paged_copy),
         "output_reserve_bytes": int(out_rows * paged_w),
+        "quant_working_bytes": int(quant_working),
         "publish_copy_bytes": int(publish_copy),
         "lease_capacity_tokens": (
             int(lease["capacity_tokens"])
@@ -20221,9 +20260,12 @@ def _run_prefill_admission(
         if not (stored or committed):
             return False
         if isinstance(per_session_cap, int) and per_session_cap > 0:
+            # The snapshot's width: a dense decode cache, or a quantized one
+            # read back dequantized, is full width; plain pages are paged.
             width = (
                 geometry.live_bytes_per_token
                 if layout == "contiguous_dense_decode"
+                or str(geometry.kv_quantization or "off").lower() in {"q4", "q8"}
                 else geometry.paged_bytes_per_token
             )
             # The put refuses a snapshot over the per-session cap, and both

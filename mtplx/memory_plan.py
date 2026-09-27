@@ -204,6 +204,29 @@ def qsa_aux_bytes_per_token_from_config(config: dict | None) -> int:
     return (n_qsa + 1) * per_layer + mtp_head_kv
 
 
+def mtp_history_bytes_per_token_from_config(config: dict | None) -> int:
+    """KV the MTP head keeps per committed token under the ``committed``
+    MTP-history policy, for families whose aux term does not already count
+    it: the Qwen 3.5/3.6/3.8 hybrids' MTP layers are full attention with the
+    trunk's KV heads and head size, bf16. 4,096 B a token on the 27B and the
+    4B (one layer, 4 KV heads x 256). Zero for QSA hybrids (their aux term
+    counts the MTP head) and for configs that do not declare
+    ``mtp_num_hidden_layers``."""
+
+    if not isinstance(config, dict) or _qsa_geometry(config) is not None:
+        return 0
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        layers = int(text.get("mtp_num_hidden_layers") or config.get("mtp_num_hidden_layers") or 0)
+        kv_heads = int(text.get("num_key_value_heads") or 0)
+        head_dim = int(text.get("head_dim") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if layers <= 0 or kv_heads <= 0 or head_dim <= 0:
+        return 0
+    return layers * 2 * kv_heads * head_dim * 2
+
+
 def qsa_prefill_transient_bytes_per_token_from_config(
     config: dict | None, *, chunk_size: int = 2048
 ) -> int:
@@ -364,6 +387,10 @@ class MemoryPlan:
     # Zero for families without them — the fit then matches the legacy solve.
     aux_bytes_per_token: int = 0
     prefill_transient_bytes_per_token: int = 0
+    # The committed MTP-history cache per token of a non-QSA MTP family
+    # (mtp_history_bytes_per_token_from_config). The request admission
+    # prices it; the fit and the bank budgets do not count it yet.
+    mtp_history_bytes_per_token: int = 0
 
     model_fits: bool = True
     # Largest window the machine can commit to (weights + full-window KV +
@@ -429,6 +456,7 @@ class MemoryPlan:
             "prefill_transient_bytes_per_token": int(
                 self.prefill_transient_bytes_per_token
             ),
+            "mtp_history_bytes_per_token": int(self.mtp_history_bytes_per_token),
             "model_fits": self.model_fits,
             "context_window_fit": int(self.context_window_fit),
             "context_window_resolved": int(self.context_window_resolved),
@@ -467,6 +495,7 @@ def plan_memory(
     usable_bytes_explicit: bool = False,
     resident_floor_bytes: int | None = None,
     tight_machine_measured: bool = False,
+    mtp_history_bytes_per_token: int = 0,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -683,6 +712,7 @@ def plan_memory(
         kv_bytes_per_token_effective=kv_effective,
         aux_bytes_per_token=aux_pt,
         prefill_transient_bytes_per_token=transient_pt,
+        mtp_history_bytes_per_token=max(0, int(mtp_history_bytes_per_token)),
         model_fits=model_fits,
         context_window_fit=context_fit,
         context_window_resolved=resolved,
