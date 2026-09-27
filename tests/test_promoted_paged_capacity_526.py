@@ -737,7 +737,14 @@ class _PagedCountingModel:
         return (logits, hidden) if return_hidden else logits
 
 
-def _generate_counting(mode: str, *, prompt_len: int, max_tokens: int, blocks: int, lazy: bool, monkeypatch):
+def _counting_prompt(prompt_len: int) -> list[int]:
+    return [(i % (_PagedCountingModel.V - 1)) + 1 for i in range(prompt_len)]
+
+
+def _generate_counting(
+    mode: str, *, prompt_len: int, max_tokens: int, blocks: int, lazy: bool, monkeypatch,
+    token_callback=None,
+):
     from pathlib import Path
 
     from mtplx.generation import generate_mtpk
@@ -763,12 +770,13 @@ def _generate_counting(mode: str, *, prompt_len: int, max_tokens: int, blocks: i
         model=model, tokenizer=_Tokenizer(), model_path=Path("tiny-paged"),
         mtp_enabled=True, contract=MTPContract(),
     )
-    prompt = [(i % (model.V - 1)) + 1 for i in range(prompt_len)]
+    prompt = _counting_prompt(prompt_len)
     out = generate_mtpk(
         rt, prompt, max_tokens=max_tokens,
         sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
         speculative_depth=1, seed=0, stop_token_ids=set(),
         verify_strategy="capture_commit", capture_final_state=True,
+        token_callback=token_callback,
     )
     wanted = [(prompt[-1] + 1 + i) % model.V for i in range(max_tokens)]
     return model, out, wanted
@@ -823,6 +831,173 @@ def test_generation_commits_one_token_past_a_full_promoted_cache(mode, path, mon
     assert got.offset == want.offset
     for leaf, (g, w) in enumerate(zip(got.state, want.state)):
         assert np.array_equal(np.array(g.astype(mx.float32)), np.array(w.astype(mx.float32))), leaf
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_growth_refused_at_the_final_commit_keeps_the_response_and_banks_nothing(mode, monkeypatch):
+    """A refusal after the last token was emitted comes from the final
+    pending-token commit, which is session-bank bookkeeping. generate_mtpk
+    catches it there: the completed response stands (this refusal is not a
+    507), the turn is marked unsafe to commit, and the bank stores nothing
+    for it, neither a snapshot nor a live-reference lease. The next request
+    then runs normally."""
+
+    from threading import Lock
+    from types import SimpleNamespace
+
+    from mtplx.server.openai import _store_generation_final_history_snapshot
+
+    _install_available(monkeypatch, 1 * 1024**3)  # every growth is refused
+    shape = dict(prompt_len=10, max_tokens=23)
+    model, out, wanted = _generate_counting(
+        mode, blocks=BLOCKS, lazy=False, monkeypatch=monkeypatch, **shape
+    )
+    assert out.tokens == wanted
+    errors = [
+        e["final_state_capture_error"] for e in out.stats.events
+        if isinstance(e, dict) and "final_state_capture_error" in e
+    ]
+    assert len(errors) == 1 and "insufficient memory to grow the paged KV cache" in errors[0]
+    assert "refusing before any row is written" in errors[0]
+    assert out.final_state is not None and out.final_state.safe_to_commit is False
+    (final_cache,) = out.final_state.final_trunk_cache
+    assert final_cache.offset == 32  # the refused row was never written
+
+    class _Bank:
+        def __init__(self) -> None:
+            self.puts: list[dict] = []
+
+        def put(self, **kwargs):
+            self.puts.append(kwargs)
+            return SimpleNamespace(prefix_len=len(kwargs["token_ids"]), nbytes=1, token_hash="h")
+
+    bank = _Bank()
+    state = SimpleNamespace(sessions=SimpleNamespace(bank=bank, peek=lambda _sid: None), lock=Lock())
+    outcome = _store_generation_final_history_snapshot(
+        state,
+        session_id="pi-session",
+        prompt_ids=_counting_prompt(shape["prompt_len"]),
+        generated={"tokens": list(out.tokens), "_final_state": out.final_state},
+        messages=[],
+        assistant_content=out.text,
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+        keep_live_ref=True,
+    )
+    assert outcome["stored"] is False and outcome["reason"] == "generation_final_state_unsafe"
+    assert bank.puts == []
+
+    _install_available(monkeypatch, 60 * 1024**3)  # the next request, memory back
+    _model, again, wanted_again = _generate_counting(
+        mode, blocks=BLOCKS, lazy=False, monkeypatch=monkeypatch, **shape
+    )
+    assert again.tokens == wanted_again and again.final_state.safe_to_commit is True
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_growth_refused_mid_generation_raises_the_memory_refusal_after_the_emitted_tokens(mode, monkeypatch):
+    """A refusal before the last token (here the lazy-bonus commit) leaves
+    generate_mtpk as PagedKVGrowthRefused, a MemoryError; the server answers
+    it with its 507 frame (next test). Every token streamed before it is
+    the exact count."""
+
+    _install_available(monkeypatch, 1 * 1024**3)
+    emitted: list[int] = []
+    with pytest.raises(PagedKVGrowthRefused, match="insufficient memory to grow the paged KV cache"):
+        _generate_counting(
+            mode, prompt_len=11, max_tokens=30, blocks=BLOCKS, lazy=True,
+            monkeypatch=monkeypatch, token_callback=emitted.extend,
+        )
+    prompt = _counting_prompt(11)
+    wanted = [(prompt[-1] + 1 + i) % _PagedCountingModel.V for i in range(30)]
+    assert 0 < len(emitted) < 30 and emitted == wanted[: len(emitted)]
+
+
+def test_a_growth_refusal_mid_stream_is_a_507_frame_banks_nothing_and_the_next_request_runs(monkeypatch):
+    """The server side of a refusal before the last token: the stream carries
+    the tokens already produced, then one error frame, insufficient_memory
+    with the refusal's own words, then [DONE]; the engine sheds its caches as
+    for any allocation failure, the session bank stores nothing for the
+    turn, and the next request is answered."""
+
+    import json
+
+    from fastapi.testclient import TestClient
+
+    import mtplx.server.openai as openai
+    from test_server_openai import _fake_final_state, _fake_streaming_session_state
+
+    state = _fake_streaming_session_state()
+    shed: list[bool] = []
+    monkeypatch.setattr(openai, "_shed_after_allocation_failure", lambda _state: shed.append(True))
+    refusal = (
+        "insufficient memory to grow the paged KV cache: growing 16 caches from 16512 to "
+        "24768 rows for a 4-row window at offset 16510 needs 1.21 GiB while this Mac has "
+        "0.90 GiB available and keeps 3.20 GiB free for the desktop; refusing before any "
+        "row is written"
+    )
+    calls = {"n": 0}
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        calls["n"] += 1
+        token_callback = kwargs.get("token_callback")
+        tokens = [ord("O"), ord("K")]
+        if calls["n"] == 1:
+            if token_callback is not None:
+                token_callback(tokens[:1])
+            raise PagedKVGrowthRefused(refusal)
+        if token_callback is not None:
+            token_callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {"generation_mode": kwargs["generation_mode"], "mtp_depth": kwargs["depth"]},
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": _fake_final_state(tokens),
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    request = {
+        "messages": [{"role": "user", "content": "Count"}],
+        "enable_thinking": False,
+        "max_tokens": 8,
+    }
+    with TestClient(openai.create_app(state)) as client:
+        with client.stream(
+            "POST", "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "pi-session"},
+            json={**request, "stream": True},
+        ) as response:
+            status = response.status_code
+            body = response.read().decode()
+        second = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "pi-session"},
+            json=request,
+        )
+
+    assert status == 200  # the stream had started
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: {")
+    ]
+    content = "".join(
+        (choice.get("delta") or {}).get("content") or ""
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    assert content == "O"
+    (error,) = [payload["error"] for payload in payloads if "error" in payload]
+    assert error["code"] == "insufficient_memory"
+    assert refusal in error["message"]
+    assert body.rstrip().endswith("data: [DONE]")
+    assert shed == [True]
+    assert state.sessions.bank.puts == []  # nothing banked for the refused turn
+    assert second.status_code == 200
+    assert second.json()["choices"][0]["message"]["content"] == "OK"
 
 
 @pytest.mark.parametrize("mode", MODES)
