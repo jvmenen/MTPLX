@@ -29,6 +29,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from ..compile_state import is_compile_trace_error
 from .sdpa_2pass_paged import unnormalized_partials_dtype
 from .sdpa_gqa_packed import (  # shared, proven pieces
     _bail,
@@ -40,14 +41,19 @@ from .sdpa_gqa_packed import (  # shared, proven pieces
 def _concrete_offset(offset) -> int | None:
     """The host value of an array offset, or None while ``mx.compile`` traces.
 
-    ``.item()`` inside a trace raises ValueError; eagerly it is one scalar
-    sync (the same probe ``cache_state._concrete_offset`` uses).
+    Eagerly this is one scalar sync. Inside a trace ``.item()`` raises MLX's
+    refusal, recognised by ``compile_state.is_compile_trace_error`` exactly
+    as ``cache_state._concrete_offset`` does; every other ValueError (a NaN
+    offset that ``int()`` cannot convert, a failed evaluation) is a real fault
+    and propagates instead of skipping the range check below.
     """
 
     try:
         return int(offset.item())
-    except ValueError:
-        return None
+    except ValueError as exc:
+        if is_compile_trace_error(exc):
+            return None
+        raise
 
 
 def _static_blocks(capacity: int, max_offset: int | None) -> int:

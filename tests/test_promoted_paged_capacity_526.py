@@ -699,3 +699,45 @@ def test_packed_quant_kernel_refuses_an_eager_array_offset_past_its_buffers(bits
     assert np.array_equal(
         np.array(by_array.astype(mx.float32)), np.array(by_int.astype(mx.float32))
     )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [8, 4])
+def test_packed_quant_kernel_raises_on_an_eager_nan_offset(bits):
+    # int(nan) raises ValueError, which the kernel's offset probe used to read
+    # as "traced": the range check was skipped and the kernel dispatched with
+    # a NaN cast to int32. Old code: "DID NOT RAISE".
+    from mtplx.kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+
+    head_dim, capacity = 256, 40
+    mx.random.seed(bits)
+    queries = mx.random.normal((1, 4, 2, head_dim)).astype(mx.bfloat16)
+    k_q, k_s = quantize_symmetric(mx.random.normal((1, 2, capacity, head_dim)), bits=bits)
+    v_q, v_s = quantize_symmetric(mx.random.normal((1, 2, capacity, head_dim)), bits=bits)
+    with pytest.raises(ValueError, match="NaN"):
+        sdpa_gqa_packed_tail_quant(
+            queries=queries, k_q=k_q, k_scale=k_s, v_q=v_q, v_scale=v_s,
+            offset=mx.array(float("nan")), scale=head_dim**-0.5, bits=bits,
+        )
+
+
+def test_packed_quant_offset_probe_exempts_only_the_trace_refusal():
+    from mtplx.kernels.sdpa_gqa_packed_quant import _concrete_offset as kernel_offset
+
+    class _FailingOffset:
+        def item(self):
+            raise ValueError("an unrelated evaluation failure")
+
+    # Old code: None, so the caller skipped its range check.
+    with pytest.raises(ValueError, match="unrelated evaluation failure"):
+        kernel_offset(_FailingOffset())
+
+    seen = {}
+
+    def body(offset):
+        seen["traced"] = kernel_offset(offset)
+        return offset + 1
+
+    mx.eval(mx.compile(body)(mx.array(3, dtype=mx.int32)))
+    assert seen == {"traced": None}
+    assert kernel_offset(mx.array(7, dtype=mx.int32)) == 7
