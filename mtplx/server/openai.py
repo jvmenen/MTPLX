@@ -19389,6 +19389,10 @@ class _AdmissionGeometry:
     weights_bytes: int
     resident_bytes_per_token: int | None = None
     resident_fixed_bytes: int = 0
+    # The per-token working set outside the KV pages (QSA streams, the MTP
+    # head's KV): what a leased paged cache still grows by per new token
+    # when its pages already hold the rows.
+    aux_bytes_per_token: int = 0
 
     @property
     def resident_width(self) -> int:
@@ -19426,6 +19430,7 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         weights_bytes=int(getattr(plan, "model_weights_bytes", 0) or 0),
         resident_bytes_per_token=resident,
         resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
+        aux_bytes_per_token=aux,
     )
 
 
@@ -19628,6 +19633,35 @@ def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
     return getattr(entry, "snapshot_settled_at", None) is None
 
 
+def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
+    """What a lease of ``entry`` extends in place: its live cache's paged
+    layers, their allocated capacity and block size. None when the entry
+    holds no live cache to read; ``{"paged": False}`` when that cache has no
+    paged layers."""
+
+    cache = getattr(entry, "cache_ref", None)
+    if not isinstance(cache, (list, tuple)):
+        return None
+    capacities: list[int] = []
+    block_size = 0
+    for layer in cache:
+        if getattr(layer, "allocated_blocks", None) is None:
+            continue
+        try:
+            capacities.append(int(layer.capacity))
+            block_size = int(layer.block_size)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if not capacities:
+        return {"paged": False}
+    return {
+        "paged": True,
+        "capacity_tokens": min(capacities),
+        "paged_layers": len(capacities),
+        "block_size": block_size,
+    }
+
+
 def _admission_growth(
     geometry: _AdmissionGeometry,
     *,
@@ -19639,6 +19673,7 @@ def _admission_growth(
     output_tokens: int,
     publish: bool,
     scratch_bytes: int,
+    lease: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -19659,7 +19694,14 @@ def _admission_growth(
 
     Nothing already resident is added again: the restore source's own
     snapshot is inside the measured bytes, and a pure lease writes into the
-    rows it already holds.
+    rows it already holds. A lease of a paged cache (``lease``, read off the
+    live cache by ``_lease_cache_shape``) grows only when its allocated
+    capacity cannot hold the prompt or the request's reservation, and then
+    by the cache's own geometric step (``cache_state.paged_grown_blocks``),
+    with one layer's arrays copied at a time; zero when it fits (the review
+    of 9c96dd9c: a 196,608-token capacity grows to 262,144 for a
+    196,609-token prompt, 4 GiB on the 27B, where the old model charged three
+    rows, and a lease with room was charged its reservation again).
     """
 
     P = max(0, int(prompt_tokens))
@@ -19670,16 +19712,46 @@ def _admission_growth(
     restore_rows = R if restore_copies_prefix else 0
     new_rows = restore_rows + M
     contiguous = layout in {"contiguous_dense_decode", "contiguous_then_repage"}
-    # A lease of a cache that was already repaged extends it in place.
-    leased_paged = (
-        R > 0
-        and not restore_copies_prefix
-        and source_layout == "contiguous_then_repage"
-    )
+    lease = lease if (R > 0 and not restore_copies_prefix) else None
+    if lease is not None:
+        # The lease's own cache says whether it is paged.
+        leased_paged = bool(lease.get("paged"))
+    else:
+        # A lease of a cache that was already repaged extends it in place.
+        leased_paged = (
+            R > 0
+            and not restore_copies_prefix
+            and source_layout == "contiguous_then_repage"
+        )
     repages = layout == "contiguous_then_repage" and not leased_paged
     paged_live = repages or leased_paged or not contiguous
     out_rows = max(0, int(output_tokens)) if paged_live else 0
-    if contiguous and not leased_paged:
+    lease_transient = 0
+    lease_capacity_after = None
+    if leased_paged and lease is not None and lease.get("capacity_tokens") is not None:
+        from mtplx.cache_state import paged_lease_capacity_after
+
+        aux_w = max(0, int(geometry.aux_bytes_per_token))
+        page_w = max(0, paged_w - aux_w)
+        capacity = int(lease["capacity_tokens"])
+        lease_capacity_after = paged_lease_capacity_after(
+            capacity,
+            int(lease.get("block_size") or 16),
+            prompt_tokens=P,
+            reserved_tokens=P + out_rows,
+            repages=layout == "contiguous_then_repage",
+        )
+        grown = max(0, lease_capacity_after - capacity)
+        if grown:
+            # Each layer's grow concatenates its pages with the new blocks:
+            # the old arrays live beside the new ones one layer at a time.
+            lease_transient = (
+                lease_capacity_after * page_w // max(1, int(lease.get("paged_layers") or 1))
+            )
+        row_width = paged_w
+        restore_fixed = 0
+        live_prefill = grown * page_w + (M + out_rows) * aux_w
+    elif contiguous and not leased_paged:
         # A restored prefix is what the banked cache keeps (the resident
         # width); the rows this prefill writes are at full width.
         row_width = geometry.resident_width
@@ -19693,7 +19765,7 @@ def _admission_growth(
         P * max(0, int(geometry.context_transient_bytes_per_token)) if M > 0 else 0
     )
     scratch = max(0, int(scratch_bytes))
-    prefill_end = live_prefill + context_transient + scratch
+    prefill_end = live_prefill + context_transient + scratch + lease_transient
     paged_copy = (P + out_rows) * paged_w if repages else 0
     repage = live_prefill + paged_copy if repages else 0
     if repages:
@@ -19718,6 +19790,13 @@ def _admission_growth(
         "repage_copy_bytes": int(paged_copy),
         "output_reserve_bytes": int(out_rows * paged_w),
         "publish_copy_bytes": int(publish_copy),
+        "lease_capacity_tokens": (
+            int(lease["capacity_tokens"])
+            if lease is not None and lease.get("capacity_tokens") is not None
+            else None
+        ),
+        "lease_capacity_after_tokens": lease_capacity_after,
+        "lease_grow_transient_bytes": int(lease_transient),
         "prefill_end_bytes": int(prefill_end),
         "repage_bytes": int(repage),
         "decode_start_bytes": int(decode_start),
@@ -20156,7 +20235,11 @@ def _run_prefill_admission(
         return True
 
     def growth(
-        reused: int, copies: bool, source_layout: str | None, width: int | None
+        reused: int,
+        copies: bool,
+        source_layout: str | None,
+        width: int | None,
+        lease: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
         rows = miss if width is None else min(miss, width)
@@ -20173,6 +20256,7 @@ def _run_prefill_admission(
             output_tokens=output_tokens,
             publish=publishes(miss),
             scratch_bytes=scratch,
+            lease=lease,
         )
         model["scratch_source"] = scratch_source
         if scratch_source.startswith("geometry_pending_calibration"):
@@ -20292,10 +20376,18 @@ def _run_prefill_admission(
         if reused_tokens > 0 and not copies
         else None
     )
+    lease = (
+        _lease_cache_shape(source_entry)
+        if reused_tokens > 0 and not copies and source_entry is not None
+        else None
+    )
     miss_tokens = max(0, prompt_tokens - reused_tokens)
 
     def price() -> dict[Any, dict[str, Any]]:
-        return {w: growth(reused_tokens, copies, source_layout, w) for w in widths}
+        return {
+            w: growth(reused_tokens, copies, source_layout, w, lease=lease)
+            for w in widths
+        }
 
     def widest_fit(snapshot: Mapping[str, Any], models: Mapping[Any, Any]) -> Any:
         for w in widths:

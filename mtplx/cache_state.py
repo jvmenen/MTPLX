@@ -657,14 +657,26 @@ def _paged_gqa_sdpa(
     )
 
 
-def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int:
+def _dynamic_paged_num_blocks(
+    *,
+    block_size: int,
+    configured_blocks: int,
+    request_tokens: int | None = None,
+) -> int:
+    """Blocks a paged cache is installed (or re-configured) with for the
+    running request. ``request_tokens`` stands in for the request's
+    ``MTPLX_DYNAMIC_PAGED_KV_TOKENS`` when the admission asks before the
+    request's environment is applied."""
+
     if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
         return int(configured_blocks)
     min_blocks = max(
         int(configured_blocks),
         _env_int("MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS", int(configured_blocks)),
     )
-    request_tokens = max(0, _env_int("MTPLX_DYNAMIC_PAGED_KV_TOKENS", 0))
+    if request_tokens is None:
+        request_tokens = _env_int("MTPLX_DYNAMIC_PAGED_KV_TOKENS", 0)
+    request_tokens = max(0, int(request_tokens))
     previous_high_water = max(
         0,
         _env_int("MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER", 0),
@@ -676,6 +688,65 @@ def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int
         return min_blocks
     required_blocks = (needed + int(block_size) - 1) // int(block_size)
     return max(min_blocks, required_blocks)
+
+
+def paged_grown_blocks(current_blocks: int, required_tokens: int, block_size: int) -> int:
+    """The block count a paged cache grows to when ``required_tokens`` do
+    not fit (``VllmMetalPagedKVCache._grow_to_capacity``): what is required,
+    or 1.5 times the current count, and never less than one block more.
+    Geometric growth must not overshoot the serving context window (#150:
+    the 1.5x step at 100k+ ctx allocates GiBs of blocks no request can ever
+    address); a genuinely larger requirement still wins, correctness over
+    the clamp. The admission prices a lease's growth with the same rule."""
+
+    block_size = max(1, int(block_size))
+    current_blocks = int(current_blocks)
+    required_blocks = (int(required_tokens) + block_size - 1) // block_size
+    grown_blocks = max(
+        required_blocks,
+        int((current_blocks * 3 + 1) // 2),
+        current_blocks + 1,
+    )
+    window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
+    if window_tokens > 0:
+        window_blocks = (int(window_tokens) + block_size - 1) // block_size
+        if window_blocks >= required_blocks:
+            grown_blocks = min(grown_blocks, max(window_blocks, current_blocks))
+    return int(grown_blocks)
+
+
+def paged_lease_capacity_after(
+    capacity_tokens: int,
+    block_size: int,
+    *,
+    prompt_tokens: int,
+    reserved_tokens: int,
+    repages: bool,
+) -> int:
+    """The capacity a leased paged cache ends a prefill with. The prefill's
+    writes grow it when the prompt does not fit (``_write_tail``); the
+    repage after the prefill re-installs it with the request's reservation
+    (``install_vllm_metal_paged_attention_kv_cache``), growing it again when
+    that asks for more. Unchanged when both fit."""
+
+    block_size = max(1, int(block_size))
+    capacity = int(capacity_tokens)
+    if int(prompt_tokens) > capacity:
+        capacity = block_size * paged_grown_blocks(
+            capacity // block_size, int(prompt_tokens), block_size
+        )
+    if repages and _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
+        configured = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024")
+        wanted = block_size * _dynamic_paged_num_blocks(
+            block_size=block_size,
+            configured_blocks=configured,
+            request_tokens=int(reserved_tokens),
+        )
+        if wanted > capacity:
+            capacity = block_size * paged_grown_blocks(
+                capacity // block_size, wanted, block_size
+            )
+    return int(capacity)
 
 
 def _paged_attention_requires_external_ops(
@@ -933,23 +1004,9 @@ class VllmMetalPagedKVCache:
         current_blocks = (
             int(self.num_blocks) if allocated_blocks is None else int(allocated_blocks)
         )
-        required_blocks = (int(required_tokens) + self.block_size - 1) // self.block_size
-        grown_blocks = max(
-            required_blocks,
-            int((current_blocks * 3 + 1) // 2),
-            int(current_blocks) + 1,
+        grown_blocks = paged_grown_blocks(
+            current_blocks, int(required_tokens), int(self.block_size)
         )
-        window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
-        if window_tokens > 0:
-            # Geometric growth must not overshoot the serving context window
-            # (#150: the 1.5x step at 100k+ ctx allocates GiBs of blocks no
-            # request can ever address). A genuinely larger requirement still
-            # wins — correctness over the clamp.
-            window_blocks = (int(window_tokens) + self.block_size - 1) // self.block_size
-            if window_blocks >= required_blocks:
-                grown_blocks = min(
-                    grown_blocks, max(window_blocks, int(current_blocks))
-                )
         if grown_blocks <= current_blocks:
             self.num_blocks = int(current_blocks)
             return True
