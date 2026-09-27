@@ -17,6 +17,7 @@ decode loop on both copy lanes.
 from __future__ import annotations
 
 import math
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -42,12 +43,26 @@ from test_context_copy_stats import _ScriptedModel, _clean_env, _runtime
 
 
 FAMILY = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
+QWEN_VOCAB = 248_320
 CONFIGS = (
     FAMILY,
     SamplerConfig(temperature=0.6, top_p=0.95, top_k=20),
     SamplerConfig(temperature=1.0, top_p=1.0, top_k=20),
     SamplerConfig(temperature=0.7, top_p=0.8, top_k=5),
 )
+
+
+@pytest.fixture()
+def metal():
+    """The bit-equality claims are about the Metal kernels: run them there."""
+
+    if not mx.metal.is_available():
+        pytest.skip("the claims under test are about the Metal kernels")
+    previous = mx.default_device()
+    mx.set_default_device(mx.gpu)
+    assert mx.default_device() == mx.gpu
+    yield
+    mx.set_default_device(previous)
 
 
 def _per_row_block_accept(block_logits, block, sampler, rng):
@@ -191,6 +206,85 @@ def test_rows_reader_raises_on_a_non_finite_row_only_when_it_is_read():
     # The per-row reader raises the same error on that row.
     with pytest.raises(NonFiniteLogitsError):
         sparse_distribution_from_mlx_logits(mx.array(logits[2]), FAMILY)
+
+
+# --- rows past the first rejection, and rows that are examined -------------
+
+
+def _rejecting_block(bad_row: np.ndarray, *, width: int = 8, bad_index: int = 1):
+    """Row 0 strongly prefers token 0 and the first copied token is 1,000,
+    far outside its top-k: the copy is rejected at row 0 with certainty and
+    the correction is drawn from row 0. ``bad_row`` sits at ``bad_index``,
+    inside the same 8-row chunk, where the per-row loop never looks."""
+
+    draws = np.random.default_rng(0)
+    logits = draws.normal(size=(width + 1, QWEN_VOCAB)).astype(np.float32)
+    logits[0, 0] = 30.0
+    logits[bad_index] = bad_row
+    block = [1000] + [int(t) for t in draws.integers(QWEN_VOCAB, size=width - 1)]
+    block_logits = mx.array(logits).astype(mx.bfloat16)
+    mx.eval(block_logits)
+    return block_logits, block
+
+
+def _same_outcome_and_state(block_logits, block, config):
+    stock_rng = np.random.default_rng(0)
+    new_rng = np.random.default_rng(0)
+    stock = _per_row_block_accept(block_logits, block, config, stock_rng)
+    new = _point_mass_block_accept(block_logits, block, config, new_rng)
+    assert stock == new
+    assert stock[0] == 0 and stock[1] == 0  # rejected at row 0, corrected to token 0
+    assert new_rng.bit_generator.state == stock_rng.bit_generator.state
+
+
+def test_an_unread_all_nan_row_cannot_fail_the_block_under_strict_warnings(metal):
+    """Review scenario 1: an all-NaN row after a certain rejection. The
+    per-row loop never examines it; with RuntimeWarning promoted to an
+    error, the whole-block host arithmetic used to raise "All-NaN slice
+    encountered" before the first draw."""
+
+    block_logits, block = _rejecting_block(np.full(QWEN_VOCAB, np.nan, dtype=np.float32))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        _same_outcome_and_state(block_logits, block, FAMILY)
+
+
+def test_an_unread_minus_inf_row_cannot_fail_the_block_under_numpy_raise(metal):
+    """Review scenario 2: top-p off (the max-subtraction branch) and an
+    all -inf later row under ``np.seterr(invalid="raise")``: the
+    whole-block subtraction used to raise "invalid value encountered in
+    subtract"."""
+
+    no_top_p = SamplerConfig(temperature=1.0, top_p=1.0, top_k=20)
+    block_logits, block = _rejecting_block(
+        np.full(QWEN_VOCAB, -np.inf, dtype=np.float32), bad_index=5
+    )
+    with np.errstate(invalid="raise"):
+        _same_outcome_and_state(block_logits, block, no_top_p)
+
+
+def test_an_examined_bad_row_fails_exactly_as_under_the_per_row_reader(metal):
+    """The examined row keeps the per-row reader's behaviour: the host
+    fallback's NonFiniteLogitsError by default, and under strict warnings
+    the same RuntimeWarning from the same statement."""
+
+    draws = np.random.default_rng(1)
+    logits = draws.normal(size=(9, QWEN_VOCAB)).astype(np.float32)
+    logits[0] = np.nan
+    block_logits = mx.array(logits).astype(mx.bfloat16)
+    block = [int(t) for t in draws.integers(QWEN_VOCAB, size=8)]
+
+    for accept in (_per_row_block_accept, _point_mass_block_accept):
+        with pytest.raises(NonFiniteLogitsError):
+            accept(block_logits, block, FAMILY, np.random.default_rng(0))
+    messages = []
+    for accept in (_per_row_block_accept, _point_mass_block_accept):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with pytest.raises(RuntimeWarning) as raised:
+                accept(block_logits, block, FAMILY, np.random.default_rng(0))
+        messages.append(str(raised.value))
+    assert messages[0] == messages[1]
 
 
 def _accept_block(rng: np.random.Generator, vocab: int, width: int):

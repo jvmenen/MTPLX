@@ -6706,11 +6706,11 @@ def _point_mass_block_accept(
     The target distribution of every row comes from one device read
     (``sparse_distribution_rows_from_mlx_logits``) instead of one read per
     examined row, which a 24-token block used to pay up to 24 times. Row ``i``
-    is exactly the per-row reader's distribution for that row, and the
-    generator is drawn in the same order (one uniform per examined token, then
-    the correction), so the accepted count, the correction and the generator
-    state afterwards are those of the per-row loop. Rows past the first
-    rejection are computed and never read.
+    is exactly the per-row reader's distribution for that row, the host
+    arithmetic runs only for the rows examined, and the generator is drawn in
+    the same order (one uniform per examined token, then the correction), so
+    the accepted count, the correction and the generator state afterwards are
+    those of the per-row loop.
 
     Returns ``(accepted, correction)``; ``correction`` is None when every
     copied token was accepted.
