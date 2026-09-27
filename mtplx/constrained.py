@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -45,7 +46,67 @@ SUPPORTED_RESPONSE_FORMAT_TYPES = ("text", "json_object", "json_schema")
 
 # ``json_object`` promises a JSON object (OpenAI semantics), not merely any
 # JSON value, so the generic grammar pins the top-level type.
-_JSON_OBJECT_SCHEMA = '{"type": "object"}'
+_JSON_OBJECT_SCHEMA: dict[str, Any] = {"type": "object"}
+
+# Whitespace the JSON grammars admit wherever JSON allows it: the `space` rule
+# of llama.cpp's json-schema-to-grammar (`| " " | "\n"{1,2} [ \t]{0,20}`), i.e.
+# one space, or one or two newlines followed by at most 20 spaces or tabs.
+# llguidance's default is `[\x20\x0A\x0D\x09]+` at every such point: unbounded,
+# CR included. Whitespace leaves the grammar exactly where it was, so once a
+# whitespace token narrowly beats every legal value token under greedy decoding
+# it wins again at the next step, and the document never finishes (#547:
+# `"tests_run":`, two spaces, then 640 CR tokens until max_tokens).
+_JSON_WHITESPACE_PATTERN = r"\x20|\x0A{1,2}[\x20\x09]{0,20}"
+
+
+def _llguidance_release() -> tuple[int, int, int] | None:
+    match = re.search(r"llguidance@(\d+)\.(\d+)\.(\d+)", LLGUIDANCE_VERSION or "")
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+# llguidance matches the JSON whitespace pattern at most once per position from
+# 1.8.0 on (guidance-ai/llguidance#370, "single-match skip lexemes"). Earlier
+# releases re-apply it any number of times at one position, so a bound written
+# into the pattern bounds nothing there.
+_JSON_WHITESPACE_SINGLE_MATCH = (_llguidance_release() or (0, 0, 0)) >= (1, 8, 0)
+
+
+def _json_compile_options() -> dict[str, Any]:
+    """llguidance JSON options under which no whitespace run is unbounded."""
+    if _JSON_WHITESPACE_SINGLE_MATCH:
+        return {"whitespace_pattern": _JSON_WHITESPACE_PATTERN}
+    # Without single-match whitespace the only finite layout is whitespace the
+    # grammar matches exactly once: one optional space after each separator,
+    # as in {"a": 1, "b": [true, false]} (no pretty-printed newlines).
+    return {
+        "whitespace_flexible": False,
+        "item_separator": r",\x20?",
+        "key_separator": r":\x20?",
+    }
+
+
+def _grammar_schema_json(schema: dict[str, Any]) -> str:
+    """The JSON Schema text llguidance compiles for a request.
+
+    llguidance fixes object properties to the order they appear in the schema
+    (and resolves allOf/anyOf/additionalProperties precedence by position), so
+    key order is part of the grammar: this text keeps the client's order, and
+    the grammar caches key on exactly this text. Sorting the keys here used to
+    force alphabetical properties (#547).
+
+    The compile options travel as the schema's own top-level ``x-guidance``
+    object, the one place both ``grammar_from_json_schema`` and a lark
+    ``%json`` block read them; keys the client set there win.
+    """
+    client_options = schema.get("x-guidance", {})
+    if not isinstance(client_options, dict):
+        raise ResponseFormatError("JSON Schema 'x-guidance' must be an object")
+    options = {**_json_compile_options(), **client_options}
+    return json.dumps({**schema, "x-guidance": options}, separators=(",", ":"))
+
 
 # Strict tool-call constraint markers. These are the Qwen/Hermes-family
 # native tool-call and thinking tokens; strict mode only activates when the
@@ -155,7 +216,7 @@ def constraint_spec_from_response_format(
             "silently return unconstrained output"
         )
     if format_type == "json_object":
-        schema_json = _JSON_OBJECT_SCHEMA
+        schema = _JSON_OBJECT_SCHEMA
     else:
         wrapper = response_format.get("json_schema")
         if wrapper is None and isinstance(response_format.get("schema"), dict):
@@ -171,7 +232,7 @@ def constraint_spec_from_response_format(
                 "response_format type 'json_schema' requires json_schema.schema "
                 "to be a JSON Schema object"
             )
-        schema_json = _canonical_schema_json(schema)
+    schema_json = _grammar_schema_json(schema)
     grammar = _cached_grammar_for_schema(schema_json, think_prelude=False)
     think_start_id = (
         _single_token_id(tokenizer, THINK_START) if tokenizer is not None else None
@@ -234,13 +295,15 @@ def tool_call_constraint_spec(
         _single_token_id(tokenizer, THINK_START) is not None
         and _single_token_id(tokenizer, THINK_END) is not None
     )
+    # Key order inside each tool schema is part of its grammar (see
+    # _grammar_schema_json), so the key keeps it rather than sorting it away.
     cache_key = "structtool:" + json.dumps(
         {
             "functions": [[name, schema] for name, schema in functions],
             "think": include_think,
             "llg": LLGUIDANCE_VERSION,
+            "json_options": _json_compile_options(),
         },
-        sort_keys=True,
         separators=(",", ":"),
     )
     with _CACHE_LOCK:
@@ -345,8 +408,8 @@ def _tool_call_lark_grammar(
         head = f'\n{{"name": "{name_inner}", "arguments": '
         alternatives.append(
             f"TAG_TEXT <tool_call> {_lark_string(head)} %json "
-            f"{json.dumps(schema)} {_lark_string('}')} {_lark_string(chr(10))} "
-            "</tool_call>"
+            f"{_grammar_schema_json(schema)} {_lark_string('}')} "
+            f"{_lark_string(chr(10))} </tool_call>"
         )
     if include_think:
         alternatives.append("TAG_TEXT <think> TAG_TEXT </think>")
@@ -461,20 +524,17 @@ class GrammarConstraint:
 
 # --- caches ---------------------------------------------------------------
 #
-# A compiled grammar is schema- and engine-version-specific; the LLTokenizer
-# wrap is tokenizer-object- and vocab-width-specific. Both caches hold strong
-# references (the server keeps one tokenizer for its lifetime) and are
-# bounded, so id() reuse after GC cannot alias a live entry.
+# A compiled grammar is schema- and engine-version-specific (key order
+# included: two schemas that differ only in property order are different
+# grammars); the LLTokenizer wrap is tokenizer-object- and vocab-width-specific.
+# Both caches hold strong references (the server keeps one tokenizer for its
+# lifetime) and are bounded, so id() reuse after GC cannot alias a live entry.
 
 _GRAMMAR_CACHE: OrderedDict[str, str] = OrderedDict()
 _GRAMMAR_CACHE_MAX = 64
 _TOKENIZER_CACHE: OrderedDict[tuple[int, int], tuple[Any, Any]] = OrderedDict()
 _TOKENIZER_CACHE_MAX = 4
 _CACHE_LOCK = threading.Lock()
-
-
-def _canonical_schema_json(schema: dict[str, Any]) -> str:
-    return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
 def _cached_grammar_for_schema(schema_json: str, *, think_prelude: bool = False) -> str:
