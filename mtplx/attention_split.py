@@ -164,9 +164,12 @@ def last_kv_attention_line() -> str | None:
     ``MTPLX_KV_ATTENTION_TRACE=nonfinite`` for per-layer values and verdicts.
     """
 
-    if not _KV_ATTENTION_LAST:
+    # A copy, not a live walk: the model thread of another request may be
+    # adding a layer's record while the server thread formats this one.
+    records = dict(_KV_ATTENTION_LAST)
+    if not records:
         return None
-    record = _KV_ATTENTION_LAST[min(_KV_ATTENTION_LAST)]
+    record = records[min(records)]
     return _format_kv_attention(record, offset=record[6], finite="unchecked")
 
 
