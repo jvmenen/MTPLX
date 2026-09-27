@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "un servidor MTPLX iniciado fuera de la app";
 "Another AIME run is already active." = "Ya hay otra ejecución de AIME activa.";
 "another app" = "otra app";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "Otro servidor MTPLX ocupa el puerto %@ (pid %@); esta app no está conectada a él.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "Otro servidor MTPLX ocupa el puerto %@; esta app no está conectada a él.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "Otro proceso está llevando este Mac a presión de memoria. La decodificación puede bajar mientras dure el pico; la huella del propio motor se mantiene estable y no se ha desalojado nada.";
 "ANSWER" = "RESPUESTA";
 "API key" = "Clave de API";

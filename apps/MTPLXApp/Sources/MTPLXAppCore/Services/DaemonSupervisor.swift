@@ -416,6 +416,20 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
     }
 
+    /// The launch id of the daemon this supervisor runs, adopted or is
+    /// launching, or `nil` when it holds none (#528). A /health answer
+    /// speaks for that daemon only when it carries this id: another server
+    /// can take the port, and it answers /health too.
+    public func activeLaunchID() -> String? {
+        lock.withLock {
+            if adoptedProcessID != nil {
+                return adoptedLaunchID
+            }
+            guard process != nil || launchInProgress else { return nil }
+            return ownedLaunchID
+        }
+    }
+
     /// The daemon root pid this supervisor owns or adopted, for liveness
     /// checks that must not depend on HTTP answering (issue #487).
     public func daemonProcessIdentifier() -> pid_t? {

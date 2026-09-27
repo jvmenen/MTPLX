@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "сервер MTPLX, запущенный вне приложения";
 "Another AIME run is already active." = "Другой прогон AIME уже выполняется.";
 "another app" = "другое приложение";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "Порт %@ занят другим сервером MTPLX (pid %@); это приложение к нему не подключено.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "Порт %@ занят другим сервером MTPLX; это приложение к нему не подключено.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "Другой процесс создаёт нагрузку на память этого Mac. Скорость декодирования может проседать, пока длится всплеск; собственная память движка стабильна, и ничего не вытеснено.";
 "ANSWER" = "ОТВЕТ";
 "API key" = "Ключ API";

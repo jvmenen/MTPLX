@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "アプリ外で起動されたMTPLXサーバー";
 "Another AIME run is already active." = "別のAIME実行がすでに進行中です。";
 "another app" = "別のアプリ";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "別のMTPLXサーバーがポート%@を使用しています（pid %@）。このアプリはそのサーバーに接続していません。";
+"Another MTPLX server holds port %@; this app is not connected to it." = "別のMTPLXサーバーがポート%@を使用しています。このアプリはそのサーバーに接続していません。";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "別のプロセスがこのMacをメモリ負荷状態にしています。スパイクの間はデコード速度が低下することがありますが、エンジン自体の使用量は安定しており、何も退避されていません。";
 "ANSWER" = "答え";
 "API key" = "APIキー";

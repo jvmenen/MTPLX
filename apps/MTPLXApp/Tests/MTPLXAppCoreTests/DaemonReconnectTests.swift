@@ -603,12 +603,11 @@ final class DaemonReconnectTests: XCTestCase {
 
     /// The app's daemon is gone and a stranger answers on its port. A
     /// healthy answer from the stranger must never read as this app's engine
-    /// running. The lost daemon takes the watchdog's reap path: Degraded
-    /// ("lost contact"), then Stopped once the supervisor has let go of it,
-    /// the same end state as a reap by the watchdog. The stranger is never
-    /// signalled and the configured port is not moved.
+    /// running. The app lets its lost daemon go and stays Degraded naming
+    /// the other server, rather than Stopped, which hid the cause. Stop
+    /// never signals the stranger and the configured port is not moved.
     @MainActor
-    func testAnotherServerOnThePortNeverReadsRunning() async throws {
+    func testAnotherServerOnThePortIsNamedAndNeverSignalled() async throws {
         let daemon = try ReconnectFakeDaemon.make()
         let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
         addTeardownBlock { if prior.isRunning { prior.terminate() } }
@@ -640,19 +639,96 @@ final class DaemonReconnectTests: XCTestCase {
             !supervisor.isRunning() && store.daemonState != .stopping
         }
 
-        XCTAssertNotEqual(
-            store.daemonState, .running,
-            "another server answering on the port must never read as this app's engine running"
+        let strangerPID = try XCTUnwrap(strangerHealth.startup?.pid)
+        guard case .degraded(let reason) = store.daemonState else {
+            return XCTFail("another server on the port must stay visible as Degraded, got \(store.daemonState)")
+        }
+        XCTAssertEqual(
+            reason,
+            "Another MTPLX server holds port \(daemon.port) (pid \(strangerPID)); this app is not connected to it."
         )
-        XCTAssertNotEqual(badge(store).tone, .healthy)
-        XCTAssertNotEqual(badge(store).label, "Running")
+        let named = badge(store)
+        XCTAssertEqual(named.tone, .failed)
+        XCTAssertTrue(named.label.hasPrefix("Degraded — Another MTPLX server"), named.label)
+        XCTAssertEqual(named.help, "Degraded: \(reason)")
         XCTAssertNotEqual(
-            store.health?.startup?.pid, strangerHealth.startup?.pid,
+            store.health?.startup?.pid, strangerPID,
             "a stranger's pid must never become the app's, where Stop would signal it"
         )
         XCTAssertFalse(supervisor.isRunning(), "the app no longer claims a daemon it lost")
-        XCTAssertTrue(stranger.isRunning, "the other server is never signalled")
+
+        await store.stopDaemon()
+        XCTAssertTrue(stranger.isRunning, "Stop never signals the other server")
+        let stillThere = try await daemon.waitUntilHealthy()
+        XCTAssertEqual(stillThere.startup?.pid, strangerPID)
         XCTAssertEqual(store.configuration.port, daemon.port)
+    }
+
+    /// An adopted daemon exits and another server takes its port. The live
+    /// stats stream ends cleanly and reopens on the new server, and the
+    /// watchdog keeps probing. Neither may let the other server's answer
+    /// stand for the app's daemon (on 1de2b1c0 the watchdog published it as
+    /// `health`, and Stop then signalled its pid).
+    @MainActor
+    private func assertAnotherServerAfterACleanStreamEnd(strangerLaunchID: String?) async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        let priorHealth = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let supervisor = DaemonSupervisor()
+        let store = daemon.makeStore(
+            configuration: MTPLXAppConfiguration(),
+            supervisor: supervisor,
+            fans: FanCallRecorder()
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(store.health?.startup?.launchId, priorHealth.startup?.launchId, "adopted")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+
+        prior.terminate()
+        prior.waitUntilExit()
+        let stranger = try daemon.launchOutsideTheApp(launchID: strangerLaunchID)
+        addTeardownBlock { if stranger.isRunning { stranger.terminate() } }
+        let strangerHealth = try await daemon.waitUntilHealthy()
+        let strangerPID = try XCTUnwrap(strangerHealth.startup?.pid)
+        XCTAssertEqual(strangerHealth.startup?.launchId, strangerLaunchID)
+
+        try await pollUntil("the other server is named", timeout: 15) {
+            if case .degraded(let reason) = store.daemonState {
+                return reason.hasPrefix("Another MTPLX server holds port \(daemon.port)")
+            }
+            return false
+        }
+        // More watchdog rounds (every 3 s) before Stop: nothing may publish
+        // the other server's answer as the app's daemon meanwhile.
+        try await Task.sleep(nanoseconds: 4_000_000_000)
+        guard case .degraded(let reason) = store.daemonState else {
+            return XCTFail("expected Degraded naming the other server, got \(store.daemonState)")
+        }
+        XCTAssertTrue(reason.contains("(pid \(strangerPID))"), reason)
+        XCTAssertNotEqual(store.health?.startup?.pid, strangerPID)
+        XCTAssertTrue(badge(store).label.hasPrefix("Degraded — Another MTPLX server"), badge(store).label)
+        XCTAssertFalse(supervisor.isRunning(), "the app let go of the daemon it lost")
+
+        await store.stopDaemon()
+        XCTAssertTrue(stranger.isRunning, "Stop must never signal another server")
+        let stillThere = try await daemon.waitUntilHealthy()
+        XCTAssertEqual(stillThere.startup?.pid, strangerPID)
+        XCTAssertEqual(daemon.spawns().count, 2, "the prior daemon and the stranger; the app launched nothing")
+    }
+
+    @MainActor
+    func testAnotherServerWithoutALaunchIDAfterACleanStreamEnd() async throws {
+        try await assertAnotherServerAfterACleanStreamEnd(strangerLaunchID: nil)
+    }
+
+    @MainActor
+    func testAnotherServerWithADifferentLaunchIDAfterACleanStreamEnd() async throws {
+        try await assertAnotherServerAfterACleanStreamEnd(strangerLaunchID: "other-session-\(UUID().uuidString)")
     }
 
     // MARK: Live stats drop while the daemon stays healthy

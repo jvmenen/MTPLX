@@ -448,6 +448,11 @@ public final class MTPLXBackendStore: ObservableObject {
     /// older value has been cancelled, however far it still has to unwind,
     /// and a later request must not settle for its outcome.
     private var stopGeneration = 0
+    /// Set when another server answered on the port of the daemon of this
+    /// lifecycle and the app let that daemon go (#528). The terminal
+    /// cleanup then shows this reason as Degraded instead of Stopped, so the
+    /// cause stays on screen rather than inviting a Start that moves ports.
+    private var portLoss: (lifecycleEpoch: Int, reason: String)?
     /// The Degraded value a failed configuration change left on screen
     /// while the previous daemon kept serving. A reconnect leaves it in
     /// place so the failed change stays visible; an explicit start clears it.
@@ -1008,6 +1013,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // A Stop or a reap may still be tearing the previous daemon down;
         // what the supervisor holds is only known once that has finished.
         await awaitDaemonTeardown()
+        portLoss = nil
         switch supervisor.currentHold() {
         case .held(let held):
             // This app already runs a daemon: reconnect to it. Asking the
@@ -1684,7 +1690,8 @@ public final class MTPLXBackendStore: ObservableObject {
             activeLaunchID = nil
         }
         let shouldWarnIfFanRestoreFails = shouldRestoreFanModeOnStop()
-        let startupPID = health?.startup?.pid.map(pid_t.init)
+        let startupPID = heldDaemonStartupPID()
+        portLoss = nil
         let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
         let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
         modelDownloadTask?.cancel()
@@ -1964,6 +1971,7 @@ public final class MTPLXBackendStore: ObservableObject {
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
         if let existing = try? await apiClient.health(), existing.ok {
+            try refuseAnotherServersAnswer(existing)
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
                 ?? currentFanMode
@@ -1987,6 +1995,7 @@ public final class MTPLXBackendStore: ObservableObject {
         }
 
         if let ready = try? await apiClient.health(), ready.ok {
+            try refuseAnotherServersAnswer(ready)
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
                 ?? currentFanMode
@@ -2193,6 +2202,13 @@ public final class MTPLXBackendStore: ObservableObject {
             let fetchedCapabilities = try await capabilities
             let fetchedSessions = try await sessions
             guard isCurrent?() ?? true else { return }
+            if case .anotherServer(let held) = source(of: fetchedHealth) {
+                releaseDaemonToAnotherServer(fetchedHealth, held: held)
+                throw DaemonSupervisorError.portOccupied(
+                    pid: fetchedHealth.startup?.pid,
+                    launchID: fetchedHealth.startup?.launchId
+                )
+            }
             self.health = fetchedHealth
             self.capabilities = fetchedCapabilities
             self.sessions = fetchedSessions
@@ -2834,6 +2850,17 @@ public final class MTPLXBackendStore: ObservableObject {
                 // store state.
                 guard snapshot.lifecycleEpoch > lastTerminalCleanupLifecycleEpoch
                 else { break }
+                if let loss = portLoss, loss.lifecycleEpoch == snapshot.lifecycleEpoch {
+                    // The app let this daemon go because another server
+                    // answers on its port (#528). Stopped would hide why.
+                    cleanupTerminalDaemonSessionIfNeeded(
+                        lifecycleEpoch: snapshot.lifecycleEpoch,
+                        terminalState: .degraded(loss.reason),
+                        terminalStartupPhase: .failed(loss.reason),
+                        terminalConnectionState: .failed(loss.reason)
+                    )
+                    break
+                }
                 cleanupTerminalDaemonSessionIfNeeded(
                     lifecycleEpoch: snapshot.lifecycleEpoch,
                     terminalState: .stopped,
@@ -3058,6 +3085,94 @@ public final class MTPLXBackendStore: ObservableObject {
         return held.baseURL == baseURL
     }
 
+    /// Who answered a healthy /health (#528).
+    private enum HealthSource {
+        /// The daemon this app runs: the answer carries its launch id.
+        case heldDaemon
+        /// Something else answers where the held daemon listens.
+        case anotherServer(HeldDaemon)
+        /// No daemon is held yet, or the held one has no launch id.
+        case unattributed
+    }
+
+    /// `health` supplies the pid that Stop and the reap path signal and the
+    /// watchdog's process evidence, so only an answer carrying the held
+    /// daemon's launch id may become `health`. A server that took the port
+    /// answers /health too.
+    private func source(of payload: HealthPayload) -> HealthSource {
+        guard case .held(let held) = supervisor.currentHold(),
+              let heldLaunchID = held.launchID
+        else { return .unattributed }
+        return payload.startup?.launchId == heldLaunchID ? .heldDaemon : .anotherServer(held)
+    }
+
+    /// The pid /health reported for the daemon this app runs, when that
+    /// answer carried the daemon's launch id. Stop and the reap path add it
+    /// to the process family they signal (the model server can outlive its
+    /// wrapper). A pid from any other answer may belong to a server that
+    /// took the port, and is never signalled (#528).
+    private func heldDaemonStartupPID() -> pid_t? {
+        guard let startup = health?.startup,
+              let pid = startup.pid,
+              let launchID = startup.launchId,
+              launchID == supervisor.activeLaunchID()
+        else { return nil }
+        return pid_t(pid)
+    }
+
+    /// Another server answers /health where this app's daemon listens: the
+    /// daemon lost its port. Typically an adopted daemon exited (the app
+    /// gets no exit callback for a process it did not launch) and
+    /// `mtplx serve`, started in a terminal, took the port. The app lets its
+    /// daemon go through the reap path, keeps the other server's pid out of
+    /// `health` so Stop never signals it, and stays Degraded naming the
+    /// other server rather than falling to Stopped (#528).
+    private func releaseDaemonToAnotherServer(_ answer: HealthPayload, held: HeldDaemon) {
+        switch daemonState {
+        case .stopped, .stopping, .crashed:
+            return
+        case .running, .warming, .starting, .degraded:
+            break
+        }
+        let port = held.baseURL.port.map { String($0) } ?? held.baseURL.absoluteString
+        let reason: String
+        if let pid = answer.startup?.pid {
+            reason = tr(
+                "Another MTPLX server holds port %@ (pid %@); this app is not connected to it.",
+                port,
+                String(pid)
+            )
+        } else {
+            reason = tr("Another MTPLX server holds port %@; this app is not connected to it.", port)
+        }
+        if health?.startup?.launchId != held.launchID {
+            health = nil
+        }
+        let answeredLaunch = answer.startup?.launchId ?? "none"
+        let answeredPID = answer.startup?.pid.map { String($0) } ?? "unknown"
+        let heldLaunch = held.launchID ?? "unknown"
+        let address = held.baseURL.absoluteString
+        Task { [supervisor] in
+            await supervisor.logs.append(
+                "another server answers /health at \(address) (launch \(answeredLaunch), pid \(answeredPID)); letting go of daemon launch \(heldLaunch) and leaving that server alone",
+                stream: .system
+            )
+        }
+        portLoss = (held.lifecycleEpoch, reason)
+        reapDaemon(reason: reason)
+    }
+
+    /// The benchmark's readiness check: another server's answer is not a
+    /// ready daemon.
+    private func refuseAnotherServersAnswer(_ payload: HealthPayload) throws {
+        guard case .anotherServer(let held) = source(of: payload) else { return }
+        releaseDaemonToAnotherServer(payload, held: held)
+        if case .degraded(let reason) = daemonState {
+            throw BenchmarkDaemonReadinessError.startupFailed(reason)
+        }
+        throw BenchmarkDaemonReadinessError.unreachable(held.baseURL)
+    }
+
     /// Reconnect the store to the daemon the supervisor already holds
     /// (#528). A start request that finds one, Refresh, and a live-stats
     /// stream that comes back after dropping all run this. It never
@@ -3069,9 +3184,8 @@ public final class MTPLXBackendStore: ObservableObject {
     ///   is running. The badge says so, and a missing or dropped live-stats
     ///   stream and a missing watchdog start again.
     /// - a server answers there under another launch id, or none: this
-    ///   app's daemon no longer holds its port. That is a real loss of
-    ///   contact and takes the watchdog's reap path; the other server's pid
-    ///   is dropped first so a Stop can never signal it.
+    ///   app's daemon no longer holds its port. The app lets it go and
+    ///   names the other server (`releaseDaemonToAnotherServer`).
     /// - no answer it can attribute (busy, 401, an undecodable payload):
     ///   nothing changes. A busy daemon stays Running and only the
     ///   watchdog decides that a silent one is gone (#487).
@@ -3111,12 +3225,7 @@ public final class MTPLXBackendStore: ObservableObject {
             return
         }
         guard payload.startup?.launchId == heldLaunchID else {
-            if health?.startup?.launchId != heldLaunchID {
-                health = nil
-            }
-            markDaemonUnreachableIfNeeded(
-                reason: tr("MTPLX lost contact with the model server. Start it again.")
-            )
+            releaseDaemonToAnotherServer(payload, held: held)
             return
         }
         health = payload
@@ -3187,7 +3296,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the supervisor's root (the wrapper), an adopted daemon has neither
     /// and is judged by its port alone.
     private func gatherDaemonLivenessEvidence() async -> DaemonLivenessEvidence {
-        let pid = health?.startup?.pid.map(pid_t.init) ?? supervisor.daemonProcessIdentifier()
+        let pid = heldDaemonStartupPID() ?? supervisor.daemonProcessIdentifier()
         let processAlive = pid.map(DaemonSupervisor.processIsAlive)
         let url = baseURL
         // Read the main-actor constant here; the detached probe must not
@@ -3256,6 +3365,13 @@ public final class MTPLXBackendStore: ObservableObject {
                 else { return }
                 switch liveness {
                 case .healthy(let health) where health.ok:
+                    if case .anotherServer(let held) = self.source(of: health) {
+                        // The answer is not this app's daemon: an adopted
+                        // daemon exited and another server took its port
+                        // (#528). Its pid must never become `health`.
+                        self.releaseDaemonToAnotherServer(health, held: held)
+                        return
+                    }
                     tracker.recordAnswer()
                     loggedBusy = false
                     self.daemonUnresponsiveFor = nil
@@ -3351,8 +3467,13 @@ public final class MTPLXBackendStore: ObservableObject {
         case .stopped, .degraded, .stopping, .crashed:
             return
         }
+        reapDaemon(reason: reason)
+    }
 
-        let startupPID = health?.startup?.pid.map(pid_t.init)
+    /// Show `reason` as Degraded and stop the supervisor's daemon family in
+    /// the background.
+    private func reapDaemon(reason: String) {
+        let startupPID = heldDaemonStartupPID()
         // The reap stops the supervisor like Stop does; a start request
         // after it must launch rather than join a start the reap ended.
         stopGeneration &+= 1

@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "앱 외부에서 시작된 MTPLX 서버";
 "Another AIME run is already active." = "다른 AIME 실행이 이미 활성화되어 있습니다.";
 "another app" = "다른 앱";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "포트 %@에서 다른 MTPLX 서버가 실행 중입니다(pid %@). 이 앱은 해당 서버에 연결되어 있지 않습니다.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "포트 %@에서 다른 MTPLX 서버가 실행 중입니다. 이 앱은 해당 서버에 연결되어 있지 않습니다.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "다른 프로세스로 인해 이 Mac의 메모리 압박이 증가하고 있습니다. 사용량 급증이 지속되는 동안 디코드 속도가 일시적으로 떨어질 수 있습니다. 엔진 자체의 사용량은 안정적이며 축출된 항목은 없습니다.";
 "ANSWER" = "답안";
 "API key" = "API 키";
