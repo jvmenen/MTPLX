@@ -1538,6 +1538,49 @@ final class DaemonReconnectTests: XCTestCase {
         )
     }
 
+    // MARK: Codex final review, finding 5: the benchmark needs the app's own daemon
+
+    /// `mtplx serve` from a terminal holds the configured port and the app
+    /// holds nothing. The benchmark used to take that server as ready, run
+    /// against it and post settings to it. It now says the port is held by
+    /// a server started outside the app, and starts nothing beside it.
+    @MainActor
+    func testTheBenchmarkRefusesAServerStartedOutsideTheApp() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await daemon.waitUntilHealthy()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        do {
+            let ready = try await store.ensureDaemonReadyForBenchmark()
+            XCTFail("the benchmark took a server the app does not run (pid \(ready.startup?.pid ?? -1))")
+        } catch BenchmarkDaemonReadinessError.startupFailed(let reason) {
+            XCTAssertTrue(reason.contains("started outside the app"), reason)
+        }
+
+        XCTAssertNotEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        XCTAssertEqual(daemon.spawns().count, 1, "no second model was started beside it")
+        XCTAssertTrue(terminalServer.isRunning)
+    }
+
+    /// The app's own daemon still passes, without a second launch.
+    @MainActor
+    func testTheBenchmarkUsesTheAppsOwnDaemon() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        let launched = try XCTUnwrap(store.health?.startup)
+
+        let ready = try await store.ensureDaemonReadyForBenchmark()
+
+        XCTAssertEqual(ready.startup?.launchId, launched.launchId)
+        XCTAssertEqual(daemon.spawns().count, 1)
+        XCTAssertEqual(store.daemonState, .running)
+    }
+
     // MARK: Closing the window during a model load
 
     /// Closing the main window cancels its launch task. The start runs on a

@@ -2079,9 +2079,13 @@ public final class MTPLXBackendStore: ObservableObject {
 
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
+        // Only the app's own daemon is a ready daemon (#528). Any healthy
+        // server at the configured port used to count: with nothing held,
+        // `mtplx serve` started in a terminal got the benchmark, and the
+        // pending live settings were posted to it.
         let holdBeforeProbe = supervisor.currentHold()
-        if let existing = try? await apiClient.health(), existing.ok {
-            try refuseAnotherServersAnswer(existing, askedOf: holdBeforeProbe)
+        if let existing = try? await apiClient.health(), existing.ok,
+           try answerIsTheHeldDaemon(existing, askedOf: holdBeforeProbe) {
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
                 ?? currentFanMode
@@ -2105,8 +2109,8 @@ public final class MTPLXBackendStore: ObservableObject {
         }
 
         let holdAfterStart = supervisor.currentHold()
-        if let ready = try? await apiClient.health(), ready.ok {
-            try refuseAnotherServersAnswer(ready, askedOf: holdAfterStart)
+        if let ready = try? await apiClient.health(), ready.ok,
+           try answerIsTheHeldDaemon(ready, askedOf: holdAfterStart) {
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
                 ?? currentFanMode
@@ -3304,15 +3308,38 @@ public final class MTPLXBackendStore: ObservableObject {
         return true
     }
 
-    /// The benchmark's readiness check: another server's answer is not a
-    /// ready daemon.
-    private func refuseAnotherServersAnswer(_ payload: HealthPayload, askedOf hold: DaemonHold) throws {
-        guard case .anotherServer(let held) = source(of: payload, askedOf: hold) else { return }
-        releaseDaemonToAnotherServer(payload, held: held)
-        if case .degraded(let reason) = daemonState {
-            throw BenchmarkDaemonReadinessError.startupFailed(reason)
+    /// The benchmark's readiness check: true only for an answer from the
+    /// daemon the app holds. Another server on the held daemon's port ends
+    /// the check with that server named; an answer from a server the app
+    /// does not hold, or a stale one, is simply not a ready daemon.
+    private func answerIsTheHeldDaemon(_ payload: HealthPayload, askedOf hold: DaemonHold) throws -> Bool {
+        switch source(of: payload, askedOf: hold) {
+        case .heldDaemon:
+            return true
+        case .anotherServer(let held):
+            releaseDaemonToAnotherServer(payload, held: held)
+            if case .degraded(let reason) = daemonState {
+                throw BenchmarkDaemonReadinessError.startupFailed(reason)
+            }
+            throw BenchmarkDaemonReadinessError.unreachable(held.baseURL)
+        case .unattributed:
+            if case .none = hold, payload.startup?.launchId?.isEmpty != false {
+                // A server the app never launched (no app launch id, such
+                // as `mtplx serve` from a terminal) holds the configured
+                // port. It is not the app's daemon, and loading a second
+                // model beside it is not the benchmark's call: say so, as
+                // Play's port check does.
+                let port = String(configuration.port)
+                throw BenchmarkDaemonReadinessError.startupFailed(
+                    tr("Port %@ is held by an MTPLX server started outside the app. Press Ctrl-C in its terminal or run `mtplx stop --port %@`, then press Play.", port, port)
+                )
+            }
+            // An app-owned daemon the app does not hold yet: the start that
+            // follows adopts it, or replaces it when it no longer matches.
+            return false
+        case .stale:
+            return false
         }
-        throw BenchmarkDaemonReadinessError.unreachable(held.baseURL)
     }
 
     /// Reconnect the store to the daemon the supervisor already holds
