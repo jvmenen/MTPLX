@@ -622,6 +622,11 @@ def _install_batch_invariant_lane(model: Any) -> None:
         )
         return
     invariant_report = install_batch_invariant_prefill(model)
+    from .a3b_moe_prefill_combine import install_a3b_moe_prefill_combine, switched_on
+
+    if switched_on():
+        # Only on the lane: the combine reads the lane's sorted expert output.
+        invariant_report["moe_prefill_combine_blocks"] = install_a3b_moe_prefill_combine(model)
     logger.info("[batch-invariant-prefill] %s", invariant_report)
 
 
