@@ -859,12 +859,16 @@ def gemma4_prefill_attention_bytes(config: Any, rows: int, cached_tokens: int) -
 # score blocks grow with the square of the prompt.
 GEMMA4_PREFILL_CHUNK_ENV = "MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS"
 _GEMMA4_WHOLE_PREFILL = frozenset({"0", "whole", "off", "none", "false", "no"})
+# The narrowest chunk: every forward carries at least two rows (a one-row
+# forward takes the sliding caches' decode path) and at most the width the
+# admission prices, and a width of two cannot split an odd span that way.
+GEMMA4_MIN_PREFILL_CHUNK = 3
 
 
 def gemma4_prefill_chunk_tokens(context_tokens: int) -> int | None:
     """The rows one prefill forward runs for a prompt of ``context_tokens``,
-    or ``None`` for the whole uncached span in one forward. Never under two
-    rows: a one-row forward takes the sliding caches' decode path."""
+    or ``None`` for the whole uncached span in one forward. Never under
+    ``GEMMA4_MIN_PREFILL_CHUNK``."""
 
     import os
 
@@ -881,7 +885,7 @@ def gemma4_prefill_chunk_tokens(context_tokens: int) -> int | None:
             width = None
     if width is None or width <= 0:
         width = _prefill_chunk_size(int(context_tokens))
-    return max(2, int(width))
+    return max(GEMMA4_MIN_PREFILL_CHUNK, int(width))
 
 
 def gemma4_prefill_spans(rows: int, width: int | None) -> list[tuple[int, int]]:
@@ -892,20 +896,28 @@ def gemma4_prefill_spans(rows: int, width: int | None) -> list[tuple[int, int]]:
     remainder first: the sliding caches keep their window plus the last
     chunk's rows once the prefill ends, and a full last chunk is what lets
     the session bank trim a banked prompt boundary up to width - 1 rows back
-    (``Gemma4RollbackRotatingKVCache.trim``). A one-row remainder rides with
-    the first full chunk, so every forward carries at least two rows and
-    takes the sliding caches' concat path."""
+    (``Gemma4RollbackRotatingKVCache.trim``). Every forward carries at least
+    two rows (the sliding caches' concat path) and at most ``width``, the
+    width the admission prices: a one-row remainder becomes two rows ahead
+    of a chunk one row short (4,097 rows at 2,048: 2, 2,047, 2,048)."""
 
     rows = max(0, int(rows))
     if rows == 0:
         return []
-    if width is None or rows <= max(2, int(width)):
+    if width is None:
         return [(0, rows)]
-    width = max(2, int(width))
+    width = max(GEMMA4_MIN_PREFILL_CHUNK, int(width))
+    if rows <= width:
+        return [(0, rows)]
     head = rows % width
     if head == 1:
-        head += width
-    edges = [0, *range(head or width, rows + 1, width)]
+        sizes = [2, width - 1]
+    else:
+        sizes = [head] if head else []
+    sizes += [width] * ((rows - sum(sizes)) // width)
+    edges = [0]
+    for size in sizes:
+        edges.append(edges[-1] + size)
     return list(pairwise(edges))
 
 
@@ -1715,7 +1727,7 @@ class Gemma4AssistantRuntime:
         default = gemma4_prefill_chunk_tokens(int(prompt_tokens))
         if default is None:
             return [None]
-        first = max(2, int(requested)) if requested else default
+        first = max(GEMMA4_MIN_PREFILL_CHUNK, int(requested)) if requested else default
         return [first, default] if default < first else [first]
 
     def prefill_cache_layout(self, context_tokens: int) -> str:

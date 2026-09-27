@@ -191,26 +191,33 @@ def _held_rows(item) -> tuple[mx.array, mx.array]:
     [
         (300, 512, [300]),
         (512, 512, [512]),
-        (513, 512, [513]),
+        (513, 512, [2, 511]),
         (514, 512, [2, 512]),
         (1024, 512, [512, 512]),
         (1100, 512, [76, 512, 512]),
-        (1025, 512, [513, 512]),
-        (7, 3, [4, 3]),
-        (8, 2, [2, 2, 2, 2]),
-        (9, 2, [3, 2, 2, 2]),
+        (1025, 512, [2, 511, 512]),
+        (2049, 2048, [2, 2047]),
+        (4097, 2048, [2, 2047, 2048]),
+        (7, 3, [2, 2, 3]),
+        (9, 3, [3, 3, 3]),
+        # A width of two cannot split an odd span into forwards of two or
+        # more rows; the narrowest chunk is three.
+        (8, 2, [2, 3, 3]),
     ],
 )
 def test_the_chunks_end_full_at_the_last_row_and_never_run_one_row(rows, width, spans):
     """The remainder goes first so the last chunk is full (the sliding caches
     keep their window plus it, what a banked prompt boundary can be trimmed
-    back through); a one-row remainder rides with the first full chunk."""
+    back through). No forward runs more rows than the width the admission
+    prices, or fewer than two: a one-row remainder becomes two rows ahead of
+    a chunk one row short."""
 
     got = gemma4.gemma4_prefill_spans(rows, width)
     assert [end - start for start, end in got] == spans
     assert got[0][0] == 0 and got[-1][1] == rows
     assert all(a[1] == b[0] for a, b in pairwise(got))
     assert all(end - start >= 2 for start, end in got) or rows == 1
+    assert all(end - start <= max(gemma4.GEMMA4_MIN_PREFILL_CHUNK, width) for start, end in got)
 
 
 def test_the_width_is_the_house_chunk_unless_gemma_or_the_request_says_otherwise(
@@ -228,7 +235,7 @@ def test_the_width_is_the_house_chunk_unless_gemma_or_the_request_says_otherwise
     with generation.prefill_chunk_size_override(256):
         assert gemma4.gemma4_prefill_chunk_tokens(30_000) == 256
     with generation.prefill_chunk_size_override(1):
-        assert gemma4.gemma4_prefill_chunk_tokens(30_000) == 2
+        assert gemma4.gemma4_prefill_chunk_tokens(30_000) == 3
     for whole in ("whole", "0", "off"):
         monkeypatch.setenv(CHUNK_ENV, whole)
         assert gemma4.gemma4_prefill_chunk_tokens(30_000) is None
@@ -273,8 +280,8 @@ def test_the_admission_prices_the_width_the_prefill_runs(monkeypatch, knob, requ
         (16, 300, 64, [44, 64, 64, 64, 64]),
         # Window wider than the chunk.
         (128, 300, 64, [44, 64, 64, 64, 64]),
-        # A one-row remainder, carried by the first chunk.
-        (64, 2049, 512, [513, 512, 512, 512]),
+        # A one-row remainder: two rows, then a chunk one row short.
+        (64, 2049, 512, [2, 511, 512, 512, 512]),
         (32, 1000, 96, [40] + [96] * 10),
     ],
 )
@@ -337,6 +344,11 @@ def test_only_prompts_longer_than_one_chunk_are_split(tiny_pair, monkeypatch, cp
     assert np.array_equal(_np(single.hidden), _np(whole.hidden))
     windows = [c for c in cache if isinstance(c, gemma4.Gemma4RollbackRotatingKVCache)]
     assert windows and all(c._last_update is not None for c in windows)
+
+    # One row past the width is two forwards, neither wider than the width
+    # the admission priced.
+    _cache, _output, forwards = _prefill(runtime, prompt[:65], 64, monkeypatch)
+    assert forwards == [2, 63]
 
     cache, _output, forwards = _prefill(runtime, prompt, 64, monkeypatch)
     assert forwards == [2, 64]
