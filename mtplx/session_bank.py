@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import mlx.core as mx
 import numpy as np
@@ -683,6 +685,7 @@ class SessionBank:
         self.active_pin_ttl_s = _active_session_pin_ttl_s()
         self._session_last_active: dict[str, float] = {}
         self.per_session_max_entries = _per_session_max_entries()
+        self._maintenance = threading.local()
         self.cold_tier = cold_tier
         # Optional idle-lane dispatcher for SSD cold-tier enqueues. Post-#169
         # put_entry encodes the full-KV payload at enqueue time, so calling it
@@ -783,6 +786,24 @@ class SessionBank:
         """
         for session_id in session_ids or ():
             self._touch_session(str(session_id))
+
+    @contextmanager
+    def maintenance_reads(self) -> Iterator[None]:
+        """Restores in this block (this thread only) keep the entry's recency.
+
+        The async postcommit re-renders a turn's history by restoring the
+        turn's own prompt-prefix entry. That read is bank maintenance, not a
+        client using the entry: letting it refresh last_access_s ranked the
+        superseded prompt prefix above a sibling lineage under the
+        per-session retention cap, and evicted the entry the next
+        tool-fed retry needed (vondst 54, 2026-09-27: 14-20K re-prefills).
+        """
+        depth = getattr(self._maintenance, "depth", 0)
+        self._maintenance.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._maintenance.depth = depth
 
     def _touch_session(self, session_id: str | None) -> None:
         if not session_id or self.active_pin_ttl_s <= 0:
@@ -1844,7 +1865,8 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
         entry.hits += 1
-        entry.last_access_s = time.time()
+        if not getattr(self._maintenance, "depth", 0):
+            entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
         lookup_len = len(tuple(int(token) for token in token_ids))
