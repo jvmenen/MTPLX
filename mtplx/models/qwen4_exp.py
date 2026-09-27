@@ -65,6 +65,7 @@ from mlx_lm.models.qwen3_next import (
 from mtplx import nax_detect
 from mtplx.attention_context import current_attention_phase
 from mtplx.attention_math import attention_gate
+from mtplx.float32_operand import float32_operand
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
 
 
@@ -290,12 +291,22 @@ def _rope_cos_sin(
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
     emb = mx.concatenate([angles, angles], axis=-1)
-    cosine = mx.cos(emb)
-    sine = mx.sin(emb)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(emb), attention_scaling), _yarn_amplitude(
+        mx.sin(emb), attention_scaling
+    )
+
+
+def _yarn_amplitude(table: mx.array, attention_scaling: float) -> mx.array:
+    """A float32 rotary table times the static-YaRN amplitude.
+
+    The amplitude (0.1 * ln(factor) + 1, 1.1386294 at factor 4) is read from
+    memory, not written into a fused kernel of the compiled verifier with 7
+    significant digits (mtplx/float32_operand.py). 1.0 leaves the table as is.
+    """
+
+    if attention_scaling == 1.0:
+        return table
+    return table * float32_operand(attention_scaling)
 
 
 def _build_mrope_axes(section: list, interleaved: bool) -> list[int]:
@@ -354,7 +365,7 @@ def _vision_position_cos_sin(positions, inv_freq, axes, scaling=1.0):
         prompt_positions = mx.take(table, mx.clip(positions, 0, table.shape[1] - 1), axis=1)
         positions3 = mx.where((positions < table.shape[1])[None, :], prompt_positions, positions3)
     cos, sin = _mrope_cos_sin(positions3, inv_freq, axes)
-    return cos * scaling, sin * scaling
+    return _yarn_amplitude(cos, scaling), _yarn_amplitude(sin, scaling)
 
 
 def _vision_chunk_cos_sin(
@@ -399,9 +410,8 @@ def _vision_chunk_cos_sin(
         cos_in, sin_in = _mrope_cos_sin(
             table[:, pos_start : pos_start + inside], inv_freq, axes
         )
-        if attention_scaling != 1.0:
-            cos_in = cos_in * float(attention_scaling)
-            sin_in = sin_in * float(attention_scaling)
+        cos_in = _yarn_amplitude(cos_in, attention_scaling)
+        sin_in = _yarn_amplitude(sin_in, attention_scaling)
         if not past:
             return cos_in, sin_in
     first_past = pos_start + inside + delta
@@ -458,12 +468,9 @@ def _rope_cos_sin_half(
     """
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
-    cosine = mx.cos(angles)
-    sine = mx.sin(angles)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(angles), attention_scaling), _yarn_amplitude(
+        mx.sin(angles), attention_scaling
+    )
 
 
 def _apply_partial_rope_half(
@@ -3016,12 +3023,6 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
-        # float32(sqrt(head_dim)), read through ``_score_divisor``.
-        object.__setattr__(
-            self,
-            "_sqrt_head_dim_buffer",
-            mx.array([math.sqrt(self.head_dim)] * 2, dtype=mx.float32),
-        )
         self._mrope_axes = (
             mx.array(_build_mrope_axes(args.mrope_section, args.mrope_interleaved), dtype=mx.int32)
             if args.mrope_section and sum(args.mrope_section) == int(args.rotary_dim) // 2
@@ -3029,22 +3030,19 @@ class QSAIndexer(nn.Module):
         )
 
     def _score_divisor(self) -> mx.array:
-        """The block-score divisor float32(sqrt(head_dim)), never a constant.
+        """The block-score divisor float32(sqrt(head_dim)), read from memory.
 
         The fixed-bank verify lane records ``_select_eager`` into the compiled
-        verifier. Divided by the Python float, sqrt(head_dim) becomes a scalar
-        constant of any fused kernel the division joins, and MLX 0.32.2 writes
-        such constants into the kernel source with 7 significant digits
-        (mlx/backend/common/compiled.h): sqrt(128) = 11.3137083 reads back as
-        11.31371, which turns distinct scores such as 1.5000001 / sqrt(128)
-        and 1.5000002 / sqrt(128) into a tie that the top-k cutoff breaks by
-        block id. A one-element array with no primitive is inlined the same
-        way (mlx/compile.cpp takes it for a constant), so the divisor is the
-        output of a slice: always read from memory, the float32 that the eager
-        division and the Metal selectors (SQRT_HEAD_DIM) use.
+        verifier. As a Python float, sqrt(head_dim) would be a constant of the
+        fused kernel the division joins, written with 7 significant digits:
+        sqrt(128) = 11.3137083 reads back as 11.31371, which turns distinct
+        scores such as 1.5000001 / sqrt(128) and 1.5000002 / sqrt(128) into a
+        tie that the top-k cutoff breaks by block id (mtplx/float32_operand.py).
+        The operand is the float32 the eager division and the Metal selectors
+        (SQRT_HEAD_DIM) use.
         """
 
-        return self._sqrt_head_dim_buffer[:1]
+        return float32_operand(math.sqrt(self.head_dim))
 
     def _uses_vision_positions(self) -> bool:
         return vision_qsa_enabled() and self._mrope_axes is not None and vision_rope_state() is not None
