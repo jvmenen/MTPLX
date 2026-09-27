@@ -467,6 +467,87 @@ class TwoHeadPagedRuntime:
         return logits, captures
 
 
+class ThreeLayerPagedRuntime(TwoHeadPagedRuntime):
+    """The same toy with THREE attention layers over paged KV behind one mask.
+
+    Like every model forward, the mask is built once, from the first
+    full-attention layer's cache, and serves every attention layer; each
+    layer writes its own pages. A layer missing from the first adapter's
+    reservation group would reach its write unreserved and hit the backstop.
+    """
+
+    LAYERS = 3
+
+    def __init__(self, mode: str, *, blocks: int = BLOCKS, seed: int = 7) -> None:
+        super().__init__(mode, blocks=blocks, seed=seed)
+        width = HEADS * HEAD_DIM
+        mx.random.seed(seed + 100)
+        self.layer_w = [
+            tuple(0.4 * mx.random.normal((self.D, width)) for _ in range(3))
+            for _ in range(self.LAYERS)
+        ]
+        mx.eval(*[w for ws in self.layer_w for w in ws])
+
+    def make_cache(self) -> list:
+        gdn, _paged = super().make_cache()
+        pages = [
+            VllmMetalPagedKVCache(
+                block_size=BLOCK, num_blocks=self.blocks, kv_quant_config=_config(self.mode)
+            )
+            for _ in range(self.LAYERS)
+        ]
+        return [gdn, *pages]
+
+    def _forward(self, input_ids, cache):
+        from mlx_lm.models.base import create_attention_mask
+
+        B, S = int(input_ids.shape[0]), int(input_ids.shape[1])
+        gdn_entry, *attn_entries = cache
+        h = self.embed[input_ids]
+        built_mask = create_attention_mask(h, attn_entries[0])
+
+        conv = gdn_entry.cache[0]
+        state = gdn_entry.cache[1]
+        conv_steps, state_steps, outs = [], [], []
+        for t in range(S):
+            conv = mx.concatenate([conv[:, 1:, :], h[:, t : t + 1, :]], axis=1)
+            mixed = mx.tanh(conv.reshape(B, -1) @ self.w_conv)
+            state = mx.tanh(state + mixed[:, None, :, None] * mixed[:, None, None, :])
+            conv_steps.append(conv)
+            state_steps.append(state)
+            outs.append(mx.sum(state, axis=-1))
+        gdn_entry[0] = conv
+        gdn_entry[1] = state
+        gdn_entry.advance(S)
+        h = h + mx.concatenate(outs, axis=1)
+
+        for (w_k, w_v, w_q), attn_entry in zip(self.layer_w, attn_entries):
+            def heads(w):
+                return (h @ w).reshape(B, S, HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+
+            keys, values = heads(w_k), heads(w_v)
+            if self.mode == "plain":
+                keys, values = keys.astype(mx.bfloat16), values.astype(mx.bfloat16)
+            k_buf, v_buf = attn_entry.update_and_fetch(keys, values)
+            capacity = int(k_buf.shape[2])
+            if isinstance(built_mask, mx.array):
+                mask = built_mask.astype(mx.float32)
+            else:
+                offset = attn_entry.offset
+                limit = offset - S + 1 + mx.arange(S)
+                mask = (mx.arange(capacity)[None, :] < limit[:, None]).astype(mx.float32)
+            scores = heads(w_q) @ mx.swapaxes(k_buf, 2, 3).astype(mx.float32)
+            attn = (scores * mask) @ v_buf.astype(mx.float32)
+            h = h + attn.transpose(0, 2, 1, 3).reshape(B, S, -1) @ self.w_ao
+        captures = {
+            0: {
+                "conv_states": mx.stack(conv_steps, axis=1),
+                "states": mx.stack(state_steps, axis=1),
+            }
+        }
+        return h @ self.w_out, h, captures
+
+
 def _prefill(rt, cache, rows: int) -> None:
     rt.forward_ar_capture(mx.array([[i % 5 for i in range(rows)]]), cache=cache, return_hidden=True)
 
@@ -741,3 +822,89 @@ def test_packed_quant_offset_probe_exempts_only_the_trace_refusal():
     mx.eval(mx.compile(body)(mx.array(3, dtype=mx.int32)))
     assert seen == {"traced": None}
     assert kernel_offset(mx.array(7, dtype=mx.int32)) == 7
+
+
+def _assert_one_group(cache) -> list:
+    adapters = [entry for entry in cache if isinstance(entry, TensorOffsetVllmMetalPagedKVCache)]
+    for adapter in adapters:
+        assert [id(m) for m in adapter._window_members()] == [id(a) for a in adapters]
+    return adapters
+
+
+def _round(bank, rt, cache, ids):
+    logits, _h, captures = _verify(bank, rt, cache, ids)
+    assert commit_captured_prefix(cache, captures, keep_tokens=len(ids), verified_tokens=len(ids))
+    return logits
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_one_mask_reserves_every_layer_through_demotion_restore_and_repromotion(mode):
+    """Three attention layers cross the capacity through the one mask the
+    forward builds from the first layer's cache; then the bank demotes the
+    list, a snapshot of it is restored into a fresh list (a session-bank
+    restore), the fresh list is promoted again and crosses the next capacity.
+    At every stage the reservation group is exactly the list's adapters, every
+    layer grows together, and rows and logits match a run preallocated at 128
+    rows through the same stages."""
+
+    from mtplx.cache_state import restore_cache, snapshot_cache
+
+    rt = ThreeLayerPagedRuntime(mode)
+    ref_rt = ThreeLayerPagedRuntime(mode, blocks=8)
+    runs = []
+    for runtime in (rt, ref_rt):
+        bank = CompiledVerifyBank(runtime)
+        cache = runtime.make_cache()
+        _prefill(runtime, cache, 27)
+        runs.append([runtime, bank, cache])
+
+    def both(ids):
+        outs = [_round(bank, runtime, cache, ids) for runtime, bank, cache in runs]
+        np.testing.assert_allclose(np.array(outs[0]), np.array(outs[1]), rtol=1e-6, atol=1e-6)
+        for layer in range(1, 4):
+            got, want = runs[0][2][layer], runs[1][2][layer]
+            assert got.size() == want.size()
+            _assert_same(_rows(got, 0, got.size()), _rows(want, 0, want.size()), f"layer {layer}")
+
+    both([1, 2, 3, 4])  # compiled, 27 -> 31: promotes all three layers
+    adapters = _assert_one_group(runs[0][2])
+    assert len(adapters) == 3 and {a.capacity for a in adapters} == {32}
+    both([4, 3, 2, 1])  # 31 + 4 > 32: one mask reserves every layer
+    assert [a.capacity for a in _assert_one_group(runs[0][2])] == [48, 48, 48]
+
+    for run in runs:  # demote, snapshot, restore into a fresh list
+        runtime, bank, cache = run
+        assert bank.demote(cache) == 3
+        assert all(type(entry) is VllmMetalPagedKVCache for entry in cache[1:])
+        fresh = runtime.make_cache()
+        restore_cache(fresh, snapshot_cache(cache))
+        run[1] = CompiledVerifyBank(runtime)
+        run[2] = fresh
+
+    both([2, 4, 1, 3])  # 35 -> 39, re-promoted
+    first = _assert_one_group(runs[0][2])
+    assert [a.capacity for a in first] == [48, 48, 48]
+    both([3, 1, 4, 2])  # 43
+    both([1, 1, 2, 2])  # 47
+    both([2, 2, 1, 1])  # 47 + 4 > 48: every layer grows again
+    grown = _assert_one_group(runs[0][2])
+    assert [a.capacity for a in grown] == [80, 80, 80]
+    assert all(a.size() == 51 for a in grown)
+
+
+def test_a_list_rebuilt_from_promoted_adapters_is_relinked_as_one_group(monkeypatch):
+    """Linking used to happen only when a pass promoted something new, so a
+    list assembled from adapters promoted elsewhere kept their old groups
+    and the first adapter's mask reserved only part of the list."""
+
+    monkeypatch.setenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", "1")
+    first = [_promoted("q8"), _promoted("q8")]
+    second = [_promoted("q8")]
+    link_paged_window_group(first)
+    link_paged_window_group(second)
+    rebuilt = [first[0], second[0], first[1]]
+    assert graphbank_module.promote_kv_cache_offsets(rebuilt, reserve_tokens=4) == (0, {})
+    _assert_one_group(rebuilt)  # old code: first[0]'s group was still [first[0], first[1]]
+
+    reserve_paged_window(rebuilt[0]._window_members(), 4)  # 31 + 4 > 32 for all three
+    assert [a.capacity for a in rebuilt] == [48, 48, 48]
