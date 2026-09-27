@@ -546,6 +546,41 @@ actor FanCallRecorder {
     }
 }
 
+/// A TCP listener that takes connections into its backlog and never
+/// answers. To the port preflight it is another app on the port, which it
+/// re-probes for the whole settle window.
+final class SilentListener {
+    private let descriptor: Int32
+
+    init(port: Int) throws {
+        descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var reuse: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port)).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, Darwin.listen(descriptor, 16) == 0 else {
+            let failure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EADDRINUSE)
+            Darwin.close(descriptor)
+            throw failure
+        }
+    }
+
+    func close() {
+        Darwin.close(descriptor)
+    }
+}
+
 /// Runs an action set by the test at most once, the first time `run` is
 /// called after it was set; before that, `run` does nothing.
 actor OneShotAction {
@@ -1371,6 +1406,36 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.health?.startup?.launchId, replacement.launchID)
         try await pollUntil("live stats open") { store.connectionState == .open }
         XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: Codex final review, finding 2: Stop while a start still prepares
+
+    /// Stop lands while a start is still in the port preflight, before it
+    /// has launched anything. The start used to carry on after Stop
+    /// returned and launch on the next free port.
+    @MainActor
+    func testStopDuringThePortPreflightMeansNothingLaunches() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let listener = try SilentListener(port: daemon.port)
+        defer { listener.close() }
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        store.portSettleTimeoutSeconds = 3
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        let start = Task { @MainActor in await store.startDaemon() }
+        // The preflight re-probes the silent port for about four seconds.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        await store.stopDaemon()
+        await start.value
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(daemon.spawns().count, 0, "nothing launches after Stop")
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertEqual(store.startupPhase, .idle)
+        XCTAssertNil(store.portFallbackNotice, "no port move for a launch that did not happen")
+        XCTAssertEqual(store.configuration.port, daemon.port)
+        let logged = await logsMention(store, "start abandoned")
+        XCTAssertTrue(logged, "the Logs window records why nothing launched")
     }
 
     // MARK: Closing the window during a model load

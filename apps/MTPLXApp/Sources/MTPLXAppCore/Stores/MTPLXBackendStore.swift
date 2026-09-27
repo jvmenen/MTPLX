@@ -1041,7 +1041,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // window) must not cancel the launch. Awaiting the value from a
         // cancelled task still waits for it.
         let task = Task { @MainActor [self] in
-            await runStartRequest(target: target)
+            await runStartRequest(target: target, stopGeneration: generation)
             if runningStart?.id == id {
                 runningStart = nil
             }
@@ -1050,10 +1050,44 @@ public final class MTPLXBackendStore: ObservableObject {
         await task.value
     }
 
-    private func runStartRequest(target: LaunchTarget?) async {
+    /// Whether a Stop (or a reap) came after the start request that began
+    /// under `generation` (#528). Stop could finish while a start was still
+    /// preparing (the runtime check, the port preflight): nothing had been
+    /// launched, so Stop had nothing to cancel, and the start went on to
+    /// launch after Stop. The start checks this after every await before
+    /// it launches.
+    private func startWasStopped(since generation: Int) -> Bool {
+        stopGeneration != generation
+    }
+
+    /// End a start that a Stop overtook before it launched anything. The
+    /// Stop owns the engine state; undo only what the start itself changed.
+    private func abandonStoppedStart(during step: String) async {
+        if let fallback = activePortFallback {
+            // The fallback port belonged to the launch that is not happening.
+            var next = configuration
+            next.port = fallback.configured
+            configuration = next
+            activePortFallback = nil
+        }
+        portFallbackNotice = nil
+        if startupPhase == .launching {
+            startupPhase = .idle
+        }
+        await supervisor.logs.append(
+            "start abandoned: Stop was pressed while it was \(step); nothing was launched",
+            stream: .system
+        )
+    }
+
+    private func runStartRequest(target: LaunchTarget?, stopGeneration generation: Int) async {
         // A Stop or a reap may still be tearing the previous daemon down;
         // what the supervisor holds is only known once that has finished.
         await awaitDaemonTeardown()
+        if startWasStopped(since: generation) {
+            await abandonStoppedStart(during: "waiting for the previous daemon to stop")
+            return
+        }
         portLoss = nil
         configurationChangeFailure = nil
         switch supervisor.currentHold() {
@@ -1090,7 +1124,7 @@ public final class MTPLXBackendStore: ObservableObject {
             configuration = next
             activePortFallback = nil
         }
-        await startDaemon(target: target, attemptedPortRemediation: false)
+        await startDaemon(target: target, attemptedPortRemediation: false, stopGeneration: generation)
     }
 
     /// `attemptedPortRemediation` bounds the relaunch to one retry: a
@@ -1099,7 +1133,8 @@ public final class MTPLXBackendStore: ObservableObject {
     /// surfaces through the normal degraded path.
     private func startDaemon(
         target: LaunchTarget?,
-        attemptedPortRemediation: Bool
+        attemptedPortRemediation: Bool,
+        stopGeneration generation: Int
     ) async {
         // `mtplx serve` refuses non-loopback binds without an API key
         // (validate_server_security_args) — the process exits at argparse
@@ -1145,6 +1180,10 @@ public final class MTPLXBackendStore: ObservableObject {
         // process in the background; wait for it so supervisor.start()
         // doesn't trip `.alreadyRunning`.
         await awaitDaemonTeardown()
+        if startWasStopped(since: generation) {
+            await abandonStoppedStart(during: "waiting for the previous daemon to stop")
+            return
+        }
         healthWatchTask?.cancel()
         healthWatchTask = nil
         let launchID = UUID().uuidString
@@ -1154,12 +1193,24 @@ public final class MTPLXBackendStore: ObservableObject {
             supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
             lastDaemonTarget = target
             try await prepareRuntimeForDaemonStart()
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "checking the runtime")
+                return
+            }
             // Pre-flight the configured port before any integration writes
             // its config: adoptable app-owned daemons are left for the
             // supervisor, stale app-owned daemons are replaced in place,
             // and everything else moves us to the next free port so the
             // user never sees a raw "port occupied" failure.
-            await preflightConfiguredPort(target: target, launchID: launchID)
+            await preflightConfiguredPort(
+                target: target,
+                launchID: launchID,
+                isCurrent: { !self.startWasStopped(since: generation) }
+            )
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "checking who holds the port")
+                return
+            }
             if target == .openCode {
                 let result = try openCodeIntegration.sync(configuration: configuration)
                 await supervisor.logs.append(
@@ -1192,6 +1243,12 @@ public final class MTPLXBackendStore: ObservableObject {
                 target: target,
                 launchID: launchID
             )
+            // The last check before the launch. From here on a Stop cancels
+            // the launch through `activeLaunchID` and the supervisor.
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "preparing the launch")
+                return
+            }
             // Another lifecycle can claim the supervisor while this request
             // prepares (an adoption, an automatic restart, a model swap).
             // Keep what this request replaces so it can hand it back.
@@ -1256,6 +1313,7 @@ public final class MTPLXBackendStore: ObservableObject {
             }
             if !attemptedPortRemediation,
                !cancelledLaunchIDs.contains(launchID),
+               !startWasStopped(since: generation),
                Self.failureIndicatesPortConflict(error),
                await remediatePortConflict(target: target, launchID: launchID) {
                 if activeLaunchID == launchID {
@@ -1265,7 +1323,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     "retrying daemon launch after port remediation",
                     stream: .system
                 )
-                await startDaemon(target: target, attemptedPortRemediation: true)
+                await startDaemon(target: target, attemptedPortRemediation: true, stopGeneration: generation)
                 return
             }
             let failureDescription = Self.humanizedStartFailure(
@@ -1334,9 +1392,14 @@ public final class MTPLXBackendStore: ObservableObject {
     /// - CLI-started MTPLX server or a foreign app: never touch someone
     ///   else's process; move to the next free port, persist it, and
     ///   surface a one-line banner.
+    ///
+    /// `isCurrent` is false once a Stop has overtaken the start that runs
+    /// this preflight (#528): nothing is terminated and the port is not moved
+    /// after that.
     func preflightConfiguredPort(
         target: LaunchTarget?,
-        launchID: String
+        launchID: String,
+        isCurrent: () -> Bool = { true }
     ) async {
         // Issue #409: a foreign-looking occupant is re-probed over the
         // settle window before the port is moved — a draining MTPLX
@@ -1347,6 +1410,7 @@ public final class MTPLXBackendStore: ObservableObject {
             apiKey: configuration.apiKey,
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
+        guard isCurrent() else { return }
         let occupantDescription: String
         switch occupant {
         case .free:
@@ -1371,6 +1435,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     "replacing stale app-owned daemon pid \(stalePID) on port \(configuration.port)",
                     stream: .system
                 )
+                guard isCurrent() else { return }
                 await supervisor.terminateExternalDaemon(rootPID: pid_t(stalePID))
                 return
             }
@@ -1387,6 +1452,7 @@ public final class MTPLXBackendStore: ObservableObject {
             let wedged = await Task.detached(priority: .userInitiated) {
                 PortPreflight.appOwnedListener(port: port)
             }.value
+            guard isCurrent() else { return }
             if let wedged {
                 await supervisor.logs.append(
                     "port preflight: \(port) held by a wedged app-owned daemon "
@@ -1408,6 +1474,7 @@ public final class MTPLXBackendStore: ObservableObject {
             }
             occupantDescription = tr("another app")
         }
+        guard isCurrent() else { return }
         let occupiedPort = configuration.port
         guard
             let freePort = PortPreflight.nextFreePort(
