@@ -627,6 +627,11 @@ def _install_batch_invariant_lane(model: Any) -> None:
     # ladder's narrower ones, so recording boundaries inside it leaves every
     # result unchanged.
     invariant_report["gdn_inforward_layers"] = install_gdn_inforward_boundaries(model)
+    from .a3b_moe_prefill_combine import install_a3b_moe_prefill_combine, switched_on
+
+    if switched_on():
+        # Only on the lane: the combine reads the lane's sorted expert output.
+        invariant_report["moe_prefill_combine_blocks"] = install_a3b_moe_prefill_combine(model)
     logger.info("[batch-invariant-prefill] %s", invariant_report)
 
 
