@@ -190,6 +190,7 @@
 "Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "Un autre serveur MTPLX occupe le port %@ (pid %@) ; cette application n'y est pas connectée.";
 "Another MTPLX server holds port %@; this app is not connected to it." = "Un autre serveur MTPLX occupe le port %@ ; cette application n'y est pas connectée.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "Un autre processus provoque une pression mémoire sur ce Mac. Le décodage peut fléchir pendant le pic ; l'empreinte propre du moteur reste stable et rien n'a été expulsé.";
+"Another server holds port %@; this app is not connected to it." = "Un autre serveur occupe le port %@ ; cette application n'y est pas connectée.";
 "ANSWER" = "RÉPONSE";
 "API key" = "Clé d'API";
 "API key (optional)" = "Clé d'API (facultatif)";

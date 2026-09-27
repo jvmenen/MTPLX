@@ -1474,6 +1474,70 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertTrue(logged, "the Logs window records the pid it left alone")
     }
 
+    // MARK: Codex final review, finding 4: a server that does not identify itself
+
+    /// An adopted daemon exits and a server that does not identify itself
+    /// takes its port: /health answers 401 (a key the app does not have) or
+    /// an undecodable 200. Both prove a live server and used to reset the
+    /// watchdog every round, so the badge read Running for good. With the
+    /// app's daemon gone, the app now lets it go and names the other server.
+    @MainActor
+    private func assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+        undecodableHealth: Bool,
+        strangerKey: String?
+    ) async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        _ = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let supervisor = DaemonSupervisor()
+        let store = daemon.makeStore(
+            configuration: MTPLXAppConfiguration(),
+            supervisor: supervisor,
+            fans: FanCallRecorder()
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+
+        prior.terminate()
+        prior.waitUntilExit()
+        try daemon.setHealthUndecodable(undecodableHealth)
+        let stranger = try daemon.launchOutsideTheApp(launchID: nil, apiKey: strangerKey)
+        addTeardownBlock { if stranger.isRunning { stranger.terminate() } }
+        try await daemon.waitUntilAnswering()
+
+        let expected = "Another server holds port \(daemon.port); this app is not connected to it."
+        try await pollUntil("the other server is named", timeout: 15) {
+            store.daemonState == .degraded(expected)
+        }
+        XCTAssertEqual(store.daemonState, .degraded(expected))
+        XCTAssertTrue(badge(store).label.hasPrefix("Degraded — Another server"), badge(store).label)
+        XCTAssertFalse(supervisor.isRunning(), "the app let go of the daemon it lost")
+
+        await store.stopDaemon()
+        XCTAssertTrue(stranger.isRunning, "Stop never signals the other server")
+    }
+
+    @MainActor
+    func testAServerAnswering401AfterTheAdoptedDaemonExitsIsNamed() async throws {
+        try await assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+            undecodableHealth: false,
+            strangerKey: "a-key-the-app-does-not-have"
+        )
+    }
+
+    @MainActor
+    func testAServerAnsweringUndecodableHealthAfterTheAdoptedDaemonExitsIsNamed() async throws {
+        try await assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+            undecodableHealth: true,
+            strangerKey: nil
+        )
+    }
+
     // MARK: Closing the window during a model load
 
     /// Closing the main window cancels its launch task. The start runs on a

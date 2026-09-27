@@ -3245,7 +3245,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// daemon go through the reap path, keeps the other server's pid out of
     /// `health` so Stop never signals it, and stays Degraded naming the
     /// other server rather than falling to Stopped (#528).
-    private func releaseDaemonToAnotherServer(_ answer: HealthPayload, held: HeldDaemon) {
+    /// `answer` is nil when the server did not identify itself (an
+    /// undecodable /health, or 401/403) and the held daemon is known gone.
+    private func releaseDaemonToAnotherServer(_ answer: HealthPayload?, held: HeldDaemon) {
         switch daemonState {
         case .stopped, .stopping, .crashed:
             return
@@ -3254,30 +3256,52 @@ public final class MTPLXBackendStore: ObservableObject {
         }
         let port = held.baseURL.port.map { String($0) } ?? held.baseURL.absoluteString
         let reason: String
-        if let pid = answer.startup?.pid {
-            reason = tr(
-                "Another MTPLX server holds port %@ (pid %@); this app is not connected to it.",
-                port,
-                String(pid)
-            )
+        let identity: String
+        if let answer {
+            if let pid = answer.startup?.pid {
+                reason = tr(
+                    "Another MTPLX server holds port %@ (pid %@); this app is not connected to it.",
+                    port,
+                    String(pid)
+                )
+            } else {
+                reason = tr("Another MTPLX server holds port %@; this app is not connected to it.", port)
+            }
+            let answeredLaunch = answer.startup?.launchId ?? "none"
+            let answeredPID = answer.startup?.pid.map { String($0) } ?? "unknown"
+            identity = "launch \(answeredLaunch), pid \(answeredPID)"
         } else {
-            reason = tr("Another MTPLX server holds port %@; this app is not connected to it.", port)
+            reason = tr("Another server holds port %@; this app is not connected to it.", port)
+            identity = "it did not identify itself, and daemon launch \(held.launchID ?? "unknown") no longer runs"
         }
         if health?.startup?.launchId != held.launchID {
             health = nil
         }
-        let answeredLaunch = answer.startup?.launchId ?? "none"
-        let answeredPID = answer.startup?.pid.map { String($0) } ?? "unknown"
         let heldLaunch = held.launchID ?? "unknown"
         let address = held.baseURL.absoluteString
         Task { [supervisor] in
             await supervisor.logs.append(
-                "another server answers /health at \(address) (launch \(answeredLaunch), pid \(answeredPID)); letting go of daemon launch \(heldLaunch) and leaving that server alone",
+                "another server answers /health at \(address) (\(identity)); letting go of daemon launch \(heldLaunch) and leaving that server alone",
                 stream: .system
             )
         }
         portLoss = (held.lifecycleEpoch, reason)
         reapDaemon(reason: reason)
+    }
+
+    /// Something answered at the held daemon's address without identifying
+    /// itself (an undecodable /health, or 401/403). That proves a live
+    /// server, not a live daemon of this app: an adopted daemon gives no
+    /// exit callback, and one that exited left its port to whatever took
+    /// it, which kept the badge Running for good (#528). If the held
+    /// daemon's process is gone, let it go. Returns whether it did.
+    private func releaseIfTheHeldDaemonIsGone(askedOf hold: DaemonHold) -> Bool {
+        guard case .held(let held) = hold,
+              supervisor.currentHold() == hold,
+              !supervisor.heldDaemonIsRunning()
+        else { return false }
+        releaseDaemonToAnotherServer(nil, held: held)
+        return true
     }
 
     /// The benchmark's readiness check: another server's answer is not a
@@ -3329,6 +3353,14 @@ public final class MTPLXBackendStore: ObservableObject {
         guard case .healthy(let payload) = answer, payload.ok,
               let heldLaunchID = held.launchID
         else {
+            switch answer {
+            case .aliveUndecodable, .aliveUnauthorized:
+                if releaseIfTheHeldDaemonIsGone(askedOf: .held(held)) {
+                    return
+                }
+            case .healthy, .unreachable:
+                break
+            }
             if shouldProbeDaemonHealth, healthWatchTask == nil {
                 startDaemonHealthWatchdog()
             }
@@ -3406,7 +3438,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// and is judged by its port alone.
     private func gatherDaemonLivenessEvidence() async -> DaemonLivenessEvidence {
         let pid = heldDaemonStartupPID() ?? supervisor.daemonProcessIdentifier()
-        let processAlive = pid.map(DaemonSupervisor.processIsAlive)
+        // Alive means still the app's daemon, not merely an occupied pid
+        // (#528): a pid is reused once its process has exited.
+        let processAlive = pid.map { supervisor.pidRunsHeldDaemon($0) }
         let url = baseURL
         // Read the main-actor constant here; the detached probe must not
         // touch actor-isolated state.
@@ -3510,6 +3544,11 @@ public final class MTPLXBackendStore: ObservableObject {
                     // to kill a serving process (2026-07-06: the watchdog
                     // reaped a healthy daemon 95 s after an OpenCode run
                     // because one /health field stopped matching Codable).
+                    // Unless the app's daemon no longer runs: then the
+                    // answer comes from another server on its port (#528).
+                    if self.releaseIfTheHeldDaemonIsGone(askedOf: holdAtProbe) {
+                        return
+                    }
                     tracker.recordAnswer()
                     self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
@@ -3524,7 +3563,11 @@ public final class MTPLXBackendStore: ObservableObject {
                     continue
                 case .aliveUnauthorized:
                     // 401/403 proves a live daemon; an API-key mismatch is a
-                    // configuration problem, never grounds to reap.
+                    // configuration problem, never grounds to reap. Unless
+                    // the app's daemon no longer runs (#528).
+                    if self.releaseIfTheHeldDaemonIsGone(askedOf: holdAtProbe) {
+                        return
+                    }
                     tracker.recordAnswer()
                     self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
