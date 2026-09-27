@@ -65,6 +65,7 @@ from mlx_lm.models.qwen3_next import (
 from mtplx import nax_detect
 from mtplx.attention_context import current_attention_phase
 from mtplx.attention_math import attention_gate
+from mtplx.float32_operand import float32_operand
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
 
 
@@ -290,12 +291,22 @@ def _rope_cos_sin(
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
     emb = mx.concatenate([angles, angles], axis=-1)
-    cosine = mx.cos(emb)
-    sine = mx.sin(emb)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(emb), attention_scaling), _yarn_amplitude(
+        mx.sin(emb), attention_scaling
+    )
+
+
+def _yarn_amplitude(table: mx.array, attention_scaling: float) -> mx.array:
+    """A float32 rotary table times the static-YaRN amplitude.
+
+    The amplitude (0.1 * ln(factor) + 1, 1.1386294 at factor 4) is read from
+    memory, not written into a fused kernel of the compiled verifier with 7
+    significant digits (mtplx/float32_operand.py). 1.0 leaves the table as is.
+    """
+
+    if attention_scaling == 1.0:
+        return table
+    return table * float32_operand(attention_scaling)
 
 
 def _build_mrope_axes(section: list, interleaved: bool) -> list[int]:
@@ -354,7 +365,7 @@ def _vision_position_cos_sin(positions, inv_freq, axes, scaling=1.0):
         prompt_positions = mx.take(table, mx.clip(positions, 0, table.shape[1] - 1), axis=1)
         positions3 = mx.where((positions < table.shape[1])[None, :], prompt_positions, positions3)
     cos, sin = _mrope_cos_sin(positions3, inv_freq, axes)
-    return cos * scaling, sin * scaling
+    return _yarn_amplitude(cos, scaling), _yarn_amplitude(sin, scaling)
 
 
 def _vision_chunk_cos_sin(
@@ -399,9 +410,8 @@ def _vision_chunk_cos_sin(
         cos_in, sin_in = _mrope_cos_sin(
             table[:, pos_start : pos_start + inside], inv_freq, axes
         )
-        if attention_scaling != 1.0:
-            cos_in = cos_in * float(attention_scaling)
-            sin_in = sin_in * float(attention_scaling)
+        cos_in = _yarn_amplitude(cos_in, attention_scaling)
+        sin_in = _yarn_amplitude(sin_in, attention_scaling)
         if not past:
             return cos_in, sin_in
     first_past = pos_start + inside + delta
@@ -458,12 +468,9 @@ def _rope_cos_sin_half(
     """
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
-    cosine = mx.cos(angles)
-    sine = mx.sin(angles)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(angles), attention_scaling), _yarn_amplitude(
+        mx.sin(angles), attention_scaling
+    )
 
 
 def _apply_partial_rope_half(
@@ -1101,6 +1108,17 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
         )
 
 
+@mx.compile
+def _verify_inject(logits: mx.array, hc_count: int) -> mx.array:
+    # The inject gate as the compiled verifier computes it. Inside a verify
+    # trace the divide, the sigmoid and the multiply fuse into one kernel,
+    # and MLX 0.32.2's fused sigmoid (fast exp) differs from its standalone
+    # kernel (precise exp) at some inputs, in bfloat16 at -6.84375 after the
+    # divide. The eager verify forward runs this same fused expression, the
+    # contract mtplx/attention_math.py sets for the attention output gate.
+    return 2.0 * mx.sigmoid(logits / hc_count)
+
+
 class GatedResidual(nn.Module):
     """The Gated Residual read/write mixer (hyper-connections)."""
 
@@ -1208,7 +1226,11 @@ class GatedResidual(nn.Module):
         mixed_input = mx.mean(mix * grouped, axis=-2)
         if "block_inject_weight" not in self:
             return mixed_input
-        inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
+        logits = self.block_inject_weight(normed)
+        if current_attention_phase() == "decode_verify":
+            inject = _verify_inject(logits, self.hc_count)
+        else:
+            inject = 2.0 * mx.sigmoid(logits / self.hc_count)
         return mixed_input, hyper_input, inject
 
 
@@ -1269,7 +1291,7 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if (
             # Fused verify path (MTPLX_FUSED_MOE_VERIFY=1, dark): the M=2..4
@@ -1310,11 +1332,40 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if _moe_prefill_combine_applies(self, x):
             return self._prefill_call(x)
+        if (
+            current_attention_phase() == "decode_verify"
+            and getattr(self, "sharding_group", None) is None
+        ):
+            return self._verify_call(x)
         return super().__call__(x)
+
+    def _verify_call(self, x: mx.array) -> mx.array:
+        """The parent's forward with the shared-expert gate under the verify
+        gate contract.
+
+        mlx_lm's Qwen3NextSparseMoeBlock computes
+        ``sigmoid(shared_expert_gate(x)) * shared_expert(x)``. Inside the
+        compiled verifier's trace that sigmoid fuses with the multiply and the
+        add, and MLX 0.32.2's fused sigmoid differs from its standalone kernel
+        at some inputs (bfloat16 -6.84375), so the eager verify forward takes
+        the same lowering through attention_gate (mtplx/attention_math.py).
+        Routing and experts are the parent's own ops, in its order.
+        """
+
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
+        return y + shared_y
 
     def _prefill_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the combine tail as one kernel.
@@ -3051,12 +3102,6 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
-        # float32(sqrt(head_dim)), read through ``_score_divisor``.
-        object.__setattr__(
-            self,
-            "_sqrt_head_dim_buffer",
-            mx.array([math.sqrt(self.head_dim)] * 2, dtype=mx.float32),
-        )
         self._mrope_axes = (
             mx.array(_build_mrope_axes(args.mrope_section, args.mrope_interleaved), dtype=mx.int32)
             if args.mrope_section and sum(args.mrope_section) == int(args.rotary_dim) // 2
@@ -3064,22 +3109,19 @@ class QSAIndexer(nn.Module):
         )
 
     def _score_divisor(self) -> mx.array:
-        """The block-score divisor float32(sqrt(head_dim)), never a constant.
+        """The block-score divisor float32(sqrt(head_dim)), read from memory.
 
         The fixed-bank verify lane records ``_select_eager`` into the compiled
-        verifier. Divided by the Python float, sqrt(head_dim) becomes a scalar
-        constant of any fused kernel the division joins, and MLX 0.32.2 writes
-        such constants into the kernel source with 7 significant digits
-        (mlx/backend/common/compiled.h): sqrt(128) = 11.3137083 reads back as
-        11.31371, which turns distinct scores such as 1.5000001 / sqrt(128)
-        and 1.5000002 / sqrt(128) into a tie that the top-k cutoff breaks by
-        block id. A one-element array with no primitive is inlined the same
-        way (mlx/compile.cpp takes it for a constant), so the divisor is the
-        output of a slice: always read from memory, the float32 that the eager
-        division and the Metal selectors (SQRT_HEAD_DIM) use.
+        verifier. As a Python float, sqrt(head_dim) would be a constant of the
+        fused kernel the division joins, written with 7 significant digits:
+        sqrt(128) = 11.3137083 reads back as 11.31371, which turns distinct
+        scores such as 1.5000001 / sqrt(128) and 1.5000002 / sqrt(128) into a
+        tie that the top-k cutoff breaks by block id (mtplx/float32_operand.py).
+        The operand is the float32 the eager division and the Metal selectors
+        (SQRT_HEAD_DIM) use.
         """
 
-        return self._sqrt_head_dim_buffer[:1]
+        return float32_operand(math.sqrt(self.head_dim))
 
     def _uses_vision_positions(self) -> bool:
         return vision_qsa_enabled() and self._mrope_axes is not None and vision_rope_state() is not None
@@ -4264,7 +4306,10 @@ def _qsa_rows_gather_attention(
     materialized: q is viewed [1, H_kv, rep, S, 1, D] against
     [1, H_kv, 1, S, D, K]. Invalid slots score -inf before the fp32
     softmax, identical math to the dense bool-mask product over the same
-    visible set.
+    visible set. The float32 scores take the softmax scale from memory, not
+    as a 7-digit constant of a fused kernel (mtplx/float32_operand.py): the
+    shipping head size 256 gives 0.0625, exact either way, but 128 or 32 would
+    not.
     """
     B, H, S, D = q.shape
     H_kv = int(k.shape[1])
@@ -4275,16 +4320,17 @@ def _qsa_rows_gather_attention(
         rep = H // H_kv
         q_view = q.reshape(1, H_kv, rep, S, 1, D)
         k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
-        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
+        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * float32_operand(
+            scale
+        )
         scores = mx.where(token_ok[None, None, None], scores, neg)
         probs = mx.softmax(scores, axis=-1).astype(q.dtype)
         v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
         out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
         return out.reshape(1, H, S, D)
-    scores = (
-        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
-        * scale
-    )
+    scores = mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(
+        mx.float32
+    ) * float32_operand(scale)
     scores = mx.where(token_ok[None, None], scores, neg)
     probs = mx.softmax(scores, axis=-1).astype(q.dtype)
     return mx.matmul(probs[..., None, :], v_sel).squeeze(-2)
@@ -4414,7 +4460,14 @@ def _qsa_blocks_to_dense_mask(
 
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
-    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
+    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer.
+
+    Every lane applies the output gate through attention_gate: on a verify
+    forward an eager call takes the same sigmoid lowering as the compiled
+    verifier's trace (in bfloat16 MLX 0.32.2's fused and standalone sigmoid
+    differ at -6.84375; mtplx/attention_math.py); elsewhere it is
+    ``out * mx.sigmoid(gate)``. This class never reaches the dense attention
+    hook of mtplx/attention_split.py, which applies the same contract."""
 
     # The QSA indexer mask is part of this module's semantics (and __call__
     # takes (x, cache)): any generic dense-SDPA rewrite that replaces
@@ -4611,7 +4664,7 @@ class Attention(nn.Module):
                 self.scale,
             )
             out = out.reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash_prefill":
             # Large-S prefill consumes compact per-row block selections
@@ -4716,7 +4769,7 @@ class Attention(nn.Module):
             )
             if out is not None:
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-                return _linear(self.o_proj, out * mx.sigmoid(gate))
+                return _linear(self.o_proj, attention_gate(out, gate))
 
             # Static unsupported geometry falls back exactly.  Once the
             # supported kernel is dispatched, failures propagate instead of
@@ -4745,7 +4798,7 @@ class Attention(nn.Module):
                 _qsa_rows_gather_kv_route(cache, S),
             )
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if sel_mask is not None and sel_mask.ndim == 1:
             # QSA gather lane (decode): the indexer returned the selected
@@ -4776,7 +4829,7 @@ class Attention(nn.Module):
         else:
             out = _verify_sdpa(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return _linear(self.o_proj, out * mx.sigmoid(gate))
+        return _linear(self.o_proj, attention_gate(out, gate))
 
 
 _MASK64 = (1 << 64) - 1

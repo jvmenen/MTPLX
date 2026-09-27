@@ -70,14 +70,19 @@ def _layer(monkeypatch):
     return layer, width
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="fused kernels are the GPU's")
-def test_an_eager_verify_forward_takes_the_compiled_verifiers_gate(monkeypatch):
-    layer, width = _layer(monkeypatch)
+def _inputs(width):
     hidden = (mx.random.normal((1, ROWS, width), key=mx.random.key(1)) * 0.5).astype(
         mx.bfloat16
     )
     ids = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
     mx.eval(hidden, ids)
+    return hidden, ids
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="fused kernels are the GPU's")
+def test_an_eager_verify_forward_takes_the_compiled_verifiers_gate(monkeypatch):
+    layer, width = _layer(monkeypatch)
+    hidden, ids = _inputs(width)
 
     def forward(hidden, ids):
         return layer(hidden, ids, None)
@@ -87,3 +92,31 @@ def test_an_eager_verify_forward_takes_the_compiled_verifiers_gate(monkeypatch):
         compiled = mx.compile(forward)(hidden, ids)
         mx.eval(eager, compiled)
     assert mx.array_equal(compiled, eager).item()
+
+
+@pytest.mark.parametrize("phase", ["prefill", "ar_decode", "postcommit", "unknown"])
+def test_every_other_phase_keeps_the_stock_gate_bit_for_bit(monkeypatch, phase):
+    # Outside decode_verify the gate is the expression the layer always had,
+    # sigmoid(gate) * value, with its factors swapped (IEEE multiplication
+    # commutes): the same bits, eagerly and compiled.
+    import mtplx.models.qwen4_exp as qwen4_exp
+
+    layer, width = _layer(monkeypatch)
+    hidden, ids = _inputs(width)
+
+    def forward(hidden, ids):
+        return layer(hidden, ids, None)
+
+    with attention_phase(phase):
+        new = forward(hidden, ids)
+        new_compiled = mx.compile(forward)(hidden, ids)
+        mx.eval(new, new_compiled)
+    monkeypatch.setattr(
+        qwen4_exp, "attention_gate", lambda output, gate: mx.sigmoid(gate) * output
+    )
+    with attention_phase(phase):
+        old = forward(hidden, ids)
+        old_compiled = mx.compile(forward)(hidden, ids)
+        mx.eval(old, old_compiled)
+    assert mx.array_equal(new, old).item()
+    assert mx.array_equal(new_compiled, old_compiled).item()

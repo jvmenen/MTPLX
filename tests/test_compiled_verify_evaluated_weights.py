@@ -18,8 +18,10 @@ on M5, while M1 to M4 read all 23 mantissa bits.
 Checked here:
 
 * the first verify trace of a fresh runtime, on a request that is compiled
-  from its first round, finds every array reachable from the model evaluated,
-  and a separate fresh runtime run eagerly produces the same tokens: the
+  from its first round, finds every array reachable from the model evaluated;
+  every compiled round's logits, hidden state, captures and state equal the
+  eager verifier's (parity2), and a separate fresh runtime run eagerly
+  produces the same tokens: the
   synthetic four-layer ``qwen3_5`` model of ``tests/dense_mrope_synth.py``;
   the synthetic Ternary Bonsai 2 pack of ``tests/prism_hadamard_synth.py``
   through ``runtime.load``, the shipping loader; and Flash-Next's fixed-M4
@@ -226,6 +228,14 @@ def _bank(out) -> dict:
     return out.stats.graphbank["compiled_verify"]
 
 
+def _assert_every_round_exact(bank: dict) -> None:
+    """parity2 compared every compiled round with the eager verifier: all equal."""
+
+    assert bank["compiled_calls"] >= 1 and bank["fallback_calls"] == 0, bank
+    assert bank["parity2_calls"] == bank["compiled_calls"], bank
+    assert bank["parity2_divergent_calls"] == 0, bank.get("parity2_first_divergence")
+
+
 def test_the_lazy_array_detector_sees_every_holder_kind():
     # The check below is only as good as its detector: a lazy array under a
     # private key, in a list, in a __slots__ holder, on a plain object from
@@ -286,14 +296,17 @@ def test_a_fresh_runtime_traces_its_first_verify_step_with_every_array_evaluated
     tmp_path, monkeypatch
 ):
     snapshots = _first_trace_spy(monkeypatch)
-    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    # parity2: the compiled verifier runs first and stays authoritative, and
+    # every round's logits, hidden state, captures and state are compared
+    # with the eager verifier's.
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity2")
     compiled = _generate(_runtime(tmp_path / "compiled", "q4-bfloat16"), sampler=NATIVE,
                          draft_sampler=NATIVE_DRAFT)
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "0")
     eager = _generate(_runtime(tmp_path / "eager", "q4-bfloat16"), sampler=NATIVE,
                       draft_sampler=NATIVE_DRAFT)
 
-    assert _bank(compiled)["compiled_calls"] >= 1
+    _assert_every_round_exact(_bank(compiled))
     assert snapshots, "no compiled verify step was built"
     assert all(paths == [] for paths in snapshots), snapshots
     assert compiled.tokens == eager.tokens
@@ -309,7 +322,7 @@ def test_the_shipping_loader_hands_the_first_trace_evaluated_arrays(tmp_path, mo
     prism_hadamard_synth.write_synthetic_mtp_sidecar(pack)
     prompt = [(5 * i + 1) % 300 for i in range(24)]
     snapshots = _first_trace_spy(monkeypatch)
-    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "parity2")
     compiled = _generate(runtime.load(pack.path, mtp=True), sampler=NATIVE,
                          draft_sampler=NATIVE_DRAFT, prompt=prompt)
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "0")
@@ -317,7 +330,8 @@ def test_the_shipping_loader_hands_the_first_trace_evaluated_arrays(tmp_path, mo
                       draft_sampler=NATIVE_DRAFT, prompt=prompt)
 
     bank = _bank(compiled)
-    assert bank["compiled_calls"] >= 1 and not bank.get("permanent_eager"), bank
+    assert not bank.get("permanent_eager"), bank
+    _assert_every_round_exact(bank)
     assert snapshots and all(paths == [] for paths in snapshots), snapshots
     assert compiled.tokens == eager.tokens
 
@@ -404,12 +418,23 @@ def test_flash_next_fixed_m4_lane_traces_its_first_verify_step_with_every_array_
         )
 
     snapshots = _first_trace_spy(monkeypatch)
-    compiled = run("1")
+    # parity2 is the installed lane's instrument: compiled authoritative, every
+    # round's logits, hidden state, recurrent state and captures compared.
+    compiled = run("parity2")
     eager = run("0")
     bank = _bank(compiled)
-    assert bank["compiled_calls"] >= 1, bank
     (key,) = bank["compiled_keys"]  # the fixed-M4 lane's one text trace
     assert key.startswith("m4:"), key
+    record = bank["fixed_m4_parity2"]
+    assert record["compiled_rounds"] == bank["compiled_calls"] > 0, record
+    assert record["divergent_rounds"] == 0, record["first_divergence"]
+    for name in (
+        "logits_max_abs_diff",
+        "hidden_max_abs_diff",
+        "state_max_abs_diff",
+        "capture_max_abs_diff",
+    ):
+        assert record[name] == 0.0, (name, record[name])
     assert snapshots and all(paths == [] for paths in snapshots), snapshots
     assert compiled.tokens == eager.tokens
 

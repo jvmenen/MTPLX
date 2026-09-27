@@ -2060,6 +2060,16 @@ def _float32_gdn_key_scale_head_dim(runtime: Any) -> int | None:
         return None
 
 
+def _float32_gdn_key_scale_why(head_k_dim: int) -> str:
+    """The logged reason for a float32 GDN key-scale demotion."""
+
+    return (
+        "float32 activations, and MLX writes the GDN key scale "
+        f"{head_k_dim}**-0.5 into fused kernels with 7 significant digits, so "
+        "the compiled verifier would not match the eager one"
+    )
+
+
 def compare_verify_outputs(
     reference: dict[str, Any],
     candidate: dict[str, Any],
@@ -2247,15 +2257,14 @@ class CompiledVerifyBank:
                 self.permanent_eager_reason = (
                     f"float32_gdn_key_scale:head_k_dim={head_k_dim}"
                 )
+                # A bank that may never fall back (the Flash-Next fixed-M4
+                # lane's) verifies eagerly here instead of refusing the
+                # request: eager is the decision, and it is logged once.
+                self.strict_no_fallback = False
                 _record_permanent_eager(
                     self.permanent_eager_reason,
                     once=True,
-                    why=(
-                        "float32 activations, and MLX writes the GDN key scale "
-                        f"{head_k_dim}**-0.5 into fused kernels with 7 "
-                        "significant digits, so the compiled verifier would not "
-                        "match the eager one"
-                    ),
+                    why=_float32_gdn_key_scale_why(head_k_dim),
                 )
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
         capture_layout = getattr(runtime, "_mtplx_capture_layout", None)
