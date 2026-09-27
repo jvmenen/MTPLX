@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLX لا يعمل.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "يشغّل MTPLX هذا النموذج حاليًا. بدّل النموذج أو أوقف MTPLX أولًا.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX قيد التشغيل، ولكن لم يتم العثور على OpenCode Desktop في /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX قيد التشغيل. جارٍ الاتصال بالإحصائيات المباشرة…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX قيد التشغيل. جارٍ إعادة الاتصال بالإحصائيات المباشرة (المحاولة %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX قيد التشغيل. الإحصائيات المباشرة غير متاحة: %@";
 "MTPLX is unreachable — is it running?" = "تعذر الوصول إلى MTPLX — هل هو قيد التشغيل؟";
 "MTPLX is up, checking health." = "MTPLX يعمل، جارٍ التحقق من سلامة التشغيل.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX لا يعمل. اضغط على زر التشغيل لبدء نموذج.";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "تشغيل أول رموز الإحماء قبل فتح الدردشة.";
 "Running tool…" = "جارٍ تشغيل الأداة…";
 "Running your new model on this Mac to see how fast it actually is." = "تشغيل نموذجك الجديد على هذا الـ Mac لمعرفة مدى سرعته الفعلية.";
+"Running · connecting live stats" = "قيد التشغيل · جارٍ الاتصال بالإحصائيات المباشرة";
+"Running · live stats unavailable" = "قيد التشغيل · الإحصائيات المباشرة غير متاحة";
+"Running · reconnecting live stats" = "قيد التشغيل · جارٍ إعادة الاتصال بالإحصائيات المباشرة";
 "Running." = "قيد التشغيل.";
 "Running. Waiting for stats." = "قيد التشغيل. في انتظار الإحصائيات.";
 "running…" = "قيد التشغيل…";

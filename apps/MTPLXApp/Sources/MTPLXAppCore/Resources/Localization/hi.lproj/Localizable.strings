@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLX नहीं चल रहा है।";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX अभी यह मॉडल चला रहा है। पहले मॉडल बदलें या MTPLX रोकें।";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX चल रहा है, लेकिन /Applications/OpenCode.app पर OpenCode Desktop नहीं मिला।";
+"MTPLX is running. Connecting to live stats…" = "MTPLX चल रहा है। लाइव आंकड़ों से कनेक्ट किया जा रहा है…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX चल रहा है। लाइव आंकड़े फिर से कनेक्ट हो रहे हैं (प्रयास %lld)।";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX चल रहा है। लाइव आंकड़े उपलब्ध नहीं हैं: %@";
 "MTPLX is unreachable — is it running?" = "MTPLX तक नहीं पहुँचा जा सकता — क्या यह चल रहा है?";
 "MTPLX is up, checking health." = "MTPLX चालू है, स्वास्थ्य की जांच की जा रही है।";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX नहीं चल रहा है। मॉडल शुरू करने के लिए प्ले बटन दबाएं।";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "चैट खुलने से पहले पहले वार्मअप टोकन चलाए जा रहे हैं।";
 "Running tool…" = "टूल चलाया जा रहा है…";
 "Running your new model on this Mac to see how fast it actually is." = "यह देखने के लिए कि आपका नया मॉडल वास्तव में कितना तेज़ है, इसे इस Mac पर चलाया जा रहा है।";
+"Running · connecting live stats" = "चल रहा है · लाइव आंकड़े कनेक्ट हो रहे हैं";
+"Running · live stats unavailable" = "चल रहा है · लाइव आंकड़े उपलब्ध नहीं";
+"Running · reconnecting live stats" = "चल रहा है · लाइव आंकड़े फिर से कनेक्ट हो रहे हैं";
 "Running." = "चल रहा है।";
 "Running. Waiting for stats." = "चल रहा है। आंकड़ों की प्रतीक्षा की जा रही है।";
 "running…" = "चल रहा है…";

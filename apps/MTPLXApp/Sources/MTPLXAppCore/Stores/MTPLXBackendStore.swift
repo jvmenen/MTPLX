@@ -432,6 +432,17 @@ public final class MTPLXBackendStore: ObservableObject {
     private var recoveredAutomaticRestartGeneration = 0
     private var lastAppliedSupervisionRevision = -1
     private var lastTerminalCleanupLifecycleEpoch = 0
+    /// A start request in flight, and the requests that arrived while it
+    /// ran (#528). They join it instead of racing it for the supervisor:
+    /// the loser used to get `alreadyRunning`, publish Degraded over the
+    /// daemon the winner launched, and replace the winner's launch id so
+    /// the winner could not finish either.
+    private var startInFlight = false
+    private var startJoiners: [CheckedContinuation<Void, Never>] = []
+    /// The Degraded value a failed configuration change left on screen
+    /// while the previous daemon kept serving. A reconnect leaves it in
+    /// place so the failed change stays visible; an explicit start clears it.
+    private var failedRequestDegradation: DaemonState?
     private let daemonStartupTimeoutSeconds: TimeInterval = 600
 
     public init(
@@ -845,6 +856,15 @@ public final class MTPLXBackendStore: ObservableObject {
             if activeLaunchID == launchID {
                 activeLaunchID = nil
             }
+            if case DaemonSupervisorError.alreadyRunning = error {
+                // Another lifecycle claimed the supervisor between this
+                // restart's stop and its start (#528). Its daemon, fans and
+                // recovery are its own: no fan restore, no Degraded and no
+                // late recovery for a launch that never ran. The caller
+                // still learns that this restart did not happen.
+                await reconcileHeldDaemon()
+                throw error
+            }
             let failedPhase = startupPhase
             // A failed swap must not leave fans pinned at max with no
             // daemon running (mirrors the fresh-start failure path).
@@ -873,6 +893,13 @@ public final class MTPLXBackendStore: ObservableObject {
             }
             daemonState = .degraded(failureDescription)
             startupPhase = .failed(failureDescription)
+            if case .held = supervisor.currentHold() {
+                // The change failed before the running daemon was touched
+                // (runtime preparation or a client config write), so that
+                // daemon keeps serving the previous configuration. A
+                // reconnect must not wipe this failure off the screen.
+                failedRequestDegradation = daemonState
+            }
             await refreshLogs()
             scheduleLateHealthRecovery(launchID: launchID, target: recoveryTarget)
             throw error
@@ -924,6 +951,39 @@ public final class MTPLXBackendStore: ObservableObject {
     /// merged onto the user's Settings. Picking a target persists it as
     /// `lastLaunchTarget` so a subsequent click can skip the picker.
     public func startDaemon(target: LaunchTarget?) async {
+        // The window's launch task runs again when a window reopens, Start
+        // can be pressed while a model loads, and Hermes or the benchmark
+        // ask for a ready daemon. A start already in flight owns the
+        // outcome; a second one joins it (#528).
+        if startInFlight {
+            await withCheckedContinuation { startJoiners.append($0) }
+            return
+        }
+        startInFlight = true
+        defer {
+            startInFlight = false
+            let joiners = startJoiners
+            startJoiners.removeAll()
+            joiners.forEach { $0.resume() }
+        }
+        // A Stop or a reap may still be tearing the previous daemon down;
+        // what the supervisor holds is only known once that has finished.
+        await awaitDaemonTeardown()
+        switch supervisor.currentHold() {
+        case .held:
+            // This app already runs a daemon: reconnect to it. Asking the
+            // supervisor to start again threw `alreadyRunning`, which the
+            // badge showed as "Degraded" over a healthy daemon until the
+            // app was quit (#528). No launch, no fan change, no port change.
+            await reconcileHeldDaemon(clearingFailedRequest: true)
+            return
+        case .settling:
+            // An automatic restart, a model swap or a stop holds the
+            // supervisor and publishes its own outcome.
+            return
+        case .none:
+            break
+        }
         clientHandoffNotice = nil
         portFallbackNotice = nil
         if let fallback = activePortFallback {
@@ -993,6 +1053,8 @@ public final class MTPLXBackendStore: ObservableObject {
         healthWatchTask?.cancel()
         healthWatchTask = nil
         let launchID = UUID().uuidString
+        var supersededPresentation: (DaemonState, DaemonStartupPhase)?
+        var supersededLaunchID: String?
         do {
             supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
             lastDaemonTarget = target
@@ -1035,6 +1097,11 @@ public final class MTPLXBackendStore: ObservableObject {
                 target: target,
                 launchID: launchID
             )
+            // Another lifecycle can claim the supervisor while this request
+            // prepares (an adoption, an automatic restart, a model swap).
+            // Keep what this request replaces so it can hand it back.
+            supersededPresentation = (daemonState, startupPhase)
+            supersededLaunchID = activeLaunchID
             daemonState = .starting
             startupPhase = .launching
             activeLaunchID = launchID
@@ -1072,6 +1139,26 @@ public final class MTPLXBackendStore: ObservableObject {
                 activeLaunchID = nil
             }
         } catch {
+            if case DaemonSupervisorError.alreadyRunning = error {
+                // The supervisor was claimed between this request's check
+                // and its launch (#528). The daemon that holds it is not
+                // this request's to judge: hand back the state and launch
+                // id it replaced, restore no fans, publish no Degraded and
+                // schedule no recovery for a launch that never ran. Then
+                // reconnect if that daemon is already up.
+                cancelledLaunchIDs.remove(launchID)
+                if activeLaunchID == launchID {
+                    activeLaunchID = supersededLaunchID
+                }
+                if daemonState == .starting,
+                   startupPhase == .launching,
+                   case let (previousState, previousPhase)? = supersededPresentation {
+                    daemonState = previousState
+                    startupPhase = previousPhase
+                }
+                await reconcileHeldDaemon(clearingFailedRequest: true)
+                return
+            }
             if !attemptedPortRemediation,
                !cancelledLaunchIDs.contains(launchID),
                Self.failureIndicatesPortConflict(error),
@@ -2603,10 +2690,27 @@ public final class MTPLXBackendStore: ObservableObject {
             await client.connect(
                 snapshotIntervalMs: interval,
                 onState: { state in
-                    await MainActor.run {
-                        guard self?.daemonTransportGeneration == transportGeneration else { return }
-                        if keepOpen, state == .connecting { return }
+                    let reconnected = await MainActor.run { () -> Bool in
+                        guard self?.daemonTransportGeneration == transportGeneration else { return false }
+                        if keepOpen, state == .connecting { return false }
+                        let wasReconnecting: Bool
+                        if case .reconnecting? = self?.connectionState {
+                            wasReconnecting = true
+                        } else {
+                            wasReconnecting = false
+                        }
                         self?.connectionState = state
+                        return wasReconnecting && state == .open
+                    }
+                    // The stream came back after dropping (a sleep, a
+                    // network blip): check the engine against the daemon
+                    // this app holds, so a stale badge heals without a
+                    // restart (#528). Off the stream's own loop, which
+                    // must keep reading.
+                    if reconnected {
+                        Task { @MainActor in
+                            await self?.reconcileHeldDaemon()
+                        }
                     }
                 },
                 onEvent: { event in
@@ -2881,6 +2985,110 @@ public final class MTPLXBackendStore: ObservableObject {
             recoveryGeneration: snapshot.recoveryGeneration
         )
         await refreshLogs()
+    }
+
+    /// View → Refresh and the toolbar refresh button (#528). The engine
+    /// state comes first and does not depend on the data panels decoding:
+    /// reconnect to the daemon this app holds, then reload the panels.
+    public func refresh() async {
+        await reconcileHeldDaemon()
+        // The panels describe a running engine. Read from the port while the
+        // engine starts, is degraded or is stopped, they show whatever
+        // answers there, and a failed read during a model load reached the
+        // unreachable-daemon path and reaped the loading daemon. The same
+        // read at an address the running daemon does not use (settings read
+        // from disk can move the port) would reap a healthy one.
+        guard daemonState == .running, configuredAddressReachesHeldDaemon else { return }
+        try? await refreshStaticState()
+        try? await refreshSnapshot()
+    }
+
+    /// False when the configured address is not the one the held daemon's
+    /// health was verified at, so nothing there speaks for this daemon.
+    private var configuredAddressReachesHeldDaemon: Bool {
+        guard case .held(let held) = supervisor.currentHold() else { return true }
+        return held.baseURL == baseURL
+    }
+
+    /// Reconnect the store to the daemon the supervisor already holds
+    /// (#528). A start request that finds one, Refresh, and a live-stats
+    /// stream that comes back after dropping all run this. It never
+    /// launches, stops or restarts a daemon, never touches the fans, and
+    /// keeps the metrics on screen.
+    ///
+    /// One /health probe, at the address the daemon was verified at, decides:
+    /// - the held daemon answers healthy under its own launch id: the engine
+    ///   is running. The badge says so, and a missing or dropped live-stats
+    ///   stream and a missing watchdog start again.
+    /// - a server answers there under another launch id, or none: this
+    ///   app's daemon no longer holds its port. That is a real loss of
+    ///   contact and takes the watchdog's reap path; the other server's pid
+    ///   is dropped first so a Stop can never signal it.
+    /// - no answer it can attribute (busy, 401, an undecodable payload):
+    ///   nothing changes. A busy daemon stays Running and only the
+    ///   watchdog decides that a silent one is gone (#487).
+    func reconcileHeldDaemon(clearingFailedRequest: Bool = false) async {
+        await awaitDaemonTeardown()
+        // Settings read from disk can name another port or host than the one
+        // the daemon was started on. A probe there says nothing about this
+        // daemon, and transports restarted there would lose it.
+        guard case .held(let held) = supervisor.currentHold(),
+              held.baseURL == baseURL
+        else { return }
+        let stateBefore = daemonState
+        // A model swap replaces the daemon; its own outcome is the one to show.
+        guard stateBefore != .stopping else { return }
+        if !clearingFailedRequest,
+           let failedRequest = failedRequestDegradation,
+           stateBefore == failedRequest {
+            return
+        }
+        let probeClient = MTPLXAPIClient.livenessProbe(
+            baseURL: held.baseURL,
+            apiKey: configuration.apiKey
+        )
+        let answer = await probeClient.livenessWithinDeadline(
+            seconds: Self.watchdogProbeDeadlineSeconds
+        )
+        probeClient.session.finishTasksAndInvalidate()
+        // A Stop, a reap, a swap or a newer daemon that arrived while the
+        // probe was out owns the state now.
+        guard supervisor.currentHold() == .held(held), daemonState == stateBefore else { return }
+        guard case .healthy(let payload) = answer, payload.ok,
+              let heldLaunchID = held.launchID
+        else {
+            if shouldProbeDaemonHealth, healthWatchTask == nil {
+                startDaemonHealthWatchdog()
+            }
+            return
+        }
+        guard payload.startup?.launchId == heldLaunchID else {
+            if health?.startup?.launchId != heldLaunchID {
+                health = nil
+            }
+            markDaemonUnreachableIfNeeded(
+                reason: tr("MTPLX lost contact with the model server. Start it again.")
+            )
+            return
+        }
+        health = payload
+        daemonUnresponsiveFor = nil
+        currentFanMode = verifiedFanMode(from: payload)
+            ?? currentFanMode
+            ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
+        failedRequestDegradation = nil
+        // A recovery still waiting for some other launch has nothing to do.
+        lateHealthRecoveryTask?.cancel()
+        lateHealthRecoveryTask = nil
+        if daemonState != .running {
+            daemonState = .running
+            startupPhase = .ready
+        }
+        if streamTask == nil || connectionState != .open {
+            startMetricsStream()
+        } else if healthWatchTask == nil {
+            startDaemonHealthWatchdog()
+        }
     }
 
     public func markDaemonUnreachable(reason: String) {

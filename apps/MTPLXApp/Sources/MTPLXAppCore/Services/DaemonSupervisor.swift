@@ -91,6 +91,37 @@ public enum DaemonRestartEligibility: Equatable, Sendable {
     case adoptedPriorSession
 }
 
+/// A daemon the supervisor holds that passed its /health check when it was
+/// launched or adopted. An answer on /health belongs to this daemon only if
+/// it comes from `baseURL`, the address that check ran against, and reports
+/// `launchID`, the `MTPLX_APP_LAUNCH_ID` the daemon runs under (#528).
+public struct HeldDaemon: Equatable, Sendable {
+    public let lifecycleEpoch: Int
+    public let launchID: String?
+    public let baseURL: URL
+    public let adopted: Bool
+
+    public init(lifecycleEpoch: Int, launchID: String?, baseURL: URL, adopted: Bool) {
+        self.lifecycleEpoch = lifecycleEpoch
+        self.launchID = launchID
+        self.baseURL = baseURL
+        self.adopted = adopted
+    }
+}
+
+/// What a start request finds in the supervisor (#528). `start` throws
+/// `alreadyRunning` in every case except `.none`, so a caller that asks first
+/// can reconnect to a daemon it already runs instead of failing.
+public enum DaemonHold: Equatable, Sendable {
+    /// Nothing is held: `start` launches a daemon or adopts one.
+    case none
+    /// A launch, an automatic restart or a stop holds the slot and has not
+    /// settled. Its own outcome is the one to show.
+    case settling
+    /// A daemon that passed its health check at launch or adoption.
+    case held(HeldDaemon)
+}
+
 /// Small, secret-free status surface for the app chrome and logs view.
 public struct DaemonSupervisionSnapshot: Equatable, Sendable {
     /// Monotonic delivery revision. Consumers that hop onto another executor
@@ -143,6 +174,12 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var adoptedProcessID: pid_t?
+    /// The launch id an adopted daemon reported when it was adopted, so a
+    /// later /health answer can be matched to it (`currentHold`).
+    private var adoptedLaunchID: String?
+    /// Where the held daemon's health was verified: the owned launch's
+    /// health URL or the adopted daemon's. Read only while a daemon is held.
+    private var heldBaseURL: URL?
     private let logStore: BoundedLogStore
     /// Where a failed start's output is written (#504). `nil` writes nothing:
     /// the default, so a test that fails a launch never touches the real home.
@@ -337,6 +374,38 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
     }
 
+    /// What a start request would find (#528). Mirrors the `alreadyRunning`
+    /// guard in `startOwned`: `.none` exactly when a start would proceed.
+    /// A daemon counts as held once its launch or adoption has passed
+    /// /health; until then the slot is `.settling`.
+    public func currentHold() -> DaemonHold {
+        lock.withLock {
+            guard process != nil || adoptedProcessID != nil || launchInProgress else {
+                return .none
+            }
+            guard state == .running, !launchInProgress, let heldBaseURL else {
+                return .settling
+            }
+            if adoptedProcessID != nil {
+                return .held(HeldDaemon(
+                    lifecycleEpoch: lifecycleEpoch,
+                    launchID: adoptedLaunchID,
+                    baseURL: heldBaseURL,
+                    adopted: true
+                ))
+            }
+            // An exited root whose termination handler has not run yet is
+            // about to be released; it is not a daemon to reconnect to.
+            guard process?.isRunning == true else { return .settling }
+            return .held(HeldDaemon(
+                lifecycleEpoch: lifecycleEpoch,
+                launchID: ownedLaunchID,
+                baseURL: heldBaseURL,
+                adopted: false
+            ))
+        }
+    }
+
     /// The daemon root pid this supervisor owns or adopted, for liveness
     /// checks that must not depend on HTTP answering (issue #487).
     public func daemonProcessIdentifier() -> pid_t? {
@@ -441,6 +510,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                canAdopt(existing, for: command, requireActualFanRamp: requireActualFanRamp) {
                 guard adoptCurrentLaunch(
                     existing,
+                    healthBaseURL: healthBaseURL,
                     generation: launchGeneration,
                     lifecycleEpoch: launchLifecycleEpoch,
                     automaticAttempt: automaticAttempt
@@ -501,7 +571,9 @@ public final class DaemonSupervisor: @unchecked Sendable {
             else { return false }
             process = next
             adoptedProcessID = nil
+            adoptedLaunchID = nil
             ownedLaunchID = launchIdentifier(from: command)
+            heldBaseURL = healthBaseURL
             launchInProgress = true
             // A Process has been reserved but does not have a usable PID until
             // run() returns. Keep the public phase at .starting through that
@@ -982,6 +1054,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
 
     private func adoptCurrentLaunch(
         _ health: HealthPayload,
+        healthBaseURL: URL,
         generation: Int,
         lifecycleEpoch: Int,
         automaticAttempt: Int?
@@ -995,6 +1068,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
                process == nil, adoptedProcessID == nil, !launchInProgress
             else { return false }
             adoptedProcessID = pid
+            adoptedLaunchID = health.startup?.launchId
+            heldBaseURL = healthBaseURL
             lastOwnedLaunch = nil
             automaticRestartEligible = false
             restartStatus = .idle
@@ -1072,6 +1147,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
         guard adoptCurrentLaunch(
             existing,
+            healthBaseURL: healthBaseURL,
             generation: adoptionGeneration,
             lifecycleEpoch: adoptionLifecycleEpoch,
             automaticAttempt: nil
@@ -1210,6 +1286,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             }
             process = nil
             adoptedProcessID = nil
+            adoptedLaunchID = nil
             automaticLaunchGeneration = nil
             if ownedLaunchID == stopContext.launchID {
                 ownedLaunchID = nil

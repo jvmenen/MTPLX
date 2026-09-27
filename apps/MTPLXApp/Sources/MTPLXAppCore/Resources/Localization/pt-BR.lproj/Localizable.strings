@@ -839,6 +839,9 @@
 "MTPLX is not running." = "O MTPLX não está em execução.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "O MTPLX está executando este modelo. Troque de modelo ou pare o MTPLX primeiro.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "O MTPLX está em execução, mas o OpenCode Desktop não foi encontrado em /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "O MTPLX está em execução. Conectando às estatísticas ao vivo…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "O MTPLX está em execução. As estatísticas ao vivo estão reconectando (tentativa %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "O MTPLX está em execução. As estatísticas ao vivo estão indisponíveis: %@";
 "MTPLX is unreachable — is it running?" = "O MTPLX está inacessível — ele está em execução?";
 "MTPLX is up, checking health." = "O MTPLX está ativo, verificando integridade.";
 "MTPLX isn't running. Hit the play button to start a model." = "O MTPLX não está em execução. Clique no botão de reprodução para iniciar um modelo.";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "Executando os primeiros tokens de aquecimento antes que o chat se abra.";
 "Running tool…" = "Executando ferramenta…";
 "Running your new model on this Mac to see how fast it actually is." = "Executando seu novo modelo neste Mac para ver quão rápido ele é na prática.";
+"Running · connecting live stats" = "Em execução · conectando estatísticas ao vivo";
+"Running · live stats unavailable" = "Em execução · estatísticas ao vivo indisponíveis";
+"Running · reconnecting live stats" = "Em execução · reconectando estatísticas ao vivo";
 "Running." = "Em execução.";
 "Running. Waiting for stats." = "Em execução. Aguardando estatísticas.";
 "running…" = "em execução…";

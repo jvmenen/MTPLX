@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLX 未在运行。";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX 正在运行此模型。请先切换模型或停止 MTPLX。";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX 正在运行，但未在 /Applications/OpenCode.app 找到 OpenCode Desktop。";
+"MTPLX is running. Connecting to live stats…" = "MTPLX 正在运行。正在连接实时统计…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX 正在运行。实时统计正在重新连接（第 %lld 次尝试）。";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX 正在运行。实时统计不可用：%@";
 "MTPLX is unreachable — is it running?" = "无法连接到 MTPLX — 它正在运行吗？";
 "MTPLX is up, checking health." = "MTPLX 已启动，正在检查运行状况。";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX 未在运行。点按播放按钮以启动模型。";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "在聊天打开前运行首批预热词元。";
 "Running tool…" = "正在运行工具…";
 "Running your new model on this Mac to see how fast it actually is." = "在这台 Mac 上运行你的新模型以测试其实际速度。";
+"Running · connecting live stats" = "运行中 · 正在连接实时统计";
+"Running · live stats unavailable" = "运行中 · 实时统计不可用";
+"Running · reconnecting live stats" = "运行中 · 正在重新连接实时统计";
 "Running." = "运行中。";
 "Running. Waiting for stats." = "运行中。正在等待统计数据。";
 "running…" = "正在运行…";

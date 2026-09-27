@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLX is not running.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX is running this model. Switch models or stop MTPLX first.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX is running. Connecting to live stats…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX is running. Live stats are reconnecting (attempt %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX is running. Live stats are unavailable: %@";
 "MTPLX is unreachable — is it running?" = "MTPLX is unreachable — is it running?";
 "MTPLX is up, checking health." = "MTPLX is up, checking health.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX isn't running. Hit the play button to start a model.";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "Running the first warmup tokens before chat opens.";
 "Running tool…" = "Running tool…";
 "Running your new model on this Mac to see how fast it actually is." = "Running your new model on this Mac to see how fast it actually is.";
+"Running · connecting live stats" = "Running · connecting live stats";
+"Running · live stats unavailable" = "Running · live stats unavailable";
+"Running · reconnecting live stats" = "Running · reconnecting live stats";
 "Running." = "Running.";
 "Running. Waiting for stats." = "Running. Waiting for stats.";
 "running…" = "running…";

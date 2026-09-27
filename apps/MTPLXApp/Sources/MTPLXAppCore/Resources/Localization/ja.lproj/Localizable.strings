@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLXは実行されていません。";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLXはこのモデルを実行中です。先にモデルを切り替えるか、MTPLXを停止してください。";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLXは実行中ですが、/Applications/OpenCode.appにOpenCode Desktopが見つかりませんでした。";
+"MTPLX is running. Connecting to live stats…" = "MTPLXは実行中です。ライブ統計に接続中…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLXは実行中です。ライブ統計に再接続中（試行 %lld）。";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLXは実行中です。ライブ統計を利用できません: %@";
 "MTPLX is unreachable — is it running?" = "MTPLXに接続できません — 実行中ですか？";
 "MTPLX is up, checking health." = "MTPLXは起動しています。稼働状態を確認中。";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLXは実行されていません。再生ボタンを押してモデルを開始してください。";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "チャットが開く前に最初のウォームアップトークンを実行中。";
 "Running tool…" = "ツールを実行中…";
 "Running your new model on this Mac to see how fast it actually is." = "実際の速度を確認するため、このMacで新しいモデルを実行しています。";
+"Running · connecting live stats" = "実行中 · ライブ統計に接続中";
+"Running · live stats unavailable" = "実行中 · ライブ統計を利用できません";
+"Running · reconnecting live stats" = "実行中 · ライブ統計に再接続中";
 "Running." = "実行中。";
 "Running. Waiting for stats." = "実行中。統計を待機中。";
 "running…" = "実行中…";

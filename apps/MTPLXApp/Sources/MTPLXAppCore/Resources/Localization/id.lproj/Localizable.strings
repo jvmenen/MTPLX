@@ -839,6 +839,9 @@
 "MTPLX is not running." = "MTPLX tidak berjalan.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX sedang menjalankan model ini. Ganti model atau hentikan MTPLX terlebih dahulu.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX sedang berjalan, tetapi OpenCode Desktop tidak ditemukan di /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX berjalan. Menghubungkan ke statistik langsung…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX berjalan. Statistik langsung sedang dihubungkan ulang (percobaan %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX berjalan. Statistik langsung tidak tersedia: %@";
 "MTPLX is unreachable — is it running?" = "MTPLX tidak dapat dijangkau — apakah sedang berjalan?";
 "MTPLX is up, checking health." = "MTPLX aktif, memeriksa kondisi.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX tidak berjalan. Tekan tombol putar untuk memulai model.";
@@ -1205,6 +1208,9 @@
 "Running the first warmup tokens before chat opens." = "Menjalankan token pemanasan pertama sebelum obrolan dibuka.";
 "Running tool…" = "Menjalankan alat…";
 "Running your new model on this Mac to see how fast it actually is." = "Menjalankan model baru Anda di Mac ini untuk melihat seberapa cepat performa sebenarnya.";
+"Running · connecting live stats" = "Berjalan · menghubungkan statistik langsung";
+"Running · live stats unavailable" = "Berjalan · statistik langsung tidak tersedia";
+"Running · reconnecting live stats" = "Berjalan · menghubungkan ulang statistik langsung";
 "Running." = "Berjalan.";
 "Running. Waiting for stats." = "Berjalan. Menunggu statistik.";
 "running…" = "berjalan…";
