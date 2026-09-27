@@ -1392,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "分配器曾短暂接近其上限（预填充峰值会导致此情况）。尚未逐出任何内容；若保持在此状态，缓存将在发生任何交换之前让位给 SSD。";
 "The app is closing the model server and restoring fans." = "应用正在关闭模型服务器并恢复风扇转速。";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "构建过程会下载模型并写入转换后的副本。请释放磁盘空间或选择较小的模型。";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "无法应用此更改，因此 MTPLX 仍在使用之前的设置运行：%@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "下载无法连接 Hugging Face。请检查网络连接并重试。";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "下载无法连接 Hugging Face。请检查网络连接并重试。如果 huggingface.co 在你的网络中受阻，可在“设置”中的“高级”下设置 HF 下载镜像，例如 https://hf-mirror.com。";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "引擎已清空缓存以避免使用交换空间。速度不受影响，但热会话的后续轮次将从 SSD 恢复。";

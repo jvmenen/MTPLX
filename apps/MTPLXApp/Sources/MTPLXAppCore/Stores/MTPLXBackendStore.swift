@@ -298,6 +298,13 @@ public final class MTPLXBackendStore: ObservableObject {
     /// One-line, dismissable banner shown when `settings.json` could not be
     /// read at launch and was set aside (see `loadPersistedSettings`).
     @Published public private(set) var settingsRecoveryNotice: SettingsRecoveryNotice?
+    /// A configuration change (Settings, the model picker, Forge) that
+    /// failed before its restart reached the running daemon, which keeps
+    /// serving the previous configuration (#528). Shown as its own
+    /// dismissable notice, so the engine's badge keeps telling the truth
+    /// about the engine. Cleared by the next change, a start request or
+    /// Dismiss.
+    @Published public private(set) var configurationChangeFailure: String?
     @Published public private(set) var pendingModelDownload: PendingModelDownload?
     @Published public private(set) var modelDownloadProgress: DownloadProgressSnapshot?
     @Published public private(set) var modelDownloadFailure: String?
@@ -453,10 +460,6 @@ public final class MTPLXBackendStore: ObservableObject {
     /// cleanup then shows this reason as Degraded instead of Stopped, so the
     /// cause stays on screen rather than inviting a Start that moves ports.
     private var portLoss: (lifecycleEpoch: Int, reason: String)?
-    /// The Degraded value a failed configuration change left on screen
-    /// while the previous daemon kept serving. A reconnect leaves it in
-    /// place so the failed change stays visible; an explicit start clears it.
-    private var failedRequestDegradation: DaemonState?
     private let daemonStartupTimeoutSeconds: TimeInterval = 600
 
     public init(
@@ -561,6 +564,10 @@ public final class MTPLXBackendStore: ObservableObject {
 
     public func dismissSettingsRecoveryNotice() {
         settingsRecoveryNotice = nil
+    }
+
+    public func dismissConfigurationChangeFailure() {
+        configurationChangeFailure = nil
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
@@ -766,6 +773,12 @@ public final class MTPLXBackendStore: ObservableObject {
         await awaitDaemonTeardown()
         let launchID = UUID().uuidString
         let recoveryTarget = target
+        // What a failure before the restart reaches the running daemon has
+        // to put back (#528).
+        let holdBeforeChange = supervisor.currentHold()
+        let presentationBeforeChange = (state: daemonState, phase: startupPhase)
+        let terminalCleanupEpochBeforeChange = lastTerminalCleanupLifecycleEpoch
+        configurationChangeFailure = nil
         do {
             supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
             lastDaemonTarget = target
@@ -879,6 +892,36 @@ public final class MTPLXBackendStore: ObservableObject {
                 await reconcileHeldDaemon()
                 throw error
             }
+            if case .held = holdBeforeChange, supervisor.currentHold() == holdBeforeChange {
+                // The change failed before the restart reached the running
+                // daemon (runtime preparation, a client config write, or
+                // building the command), so that daemon still serves the
+                // previous configuration. The engine is fine: keep showing
+                // and monitoring it, leave its fans alone, and show the
+                // failed change on its own. This used to publish Degraded
+                // over the serving daemon, restore its max fans to auto and
+                // stop monitoring it.
+                let failureDescription = Self.humanizedStartFailure(
+                    error,
+                    port: configuration.port
+                )
+                configurationChangeFailure = failureDescription
+                daemonState = presentationBeforeChange.state
+                startupPhase = presentationBeforeChange.phase
+                // The restart claimed this daemon's terminal callback before
+                // it built the command; hand it back so an exit of the
+                // daemon that keeps serving is still noticed.
+                lastTerminalCleanupLifecycleEpoch = terminalCleanupEpochBeforeChange
+                await supervisor.logs.append(
+                    "configuration change failed before the running daemon was restarted; it keeps serving the previous configuration: \(failureDescription)",
+                    stream: .system
+                )
+                await refreshLogs()
+                // The restart may already have closed the live stats and the
+                // watchdog; reconnect them to the daemon that keeps serving.
+                await reconcileHeldDaemon()
+                throw error
+            }
             let failedPhase = startupPhase
             // A failed swap must not leave fans pinned at max with no
             // daemon running (mirrors the fresh-start failure path).
@@ -907,13 +950,6 @@ public final class MTPLXBackendStore: ObservableObject {
             }
             daemonState = .degraded(failureDescription)
             startupPhase = .failed(failureDescription)
-            if case .held = supervisor.currentHold() {
-                // The change failed before the running daemon was touched
-                // (runtime preparation or a client config write), so that
-                // daemon keeps serving the previous configuration. A
-                // reconnect must not wipe this failure off the screen.
-                failedRequestDegradation = daemonState
-            }
             await refreshLogs()
             scheduleLateHealthRecovery(launchID: launchID, target: recoveryTarget)
             throw error
@@ -1014,6 +1050,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // what the supervisor holds is only known once that has finished.
         await awaitDaemonTeardown()
         portLoss = nil
+        configurationChangeFailure = nil
         switch supervisor.currentHold() {
         case .held(let held):
             // This app already runs a daemon: reconnect to it. Asking the
@@ -1024,7 +1061,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 "start requested while daemon launch \(held.launchID ?? "unknown") is running; reconnecting to it instead of launching",
                 stream: .system
             )
-            await reconcileHeldDaemon(clearingFailedRequest: true)
+            await reconcileHeldDaemon()
             return
         case .settling:
             // An automatic restart, a model swap or a stop holds the
@@ -1209,7 +1246,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     daemonState = previousState
                     startupPhase = previousPhase
                 }
-                await reconcileHeldDaemon(clearingFailedRequest: true)
+                await reconcileHeldDaemon()
                 return
             }
             if !attemptedPortRemediation,
@@ -3180,7 +3217,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// - no answer it can attribute (busy, 401, an undecodable payload):
     ///   nothing changes. A busy daemon stays Running and only the
     ///   watchdog decides that a silent one is gone (#487).
-    func reconcileHeldDaemon(clearingFailedRequest: Bool = false) async {
+    func reconcileHeldDaemon() async {
         await awaitDaemonTeardown()
         // The probe and any restarted transport go to the address the held
         // daemon was verified at, which is `baseURL` while it is held.
@@ -3188,11 +3225,6 @@ public final class MTPLXBackendStore: ObservableObject {
         let stateBefore = daemonState
         // A model swap replaces the daemon; its own outcome is the one to show.
         guard stateBefore != .stopping else { return }
-        if !clearingFailedRequest,
-           let failedRequest = failedRequestDegradation,
-           stateBefore == failedRequest {
-            return
-        }
         let probeClient = MTPLXAPIClient.livenessProbe(
             baseURL: held.baseURL,
             apiKey: configuration.apiKey
@@ -3221,7 +3253,6 @@ public final class MTPLXBackendStore: ObservableObject {
         currentFanMode = verifiedFanMode(from: payload)
             ?? currentFanMode
             ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
-        failedRequestDegradation = nil
         // A recovery still waiting for some other launch has nothing to do.
         lateHealthRecoveryTask?.cancel()
         lateHealthRecoveryTask = nil

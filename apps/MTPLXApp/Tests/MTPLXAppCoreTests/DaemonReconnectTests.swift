@@ -151,18 +151,25 @@ struct ReconnectFakeDaemon {
     }
 
     /// A store wired like the app's, with every side effect outside this
-    /// fixture replaced: fans are recorded, never driven, and the runtime
-    /// check resolves the fixture's own `mtplx` without touching the network.
+    /// fixture replaced: fans are recorded, never driven, the runtime
+    /// check resolves the fixture's own `mtplx` without touching the
+    /// network, and OpenCode's config lives under the fixture.
     @MainActor
     func makeStore(
         configuration: MTPLXAppConfiguration,
         supervisor: DaemonSupervisor = DaemonSupervisor(),
-        fans: FanCallRecorder
+        fans: FanCallRecorder,
+        openCodeConfigURL: URL? = nil
     ) -> MTPLXBackendStore {
         MTPLXBackendStore(
             configuration: configuration,
             settingsStore: settingsStore,
             supervisor: supervisor,
+            openCodeIntegration: OpenCodeIntegration(
+                configURL: openCodeConfigURL
+                    ?? root.appendingPathComponent("opencode/opencode.json"),
+                desktopSettingsStoreURL: root.appendingPathComponent("opencode/desktop-settings.json")
+            ),
             runtimeUpdateService: MTPLXRuntimeUpdateService(
                 manifestURL: URL(string: "http://127.0.0.1:1/releases/latest.json")!,
                 environment: [
@@ -989,6 +996,61 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.health?.startup?.pid, spawns.first?.pid)
         try await pollUntil("live stats open") { store.connectionState == .open }
         XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: A configuration change that fails before its restart
+
+    /// A change whose client config write fails before the restart reaches
+    /// the running daemon. That daemon keeps serving the previous
+    /// configuration: the badge stays Running and monitored, its max fans
+    /// are not reset, and the failure is shown on its own. On 1de2b1c0 this
+    /// published Degraded, restored the fans and stopped the watchdog; on
+    /// 2b69e352 the Degraded was also kept against Refresh and reconnects.
+    @MainActor
+    func testAChangeThatFailsBeforeItsRestartLeavesTheEngineRunning() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        // A directory where OpenCode's config file should be: the write fails.
+        let blockedConfig = daemon.root.appendingPathComponent("opencode-blocked", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockedConfig, withIntermediateDirectories: true)
+        let fans = FanCallRecorder()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .max),
+            fans: fans,
+            openCodeConfigURL: blockedConfig
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let launched = try XCTUnwrap(store.health?.startup)
+        let restoresBefore = await fans.restores
+
+        var next = store.configuration
+        next.lastLaunchTarget = LaunchTarget.openCode.rawValue
+        do {
+            try await store.applyConfiguration(next, restartIfRunning: true)
+            XCTFail("the OpenCode config write was expected to fail")
+        } catch {
+            // Settings shows "Apply failed" with this error.
+        }
+
+        XCTAssertEqual(store.daemonState, .running, "the daemon that keeps serving is not Degraded")
+        XCTAssertEqual(store.startupPhase, .ready)
+        let failure = try XCTUnwrap(store.configurationChangeFailure, "the failed change is shown on its own")
+        XCTAssertFalse(failure.isEmpty)
+        let restoresAfter = await fans.restores
+        XCTAssertEqual(restoresAfter, restoresBefore, "the serving daemon's max fans are not reset")
+        XCTAssertEqual(store.health?.startup?.launchId, launched.launchId)
+        XCTAssertEqual(daemon.spawns().count, 1, "no restart happened")
+        XCTAssertTrue(store.hasActiveDaemonTransportForTesting, "the engine is still monitored")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+
+        // An explicit start clears the notice and keeps the daemon.
+        await store.startDaemon()
+        XCTAssertNil(store.configurationChangeFailure)
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(daemon.spawns().count, 1)
     }
 
     // MARK: Closing the window during a model load

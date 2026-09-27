@@ -1392,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "할당자가 일시적으로 상한에 근접했습니다(프리필 급증 시 발생). 축출된 항목은 없습니다. 이 상태가 지속되면 스왑이 발생하기 전에 캐시가 SSD로 양보됩니다.";
 "The app is closing the model server and restoring fans." = "앱이 모델 서버를 닫고 팬 설정을 복원하는 중입니다.";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "빌드 시 모델을 다운로드하고 변환된 사본을 디스크에 씁니다. 디스크 공간을 확보하거나 더 작은 모델을 선택하십시오.";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "변경 사항을 적용할 수 없어 MTPLX가 이전 설정으로 계속 실행 중입니다: %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "다운로드 중 Hugging Face에 연결할 수 없었습니다. 네트워크 연결을 확인하고 다시 시도하십시오.";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "다운로드 중 Hugging Face에 연결할 수 없었습니다. 네트워크 연결을 확인하고 다시 시도하십시오. 네트워크에서 huggingface.co가 차단된 경우 고급 설정에서 HF 다운로드 미러(예: https://hf-mirror.com)를 설정하십시오.";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "엔진이 스왑 발생을 방지하기 위해 캐시를 비웠습니다. 속도는 보호되지만 웜 턴은 SSD에서 복원됩니다.";
