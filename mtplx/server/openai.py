@@ -20737,6 +20737,11 @@ def _run_prefill_admission(
         )
         receipt["system_memory"] = now["system"].to_dict()
     steps: list[str] = []
+    # A reclamation step that raises is recorded in the receipt and must not
+    # cost the request, but it must not pass silently either: the guard's
+    # health reports it (_note_guard_health) until a later admission gets
+    # through reclamation cleanly.
+    step_errors: list[BaseException] = []
 
     def clear_pool() -> None:
         # Freed buffers sit in the allocator pool until it is cleared; only
@@ -20749,6 +20754,7 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["cache_cleared"] = False
             receipt["cache_clear_error"] = repr(exc)
+            step_errors.append(exc)
 
     def deficit(snapshot: Mapping[str, Any]) -> int:
         # Reclamation prices the narrowest width: a request gives up its
@@ -20835,6 +20841,7 @@ def _run_prefill_admission(
                 steps.append("queued_persistence")
             except Exception as exc:
                 receipt["queued_persistence_error"] = repr(exc)
+                step_errors.append(exc)
 
         if session_bank is not None and deficit(now) > 0:
             try:
@@ -20913,6 +20920,7 @@ def _run_prefill_admission(
                         replan("chain_walk", int(chain_evicted) + int(terminal_evicted))
             except Exception as exc:
                 receipt["bank_error"] = repr(exc)
+                step_errors.append(exc)
 
     # 6. Whole idle conversations (the 2026-09-26 report: pi's compaction is
     # a new session and the conversation it summarizes is idle, holding a
@@ -20949,6 +20957,7 @@ def _run_prefill_admission(
             steps.append("idle_sessions")
         except Exception as exc:
             receipt["idle_release_error"] = repr(exc)
+            step_errors.append(exc)
         if rounds:
             receipt["idle_release"] = _merge_release_receipts(rounds)
 
@@ -20983,6 +20992,7 @@ def _run_prefill_admission(
             )
         except Exception as exc:
             receipt["own_session_release_error"] = repr(exc)
+            step_errors.append(exc)
 
     if chosen is _ADMISSION_NO_FIT:
         # Re-priced on what reclamation left: the widest chunk that now fits
@@ -21001,6 +21011,7 @@ def _run_prefill_admission(
             receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
         except Exception as exc:
             receipt.setdefault("bank_error", repr(exc))
+            step_errors.append(exc)
     growth_after = int(current["growth_bytes"])
     projected_after = int(now["engine"]) + growth_after
     receipt["active_bytes_after"] = int(now["active"])
@@ -21055,6 +21066,13 @@ def _run_prefill_admission(
         )
         receipt["retry_can_succeed"] = bool(can_succeed)
         receipt["retry_when"] = when
+    _note_guard_health(
+        state,
+        where="prefill_admission_reclamation",
+        error=step_errors[-1] if step_errors else None,
+    )
+    if step_errors:
+        receipt["guard_degraded"] = True
     _record_guard_event(state, receipt)
     try:
         print("[mtplx] memory guard " + json.dumps(receipt, default=str), flush=True)

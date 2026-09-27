@@ -103,3 +103,41 @@ def test_health_and_the_dashboard_stream_carry_it():
     assert '"memory_guard": _memory_guard_health(state),' in health_src
     dashboard_src = inspect.getsource(srv._mtplx_dashboard_snapshot)
     assert '"memory_guard": _memory_guard_health(state),' in dashboard_src
+
+
+def test_a_reclamation_step_that_raises_is_degraded_too(monkeypatch):
+    """A bank step that raised was a `bank_error` in the receipt and nothing
+    else: the admission's bank doubles once refused a keyword and the whole
+    bank step did nothing, silently. It is now guard_degraded until a later
+    admission gets through reclamation cleanly."""
+
+    import mtplx.system_memory as sm
+    from tests.test_memguard_admission import _put
+
+    state = _state()
+    bank = state.sessions.bank
+    _put(bank, range(0, 10_000), session_id="old", row_bytes=GIB // 1_000)
+    bank._session_last_active["old"] = 0.0
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("shrink exploded")
+
+    monkeypatch.setattr(bank, "shrink_to_bytes", broken)
+    monkeypatch.setattr(sm, "_reader", lambda: None)
+    monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
+    _install(
+        monkeypatch,
+        _Machine(bank, base_gib=88.0, cache_gib=0.0, host_gib=1.0),
+    )
+    receipt = srv._prefill_admission_shed(
+        state,
+        prompt_ids=list(range(1_000_000, 1_030_000)),
+        session_bank=bank,
+        session_id="fresh",
+        prefill_chunk_tokens=4096,
+    )
+    assert "shrink exploded" in receipt["bank_error"]
+    assert receipt["guard_degraded"] is True
+    health = srv._memory_guard_health(state)
+    assert health["guard_degraded"] is True
+    assert health["degraded"][0]["where"] == "prefill_admission_reclamation"
