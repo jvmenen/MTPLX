@@ -29,6 +29,7 @@ from .session_bank import (
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
     DEFAULT_PREFIX_BLOCK_SIZE,
+    QueuedPersistenceCancelError,
     SessionBank,
     block_aligned_prefix_len,
 )
@@ -2465,14 +2466,22 @@ class EngineSessionManager:
                 raise
             return session.end_release_hold
 
-        receipt = self.bank.release_sessions(
-            target_bytes,
-            keep_session_ids=kept,
-            protect_tokens=protect_tokens,
-            restore_identity=restore_identity,
-            hold_session=hold,
-            reason=reason,
-        )
+        try:
+            receipt = self.bank.release_sessions(
+                target_bytes,
+                keep_session_ids=kept,
+                protect_tokens=protect_tokens,
+                restore_identity=restore_identity,
+                hold_session=hold,
+                reason=reason,
+            )
+        except QueuedPersistenceCancelError as exc:
+            # The release happened; a queued job it could not cancel still
+            # holds its entry. The caller gets the receipt and the failure.
+            if isinstance(exc.receipt, dict):
+                exc.receipt["postcommits_aborted"] = len(postcommits_aborted)
+                exc.receipt["kept_sessions"] = sorted(kept)
+            raise
         receipt["postcommits_aborted"] = len(postcommits_aborted)
         receipt["kept_sessions"] = sorted(kept)
         return receipt

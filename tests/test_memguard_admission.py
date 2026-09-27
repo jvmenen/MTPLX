@@ -101,6 +101,44 @@ def _served_profile(monkeypatch):
     monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
 
 
+def _entries_retained_by(obj, *, depth: int = 0) -> list:
+    """The bank entries a queued job keeps alive: what its closure cells,
+    default arguments and bound partial arguments hold, followed through
+    nested functions and containers. Other objects (the bank a job's method
+    belongs to) are not descended into: their references are not the job's."""
+
+    import functools
+    import inspect
+
+    from mtplx.session_bank import SessionBankEntry
+
+    if isinstance(obj, SessionBankEntry):
+        return [obj]
+    if depth > 4:
+        return []
+    children: list = []
+    if isinstance(obj, functools.partial):
+        children = [obj.func, *obj.args, *obj.keywords.values()]
+    elif inspect.isfunction(obj):
+        for cell in obj.__closure__ or ():
+            try:
+                children.append(cell.cell_contents)
+            except ValueError:
+                continue
+        children.extend(obj.__defaults__ or ())
+        children.extend((obj.__kwdefaults__ or {}).values())
+    elif inspect.ismethod(obj):
+        children = [obj.__func__]
+    elif isinstance(obj, (tuple, list, set, frozenset)):
+        children = list(obj)
+    elif isinstance(obj, dict):
+        children = list(obj.values())
+    found: list = []
+    for child in children:
+        found.extend(_entries_retained_by(child, depth=depth + 1))
+    return found
+
+
 class _Machine:
     """MLX's allocator account and the process footprint, as the guard reads
     them: active = a fixed base, plus what the bank holds, plus what queued
@@ -128,18 +166,20 @@ class _Machine:
         self.lane = lane
 
     def queued(self) -> int:
-        """Snapshots out of the bank that a queued job still holds."""
+        """Snapshots out of the bank that a queued job still holds, found by
+        what each job in the lane retains (its closure), never by the bank's
+        own tracking map: a bank that drops its tracking while the job stays
+        queued must read as holding the memory, because it does (the review
+        of 23a94abf)."""
 
         if self.lane is None:
             return 0
         held: dict[int, int] = {}
-        for key, ref in list(getattr(self.bank, "_persistence_pending", {}).items()):
-            entry = ref()
-            if entry is None or key not in self.lane.pending:
-                continue
-            if self.bank._entries.get(entry.token_ids) is entry:
-                continue
-            held[id(entry)] = int(entry.nbytes)
+        for job in list(self.lane.pending.values()):
+            for entry in _entries_retained_by(job):
+                if self.bank._entries.get(entry.token_ids) is entry:
+                    continue
+                held[id(entry)] = int(entry.nbytes)
         return sum(held.values())
 
     def active(self) -> int:

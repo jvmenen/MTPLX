@@ -18793,8 +18793,11 @@ def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
                 protect_session_ids=_in_flight_session_ids(state),
             )
             receipt["bank_bytes_after"] = int(bank.total_nbytes)
+        _note_guard_health(state, where="allocation_failure_shed", error=None)
     except Exception as exc:
         receipt["bank_error"] = repr(exc)
+        receipt["guard_degraded"] = True
+        _note_guard_health(state, where="allocation_failure_shed", error=exc)
     try:
         import mlx.core as _mx
 
@@ -20407,6 +20410,7 @@ def _run_prefill_admission(
         _store_on_prefill_min_suffix,
         prefill_cache_layout,
     )
+    from mtplx.session_bank import QueuedPersistenceCancelError
 
     prompt_tokens = len(prompt_ids)
     if prompt_tokens <= 0:
@@ -20843,6 +20847,17 @@ def _run_prefill_admission(
                 clear_pool()
                 now = measure()
                 steps.append("queued_persistence")
+            except QueuedPersistenceCancelError as exc:
+                # Some jobs could not be cancelled and still hold their
+                # entries (the bank keeps counting them); what was let go is
+                # in the receipt, and the Mac is read again.
+                receipt["queued_persistence_error"] = repr(exc)
+                step_errors.append(exc)
+                if isinstance(exc.receipt, dict):
+                    receipt["queued_persistence_release"] = exc.receipt
+                clear_pool()
+                now = measure()
+                steps.append("queued_persistence")
             except Exception as exc:
                 receipt["queued_persistence_error"] = repr(exc)
                 step_errors.append(exc)
@@ -20865,9 +20880,19 @@ def _run_prefill_admission(
                     )
                     cancel = getattr(session_bank, "cancel_session_persistence", None)
                     if callable(cancel):
-                        receipt["superseded_persistence_cancelled"] = int(
-                            cancel(session_id)
-                        )
+                        try:
+                            receipt["superseded_persistence_cancelled"] = int(
+                                cancel(session_id)
+                            )
+                        except QueuedPersistenceCancelError as exc:
+                            # The entries are gone from RAM; the jobs that
+                            # could not be cancelled still hold theirs. The
+                            # steps below still run.
+                            receipt["superseded_persistence_cancelled"] = int(
+                                exc.cancelled
+                            )
+                            receipt["superseded_persistence_error"] = repr(exc)
+                            step_errors.append(exc)
                     clear_pool()
                     now = measure()
                     steps.append("superseded_session")
@@ -20883,15 +20908,20 @@ def _run_prefill_admission(
                 remaining = deficit(now)
                 bank_bytes_now = int(session_bank.total_nbytes)
                 if remaining > 0 and bank_bytes_now > 0:
-                    receipt["lru_entries_evicted"] = int(
-                        session_bank.shrink_to_bytes(
-                            max(0, bank_bytes_now - remaining),
-                            reason="prefill_admission",
-                            protect_active=True,
-                            protect_keys=restore["keys"],
-                            protect_session_ids=in_flight_ids,
+                    try:
+                        receipt["lru_entries_evicted"] = int(
+                            session_bank.shrink_to_bytes(
+                                max(0, bank_bytes_now - remaining),
+                                reason="prefill_admission",
+                                protect_active=True,
+                                protect_keys=restore["keys"],
+                                protect_session_ids=in_flight_ids,
+                            )
                         )
-                    )
+                    except QueuedPersistenceCancelError as exc:
+                        receipt["lru_entries_evicted"] = int(exc.receipt or 0)
+                        receipt["lru_persistence_error"] = repr(exc)
+                        step_errors.append(exc)
                     clear_pool()
                     now = measure()
                     steps.append("lru_idle_entries")
@@ -20909,13 +20939,18 @@ def _run_prefill_admission(
                     bank_bytes_now = int(session_bank.total_nbytes)
                     chain_fn = getattr(session_bank, "shrink_for_admission", None)
                     if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
-                        chain_evicted, terminal_evicted = chain_fn(
-                            max(0, bank_bytes_now - remaining),
-                            protect_tokens=probe_ids,
-                            reason="prefill_admission_chain",
-                            protect_keys=restore["keys"],
-                            protect_session_ids=in_flight_ids,
-                        )
+                        try:
+                            chain_evicted, terminal_evicted = chain_fn(
+                                max(0, bank_bytes_now - remaining),
+                                protect_tokens=probe_ids,
+                                reason="prefill_admission_chain",
+                                protect_keys=restore["keys"],
+                                protect_session_ids=in_flight_ids,
+                            )
+                        except QueuedPersistenceCancelError as exc:
+                            chain_evicted, terminal_evicted = exc.receipt or (0, 0)
+                            receipt["chain_persistence_error"] = repr(exc)
+                            step_errors.append(exc)
                         receipt["chain_entries_evicted"] = int(chain_evicted)
                         receipt["terminal_entries_evicted"] = int(terminal_evicted)
                         clear_pool()
@@ -20962,6 +20997,13 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["idle_release_error"] = repr(exc)
             step_errors.append(exc)
+            partial = getattr(exc, "receipt", None)
+            if isinstance(partial, dict):
+                # The release ran; a queued job it could not cancel still
+                # holds its entry (QueuedPersistenceCancelError).
+                rounds.append(partial)
+                clear_pool()
+                now = measure()
         if rounds:
             receipt["idle_release"] = _merge_release_receipts(rounds)
 
@@ -20997,6 +21039,11 @@ def _run_prefill_admission(
         except Exception as exc:
             receipt["own_session_release_error"] = repr(exc)
             step_errors.append(exc)
+            partial = getattr(exc, "receipt", None)
+            if isinstance(partial, dict):
+                receipt["own_session_release"] = partial
+                clear_pool()
+                now = measure()
 
     if chosen is _ADMISSION_NO_FIT:
         # Re-priced on what reclamation left: the widest chunk that now fits
@@ -21437,8 +21484,11 @@ async def _memory_pressure_loop(
                                     "bank_bytes_after": int(bank.total_nbytes),
                                 },
                             )
-                except Exception:
-                    pass
+                    _note_guard_health(state, where="dynamic_ceiling", error=None)
+                except Exception as exc:  # noqa: BLE001
+                    # A reclamation step that raises is reported (the review
+                    # of 23a94abf: a failed queued-job cancel passed silently).
+                    _note_guard_health(state, where="dynamic_ceiling", error=exc)
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
@@ -21456,6 +21506,7 @@ async def _memory_pressure_loop(
             if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
+                trim_error: BaseException | None = None
                 if bank is not None:
                     target = (
                         0
@@ -21473,15 +21524,29 @@ async def _memory_pressure_loop(
                     # holds), where the old half-the-budget target took
                     # nothing. The request's own growth is held by its
                     # admission, the per-chunk check and the sustained abort.
-                    evicted = bank.shrink_to_bytes(
-                        target,
-                        reason=(
-                            "memory_pressure_critical"
-                            if level >= 4
-                            else "memory_pressure_warning"
-                        ),
-                        protect_session_ids=_in_flight_session_ids(state),
-                    )
+                    try:
+                        evicted = bank.shrink_to_bytes(
+                            target,
+                            reason=(
+                                "memory_pressure_critical"
+                                if level >= 4
+                                else "memory_pressure_warning"
+                            ),
+                            protect_session_ids=_in_flight_session_ids(state),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # The trim gives back what it can (a queued job it
+                        # could not cancel still holds its entry, and the bank
+                        # keeps counting it), and the loop goes on; the failure
+                        # is reported, never silent (the review of 23a94abf).
+                        trim_error = exc
+                        receipt_evicted = getattr(exc, "receipt", None)
+                        evicted = (
+                            int(receipt_evicted)
+                            if isinstance(receipt_evicted, int)
+                            else 0
+                        )
+                    _note_guard_health(state, where="pressure_trim", error=trim_error)
                 if level >= 4:
                     # Under CRITICAL, shedding the buffer pool is not enough:
                     # retrieval weights are whole GB and reload in seconds, so
@@ -21528,6 +21593,9 @@ async def _memory_pressure_loop(
                     ),
                     "deferred_s": deferred_s,
                 }
+                if trim_error is not None:
+                    action_receipt["trim_error"] = repr(trim_error)
+                    action_receipt["guard_degraded"] = True
                 _record_guard_event(state, action_receipt)
                 print(
                     "[mtplx] memory pressure guard " + json.dumps(action_receipt),
