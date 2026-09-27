@@ -163,11 +163,10 @@ def test_compiled_selection_matches_eager_at_the_cut(low_block, high_block, rows
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="fused kernels are the GPU's")
 def test_the_divisor_stays_exact_where_a_division_fuses():
-    # In _select_eager the division runs alone (a reduction before it and a
-    # take of row 0 after it, neither of which MLX fuses), so a scalar
-    # divisor would still be read from memory there. The divisor must not
-    # depend on that: joined to a fused elementwise op, it still separates
-    # the pair.
+    # Whatever MLX fuses around the division in _select_eager, the divisor
+    # must hold its value inside a fused kernel: joined to a fused
+    # elementwise op, it still separates the pair. The Python float and a
+    # one-element evaluated array do not (both are inlined as constants).
     indexer = QSAIndexer(_args())
     pair = mx.array([1.5 + 2.0**-23, 1.5 + 2.0**-22], dtype=mx.float32)
 
