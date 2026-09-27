@@ -1,22 +1,24 @@
 """Gemma 4's prefill runs in chunks, and a chunked prefill is the same prefill.
 
 Gemma 4 forwarded every uncached prompt token in one call. MLX's fused
-attention takes query blocks only at head sizes 64, 80 and 128; Gemma 4's are
-256 (sliding layers) and 512 (full-attention layers), so each layer computes
-its scores as an array: prompt x prompt for a cold prompt. On the 31B (4-bit,
-128 GB M5 Max, 2026-09-27) cold prompts of 6,026 / 12,026 / 24,026 tokens
-peaked at 25 / 43 / 92 GiB of MLX memory with time to first token 13 / 41 /
-174 s, and a 32K prompt would not fit a 128 GB Mac. The prefill now forwards
-the uncached rows in chunks of the house prefill width (2,048 by default), so
-a layer's block is chunk x (cached + chunk).
+attention takes query blocks at head sizes up to 256 (MLX 0.32; 128 in 0.31),
+and Gemma 4's full-attention layers have 512-wide heads, so each of them
+computes its scores as an array: prompt x prompt for a cold prompt, beside
+the sliding layers' prompt x prompt mask. On the 31B (4-bit, 128 GB M5 Max,
+2026-09-27) cold prompts of 6,026 / 12,026 / 24,026 tokens peaked at 25 / 43 /
+92 GiB of MLX memory with time to first token 13 / 41 / 174 s, and a 32K
+prompt would not fit a 128 GB Mac. The prefill now forwards the uncached rows
+in chunks of the house prefill width (2,048 by default), so the block is
+chunk x (cached + chunk).
 
 These tests run the backend's own code (``Gemma4TargetAdapter``,
 ``Gemma4RollbackRotatingKVCache``, MLX-LM's ``KVCache``, the assistant drafter,
 the session bank) on a tiny Gemma 4 built from MLX-LM's ``gemma4_text``: six
-layers, sliding and full attention at the 31B's head sizes (so attention takes
-the same materialized path), keys equal values on the full layers, and a
-KV-shared tail (the last layer of each type reads an earlier layer's KV). The
-31B-only config gates are lifted; nothing under test depends on the sizes.
+layers, sliding and full attention at the 31B's head sizes (so the
+full-attention layers take the same unfused path as on the real pack; on the
+CPU every layer does), keys equal values on the full layers, and a KV-shared
+tail (the last layer of each type reads an earlier layer's KV). The 31B-only
+config gates are lifted; nothing under test depends on the sizes.
 
 Exactness is checked on the CPU in float32. Chunked and whole-prompt prefills
 agree to rounding there (measured max abs difference: 4e-4 on hidden states

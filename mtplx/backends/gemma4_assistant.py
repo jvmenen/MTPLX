@@ -815,14 +815,16 @@ def gemma4_prefill_attention_pairs(config: Any, rows: int, cached_tokens: int) -
     """Query-key pairs in the widest score block one prefill forward of
     ``rows`` tokens materializes over ``cached_tokens`` already cached.
 
-    MLX's fused attention takes query blocks only at head sizes 64, 80 and
-    128 (``ScaledDotProductAttention::use_fallback``, MLX 0.31); Gemma 4's
-    are 256 on the sliding layers and 512 on the full-attention layers, so
-    every layer computes its scores as an array, one layer at a time: rows x
-    (cached + rows) on a full-attention layer, which attends to every cached
-    key, and rows x (cached window + rows) on a sliding layer, which keeps
-    ``sliding_window - 1`` rows before the forward. The full-attention block
-    is the widest; a chunked prefill's last chunk is rows x the prompt."""
+    MLX's fused attention takes query blocks at head sizes up to 256 (MLX
+    0.32; up to 128 in 0.31), so Gemma 4's full-attention layers, whose heads
+    are 512 wide, always take the unfused path
+    (``ScaledDotProductAttention::use_fallback``): each computes its scores
+    for every head as an array, rows x (cached + rows), since it attends to
+    every cached key. The sliding layers (256) attend over their kept window,
+    ``sliding_window - 1`` rows, plus the new rows: a rows x (cached window +
+    rows) mask, and on MLX 0.31 scores of that size too. The layers run one
+    after another; the full-attention block is the widest, and a chunked
+    prefill's last chunk makes it rows x the prompt."""
 
     rows = max(0, int(rows))
     if rows <= 1:
@@ -2821,10 +2823,11 @@ def _gemma4_prefill_prompt(
     and hidden, the drafter's shared KV and the cache offset.
 
     Rows within one prefill width (``gemma4_prefill_chunk_tokens``) are one
-    forward. A longer span runs in chunks (``gemma4_prefill_spans``): each
-    layer's attention materializes its scores (``gemma4_prefill_attention_pairs``),
-    and one forward over N rows builds N x N of them, 92 GiB at 24,026 tokens
-    on the 31B. A chunk's block is chunk x (cached + chunk) instead. The
+    forward. A longer span runs in chunks (``gemma4_prefill_spans``): the
+    full-attention layers materialize their scores
+    (``gemma4_prefill_attention_pairs``), and one forward over N rows builds
+    N x N of them, 92 GiB at 24,026 tokens on the 31B. A chunk's block is
+    chunk x (cached + chunk) instead. The
     caches carry across chunks the way they carry across turns; every
     chunk is evaluated, the request's abort check runs between chunks, and
     MLX's buffer pool is emptied after each (a chunk's score buffers are

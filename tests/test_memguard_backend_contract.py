@@ -215,8 +215,9 @@ class TestGemmaGeometry:
         assert gemma4.gemma4_window_cache_bytes(args, 1023 + 2048) == GEMMA_CHUNK_WINDOWS
         pairs = gemma4.gemma4_prefill_attention_pairs
         assert pairs(args, 65_536, 0) == 65_536 * 65_536
-        # Head sizes 256 and 512 have no fused prefill attention in MLX:
-        # scores are materialized inside the window too.
+        # The full-attention layers' 512-wide heads have no fused prefill
+        # attention in MLX: their scores are materialized inside the window
+        # too.
         assert pairs(args, 1024, 0) == 1024 * 1024
         # The full-attention layers attend every cached key: a warm suffix
         # (or a prefill chunk) builds rows x (cached + rows), not the
