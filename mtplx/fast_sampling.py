@@ -623,6 +623,67 @@ def sparse_distribution_from_mlx_logits_relaxed_ties(
     return _host_sparse_distribution(np.asarray(row, dtype=np.float32), config)
 
 
+class SparseDistributionRows:
+    """Exact per-row sparse distributions for a block of logit rows.
+
+    Row ``i`` is the distribution ``sparse_distribution_from_mlx_logits``
+    returns for ``logits[i]`` with no penalties, bit for bit, but every row's
+    device support is built and read in ONE ``_device_serial_support_arrays``
+    call. That call is row-local end to end: the float32 cast, the scale and
+    the gathers are element-wise, ``argpartition`` sorts each row on its own,
+    ``logsumexp`` over the last axis is MLX's per-row LogSumExp kernel (its
+    variant depends on the row length only), and the host arithmetic runs
+    along axis 1. A caller that walks rows in order therefore sees exactly the
+    per-row reader's distributions while paying one host-device round trip
+    instead of one per row.
+
+    A row whose device mass is not finite takes the per-row reader's host
+    fallback (and raises the same ``NonFiniteLogitsError``) only when it is
+    read, so a row the caller never reaches can never fail the call.
+    """
+
+    __slots__ = ("_rows", "_config", "_token_rows", "_prob_rows", "_vocab_size", "_host_rows")
+
+    def __init__(self, logits: mx.array, config: SamplerConfig) -> None:
+        self._rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+        self._config = config
+        (
+            self._token_rows,
+            self._prob_rows,
+            self._vocab_size,
+        ) = _device_serial_support_arrays(self._rows, config)
+        self._host_rows: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return int(self._token_rows.shape[0])
+
+    def __getitem__(self, index: int) -> SparseDistribution:
+        dist = _serial_row_distribution(
+            self._token_rows[index], self._prob_rows[index], self._vocab_size
+        )
+        if dist is not None:
+            return dist
+        if self._host_rows is None:
+            mx.eval(self._rows)
+            self._host_rows = np.asarray(self._rows, dtype=np.float32)
+        return _host_sparse_distribution(self._host_rows[index], self._config)
+
+
+def sparse_distribution_rows_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> SparseDistributionRows | None:
+    """Per-row exact sparse distributions from one device read, or None.
+
+    None exactly where ``sparse_distribution_from_mlx_logits`` returns None
+    (greedy, or no top-k), so a caller falls back to its per-row reader there.
+    """
+
+    if config.temperature <= 0 or config.top_k <= 0:
+        return None
+    return SparseDistributionRows(logits, config)
+
+
 def sparse_distributions_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
@@ -631,27 +692,13 @@ def sparse_distributions_from_mlx_logits(
 
     This is the batched equivalent of ``sparse_distribution_from_mlx_logits``.
     It shares one MLX materialization boundary across rows and then applies the
-    exact host reference arithmetic to each row.
+    exact host reference arithmetic to each row, resolving every row up front.
     """
 
-    if config.temperature <= 0 or config.top_k <= 0:
+    rows = sparse_distribution_rows_from_mlx_logits(logits, config)
+    if rows is None:
         return None
-
-    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
-    token_rows, prob_rows, vocab_size = _device_serial_support_arrays(rows, config)
-    host_rows: np.ndarray | None = None
-    distributions: list[SparseDistribution] = []
-    for index in range(token_rows.shape[0]):
-        dist = _serial_row_distribution(
-            token_rows[index], prob_rows[index], vocab_size
-        )
-        if dist is None:
-            if host_rows is None:
-                mx.eval(rows)
-                host_rows = np.asarray(rows, dtype=np.float32)
-            dist = _host_sparse_distribution(host_rows[index], config)
-        distributions.append(dist)
-    return distributions
+    return [rows[index] for index in range(len(rows))]
 
 
 def batched_sparse_distributions_from_mlx_logits(

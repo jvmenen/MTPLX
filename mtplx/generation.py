@@ -75,6 +75,7 @@ from .fast_sampling import (
     sample_token_ids_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
     sparse_distribution_from_mlx_logits_relaxed_ties,
+    sparse_distribution_rows_from_mlx_logits,
     sparse_distributions_from_mlx_logits,
 )
 from .gdn_capture import resolve_gdn_capture_backend
@@ -6686,6 +6687,64 @@ def _batched_distributions_from_mlx_logits(
     return batched_sparse_distributions_from_mlx_logits(logits, config)
 
 
+def _point_mass_block_accept(
+    block_logits: mx.array,
+    block: Sequence[int],
+    sampler: SamplerConfig,
+    rng: np.random.Generator,
+) -> tuple[int, int | None]:
+    """Sampled acceptance of a context-copy block, in block order.
+
+    Each copied token is a point-mass proposal, so it is accepted with the
+    target's own shaped probability of that token, and the first rejection
+    draws the correction from the residual (the target with that token's mass
+    removed, renormalized). That is the probability-ratio contract of the MTP
+    verify path: the emitted stream follows the target sampling distribution
+    exactly at any temperature. Row ``i`` of ``block_logits`` scores
+    ``block[i]``.
+
+    The target distribution of every row comes from one device read
+    (``sparse_distribution_rows_from_mlx_logits``) instead of one read per
+    examined row, which a 24-token block used to pay up to 24 times. Row ``i``
+    is exactly the per-row reader's distribution for that row, and the
+    generator is drawn in the same order (one uniform per examined token, then
+    the correction), so the accepted count, the correction and the generator
+    state afterwards are those of the per-row loop. Rows past the first
+    rejection are computed and never read.
+
+    Returns ``(accepted, correction)``; ``correction`` is None when every
+    copied token was accepted.
+    """
+
+    if not block:
+        return 0, None
+    vocab = int(block_logits.shape[-1])
+    rows = sparse_distribution_rows_from_mlx_logits(
+        block_logits[: len(block)], sampler
+    )
+    accepted = 0
+    for index, drafted in enumerate(block):
+        if rows is not None:
+            target_p = rows[index]
+        else:
+            target_p = _distribution_from_mlx_logits(
+                block_logits[index], sampler, token_counts=None
+            )
+        draft_q = SparseDistribution(
+            np.array([int(drafted)], dtype=np.int64),
+            np.array([1.0], dtype=np.float64),
+            vocab,
+        )
+        accept_prob = compute_acceptance_probability(target_p, draft_q, int(drafted))
+        if float(rng.random()) <= accept_prob:
+            accepted += 1
+            continue
+        return accepted, int(
+            sample_from_distribution(residual_distribution(target_p, draft_q), rng)
+        )
+    return accepted, None
+
+
 def _validate_target_prefix_sampler_request(config: SamplerConfig) -> None:
     """Reject an unsupported external target-prefix sampler before prompt work."""
     if (
@@ -12300,32 +12359,9 @@ def generate_mtpk(
                     # renormalized). Identical probability-ratio contract to
                     # the MTP verify path: the emitted stream follows the
                     # target sampling distribution exactly at any temperature.
-                    _cc_nacc = 0
-                    _cc_vocab = int(_cc_logits.shape[-1])
-                    for _cc_i, _cc_d in enumerate(_cc_block):
-                        _cc_target_p = _distribution_from_mlx_logits(
-                            _cc_accept[0, _cc_i],
-                            sampler,
-                            token_counts=None,
-                        )
-                        _cc_draft_q = SparseDistribution(
-                            np.array([int(_cc_d)], dtype=np.int64),
-                            np.array([1.0], dtype=np.float64),
-                            _cc_vocab,
-                        )
-                        _cc_accept_prob = compute_acceptance_probability(
-                            _cc_target_p, _cc_draft_q, int(_cc_d)
-                        )
-                        if float(rng.random()) <= _cc_accept_prob:
-                            _cc_nacc += 1
-                            continue
-                        _cc_correction = int(
-                            sample_from_distribution(
-                                residual_distribution(_cc_target_p, _cc_draft_q),
-                                rng,
-                            )
-                        )
-                        break
+                    _cc_nacc, _cc_correction = _point_mass_block_accept(
+                        _cc_accept[0], _cc_block, sampler, rng
+                    )
                 # An accepted stop token ends the response: never accept, commit,
                 # or select state past it (mirrors the MTP acceptance loop's stop
                 # break). Every downstream boundary — capture-commit trim, the
@@ -12616,32 +12652,9 @@ def generate_mtpk(
                         else:
                             break
                 else:
-                    _cb_nacc = 0
-                    _cb_vocab = int(_cb_logits.shape[-1])
-                    for _cb_i, _cb_d in enumerate(_cb_block):
-                        _cb_target_p = _distribution_from_mlx_logits(
-                            _cb_accept[0, _cb_i],
-                            sampler,
-                            token_counts=None,
-                        )
-                        _cb_draft_q = SparseDistribution(
-                            np.array([int(_cb_d)], dtype=np.int64),
-                            np.array([1.0], dtype=np.float64),
-                            _cb_vocab,
-                        )
-                        _cb_accept_prob = compute_acceptance_probability(
-                            _cb_target_p, _cb_draft_q, int(_cb_d)
-                        )
-                        if float(rng.random()) <= _cb_accept_prob:
-                            _cb_nacc += 1
-                            continue
-                        _cb_correction = int(
-                            sample_from_distribution(
-                                residual_distribution(_cb_target_p, _cb_draft_q),
-                                rng,
-                            )
-                        )
-                        break
+                    _cb_nacc, _cb_correction = _point_mass_block_accept(
+                        _cb_accept[0], _cb_block, sampler, rng
+                    )
                 for _cb_i in range(_cb_nacc):
                     if _is_stop(int(_cb_block[_cb_i]), stop_token_ids):
                         _cb_nacc = _cb_i + 1
