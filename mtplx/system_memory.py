@@ -49,7 +49,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 GIB = 1024**3
 MIB = 1024**2
@@ -82,6 +82,12 @@ _SHED_FLOOR_MULTIPLE = 2
 _THRASH_COMPRESSOR_BYTES_PER_S = 256 * MIB
 _THRASH_SWAP_BYTES_PER_S = 64 * MIB
 _THRASH_MIN_GROWTH_BYTES = 256 * MIB
+# Growth is measured from every reading of the last ten seconds (and the
+# newest one before them), not only from the previous reading: the per-chunk
+# check reads every 0.2 s, and 320 MiB/s arriving in 80 MiB steps never grew
+# 256 MiB between two adjacent readings (the 2026-09-27 review of this
+# change). Ten seconds holds the guard loop's own 10 s tick.
+_THRASH_WINDOW_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -366,43 +372,90 @@ def reading_floors(reading: SystemMemory) -> tuple[int, int]:
     return system_memory_floors(reading.total_bytes, reading.wired_bytes)
 
 
-def memory_thrashing(
-    reading: SystemMemory | None, previous: SystemMemory | None
-) -> bool:
-    """The death signature between two readings.
+def _grew_fast(now: int | None, then: int | None, elapsed: float, rate: float) -> bool:
+    if now is None or then is None or elapsed <= 0:
+        return False
+    growth = int(now) - int(then)
+    return growth >= _THRASH_MIN_GROWTH_BYTES and growth / elapsed >= rate
 
-    Free pages under the abort floor while the compressor or swap grew fast
-    since ``previous``. Needs both readings with the page counters; anything
+
+def thrashing_base(
+    reading: SystemMemory | None,
+    previous: SystemMemory | Sequence[SystemMemory | None] | None,
+) -> SystemMemory | None:
+    """The earlier reading the death signature is measured from, or None.
+
+    The signature: free pages under the abort floor while the compressor or
+    swap grew fast since one of the ``previous`` readings (one reading, or
+    several from a ``ReadingWindow``). Needs the page counters; anything
     missing reads as not thrashing.
     """
 
     if reading is None or previous is None:
-        return False
+        return None
     if reading.free_bytes is None:
-        return False
+        return None
     _shed, abort = reading_floors(reading)
     if int(reading.free_bytes) >= abort:
-        return False
-    elapsed = max(0.001, float(reading.monotonic_s) - float(previous.monotonic_s))
-    if reading.compressor_bytes is not None and previous.compressor_bytes is not None:
-        growth = int(reading.compressor_bytes) - int(previous.compressor_bytes)
-        if (
-            growth >= _THRASH_MIN_GROWTH_BYTES
-            and growth / elapsed >= _THRASH_COMPRESSOR_BYTES_PER_S
+        return None
+    earlier = [previous] if isinstance(previous, SystemMemory) else list(previous)
+    for base in earlier:
+        if base is None or base is reading:
+            continue
+        elapsed = float(reading.monotonic_s) - float(base.monotonic_s)
+        if _grew_fast(
+            reading.compressor_bytes,
+            base.compressor_bytes,
+            elapsed,
+            _THRASH_COMPRESSOR_BYTES_PER_S,
+        ) or _grew_fast(
+            reading.swap_used_bytes,
+            base.swap_used_bytes,
+            elapsed,
+            _THRASH_SWAP_BYTES_PER_S,
         ):
-            return True
-    if reading.swap_used_bytes is not None and previous.swap_used_bytes is not None:
-        growth = int(reading.swap_used_bytes) - int(previous.swap_used_bytes)
-        if (
-            growth >= _THRASH_MIN_GROWTH_BYTES
-            and growth / elapsed >= _THRASH_SWAP_BYTES_PER_S
+            return base
+    return None
+
+
+def memory_thrashing(
+    reading: SystemMemory | None,
+    previous: SystemMemory | Sequence[SystemMemory | None] | None,
+) -> bool:
+    """Whether ``reading`` shows the death signature (``thrashing_base``)."""
+
+    return thrashing_base(reading, previous) is not None
+
+
+class ReadingWindow:
+    """The readings of the last ``window_s`` seconds, plus the newest one
+    before them, for ``memory_thrashing``. One per reader: the guard loop
+    keeps one, and each prefill's per-chunk check keeps its own."""
+
+    def __init__(self, window_s: float = _THRASH_WINDOW_S) -> None:
+        self.window_s = float(window_s)
+        self._readings: list[SystemMemory] = []
+
+    def readings(self) -> list[SystemMemory]:
+        return list(self._readings)
+
+    def add(self, reading: SystemMemory | None) -> None:
+        if reading is None:
+            return
+        self._readings.append(reading)
+        now_s = float(reading.monotonic_s)
+        # Keep the newest reading older than the window: at the loop's 10 s
+        # tick it is the only earlier one.
+        while (
+            len(self._readings) > 2
+            and now_s - float(self._readings[1].monotonic_s) >= self.window_s
         ):
-            return True
-    return False
+            self._readings.pop(0)
 
 
 def system_pressure_level(
-    reading: SystemMemory | None, previous: SystemMemory | None = None
+    reading: SystemMemory | None,
+    previous: SystemMemory | Sequence[SystemMemory | None] | None = None,
 ) -> int:
     """Map a reading onto the guard's scale: 1 normal, 2 warning, 4 critical."""
 
@@ -446,10 +499,12 @@ def admission_shortfall_bytes(
 
 
 __all__ = [
+    "ReadingWindow",
     "SystemMemory",
     "admission_shortfall_bytes",
     "memory_thrashing",
     "read_system_memory",
+    "thrashing_base",
     "reading_floors",
     "system_memory_floors",
     "system_memory_guard_enabled",

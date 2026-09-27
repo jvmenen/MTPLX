@@ -319,6 +319,49 @@ class TestWiredFloorsAndDeathSignature:
         after = _machine(free_gib=9.0, file_gib=5, wired_gib=88, compressor_gib=6, at_s=2.0)
         assert not sm.memory_thrashing(after, before)
 
+    def test_growth_is_measured_over_the_window_not_one_step(self):
+        """320 MiB/s arriving in 80 MiB steps a quarter second apart: no two
+        adjacent readings grew 256 MiB, and the reading a second back did."""
+
+        window = sm.ReadingWindow()
+        tripped_at = None
+        for i in range(8):
+            reading = _machine(
+                free_gib=0.2,
+                file_gib=20,
+                wired_gib=88,
+                compressor_gib=10 + i * 80 / 1024,
+                at_s=i * 0.25,
+            )
+            earlier = window.readings()
+            if earlier:
+                assert not sm.memory_thrashing(reading, earlier[-1])
+            if tripped_at is None and sm.memory_thrashing(reading, earlier):
+                tripped_at = i
+            window.add(reading)
+        assert tripped_at == 4
+        assert sm.system_pressure_level(reading, previous=window.readings()[:-1]) == 4
+
+    def test_the_window_keeps_the_newest_reading_before_it(self):
+        """The guard loop reads every 10 s: the reading one tick back is the
+        only earlier one, and it stays the base."""
+
+        window = sm.ReadingWindow(window_s=10.0)
+        first = _machine(free_gib=0.2, file_gib=20, wired_gib=88, at_s=0.0)
+        second = _machine(free_gib=0.2, file_gib=20, wired_gib=88, at_s=10.0)
+        third = _machine(free_gib=0.2, file_gib=20, wired_gib=88, at_s=20.0)
+        window.add(first)
+        window.add(second)
+        assert window.readings() == [first, second]
+        window.add(third)
+        assert window.readings() == [second, third]
+        # Readings every quarter second, a one-second window: the last
+        # second's readings plus the one exactly a second back.
+        many = sm.ReadingWindow(window_s=1.0)
+        for i in range(20):
+            many.add(_machine(free_gib=0.2, file_gib=20, wired_gib=88, at_s=i * 0.25))
+        assert [r.monotonic_s for r in many.readings()] == [3.75, 4.0, 4.25, 4.5, 4.75]
+
     def test_small_or_slow_growth_is_not_the_signature(self):
         before = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10, at_s=0.0)
         small = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10.2, at_s=0.5)

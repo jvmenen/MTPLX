@@ -158,11 +158,13 @@ from mtplx.mlx_process_env import (
     applied_command_buffer_mb as _applied_command_buffer_mb,
 )
 from mtplx.system_memory import (
+    ReadingWindow as _SystemReadingWindow,
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
     memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
     reading_floors as _system_reading_floors,
     system_pressure_level as _system_pressure_level,
+    thrashing_base as _system_thrashing_base,
 )
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
@@ -18946,30 +18948,46 @@ _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
 
 class _PrefillSystemGuard:
-    """What the Mac has left, read at the prefill's own abort site.
+    """What the Mac and the engine have left, read at the prefill's own abort site.
 
     The guard loop reads the machine every 10 s (every 2 s under the shed
-    floor) and aborts a prefill only after three critical ticks. A cold
-    chunk adds 0.1 to 0.5 GiB a second, and the 2026-09-26 report's third
-    freeze went from 5.7 GiB free to a stopped machine in about two seconds.
-    So the prefill asks before each chunk allocates (at most every 0.2 s):
-    the supply plus the engine's allocator pool under the abort floor, or
-    free pages under that floor while the compressor or swap grew since the
-    previous chunk (``memory_thrashing``), stops the request with a 507
-    before the next chunk. An unreadable machine never trips it, and the
-    trip belongs to this request only.
+    floor), waits for an idle engine on a WARNING, and aborts a prefill only
+    after three critical ticks. A cold chunk adds 0.1 to 0.5 GiB a second,
+    and the 2026-09-26 report's third freeze went from 5.7 GiB free to a
+    stopped machine in about two seconds. So the prefill asks before each
+    chunk allocates (at most every 0.2 s), with that chunk's allocation
+    reserved (its rows at full width and its scratch):
+
+      * the Mac's supply plus the engine's allocator pool, less the chunk,
+        under the abort floor;
+      * free pages under the abort floor while the compressor or swap grew
+        fast since any reading of the last ten seconds (``thrashing_base``);
+      * what the engine has in use, plus host memory past its allowance,
+        plus the chunk, over the engine's limit: an admission that
+        under-priced the request stops here instead of past the limit.
+
+    Any of them stops the request with a 507 before the chunk. An unreadable
+    machine skips the Mac's lines, ``--allow-swap`` skips all of them, and
+    the trip belongs to this request only.
     """
 
-    def __init__(self, state: Any) -> None:
+    def __init__(self, state: Any, *, chunk_reserve_bytes: int = 0) -> None:
         self.state = state
-        self.previous: Any = None
+        self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        self.window = _SystemReadingWindow()
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
         self.checks = 0
+        caps = getattr(state, "metal_memory_caps", None)
+        limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
+        self.limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
+        self.allow_swap = bool(getattr(state, "allow_swap", False))
 
     def __call__(self) -> bool:
         if self.tripped is not None:
             return True
+        if self.allow_swap:
+            return False
         now_s = time.monotonic()
         if (
             self.last_read_s is not None
@@ -18977,36 +18995,93 @@ class _PrefillSystemGuard:
         ):
             return False
         self.last_read_s = now_s
-        reading = _read_system_memory()
-        if reading is None:
-            return False
         self.checks += 1
-        previous, self.previous = self.previous, reading
-        _shed_floor, abort_floor = _system_reading_floors(reading)
+        reserve = self.chunk_reserve_bytes
         stats = _mlx_memory_stats_live()
+        active = int(stats.get("active_memory_bytes") or 0)
         pool = int(stats.get("cache_memory_bytes") or 0)
-        thrashing = _system_memory_thrashing(reading, previous)
-        if int(reading.available_bytes) + pool >= abort_floor and not thrashing:
+        reason = None
+        engine = None
+        fields: dict[str, Any] = {}
+        if self.limit > 0 and active > 0:
+            live, fields = _footprint_floor(
+                self.state, limit=self.limit, allocator_bytes=active + pool
+            )
+            engine = int(live) - pool
+            if engine + reserve > self.limit:
+                reason = "engine_limit"
+        reading = _read_system_memory()
+        earlier = self.window.readings()
+        base = None
+        abort_floor = None
+        if reading is not None:
+            self.window.add(reading)
+            _shed_floor, abort_floor = _system_reading_floors(reading)
+            if reason is None:
+                base = _system_thrashing_base(reading, earlier)
+                if base is not None:
+                    reason = "death_signature"
+                elif int(reading.available_bytes) + pool - reserve < abort_floor:
+                    reason = "under_abort_floor"
+        if reason is None:
             return False
         self.tripped = {
             "action": "prefill_system_abort",
-            "reason": "death_signature" if thrashing else "under_abort_floor",
-            "system_available_bytes": int(reading.available_bytes),
-            "system_free_bytes": reading.free_bytes,
+            "reason": reason,
+            "chunk_reserve_bytes": int(reserve),
+            "engine_bytes": engine,
+            "limit_bytes": int(self.limit) or None,
+            **fields,
             "allocator_pool_bytes": pool,
-            "abort_floor_bytes": int(abort_floor),
-            "system_memory": reading.to_dict(),
-            "previous_system_memory": (
-                previous.to_dict() if previous is not None else None
+            "system_available_bytes": (
+                int(reading.available_bytes) if reading is not None else None
             ),
+            "system_free_bytes": reading.free_bytes if reading is not None else None,
+            "abort_floor_bytes": abort_floor,
+            "system_memory": reading.to_dict() if reading is not None else None,
+            "previous_system_memory": base.to_dict() if base is not None else None,
             "interval_s": (
-                round(float(reading.monotonic_s) - float(previous.monotonic_s), 3)
-                if previous is not None
+                round(float(reading.monotonic_s) - float(base.monotonic_s), 3)
+                if reading is not None and base is not None
                 else None
             ),
             "checks": int(self.checks),
         }
         return True
+
+
+def _admission_chunk_bytes(geometry: "_AdmissionGeometry", rows: int, scratch: int) -> int:
+    """What one prefill forward allocates: its rows at full width (the
+    contiguous prefill cache holds bf16 KV) and its scratch."""
+
+    return max(0, int(rows)) * int(geometry.live_bytes_per_token) + max(0, int(scratch))
+
+
+def _prefill_chunk_reserve_bytes(
+    state: Any,
+    *,
+    prompt_tokens: int,
+    chunk_tokens: int | None,
+    priced: Mapping[str, Any] | None = None,
+) -> int:
+    """What the per-chunk check reserves for each forward of this request.
+
+    The admission's own bill when it priced the request (``priced``, the
+    growth model it settled on: it knows the reuse and the chunk it chose).
+    Otherwise (the admission is off, failed, or had nothing to measure) the
+    widest forward the prompt allows, as if nothing were reused, which can
+    only reserve more."""
+
+    if isinstance(priced, Mapping) and priced.get("chunk_bytes") is not None:
+        return max(0, int(priced["chunk_bytes"]))
+    geometry = _admission_geometry(state)
+    prompt_tokens = max(1, int(prompt_tokens))
+    width = _admission_prefill_widths(prompt_tokens, chunk_tokens)[0]
+    rows = prompt_tokens if width is None else min(prompt_tokens, int(width))
+    scratch, _source = _admission_scratch_bytes(
+        state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
+    )
+    return _admission_chunk_bytes(geometry, rows, scratch)
 
 
 def _prefill_system_abort_exception(
@@ -19026,7 +19101,15 @@ def _prefill_system_abort_exception(
     available = int(tripped.get("system_available_bytes") or 0)
     pool = int(tripped.get("allocator_pool_bytes") or 0)
     floor = int(tripped.get("abort_floor_bytes") or 0)
-    if tripped.get("reason") == "death_signature":
+    reserve = int(tripped.get("chunk_reserve_bytes") or 0)
+    reason = tripped.get("reason")
+    if reason == "engine_limit":
+        cause = (
+            f"the engine held {_gib_text(tripped.get('engine_bytes'))} and its "
+            f"next prefill chunk needs {_gib_text(reserve)}, past its "
+            f"{_gib_text(tripped.get('limit_bytes'))} limit"
+        )
+    elif reason == "death_signature":
         current = tripped.get("system_memory") or {}
         before = tripped.get("previous_system_memory") or {}
         grew = []
@@ -19051,16 +19134,26 @@ def _prefill_system_abort_exception(
         )
     else:
         cause = (
-            f"{_gib_text(available + pool)} was left free and reclaimable, "
-            f"under the {_gib_text(floor)} floor"
+            f"{_gib_text(available + pool)} was left free and reclaimable and "
+            f"the next prefill chunk needs {_gib_text(reserve)}, which would "
+            f"leave less than the {_gib_text(floor)} floor"
         )
-    message = (
-        "insufficient memory: the Mac ran out of memory it can hand out "
-        f"without compressing during this prefill ({cause}). The prefill "
-        "stopped before its next chunk; the engine shed its caches and stays "
-        "up. A retry can succeed once other apps give memory back: close some "
-        "apps and try again, or shorten the prompt."
-    )
+    if reason == "engine_limit":
+        message = (
+            "insufficient memory: this request needs more memory than the "
+            f"engine may use ({cause}). The prefill stopped before that chunk; "
+            "the engine released half of its session cache and stays up. A "
+            "retry is priced again against what is left: try again, or "
+            "shorten the prompt."
+        )
+    else:
+        message = (
+            "insufficient memory: the Mac ran out of memory it can hand out "
+            f"without compressing during this prefill ({cause}). The prefill "
+            "stopped before its next chunk; the engine shed its caches and "
+            "stays up. A retry can succeed once other apps give memory back: "
+            "close some apps and try again, or shorten the prompt."
+        )
     return HTTPException(
         status_code=507,
         detail={
@@ -19070,7 +19163,11 @@ def _prefill_system_abort_exception(
                 {
                     **dict(tripped),
                     "retry_can_succeed": True,
-                    "retry_when": "after_other_apps_free_memory",
+                    "retry_when": (
+                        "after_engine_sheds_cache"
+                        if reason == "engine_limit"
+                        else "after_other_apps_free_memory"
+                    ),
                 }
             ),
         },
@@ -19762,6 +19859,7 @@ def _prefill_admission_shed(
     restore_mode: str = "reference",
     commit_prompt_prefix: bool = False,
     restore_identity: dict[str, Any] | None = None,
+    pricing: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Price a request before its prefill; give back idle memory, or refuse.
 
@@ -19811,7 +19909,9 @@ def _prefill_admission_shed(
     A projection still over the limit, or a Mac still short of its floor,
     is refused before prefill with a structured 507 that names what holds
     the memory and whether a retry can succeed (``--allow-swap`` admits it
-    anyway). Returns the receipt when it acted, else None.
+    anyway). Returns the receipt when it acted, else None; either way the
+    growth model it settled on lands in ``pricing["growth"]`` (the per-chunk
+    check reserves its ``chunk_bytes`` before every forward).
     """
 
     if not _prefill_admission_shed_enabled():
@@ -19829,6 +19929,7 @@ def _prefill_admission_shed(
             restore_mode=restore_mode,
             commit_prompt_prefix=commit_prompt_prefix,
             restore_identity=restore_identity,
+            pricing=pricing,
         )
     except Exception as exc:  # noqa: BLE001
         # An admission guard that raises must not cost the request (the
@@ -19887,6 +19988,7 @@ def _run_prefill_admission(
     restore_mode: str,
     commit_prompt_prefix: bool,
     restore_identity: dict[str, Any] | None = None,
+    pricing: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
@@ -20001,7 +20103,12 @@ def _run_prefill_admission(
         model["scratch_source"] = scratch_source
         model["scratch_rows"] = int(max(1, rows))
         model["prefill_chunk_tokens"] = width
+        model["chunk_bytes"] = _admission_chunk_bytes(geometry, max(1, rows), scratch)
         return model
+
+    def settle(model: Mapping[str, Any]) -> None:
+        if pricing is not None:
+            pricing["growth"] = dict(model)
 
     def system_short(snapshot: Mapping[str, Any], growth_bytes: int, floor: str) -> int:
         return _system_admission_shortfall_bytes(
@@ -20034,7 +20141,9 @@ def _run_prefill_admission(
     # banked, at the request's own width. It bounds every split of this
     # prompt, so when it clears both lines the request is admitted without
     # probing the bank.
-    if shed_deficit(now, growth(0, True, None, widths[0])) <= 0:
+    cheap = growth(0, True, None, widths[0])
+    if shed_deficit(now, cheap) <= 0:
+        settle(cheap)
         return None
 
     reused_tokens = 0
@@ -20121,6 +20230,7 @@ def _run_prefill_admission(
     models = price()
     chosen = widest_fit(now, models)
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
+        settle(models[chosen])
         return None
     narrow = widths[-1]
     current = models[narrow if chosen is _ADMISSION_NO_FIT else chosen]
@@ -20336,6 +20446,7 @@ def _run_prefill_admission(
         if chosen is _ADMISSION_NO_FIT:
             chosen = narrow
     current = models[chosen]
+    settle(current)
     receipt["prefill_chunk_tokens"] = chosen
     receipt["growth"] = dict(current)
     receipt["reclamation_steps"] = steps
@@ -20651,13 +20762,15 @@ async def _memory_pressure_loop(
 
     The whole Mac (2026-09-27): the loop reads what the kernel can hand out
     without compressing (mtplx/system_memory.py) every 10 s, every 2 s while
-    that supply is under its shed floor, and keeps the previous reading so
-    free pages under the abort floor while the compressor or swap grew in
-    between (the death signature of the crash receipts) reads CRITICAL. A
-    WARNING from that supply waits for an idle engine like the others: the
-    admission already priced the running request to stay above the abort
-    floor, so a dip under the shed floor while it runs is expected, and
-    trimming then only disturbs the request. A WARNING trim halves what the
+    that supply is under its shed floor, and keeps the readings of the last
+    ten seconds so free pages under the abort floor while the compressor or
+    swap grew fast since any of them (the death signature of the crash
+    receipts) reads CRITICAL. A WARNING from that supply waits for an idle
+    engine like the others: the admission already priced the running request
+    to stay above the abort floor, so a dip under the shed floor while it
+    runs is expected, and trimming then only disturbs the request. Within a
+    request, the per-chunk check reserves the next chunk against the abort
+    floor and the engine's limit. A WARNING trim halves what the
     bank holds, not its budget, so it cannot be a no-op when the bank already
     sits under half (#525: 421 WARNING trims in a row evicted nothing). The
     sustained abort still needs three CRITICAL ticks; within a request, the
@@ -20668,7 +20781,7 @@ async def _memory_pressure_loop(
     guard = _MemoryPressureGuard()
     abort_streak = 0
     system_level = 1
-    previous_system_memory = None
+    system_window = _SystemReadingWindow()
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
@@ -20694,14 +20807,14 @@ async def _memory_pressure_loop(
             # the macOS level stays "normal" until the swap storm has begun.
             # It only ever raises the level.
             system_memory = _read_system_memory()
+            earlier_system_memory = system_window.readings()
             system_level = _system_pressure_level(
-                system_memory, previous_system_memory
+                system_memory, earlier_system_memory
             )
             system_thrashing = _system_memory_thrashing(
-                system_memory, previous_system_memory
+                system_memory, earlier_system_memory
             )
-            if system_memory is not None:
-                previous_system_memory = system_memory
+            system_window.add(system_memory)
             if system_level > level:
                 level = system_level
                 level_source = "system_available"
@@ -27086,6 +27199,7 @@ def _run_generation(
                 )
                 if _wide_chunk_receipt and request_observability is not None:
                     request_observability["prefill_wide_chunk"] = _wide_chunk_receipt
+            admission_pricing: dict[str, Any] = {}
             admission_shed = _prefill_admission_shed(
                 state,
                 prompt_ids=prompt_ids,
@@ -27111,6 +27225,7 @@ def _run_generation(
                     "draft_head_identity": session_draft_head_identity,
                     "policy_fingerprint": session_policy_fingerprint,
                 },
+                pricing=admission_pricing,
             )
             if admission_shed is not None and request_observability is not None:
                 request_observability["prefill_admission_shed"] = admission_shed
@@ -27138,7 +27253,33 @@ def _run_generation(
             request_env = dict(dynamic_kv_reservation["env"])
             if prompt_publish_skipped:
                 request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
-            prefill_system_guard = _PrefillSystemGuard(state)
+            try:
+                prefill_chunk_reserve = _prefill_chunk_reserve_bytes(
+                    state,
+                    prompt_tokens=len(prompt_ids),
+                    chunk_tokens=prefill_chunk_tokens,
+                    priced=admission_pricing.get("growth"),
+                )
+            except Exception as _reserve_exc:  # noqa: BLE001
+                # Like the admission itself: a guard that cannot price the
+                # chunk must not cost the request, and must not pass
+                # silently. The check still runs, reserving nothing.
+                prefill_chunk_reserve = 0
+                _reserve_error = {
+                    "action": "prefill_chunk_reserve_error",
+                    "error": repr(_reserve_exc),
+                }
+                _record_guard_event(state, _reserve_error)
+                try:
+                    print(
+                        "[mtplx] memory guard " + json.dumps(_reserve_error),
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            prefill_system_guard = _PrefillSystemGuard(
+                state, chunk_reserve_bytes=prefill_chunk_reserve
+            )
 
             def _prefill_abort_check() -> bool:
                 if cancel_event is not None and cancel_event.is_set():

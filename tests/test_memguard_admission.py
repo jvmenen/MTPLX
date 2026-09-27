@@ -672,7 +672,17 @@ class TestPerChunkSupplyCheck:
             monotonic_s=at_s,
         )
 
-    def _guard(self, monkeypatch, readings, *, pool_gib=0.0):
+    def _guard(
+        self,
+        monkeypatch,
+        readings,
+        *,
+        pool_gib=0.0,
+        active_gib=80.0,
+        limit_gib=None,
+        allow_swap=False,
+        **guard_kwargs,
+    ):
         sequence = iter(readings)
         last = [None]
 
@@ -688,10 +698,15 @@ class TestPerChunkSupplyCheck:
         monkeypatch.setattr(
             srv,
             "_mlx_memory_stats_live",
-            lambda: {"ok": True, "active_memory_bytes": 80 * GIB,
+            lambda: {"ok": True, "active_memory_bytes": int(active_gib * GIB),
                      "cache_memory_bytes": int(pool_gib * GIB)},
         )
-        return srv._PrefillSystemGuard(SimpleNamespace(dashboard=SimpleNamespace()))
+        # No host memory past the allowance: the engine line is MLX's own.
+        monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+        state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=allow_swap)
+        if limit_gib is not None:
+            state.metal_memory_caps = {"memory_limit_bytes": int(limit_gib * GIB)}
+        return srv._PrefillSystemGuard(state, **guard_kwargs)
 
     def test_a_supply_drop_stops_the_prefill_before_the_next_chunk(self, monkeypatch):
         guard = self._guard(
@@ -729,10 +744,122 @@ class TestPerChunkSupplyCheck:
         assert guard.tripped["reason"] == "death_signature"
 
     def test_an_unreadable_machine_never_trips(self, monkeypatch):
-        monkeypatch.setattr(sm, "_reader", lambda: None)
-        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
-        guard = srv._PrefillSystemGuard(SimpleNamespace())
+        guard = self._guard(monkeypatch, [None])
         assert guard() is False
+
+    def test_steady_compression_in_small_steps_trips_over_the_window(self, monkeypatch):
+        """Review of 9c96dd9c: the check replaced its previous reading every
+        time, so the compressor growing 320 MiB/s for five seconds in 80 MiB
+        steps never grew 256 MiB between two readings and never tripped.
+        Measured from every reading of the last ten seconds, it trips once
+        320 MiB have accumulated, a second in."""
+
+        step = 80 / 1024
+        readings = [
+            self._reading(
+                available_gib=20, free_gib=0.3, compressor_gib=10 + i * step, at_s=i * 0.25
+            )
+            for i in range(21)
+        ]
+        guard = self._guard(monkeypatch, readings)
+        results = [guard() for _ in readings]
+        assert True in results
+        assert results.index(True) == 4
+        assert guard.tripped["reason"] == "death_signature"
+        assert guard.tripped["interval_s"] == 1.0
+
+    def test_a_mac_at_its_free_page_floor_at_rest_never_trips(self, monkeypatch):
+        """The validation rerun of 54e01d1f (128 GB, 12 GB of other apps):
+        free pages sat at the kernel's floor, under the abort floor, for the
+        whole run while the compressor moved about 1 GB. Twenty seconds of
+        that, with a 100 MiB burst in one step, is not the signature."""
+
+        readings = []
+        compressor = 2.84
+        for i in range(100):
+            compressor += 20 / 1024 * 0.2 + (100 / 1024 if i == 50 else 0.0)
+            readings.append(
+                self._reading(
+                    available_gib=16, free_gib=3.8, compressor_gib=compressor, at_s=i * 0.2
+                )
+            )
+        guard = self._guard(monkeypatch, readings)
+        assert [guard() for _ in readings] == [False] * len(readings)
+
+    def test_the_next_chunk_is_reserved_before_it_allocates(self, monkeypatch):
+        """10 GiB free and reclaimable against a 5.5 GiB floor (88 GiB
+        wired): a chunk that allocates 4.6 GiB would leave 5.4 GiB, so the
+        prefill stops before it; a 4.4 GiB chunk leaves 5.6 GiB and runs."""
+
+        reading = self._reading(available_gib=10, free_gib=3, compressor_gib=3, at_s=0.0)
+        tight = self._guard(monkeypatch, [reading], chunk_reserve_bytes=int(4.6 * GIB))
+        assert tight() is True
+        assert tight.tripped["reason"] == "under_abort_floor"
+        assert tight.tripped["chunk_reserve_bytes"] == int(4.6 * GIB)
+        roomy = self._guard(monkeypatch, [reading], chunk_reserve_bytes=int(4.4 * GIB))
+        assert roomy() is False
+
+    def test_an_under_priced_request_stops_at_the_engines_limit(self, monkeypatch):
+        """The engine at 90 GiB of a 96 GiB limit with the Mac roomy: a
+        7 GiB chunk would take it past the limit, where MLX allocates anyway
+        and macOS compresses for minutes (#450). An admission that
+        under-priced the request stops here, before the chunk."""
+
+        reading = self._reading(available_gib=30, free_gib=20, compressor_gib=3, at_s=0.0)
+        guard = self._guard(
+            monkeypatch,
+            [reading],
+            active_gib=90,
+            limit_gib=96,
+            chunk_reserve_bytes=7 * GIB,
+        )
+        assert guard() is True
+        assert guard.tripped["reason"] == "engine_limit"
+        assert guard.tripped["engine_bytes"] == 90 * GIB
+        assert guard.tripped["limit_bytes"] == 96 * GIB
+        fits = self._guard(
+            monkeypatch,
+            [reading],
+            active_gib=90,
+            limit_gib=96,
+            chunk_reserve_bytes=5 * GIB,
+        )
+        assert fits() is False
+
+    def test_the_engine_line_leaves_the_pool_out(self, monkeypatch):
+        """MLX hands pooled buffers back before it allocates past its limit,
+        so 8 GiB of pool on 90 GiB active is not over a 96 GiB limit."""
+
+        reading = self._reading(available_gib=30, free_gib=20, compressor_gib=3, at_s=0.0)
+        guard = self._guard(
+            monkeypatch,
+            [reading],
+            active_gib=90,
+            pool_gib=8,
+            limit_gib=96,
+            chunk_reserve_bytes=5 * GIB,
+        )
+        assert guard() is False
+
+    def test_the_engine_line_holds_without_a_machine_reading(self, monkeypatch):
+        guard = self._guard(monkeypatch, [None], active_gib=97, limit_gib=96)
+        assert guard() is True
+        assert guard.tripped["reason"] == "engine_limit"
+        assert guard.tripped["system_memory"] is None
+
+    def test_allow_swap_is_the_operators_choice_here_too(self, monkeypatch):
+        """--allow-swap admits past every line at admission; the per-chunk
+        check used to stop the same request a chunk later."""
+
+        guard = self._guard(
+            monkeypatch,
+            [self._reading(available_gib=1, free_gib=0.5, compressor_gib=4, at_s=0.0)],
+            active_gib=97,
+            limit_gib=96,
+            allow_swap=True,
+        )
+        assert guard() is False
+        assert guard.tripped is None
 
     def test_it_plugs_into_the_prefills_abort_site(self, monkeypatch):
         from mtplx.generation import PostcommitAbort, _check_postcommit_abort
@@ -761,6 +888,23 @@ class TestPerChunkSupplyCheck:
         assert "stopped before its next chunk" in error.detail["message"]
         assert "compressor grew 2.0 GiB" in error.detail["message"]
         assert error.detail["memory"]["reason"] == "death_signature"
+
+    def test_the_engine_limit_abort_says_what_it_needed(self, monkeypatch):
+        guard = self._guard(
+            monkeypatch,
+            [self._reading(available_gib=30, free_gib=20, compressor_gib=3, at_s=0.0)],
+            active_gib=90,
+            limit_gib=96,
+            chunk_reserve_bytes=7 * GIB,
+        )
+        guard()
+        monkeypatch.setattr(srv, "_shed_after_allocation_failure", lambda state: {})
+        error = srv._prefill_system_abort_exception(SimpleNamespace(), guard.tripped)
+        assert error.status_code == 507
+        assert "the engine held 90.0 GiB" in error.detail["message"]
+        assert "needs 7.0 GiB, past its 96.0 GiB limit" in error.detail["message"]
+        assert "other apps" not in error.detail["message"]
+        assert error.detail["memory"]["retry_when"] == "after_engine_sheds_cache"
 
 
 class _LoopBank:
@@ -829,6 +973,46 @@ class TestPressureLoop:
         _run_loop(state, monkeypatch, seconds=0.2, interval_s=0.01)
         # Each reading alone reads normal (20 GiB of file cache); the second
         # against the first is the crash receipts' shape.
+        assert (0, "memory_pressure_critical") in bank.calls
+        trims = [e for e in events if e["action"] == "pressure_trim"]
+        assert trims and trims[0]["system_thrashing"] is True
+
+    def test_steady_compression_between_ticks_is_critical_over_the_window(
+        self, monkeypatch
+    ):
+        """80 MiB of compressor growth per reading never reached 256 MiB
+        between two ticks; over the loop's ten-second window it is 320 MiB/s
+        and reads CRITICAL."""
+
+        events: list[dict] = []
+        monkeypatch.setattr(
+            srv, "_record_guard_event", lambda state, payload: events.append(payload)
+        )
+        step = 80 / 1024
+        readings = [
+            TestPerChunkSupplyCheck._reading(
+                None,
+                available_gib=20,
+                free_gib=0.3,
+                compressor_gib=10 + i * step,
+                at_s=i * 0.25,
+            )
+            for i in range(12)
+        ]
+        sequence = iter(readings)
+        last = [None]
+
+        def reader():
+            try:
+                last[0] = next(sequence)
+            except StopIteration:
+                pass
+            return last[0]
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
+        state = _loop_state(bank)
+        _run_loop(state, monkeypatch, seconds=0.3, interval_s=0.01)
         assert (0, "memory_pressure_critical") in bank.calls
         trims = [e for e in events if e["action"] == "pressure_trim"]
         assert trims and trims[0]["system_thrashing"] is True
@@ -1104,7 +1288,7 @@ class TestValidationTurn:
     that. The chunk width is the first lever: a narrower forward is cheaper
     than anyone's state."""
 
-    def _admit(self, monkeypatch, *, free: int, file_backed: int):
+    def _admit(self, monkeypatch, *, free: int, file_backed: int, **admission_kwargs):
         monkeypatch.setattr(
             srv,
             "_admission_scratch_bytes",
@@ -1130,6 +1314,7 @@ class TestValidationTurn:
                 session_id="anon-julian",
                 prefill_chunk_tokens=4096,
                 restore_mode="clone",
+                **admission_kwargs,
             )
         finally:
             session.end_generation()
@@ -1185,6 +1370,104 @@ class TestValidationTurn:
         assert receipt["system_shortfall_bytes_after"] == 100_000_000
         assert receipt["prefill_chunk_tokens"] == 2048
         assert receipt["system_abort_floor_bytes_after"] == V_ABORT
+
+    def test_the_admission_hands_its_chunk_to_the_per_chunk_check(self, monkeypatch):
+        """The per-chunk check reserves what the admission priced for one
+        forward: the 2,048-row chunk it narrowed to, with that chunk's
+        scratch, not the 4,096-row one it was asked for."""
+
+        pricing: dict = {}
+        receipt, manager, _source = self._admit(
+            monkeypatch, free=V_FREE, file_backed=V_FILE_BACKED, pricing=pricing
+        )
+        assert receipt["prefill_chunk_tokens"] == 2048
+        narrow = 2048 * FN_ROW + V_SCRATCH_NARROW
+        assert pricing["growth"]["chunk_bytes"] == narrow
+        assert pricing["growth"] == receipt["growth"]
+        assert (
+            srv._prefill_chunk_reserve_bytes(
+                _flash_next_state(manager),
+                prompt_tokens=V_PROMPT,
+                chunk_tokens=4096,
+                priced=pricing["growth"],
+            )
+            == narrow
+        )
+
+    def test_an_admission_with_nothing_to_do_still_hands_its_bill(self, monkeypatch):
+        """A roomy Mac: nothing is probed or reclaimed, and the bill is the
+        cheap worst case the admission cleared (the whole prompt new, at the
+        requested chunk)."""
+
+        pricing: dict = {}
+        monkeypatch.setattr(
+            srv,
+            "_admission_scratch_bytes",
+            lambda state, *, rows, prompt_tokens, geometry: (
+                V_SCRATCH_WIDE if rows > 2048 else V_SCRATCH_NARROW,
+                "qsa_itemized",
+            ),
+        )
+        monkeypatch.setattr(
+            sm, "_reader", lambda: _v_reading(free=20_000_000_000, file_backed=V_FILE_BACKED)
+        )
+        manager = _manager()
+        machine = _Machine(manager.bank, base_gib=84.0, cache_gib=1.0, host_gib=6.0)
+        _install(monkeypatch, machine)
+        receipt = srv._prefill_admission_shed(
+            _flash_next_state(manager),
+            prompt_ids=list(range(V_PROMPT)),
+            session_bank=manager.bank,
+            session_id="anon-julian",
+            prefill_chunk_tokens=4096,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        assert receipt is None
+        assert pricing["growth"]["prefill_chunk_tokens"] == 4096
+        assert pricing["growth"]["chunk_bytes"] == 4096 * FN_ROW + V_SCRATCH_WIDE
+
+    def test_without_the_admissions_bill_the_widest_forward_is_reserved(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            srv,
+            "_admission_scratch_bytes",
+            lambda state, *, rows, prompt_tokens, geometry: (
+                V_SCRATCH_WIDE if rows > 2048 else V_SCRATCH_NARROW,
+                "qsa_itemized",
+            ),
+        )
+        state = _flash_next_state(_manager())
+        assert (
+            srv._prefill_chunk_reserve_bytes(
+                state, prompt_tokens=V_PROMPT, chunk_tokens=4096, priced=None
+            )
+            == 4096 * FN_ROW + V_SCRATCH_WIDE
+        )
+        # A prompt shorter than the chunk is one forward of its own rows.
+        assert (
+            srv._prefill_chunk_reserve_bytes(
+                state, prompt_tokens=1000, chunk_tokens=4096, priced=None
+            )
+            == 1000 * FN_ROW + V_SCRATCH_NARROW
+        )
+
+    def test_the_request_arms_its_check_with_that_bill(self):
+        import inspect
+
+        src = inspect.getsource(srv._run_generation)
+        admitted = src.index("admission_shed = _prefill_admission_shed(")
+        handed = src.index("pricing=admission_pricing,")
+        narrowed = src.index(
+            'prefill_chunk_tokens = int(admission_shed["prefill_chunk_tokens"])'
+        )
+        reserved = src.index('priced=admission_pricing.get("growth"),')
+        armed = src.index(
+            "prefill_system_guard = _PrefillSystemGuard(\n"
+            "                state, chunk_reserve_bytes=prefill_chunk_reserve"
+        )
+        assert admitted < handed < narrowed < reserved < armed
 
     def test_the_chosen_width_reaches_the_prefill(self):
         """The admission's width is the one the prefill runs: generation
