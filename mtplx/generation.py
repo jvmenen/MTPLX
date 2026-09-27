@@ -2114,6 +2114,42 @@ def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
     return "contiguous_then_repage"
 
 
+def prefill_forward_widths(
+    rt: Any, prompt_tokens: int, requested: int | None
+) -> list[int | None]:
+    """The rows one prefill forward of this runtime may run, widest first.
+
+    ``None`` is the uncached part of the prompt in one forward. A backend
+    that runs its own prefill answers for itself
+    (``rt.prefill_forward_widths``: Gemma 4 forwards the whole prompt). This
+    module's prefill loops forward the whole prompt unless sustained prefill
+    is on, and then run ``requested`` (a caller's chunk,
+    ``--prefill-chunk-tokens``, the Flash-Next wide chunk) or the profile's
+    chunk when that is narrower: the width a request can be narrowed to
+    (``prefill_chunk_size_override``).
+    """
+
+    own = getattr(rt, "prefill_forward_widths", None)
+    if callable(own):
+        return list(own(int(prompt_tokens), requested))
+    if not _sustained_prefill_enabled():
+        return [None]
+    default = max(1, int(_prefill_chunk_size(prompt_tokens)))
+    first = max(1, int(requested)) if requested else default
+    return [first, default] if default < first else [first]
+
+
+def prefill_cache_layout(rt: Any, context_tokens: int) -> str:
+    """The cache layout a prefill of ``context_tokens`` gets on this runtime:
+    the backend's own answer when it builds its own caches
+    (``rt.prefill_cache_layout``), else the sustained-prefill layout."""
+
+    own = getattr(rt, "prefill_cache_layout", None)
+    if callable(own):
+        return str(own(int(context_tokens)))
+    return _sustained_prefill_layout(context_tokens)
+
+
 _DENSE_AUTO_ANNOUNCED: Any = False
 
 
@@ -8265,6 +8301,7 @@ def generate_ar(
             trace_metadata=trace_metadata,
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
+            abort_check=abort_check,
         )
     counter_start = _runtime_counter_snapshot(rt)
     rng = np.random.default_rng(seed)
@@ -9554,6 +9591,7 @@ def generate_mtpk(
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
             requested_speculative_depth=requested_block_size,
+            abort_check=abort_check,
         )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")

@@ -19077,7 +19077,9 @@ def _prefill_chunk_reserve_bytes(
         return max(0, int(priced["chunk_bytes"]))
     geometry = _admission_geometry(state)
     prompt_tokens = max(1, int(prompt_tokens))
-    width = _admission_prefill_widths(prompt_tokens, chunk_tokens)[0]
+    width = _admission_prefill_widths(
+        getattr(state, "runtime", None), prompt_tokens, chunk_tokens
+    )[0]
     rows = prompt_tokens if width is None else min(prompt_tokens, int(width))
     scratch, _source = _admission_scratch_bytes(
         state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
@@ -19373,6 +19375,11 @@ class _AdmissionGeometry:
     ``paged_bytes_per_token`` is the paged layout's width (quantized when KV
     quantization is on). Both carry the family's per-token working set that
     the KV term misses (QSA streams, the MTP head's KV).
+    ``resident_bytes_per_token`` and ``resident_fixed_bytes`` are what a
+    contiguous cache keeps per token once decode runs, when the backend says
+    it is less than what the prefill writes: Gemma 4's sliding layers hold
+    every prompt row after a prefill forward but only their window once
+    decode trims them (unset: the live width, nothing fixed).
     """
 
     live_bytes_per_token: int
@@ -19380,6 +19387,14 @@ class _AdmissionGeometry:
     context_transient_bytes_per_token: int
     flat_transient_bytes: int
     weights_bytes: int
+    resident_bytes_per_token: int | None = None
+    resident_fixed_bytes: int = 0
+
+    @property
+    def resident_width(self) -> int:
+        if self.resident_bytes_per_token is None:
+            return int(self.live_bytes_per_token)
+        return int(self.resident_bytes_per_token)
 
 
 def _admission_geometry(state: Any) -> _AdmissionGeometry:
@@ -19394,6 +19409,13 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
     kv_paged = int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
     kv_live = max(kv_paged, int(getattr(plan, "kv_bytes_per_token", 0) or 0))
     aux = int(getattr(plan, "aux_bytes_per_token", 0) or 0)
+    # A backend that builds its own caches says what they keep once decode
+    # runs (Gemma 4: the full-attention layers per token, the sliding
+    # windows as a fixed part); the planner's figure counts every layer.
+    runtime = getattr(state, "runtime", None)
+    resident_fn = getattr(runtime, "resident_kv_bytes_per_token", None)
+    window_fn = getattr(runtime, "window_cache_bytes", None)
+    resident = int(resident_fn()) + aux if callable(resident_fn) else None
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
         paged_bytes_per_token=kv_paged + aux,
@@ -19402,10 +19424,19 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         ),
         flat_transient_bytes=flat,
         weights_bytes=int(getattr(plan, "model_weights_bytes", 0) or 0),
+        resident_bytes_per_token=resident,
+        resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
     )
 
 
 def _runtime_text_args(runtime: Any) -> Any:
+    # A backend that wraps its own target names its text config (Gemma 4's
+    # runtime has no ``model``; its adapter holds the text model).
+    own = getattr(runtime, "text_args", None)
+    if callable(own):
+        args = own()
+        if args is not None:
+            return args
     model = getattr(runtime, "model", None)
     text = getattr(model, "language_model", model)
     args = getattr(text, "args", None)
@@ -19467,10 +19498,26 @@ def _forward_row_bytes(args: Any) -> int | None:
         return None
     kv_heads = value("num_key_value_heads") or heads
     head_dim = value("head_dim") or hidden // heads
-    queries = heads * head_dim
-    rows = [2 * (hidden + 2 * queries + 2 * kv_heads * head_dim + queries + hidden)]
+
+    def attention(head_size: int, kv: int, kv_arrays: int) -> int:
+        queries = heads * head_size
+        return 2 * (hidden + 2 * queries + kv_arrays * kv * head_size + queries + hidden)
+
+    rows = [attention(head_dim, kv_heads, 2)]
+    # Gemma 4's full-attention layers: their own head size and KV heads,
+    # and one array for keys and values when they are the same.
+    global_head_dim = value("global_head_dim")
+    if global_head_dim > 0:
+        k_eq_v = bool(getattr(args, "attention_k_eq_v", False))
+        global_kv = (value("num_global_key_value_heads") if k_eq_v else 0) or kv_heads
+        rows.append(attention(global_head_dim, global_kv, 1 if k_eq_v else 2))
     intermediate = value("intermediate_size")
     if intermediate > 0:
+        if bool(getattr(args, "use_double_wide_mlp", False)) and value(
+            "num_kv_shared_layers"
+        ) > 0:
+            # The KV-shared layers run a double-width MLP (Gemma 4 E-series).
+            intermediate *= 2
         rows.append(2 * (hidden + 3 * intermediate))
     qk = 2 * value("linear_num_key_heads") * value("linear_key_head_dim")
     v = value("linear_num_value_heads") * value("linear_value_head_dim")
@@ -19522,17 +19569,28 @@ def _admission_scratch_bytes(
         return max(1, int(bill["transient_bytes"])), source
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
+    # A backend that builds attention masks as arrays says how large one
+    # forward's is (Gemma 4's sliding layers: rows x (cached window + rows)
+    # booleans). Charged twice: the mask lives for the whole forward, and
+    # building it holds one more array of its size.
+    mask_fn = getattr(runtime, "prefill_mask_bytes", None)
+    mask = (
+        2 * int(mask_fn(rows, max(0, int(prompt_tokens) - rows)))
+        if callable(mask_fn)
+        else 0
+    )
+    suffix = "+mask" if mask else ""
     row_bytes = (
         _forward_row_bytes(_runtime_text_args(runtime)) if runtime is not None else None
     )
     if not row_bytes:
-        return flat_share, "flat_per_row"
+        return flat_share + mask, "flat_per_row" + suffix
     per_row = _ADMISSION_LIVE_LAYERS * int(row_bytes)
     fixed = max(
         _ADMISSION_FIXED_FLOOR_BYTES,
         flat - per_row * _ADMISSION_FLAT_TRANSIENT_ROWS,
     )
-    return max(fixed + per_row * rows, flat_share), "geometry"
+    return max(fixed + per_row * rows, flat_share) + mask, "geometry" + suffix
 
 
 def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
@@ -19617,10 +19675,14 @@ def _admission_growth(
     paged_live = repages or leased_paged or not contiguous
     out_rows = max(0, int(output_tokens)) if paged_live else 0
     if contiguous and not leased_paged:
-        row_width = live_w
-        live_prefill = new_rows * live_w
+        # A restored prefix is what the banked cache keeps (the resident
+        # width); the rows this prefill writes are at full width.
+        row_width = geometry.resident_width
+        restore_fixed = int(geometry.resident_fixed_bytes) if restore_rows else 0
+        live_prefill = restore_rows * row_width + restore_fixed + M * live_w
     else:
         row_width = paged_w
+        restore_fixed = 0
         live_prefill = (new_rows + out_rows) * paged_w
     context_transient = (
         P * max(0, int(geometry.context_transient_bytes_per_token)) if M > 0 else 0
@@ -19637,14 +19699,14 @@ def _admission_growth(
         live_total = (P + out_rows) * paged_w
     else:
         live_decode = live_prefill
-        live_total = P * live_w
+        live_total = P * geometry.resident_width + int(geometry.resident_fixed_bytes)
     publish_copy = live_total if publish else 0
     decode_start = live_decode + publish_copy
     return {
         "layout": layout,
         "reused_tokens": int(R),
         "miss_tokens": int(M),
-        "restore_copy_bytes": int(restore_rows * row_width),
+        "restore_copy_bytes": int(restore_rows * row_width + restore_fixed),
         "live_prefill_bytes": int(live_prefill),
         "context_transient_bytes": int(context_transient),
         "scratch_bytes": int(scratch),
@@ -19955,25 +20017,22 @@ _ADMISSION_NO_FIT = object()
 
 
 def _admission_prefill_widths(
-    prompt_tokens: int, requested: int | None
+    runtime: Any, prompt_tokens: int, requested: int | None
 ) -> list[int | None]:
-    """The rows one prefill forward may run for this request, widest first.
+    """The rows one prefill forward may run for this request, widest first,
+    as the runtime runs them (``generation.prefill_forward_widths``).
 
-    ``None`` is a prompt forwarded whole: without chunked prefill the
-    generation loop runs one forward over every uncached token, and no chunk
-    override reaches it. Chunked, the request's own width comes first (the
-    Flash-Next wide chunk, a caller's override, ``--prefill-chunk-tokens``)
-    and then the profile's chunk when it is narrower: the width is a lever
-    the admission pulls before it evicts anyone's state or refuses.
+    ``None`` is the uncached part of the prompt forwarded whole: the
+    generation loop without chunked prefill, and Gemma 4 always. Chunked,
+    the request's own width comes first (the Flash-Next wide chunk, a
+    caller's override, ``--prefill-chunk-tokens``) and then the profile's
+    chunk when it is narrower: the width is a lever the admission pulls
+    before it evicts anyone's state or refuses.
     """
 
-    from mtplx.generation import _prefill_chunk_size, _sustained_prefill_enabled
+    from mtplx.generation import prefill_forward_widths
 
-    if not _sustained_prefill_enabled():
-        return [None]
-    default = max(1, int(_prefill_chunk_size(prompt_tokens)))
-    first = max(1, int(requested)) if requested else default
-    return [first, default] if default < first else [first]
+    return prefill_forward_widths(runtime, prompt_tokens, requested)
 
 
 def _run_prefill_admission(
@@ -19994,7 +20053,7 @@ def _run_prefill_admission(
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
         _store_on_prefill_min_suffix,
-        _sustained_prefill_layout,
+        prefill_cache_layout,
     )
 
     prompt_tokens = len(prompt_ids)
@@ -20052,8 +20111,9 @@ def _run_prefill_admission(
         return None
     geometry = _admission_geometry(state)
     threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
-    layout = _sustained_prefill_layout(prompt_tokens)
-    widths = _admission_prefill_widths(prompt_tokens, prefill_chunk_tokens)
+    runtime = getattr(state, "runtime", None)
+    layout = prefill_cache_layout(runtime, prompt_tokens)
+    widths = _admission_prefill_widths(runtime, prompt_tokens, prefill_chunk_tokens)
     output_tokens = int(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
@@ -20062,7 +20122,15 @@ def _run_prefill_admission(
     per_session_cap = getattr(session_bank, "per_session_max_bytes", None)
     flags = {"skip_publish": False}
 
+    own_snapshot = bool(getattr(runtime, "keeps_prompt_snapshot_with_bank", False))
+
     def publishes(miss: int) -> bool:
+        if own_snapshot:
+            # The backend clones the prompt cache before decode whenever it
+            # will bank the turn; neither store-on-prefill nor the
+            # prompt-prefix commit decides it, so skipping them saves
+            # nothing here.
+            return session_bank is not None
         if session_bank is None or flags["skip_publish"]:
             return False
         stored = store_on_prefill and miss >= store_min_suffix
@@ -20213,7 +20281,7 @@ def _run_prefill_admission(
         else True
     )
     source_layout = (
-        _sustained_prefill_layout(reused_tokens)
+        prefill_cache_layout(runtime, reused_tokens)
         if reused_tokens > 0 and not copies
         else None
     )
