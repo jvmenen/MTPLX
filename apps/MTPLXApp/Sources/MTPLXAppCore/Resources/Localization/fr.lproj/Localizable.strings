@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "un serveur MTPLX démarré hors de l'application";
 "Another AIME run is already active." = "Une autre session AIME est déjà active.";
 "another app" = "une autre application";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "Un autre serveur MTPLX occupe le port %@ (pid %@) ; cette application n'y est pas connectée.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "Un autre serveur MTPLX occupe le port %@ ; cette application n'y est pas connectée.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "Un autre processus provoque une pression mémoire sur ce Mac. Le décodage peut fléchir pendant le pic ; l'empreinte propre du moteur reste stable et rien n'a été expulsé.";
 "ANSWER" = "RÉPONSE";
 "API key" = "Clé d'API";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLX n'est pas en cours d'exécution.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX exécute ce modèle. Changez de modèle ou arrêtez MTPLX d'abord.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX est en cours d'exécution, mais OpenCode Desktop est introuvable dans /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX est en cours d'exécution. Connexion aux statistiques en direct…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX est en cours d'exécution. Reconnexion des statistiques en direct (tentative %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX est en cours d'exécution. Statistiques en direct indisponibles : %@";
 "MTPLX is unreachable — is it running?" = "MTPLX est inaccessible — est-il en cours d'exécution ?";
 "MTPLX is up, checking health." = "MTPLX est démarré, vérification de l'état.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX n'est pas en cours d'exécution. Cliquez sur le bouton de lecture pour démarrer un modèle.";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "Exécution des premiers tokens d'échauffement avant l'ouverture de la discussion.";
 "Running tool…" = "Exécution de l'outil…";
 "Running your new model on this Mac to see how fast it actually is." = "Exécution de votre nouveau modèle sur ce Mac pour mesurer sa vitesse réelle.";
+"Running · connecting live stats" = "En cours d'exécution · connexion aux statistiques en direct";
+"Running · live stats unavailable" = "En cours d'exécution · statistiques en direct indisponibles";
+"Running · reconnecting live stats" = "En cours d'exécution · reconnexion des statistiques en direct";
 "Running." = "En cours d'exécution.";
 "Running. Waiting for stats." = "En cours d'exécution. En attente des statistiques.";
 "running…" = "en cours…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "L'allocateur s'est brièvement approché de son plafond (ce qui arrive lors d'un pic de pré-remplissage). Rien n'a été expulsé ; les caches cèdent leur place au SSD avant tout swap si la situation persiste.";
 "The app is closing the model server and restoring fans." = "L'application ferme le serveur de modèle et rétablit les ventilateurs.";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "La construction télécharge le modèle et écrit une copie convertie. Libérez de l'espace disque ou choisissez un modèle plus petit.";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "La modification n'a pas pu être appliquée ; MTPLX fonctionne toujours avec les réglages précédents : %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "Le téléchargement n'a pas pu joindre Hugging Face. Vérifiez la connexion réseau et réessayez.";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "Le téléchargement n'a pas pu joindre Hugging Face. Vérifiez la connexion réseau et réessayez. Si huggingface.co est bloqué sur votre réseau, définissez un miroir de téléchargement HF dans Réglages sous Avancé, par exemple https://hf-mirror.com.";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "Le moteur a vidé ses caches pour éviter le swap. La vitesse est préservée, mais les tours chauds seront restaurés depuis le SSD.";

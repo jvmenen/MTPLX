@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "一个在应用外启动的 MTPLX 服务器";
 "Another AIME run is already active." = "另一个 AIME 运行已在进行中。";
 "another app" = "另一个应用";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "另一个 MTPLX 服务器占用了端口 %@（pid %@）；此应用未连接到它。";
+"Another MTPLX server holds port %@; this app is not connected to it." = "另一个 MTPLX 服务器占用了端口 %@；此应用未连接到它。";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "另一个进程正使这台 Mac 陷入内存压力。峰值期间解码速度可能下降；引擎自身的内存占用保持稳定，未逐出任何内容。";
 "ANSWER" = "答案";
 "API key" = "API 密钥";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLX 未在运行。";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX 正在运行此模型。请先切换模型或停止 MTPLX。";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX 正在运行，但未在 /Applications/OpenCode.app 找到 OpenCode Desktop。";
+"MTPLX is running. Connecting to live stats…" = "MTPLX 正在运行。正在连接实时统计…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX 正在运行。实时统计正在重新连接（第 %lld 次尝试）。";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX 正在运行。实时统计不可用：%@";
 "MTPLX is unreachable — is it running?" = "无法连接到 MTPLX — 它正在运行吗？";
 "MTPLX is up, checking health." = "MTPLX 已启动，正在检查运行状况。";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX 未在运行。点按播放按钮以启动模型。";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "在聊天打开前运行首批预热词元。";
 "Running tool…" = "正在运行工具…";
 "Running your new model on this Mac to see how fast it actually is." = "在这台 Mac 上运行你的新模型以测试其实际速度。";
+"Running · connecting live stats" = "运行中 · 正在连接实时统计";
+"Running · live stats unavailable" = "运行中 · 实时统计不可用";
+"Running · reconnecting live stats" = "运行中 · 正在重新连接实时统计";
 "Running." = "运行中。";
 "Running. Waiting for stats." = "运行中。正在等待统计数据。";
 "running…" = "正在运行…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "分配器曾短暂接近其上限（预填充峰值会导致此情况）。尚未逐出任何内容；若保持在此状态，缓存将在发生任何交换之前让位给 SSD。";
 "The app is closing the model server and restoring fans." = "应用正在关闭模型服务器并恢复风扇转速。";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "构建过程会下载模型并写入转换后的副本。请释放磁盘空间或选择较小的模型。";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "无法应用此更改，因此 MTPLX 仍在使用之前的设置运行：%@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "下载无法连接 Hugging Face。请检查网络连接并重试。";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "下载无法连接 Hugging Face。请检查网络连接并重试。如果 huggingface.co 在你的网络中受阻，可在“设置”中的“高级”下设置 HF 下载镜像，例如 https://hf-mirror.com。";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "引擎已清空缓存以避免使用交换空间。速度不受影响，但热会话的后续轮次将从 SSD 恢复。";

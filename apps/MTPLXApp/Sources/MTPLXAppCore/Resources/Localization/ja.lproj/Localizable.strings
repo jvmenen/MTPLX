@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "アプリ外で起動されたMTPLXサーバー";
 "Another AIME run is already active." = "別のAIME実行がすでに進行中です。";
 "another app" = "別のアプリ";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "別のMTPLXサーバーがポート%@を使用しています（pid %@）。このアプリはそのサーバーに接続していません。";
+"Another MTPLX server holds port %@; this app is not connected to it." = "別のMTPLXサーバーがポート%@を使用しています。このアプリはそのサーバーに接続していません。";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "別のプロセスがこのMacをメモリ負荷状態にしています。スパイクの間はデコード速度が低下することがありますが、エンジン自体の使用量は安定しており、何も退避されていません。";
 "ANSWER" = "答え";
 "API key" = "APIキー";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLXは実行されていません。";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLXはこのモデルを実行中です。先にモデルを切り替えるか、MTPLXを停止してください。";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLXは実行中ですが、/Applications/OpenCode.appにOpenCode Desktopが見つかりませんでした。";
+"MTPLX is running. Connecting to live stats…" = "MTPLXは実行中です。ライブ統計に接続中…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLXは実行中です。ライブ統計に再接続中（試行 %lld）。";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLXは実行中です。ライブ統計を利用できません: %@";
 "MTPLX is unreachable — is it running?" = "MTPLXに接続できません — 実行中ですか？";
 "MTPLX is up, checking health." = "MTPLXは起動しています。稼働状態を確認中。";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLXは実行されていません。再生ボタンを押してモデルを開始してください。";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "チャットが開く前に最初のウォームアップトークンを実行中。";
 "Running tool…" = "ツールを実行中…";
 "Running your new model on this Mac to see how fast it actually is." = "実際の速度を確認するため、このMacで新しいモデルを実行しています。";
+"Running · connecting live stats" = "実行中 · ライブ統計に接続中";
+"Running · live stats unavailable" = "実行中 · ライブ統計を利用できません";
+"Running · reconnecting live stats" = "実行中 · ライブ統計に再接続中";
 "Running." = "実行中。";
 "Running. Waiting for stats." = "実行中。統計を待機中。";
 "running…" = "実行中…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "アロケータが一時的に上限付近で動作しました（プリフィルのスパイクによって発生します）。破棄されたものはありません。この状態が続く場合、スワップ前にキャッシュがSSDへ退避されます。";
 "The app is closing the model server and restoring fans." = "アプリがモデルサーバーを終了し、ファンを元に戻しています。";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "ビルドはモデルをダウンロードし、変換されたコピーを書き込みます。ディスク領域を解放するか、より小さいモデルを選択してください。";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "変更を適用できなかったため、MTPLXは以前の設定のまま動作しています: %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "ダウンロードでHugging Faceに接続できませんでした。ネットワーク接続を確認して再試行してください。";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "ダウンロードでHugging Faceに接続できませんでした。ネットワーク接続を確認して再試行してください。ネットワークでhuggingface.coがブロックされている場合は、設定の「詳細設定」でHFダウンロードミラー（例: https://hf-mirror.com）を設定してください。";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "エンジンはスワップを回避するためにキャッシュを解放しました。速度は保護されますが、ウォームターンはSSDから復元されます。";

@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "uygulama dışında başlatılmış bir MTPLX sunucusu";
 "Another AIME run is already active." = "Zaten etkin başka bir AIME çalışması var.";
 "another app" = "başka bir uygulama";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "%@ bağlantı noktasını başka bir MTPLX sunucusu tutuyor (pid %@); bu uygulama ona bağlı değil.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "%@ bağlantı noktasını başka bir MTPLX sunucusu tutuyor; bu uygulama ona bağlı değil.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "Başka bir işlem bu Mac'i bellek baskısına sokuyor. Ani yükseliş sürerken kod çözme yavaşlayabilir; motorun kendi bellek kullanımı sabit ve hiçbir şey atılmadı.";
 "ANSWER" = "YANIT";
 "API key" = "API anahtarı";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLX çalışmıyor.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX şu anda bu modeli çalıştırıyor. Önce modeli değiştirin veya MTPLX'i durdurun.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX çalışıyor ama OpenCode Desktop /Applications/OpenCode.app konumunda bulunamadı.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX çalışıyor. Canlı istatistiklere bağlanılıyor…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX çalışıyor. Canlı istatistiklere yeniden bağlanılıyor (%lld. deneme).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX çalışıyor. Canlı istatistikler kullanılamıyor: %@";
 "MTPLX is unreachable — is it running?" = "MTPLX'e ulaşılamıyor, çalışıyor mu?";
 "MTPLX is up, checking health." = "MTPLX ayakta, sağlık kontrolü yapılıyor.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX çalışmıyor. Bir modeli başlatmak için oynat düğmesine basın.";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "Sohbet açılmadan önce ilk ısınma tokenları çalıştırılıyor.";
 "Running tool…" = "Araç çalıştırılıyor…";
 "Running your new model on this Mac to see how fast it actually is." = "Gerçekte ne kadar hızlı olduğunu görmek için yeni modeliniz bu Mac'te çalıştırılıyor.";
+"Running · connecting live stats" = "Çalışıyor · canlı istatistiklere bağlanılıyor";
+"Running · live stats unavailable" = "Çalışıyor · canlı istatistikler kullanılamıyor";
+"Running · reconnecting live stats" = "Çalışıyor · canlı istatistiklere yeniden bağlanılıyor";
 "Running." = "Çalışıyor.";
 "Running. Waiting for stats." = "Çalışıyor. İstatistikler bekleniyor.";
 "running…" = "çalışıyor…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "Ayırıcı kısa süre tavanına yakın çalıştı (ön dolum sıçraması bunu yapar). Hiçbir şey atılmadı; bu düzeyde kalırsa önbellekler herhangi bir takas öncesinde SSD'ye yer açar.";
 "The app is closing the model server and restoring fans." = "Uygulama model sunucusunu kapatıyor ve fanları eski durumuna getiriyor.";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "Derleme, modeli indirir ve dönüştürülmüş bir kopyasını yazar. Disk alanı açın ya da daha küçük bir model seçin.";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "Değişiklik uygulanamadı, bu yüzden MTPLX önceki ayarlarla çalışmaya devam ediyor: %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "İndirme Hugging Face'e ulaşamadı. Ağ bağlantısını kontrol edip yeniden deneyin.";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "İndirme Hugging Face'e ulaşamadı. Ağ bağlantısını kontrol edip yeniden deneyin. Ağınızda huggingface.co engelliyse Ayarlar'daki Gelişmiş bölümünden bir HF indirme yansısı ayarlayın, örneğin https://hf-mirror.com.";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "Motor, takası önlemek için önbelleklerini boşalttı. Hız korunur ama sıcak turlar SSD'den geri yüklenir.";

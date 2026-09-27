@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "ऐप के बाहर शुरू किया गया एक MTPLX सर्वर";
 "Another AIME run is already active." = "एक अन्य AIME रन पहले से सक्रिय है।";
 "another app" = "एक अन्य ऐप";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "एक अन्य MTPLX सर्वर पोर्ट %@ (pid %@) पर है; यह ऐप उससे कनेक्ट नहीं है।";
+"Another MTPLX server holds port %@; this app is not connected to it." = "एक अन्य MTPLX सर्वर पोर्ट %@ पर है; यह ऐप उससे कनेक्ट नहीं है।";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "एक अन्य प्रोसेस इस Mac को मेमोरी दबाव में डाल रही है। स्पाइक रहने तक डिकोड धीमा हो सकता है; इंजन का अपना फ़ुटप्रिंट स्थिर है और कुछ भी हटाया नहीं गया है।";
 "ANSWER" = "उत्तर";
 "API key" = "API कुंजी";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLX नहीं चल रहा है।";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "MTPLX अभी यह मॉडल चला रहा है। पहले मॉडल बदलें या MTPLX रोकें।";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX चल रहा है, लेकिन /Applications/OpenCode.app पर OpenCode Desktop नहीं मिला।";
+"MTPLX is running. Connecting to live stats…" = "MTPLX चल रहा है। लाइव आंकड़ों से कनेक्ट किया जा रहा है…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX चल रहा है। लाइव आंकड़े फिर से कनेक्ट हो रहे हैं (प्रयास %lld)।";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX चल रहा है। लाइव आंकड़े उपलब्ध नहीं हैं: %@";
 "MTPLX is unreachable — is it running?" = "MTPLX तक नहीं पहुँचा जा सकता — क्या यह चल रहा है?";
 "MTPLX is up, checking health." = "MTPLX चालू है, स्वास्थ्य की जांच की जा रही है।";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX नहीं चल रहा है। मॉडल शुरू करने के लिए प्ले बटन दबाएं।";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "चैट खुलने से पहले पहले वार्मअप टोकन चलाए जा रहे हैं।";
 "Running tool…" = "टूल चलाया जा रहा है…";
 "Running your new model on this Mac to see how fast it actually is." = "यह देखने के लिए कि आपका नया मॉडल वास्तव में कितना तेज़ है, इसे इस Mac पर चलाया जा रहा है।";
+"Running · connecting live stats" = "चल रहा है · लाइव आंकड़े कनेक्ट हो रहे हैं";
+"Running · live stats unavailable" = "चल रहा है · लाइव आंकड़े उपलब्ध नहीं";
+"Running · reconnecting live stats" = "चल रहा है · लाइव आंकड़े फिर से कनेक्ट हो रहे हैं";
 "Running." = "चल रहा है।";
 "Running. Waiting for stats." = "चल रहा है। आंकड़ों की प्रतीक्षा की जा रही है।";
 "running…" = "चल रहा है…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "एलोकेटर संक्षेप में अपनी सीमा के करीब चला (प्रीफ़िल स्पाइक ऐसा करता है)। कुछ भी हटाया नहीं गया है; यदि यह यहां रहता है तो किसी भी स्वैप से पहले कैश SSD को स्थान देते हैं।";
 "The app is closing the model server and restoring fans." = "ऐप मॉडल सर्वर को बंद कर रहा है और पंखों को सामान्य कर रहा है।";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "बिल्ड मॉडल डाउनलोड करता है और एक परिवर्तित प्रति लिखता है। डिस्क स्थान खाली करें या एक छोटा मॉडल चुनें।";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "बदलाव लागू नहीं हो सका, इसलिए MTPLX अभी भी पिछली सेटिंग्स के साथ चल रहा है: %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "डाउनलोड Hugging Face तक नहीं पहुंच सका। नेटवर्क कनेक्शन जांचें और पुनः प्रयास करें।";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "डाउनलोड Hugging Face तक नहीं पहुंच सका। नेटवर्क कनेक्शन जांचें और पुनः प्रयास करें। यदि आपके नेटवर्क पर huggingface.co अवरुद्ध है, तो सेटिंग्स में उन्नत के तहत एक HF डाउनलोड मिरर सेट करें, उदाहरण के लिए https://hf-mirror.com।";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "इंजन ने स्वैपिंग से बचने के लिए अपने कैश खाली कर दिए। गति सुरक्षित है, लेकिन वार्म टर्न SSD से पुनर्स्थापित होंगे।";

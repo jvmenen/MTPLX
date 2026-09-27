@@ -187,6 +187,8 @@
 "an MTPLX server started outside the app" = "خادم MTPLX تم تشغيله خارج التطبيق";
 "Another AIME run is already active." = "يوجد تشغيل AIME آخر نشط بالفعل.";
 "another app" = "تطبيق آخر";
+"Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "يشغل خادم MTPLX آخر المنفذ %@ (pid %@)؛ هذا التطبيق غير متصل به.";
+"Another MTPLX server holds port %@; this app is not connected to it." = "يشغل خادم MTPLX آخر المنفذ %@؛ هذا التطبيق غير متصل به.";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "عملية أخرى تضع هذا الـ Mac تحت ضغط الذاكرة. قد ينخفض فك الترميز أثناء استمرار هذا الارتفاع؛ استهلاك المحرك نفسه مستقر ولم يتم إخلاء أي شيء.";
 "ANSWER" = "الإجابة";
 "API key" = "مفتاح API";
@@ -839,6 +841,9 @@
 "MTPLX is not running." = "MTPLX لا يعمل.";
 "MTPLX is running this model. Switch models or stop MTPLX first." = "يشغّل MTPLX هذا النموذج حاليًا. بدّل النموذج أو أوقف MTPLX أولًا.";
 "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app." = "MTPLX قيد التشغيل، ولكن لم يتم العثور على OpenCode Desktop في /Applications/OpenCode.app.";
+"MTPLX is running. Connecting to live stats…" = "MTPLX قيد التشغيل. جارٍ الاتصال بالإحصائيات المباشرة…";
+"MTPLX is running. Live stats are reconnecting (attempt %lld)." = "MTPLX قيد التشغيل. جارٍ إعادة الاتصال بالإحصائيات المباشرة (المحاولة %lld).";
+"MTPLX is running. Live stats are unavailable: %@" = "MTPLX قيد التشغيل. الإحصائيات المباشرة غير متاحة: %@";
 "MTPLX is unreachable — is it running?" = "تعذر الوصول إلى MTPLX — هل هو قيد التشغيل؟";
 "MTPLX is up, checking health." = "MTPLX يعمل، جارٍ التحقق من سلامة التشغيل.";
 "MTPLX isn't running. Hit the play button to start a model." = "MTPLX لا يعمل. اضغط على زر التشغيل لبدء نموذج.";
@@ -1205,6 +1210,9 @@
 "Running the first warmup tokens before chat opens." = "تشغيل أول رموز الإحماء قبل فتح الدردشة.";
 "Running tool…" = "جارٍ تشغيل الأداة…";
 "Running your new model on this Mac to see how fast it actually is." = "تشغيل نموذجك الجديد على هذا الـ Mac لمعرفة مدى سرعته الفعلية.";
+"Running · connecting live stats" = "قيد التشغيل · جارٍ الاتصال بالإحصائيات المباشرة";
+"Running · live stats unavailable" = "قيد التشغيل · الإحصائيات المباشرة غير متاحة";
+"Running · reconnecting live stats" = "قيد التشغيل · جارٍ إعادة الاتصال بالإحصائيات المباشرة";
 "Running." = "قيد التشغيل.";
 "Running. Waiting for stats." = "قيد التشغيل. في انتظار الإحصائيات.";
 "running…" = "قيد التشغيل…";
@@ -1384,6 +1392,7 @@
 "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here." = "اقترب المخصص لفترة وجيزة من سقفه (يحدث هذا بسبب ارتفاع التعبئة المسبقة). لم يتم إخلاء أي شيء؛ تتنازل ذاكرات التخزين المؤقت لصالح SSD قبل أي تبديل (swap) إذا استمر هنا.";
 "The app is closing the model server and restoring fans." = "يقوم التطبيق بإغلاق خادم النموذج واستعادة الوضع الطبيعي للمراوح.";
 "The build downloads the model and writes a converted copy. Free up disk space or pick a smaller model." = "يقوم البناء بتنزيل النموذج وكتابة نسخة محولة. قم بتحرير مساحة على القرص أو اختر نموذجاً أصغر.";
+"The change could not be applied, so MTPLX is still running the previous settings: %@" = "تعذر تطبيق التغيير، لذا لا يزال MTPLX يعمل بالإعدادات السابقة: %@";
 "The download could not reach Hugging Face. Check the network connection and try again." = "تعذر على التنزيل الوصول إلى Hugging Face. تحقق من اتصال الشبكة وحاول مرة أخرى.";
 "The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com." = "تعذر على التنزيل الوصول إلى Hugging Face. تحقق من اتصال الشبكة وحاول مرة أخرى. إذا كان huggingface.co محجوباً على شبكتك، فقم بتعيين خادم تنزيل HF متطابق في الإعدادات ضمن \"متقدم\"، على سبيل المثال https://hf-mirror.com.";
 "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD." = "أفرغ المحرك ذاكرات التخزين المؤقت لتجنب التبديل (swap). السرعة محمية، لكن الأدوار الدافئة ستستعاد من SSD.";
