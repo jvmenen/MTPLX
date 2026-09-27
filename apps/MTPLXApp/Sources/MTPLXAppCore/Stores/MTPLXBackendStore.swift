@@ -1459,6 +1459,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     + "pid \(wedged.pid) (launch \(wedged.launchID)); reaping it and keeping the port",
                     stream: .system
                 )
+                guard isCurrent() else { return }
                 await supervisor.terminateExternalDaemon(rootPID: wedged.pid)
                 if await PortPreflight.waitUntilBindable(
                     port,
