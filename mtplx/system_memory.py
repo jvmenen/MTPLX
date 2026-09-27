@@ -13,7 +13,15 @@ needed a hard power-off. The same prefill on a quiet desktop wires about 100 GB.
 
 The supply figure is read from ``host_statistics64(HOST_VM_INFO64)``: free pages
 (the kernel's free count already includes speculative pages), purgeable pages,
-and file-backed pages, which the kernel drops without compressing anything.
+and the file-backed pages that are not speculative. Speculative pages are
+counted in both the free and the file-backed counters, so they are taken
+once. File-backed pages are credited in full: the kernel reclaims clean file
+pages without compressing anything, and ``vm_statistics64`` has no counter for
+the dirty ones, which must be written back first (the unified buffer cache
+flushes them within about 30 s, and the pages MTPLX itself maps, weights and
+the n-gram table, are read-only and clean). The floors below are the margin
+for that dirty or busy share, and the death signature catches a Mac whose
+file cache is large while its reclaim stalls anyway.
 ``kern.memorystatus_level`` is kept only as a coarse, reported signal: on macOS
 it is ``(total - wired - compressor) / total`` (this Mac, 2026-09-27: level 96
 with 3.85 GiB wired and 0.02 GiB compressed; the 2026-09-26 field report: 28
@@ -38,6 +46,7 @@ import ctypes
 import ctypes.util
 import functools
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -64,9 +73,12 @@ _SHED_FLOOR_MULTIPLE = 2
 # the pressure level still reading normal. Between two readings, free pages
 # under the abort floor together with compressor growth at 256 MiB/s or swap
 # growth at 64 MiB/s is treated as critical. Growth under 256 MiB between two
-# readings is never counted, so a single page-out burst cannot trip it. The
-# compaction the report's Mac survived compressed about 10 GiB in 30 to 60 s
-# (170 to 340 MiB/s) at free pages of 0.1 to 0.5 GiB: at this line.
+# readings (compressor or swap) is never counted, so a single page-out burst
+# cannot trip it. The compaction the report's Mac survived compressed about
+# 10 GiB in 30 to 60 s (170 to 340 MiB/s) at free pages of 0.1 to 0.5 GiB: at
+# this line. It reads net occupancy: churn that compresses and decompresses at
+# a steady total is not seen here, and falls to the supply floors instead.
+# The rates come from that one Mac; other sizes are not calibrated.
 _THRASH_COMPRESSOR_BYTES_PER_S = 256 * MIB
 _THRASH_SWAP_BYTES_PER_S = 64 * MIB
 _THRASH_MIN_GROWTH_BYTES = 256 * MIB
@@ -124,12 +136,20 @@ def _libc() -> ctypes.CDLL:
     return libc
 
 
-@functools.cache
+_HOST_PORT_LOCK = threading.Lock()
+_HOST_PORT: int | None = None
+
+
 def _host_port() -> int:
     # One send right for the process's lifetime: every mach_host_self() call
     # adds a user reference to the host port, and the guard reads the machine
-    # every few seconds for as long as the daemon runs.
-    return int(_libc().mach_host_self())
+    # every few seconds for as long as the daemon runs. The lock keeps two
+    # first calls on different threads from taking two.
+    global _HOST_PORT
+    with _HOST_PORT_LOCK:
+        if _HOST_PORT is None:
+            _HOST_PORT = int(_libc().mach_host_self())
+        return _HOST_PORT
 
 
 def _sysctl_int(name: bytes, width: int) -> int | None:
@@ -224,6 +244,20 @@ def _read_swap_used_bytes() -> int | None:
     return int(usage.xsu_used)
 
 
+def _supply_from_statistics(info: _VMStatistics64, page: int) -> tuple[int, int]:
+    """(free_bytes, file_backed_bytes) from one ``vm_statistics64`` reading.
+
+    ``free_count`` already includes the speculative pages, and so does
+    ``external_page_count`` (a speculative page is a file page read ahead):
+    the file-backed credit leaves them out so they count once.
+    """
+
+    speculative = int(info.speculative_count)
+    free = (int(info.free_count) + int(info.purgeable_count)) * int(page)
+    file_backed = max(0, int(info.external_page_count) - speculative) * int(page)
+    return free, file_backed
+
+
 def _read_kernel() -> SystemMemory | None:
     total = _sysctl_int(b"hw.memsize", 8)
     if total is None or total <= 0:
@@ -232,8 +266,7 @@ def _read_kernel() -> SystemMemory | None:
     if stats is None:
         return None
     info, page = stats
-    free = (int(info.free_count) + int(info.purgeable_count)) * page
-    file_backed = int(info.external_page_count) * page
+    free, file_backed = _supply_from_statistics(info, page)
     level = _sysctl_int(b"kern.memorystatus_level", 4)
     return SystemMemory(
         available_bytes=min(int(total), free + file_backed),
@@ -360,7 +393,10 @@ def memory_thrashing(
             return True
     if reading.swap_used_bytes is not None and previous.swap_used_bytes is not None:
         growth = int(reading.swap_used_bytes) - int(previous.swap_used_bytes)
-        if growth > 0 and growth / elapsed >= _THRASH_SWAP_BYTES_PER_S:
+        if (
+            growth >= _THRASH_MIN_GROWTH_BYTES
+            and growth / elapsed >= _THRASH_SWAP_BYTES_PER_S
+        ):
             return True
     return False
 
@@ -385,19 +421,25 @@ def system_pressure_level(
 def admission_shortfall_bytes(
     reading: SystemMemory | None, *, growth_bytes: int, reclaimable_bytes: int
 ) -> int:
-    """How far a prefill's growth would push the desktop under the shed floor.
+    """How far a request's growth would push the Mac under its floor.
 
-    ``growth_bytes`` is what the prefill will add; ``reclaimable_bytes`` is the
+    ``growth_bytes`` is what the request will add; ``reclaimable_bytes`` is the
     engine's own allocator pool, which the growth reuses before it asks the
-    system for anything. Zero means the request fits with the floor intact, and
-    an unreadable machine never reports a shortfall.
+    system for anything. The request must leave the abort floor plus a margin
+    as large as itself, up to the shed floor: a large prefill keeps the whole
+    shed floor free (its estimate and the other apps' growth during a minute
+    of prefill need the room), while a small one is not refused merely
+    because the Mac already sits between the two floors. Zero means the
+    request fits, and an unreadable machine never reports a shortfall.
     """
 
     if reading is None:
         return 0
-    shed_floor, _abort_floor = reading_floors(reading)
+    shed_floor, abort_floor = reading_floors(reading)
+    growth = max(0, int(growth_bytes))
+    margin = min(growth, max(0, shed_floor - abort_floor))
     have = int(reading.available_bytes) + max(0, int(reclaimable_bytes))
-    return max(0, int(growth_bytes) + shed_floor - have)
+    return max(0, growth + abort_floor + margin - have)
 
 
 __all__ = [

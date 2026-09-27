@@ -16,6 +16,7 @@ import pytest
 
 import mtplx.server.openai as srv
 import mtplx.system_memory as sm
+from ctypes import sizeof as ctypes_sizeof
 
 GIB = 1024**3
 RAM = 128 * GIB
@@ -78,6 +79,73 @@ class TestReading:
         _install(monkeypatch, 40)
         monkeypatch.setenv("MTPLX_SYSTEM_MEMORY_GUARD", "0")
         assert sm.read_system_memory() is None
+
+    def test_the_struct_matches_apples_rev2_layout(self):
+        """``struct vm_statistics64`` (mach/vm_statistics.h, rev2): 160 bytes,
+        aligned to 8, and the offsets the supply reads."""
+
+        layout = sm._VMStatistics64
+        assert ctypes_sizeof(layout) == 160
+        offsets = {
+            "free_count": 0,
+            "active_count": 4,
+            "inactive_count": 8,
+            "wire_count": 12,
+            "zero_fill_count": 16,
+            "purges": 80,
+            "purgeable_count": 88,
+            "speculative_count": 92,
+            "decompressions": 96,
+            "swapouts": 120,
+            "compressor_page_count": 128,
+            "throttled_count": 132,
+            "external_page_count": 136,
+            "internal_page_count": 140,
+            "total_uncompressed_pages_in_compressor": 144,
+            "swapped_count": 152,
+        }
+        for name, offset in offsets.items():
+            assert getattr(layout, name).offset == offset, name
+        # host_statistics64 is told the buffer size in 32-bit words.
+        assert ctypes_sizeof(layout) // 4 == 40
+
+    def test_speculative_pages_count_once(self):
+        """The 2026-09-27 review: free_count and external_page_count both
+        include the speculative pages, so adding them counted those twice.
+        4 GiB free (3 GiB of it speculative) and 8 GiB of file pages is
+        9 GiB the kernel can hand out, not 12."""
+
+        page = 16384
+        stats = sm._VMStatistics64()
+        stats.free_count = 4 * GIB // page
+        stats.speculative_count = 3 * GIB // page
+        stats.external_page_count = 8 * GIB // page
+        stats.purgeable_count = 0
+        free, file_backed = sm._supply_from_statistics(stats, page)
+        assert free == 4 * GIB
+        assert file_backed == 5 * GIB
+        # At 88 GiB wired the 11 GiB shed floor is short by 2 GiB: WARNING,
+        # where the double count read normal.
+        reading = sm.SystemMemory(
+            available_bytes=free + file_backed,
+            total_bytes=RAM,
+            level_percent=30,
+            free_bytes=free,
+            file_backed_bytes=file_backed,
+            wired_bytes=88 * GIB,
+        )
+        assert sm.system_pressure_level(reading) == 2
+        assert sm.admission_shortfall_bytes(
+            reading, growth_bytes=8 * GIB, reclaimable_bytes=0
+        ) == 8 * GIB + 11 * GIB - 9 * GIB
+
+    def test_purgeable_pages_are_free(self):
+        page = 16384
+        stats = sm._VMStatistics64()
+        stats.free_count = GIB // page
+        stats.purgeable_count = 2 * GIB // page
+        free, file_backed = sm._supply_from_statistics(stats, page)
+        assert (free, file_backed) == (3 * GIB, 0)
 
     def test_a_reader_that_raises_reads_unknown(self, monkeypatch):
         def boom():
@@ -216,6 +284,16 @@ class TestWiredFloorsAndDeathSignature:
         after = _machine(free_gib=0.1, file_gib=20, wired_gib=88, swap_gib=1.5, at_s=2.0)
         assert sm.memory_thrashing(after, before)
 
+    def test_swap_growth_under_the_minimum_is_not_the_signature(self):
+        # 128 MiB in 2 s is 64 MiB/s, the rate line, but under the 256 MiB
+        # a reading pair must show (the review found the swap branch
+        # skipped that minimum).
+        before = _machine(free_gib=0.1, file_gib=20, wired_gib=88, swap_gib=1.0, at_s=0.0)
+        after = _machine(
+            free_gib=0.1, file_gib=20, wired_gib=88, swap_gib=1.0 + 0.125, at_s=2.0
+        )
+        assert not sm.memory_thrashing(after, before)
+
     def test_compression_with_free_pages_to_spare_is_not_the_signature(self):
         before = _machine(free_gib=9.0, file_gib=5, wired_gib=88, compressor_gib=4, at_s=0.0)
         after = _machine(free_gib=9.0, file_gib=5, wired_gib=88, compressor_gib=6, at_s=2.0)
@@ -228,6 +306,26 @@ class TestWiredFloorsAndDeathSignature:
         assert not sm.memory_thrashing(small, before)
         assert not sm.memory_thrashing(slow, before)
         assert not sm.memory_thrashing(small, None)
+
+    def test_a_512gb_seat_keeps_floors_proportional_to_what_it_wires(self):
+        # Intended, not yet measured: the GPU's transient wiring during a
+        # command buffer grew 88 -> 92.2 GiB (4.8 percent) on the report's
+        # Mac, and it scales with what is wired. 400 GiB wired: 25 / 50 GiB.
+        assert sm.system_memory_floors(512 * GIB, wired_bytes=400 * GIB) == (
+            50 * GIB,
+            25 * GIB,
+        )
+
+    def test_a_short_request_keeps_a_margin_its_own_size(self):
+        reading = _machine(free_gib=4, file_gib=2, wired_gib=88)  # 6 GiB supply
+        _shed, abort = sm.reading_floors(reading)
+        # 0.25 GiB of growth needs the 5.5 GiB abort floor plus itself.
+        assert sm.admission_shortfall_bytes(
+            reading, growth_bytes=GIB // 4, reclaimable_bytes=0
+        ) == 0
+        assert sm.admission_shortfall_bytes(
+            reading, growth_bytes=GIB, reclaimable_bytes=0
+        ) == GIB + abort + GIB - 6 * GIB
 
     def test_admission_counts_the_wired_floor(self):
         reading = _machine(free_gib=4, file_gib=10, wired_gib=88)
