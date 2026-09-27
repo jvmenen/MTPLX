@@ -127,6 +127,60 @@ Wat wel duidelijk is: het gat schaalt sterk met gespreks-/contextlengte. Kort ge
 
 Los van vondst 60/52: deze meting liep als platform-script-taak en botste op een grens die niet in `timeout` zit. Zie vondst 62 in [VONDSTEN.md](VONDSTEN.md).
 
+## 6. Afronding 27 september, laat (zonder server, alleen code en bestaande data)
+
+### 6.1 Vondst 60: besluit en het enige open punt
+
+De drie upstream-wijzigingen die samen de tekstverschuiving tussen 2.11.3 en 2.12.0 verklaren, hebben elk een eigen reden:
+
+- **e36f5ffb (correctheid):** bij de verify-ronde zonder compile rekende de attention-gate in BF16 op een net andere manier dan dezelfde berekening mét compile. Op het 27B-model gaf dat afwijkende uitkomsten tussen die twee paden (67 sigmoid-waarden in de eerste laag). De commit laat het eager pad de gate precies zo uitrekenen als het gecompileerde pad, bit voor bit. Dat de tekst daardoor een fractie anders uitvalt dan op 2.11.3, is het gevolg van een fout die hersteld is.
+- **9a86dd6c (snelheid):** een koude prompt hakte het laatste prefill-blok helemaal op in stukjes van 256 rijen; smalle forwards zijn traag. Nu is dat een ladder met bredere stappen: 4K-prompts ongeveer een kwart sneller in de prefill (metingen van de maker op een M5 Max).
+- **4314638a (snelheid):** het dichtstbijzijnde herstelpunt ligt nu 64 tokens vóór het eind in plaats van tot 256. Een warme agentbeurt hoeft daardoor hooguit 64 tokens opnieuw te prefillen.
+
+Andere tekst bij temperatuur 0 is daarbij onvermijdelijk (andere forwardvormen geven via de MoE-routering andere afronding, zie vondst 29) en onder serverstandaard verdwijnt het verschil in tokens per ronde volledig (§5.2).
+
+**Besluit Jeroen (27 sep): niets terugdraaien, geen PR.** Vondst 60 is tekstgeluk, geen tragere berekening. De "gecombineerde fix" uit §5.2 (`main-beide`) was een meetvariant om de oorzaak te bewijzen, geen voorstel: hij zou een correctheidsfix en twee prefillversnellingen terugdraaien.
+
+**Correctie op §5.2:** de rondetijdwinst van `main-beide` (−10%) en `main-dense` (−8%) is drift, geen effect van de variant. Verify-tijd per ronde bij `decode_t0` in volgorde van de avond: o1 22,05, m1 34,75 (uitschieter), i1 23,23, d1 20,89, g1 20,58, b1 20,65, i2 20,81, o2 19,50 ms. De machine werd in de loop van de avond sneller (o1 tegen o2: 2.11.3 zelf −12%).
+
+**Open punt: kost de gecompileerde gate-helper van e36f5ffb tijd per verify-ronde?** De helper is een `mx.compile`-functie per attentielaag per verify-ronde (`mtplx/attention_math.py`, alleen in fase `decode_verify`). Indicatie uit dezelfde avond, runs vlak na elkaar: `d1-main-dense` (met helper) 20,89 ms verify per ronde tegen `g1-main-gate` en `b1-main-beide` (zonder) 20,58 en 20,65 ms, dus +1,2 tot +1,5%; `i2` (met helper) 20,81 ms. Dat valt binnen de drift en is niet hard. Meetscript voorbereid: `gatekosten.zsh` (zie §6.3).
+
+### 6.2 Vondst 52: waarom de fase-uitsplitsing mislukte
+
+**Hoofdoorzaak: twee klokken, geen functienamen.** Alle 17 gepatchte functienamen bestonden en vuurden (hooklog `h1-52-hook`: `"ontbreekt": []`, 435 `fn`-, 42 `dispatch`-, 57 `submit`-gebeurtenissen). De koppeling van gebeurtenissen aan verzoeken ging mis op de tijd:
+
+- De client (`meet52.py`, `/usr/bin/python3` 3.9.6) meet met `time.perf_counter()`. In Python 3.9 telt die vanaf de start van het proces (clienttijden ~23 tot 50 s).
+- De hook (`hook52/sitecustomize.py` versie 1, regel 54, venv-Python 3.13) meet met dezelfde functie, maar in 3.13 is dat `mach_absolute_time` sinds het opstarten van de Mac (~32.100 s).
+- `analyse.py:497` zoekt per verzoek de hookgebeurtenissen in het venster `[begin, gesloten + 50 ms]` van de client. Door het verschil van ~32.000 s viel er niets in; `fasen()` stopt dan op `analyse.py:377` zonder `voor`/`na`, en de telling op `analyse.py:500` gaf "0 met fasetijden". De README beloofde dat `analyse.py` de klok controleert, maar die controle (`klok_ok`) liep pas ná een gevonden gebeurtenis.
+
+**Drie fouten die daarna ook nog in de weg hadden gezeten** (integratietak `f26dc9a8`, `mtplx/server/openai.py`):
+
+- Het venster van 50 ms na `gesloten` bevat het begin van het volgende verzoek (de meting stuurt ze direct achter elkaar); `analyse.py:388` pakt de laatste `dispatch` en koppelt zo in een deel van de gevallen de generatie van het volgende verzoek.
+- Bij streaming chat gebeurt de bank-put niet in `_run_generation` (26653-26680) maar in een aparte postcommit-taak op de model-thread: `_store_generation_final_history_snapshot` via `_submit_foreground_model_work` met batch_key `postcommit.stream` (34986-35060). Die functie roept zelf `_generation_final_postcommit_compatibility` (23005) aan, dus versie 1 telde de controle dubbel (los en binnen het opslaan) en zag de wachttijd van die taak niet.
+- Bij completions begint `elapsed_s` pas in `_run_generation` op de model-thread (26260: `request_received_monotonic_s` ontbreekt, dan `perf_counter()`), na de wachtrij. Versie 1 hookte `_run_generation` niet en schatte het begin vanaf de `dispatch`.
+
+**De "hookkosten tot 18 ms" in §5.3 kloppen niet.** Die vergeleken de totale clienttijd met en zonder hook, inclusief het toeval in de generatie zelf (`elapsed_s` verschilde tussen de runs 4 tot 18 ms). Op het gat (client min `elapsed_s`) was het verschil 0,2 tot 4,9 ms. Offline gemeten kost een gebeurtenis in versie 1 3,3 µs (JSON, lock, write en flush), bij ~55 gebeurtenissen per verzoek ~0,2 ms.
+
+### 6.3 Reparatie en voorbereide metingen
+
+**Hook versie 2** (`hook52/sitecustomize.py`):
+
+- Eén klok: de hook meet met `perf_counter_ns` (`mach_absolute_time`), de client (`meet52.py`) met `CLOCK_UPTIME_RAW`, dezelfde klok. De hook schrijft beide klokken bij het patchen weg, zodat de analyse een verschil zou zien en corrigeren.
+- Goedkoper: per gebeurtenis alleen een tuple in een lijst (0,2 µs in plaats van 3,3 µs). Wegschrijven gebeurt bij `/health` (vóór en na de werklast), bij afsluiten en als veiligheidsnet bij een zeer lange lijst.
+- Nieuw: `_run_generation` (begin van `elapsed_s` uit `request_received_monotonic_s`, eerste en laatste token, einde), nestdiepte per getimede functie (geen dubbeltelling), wachttijd van elke taak op de model-thread met batch_key, `_skipped_idle_postcommit_snapshot` en `_metrics_envelope`.
+
+**Analyse** (`analyse52.py`): per verzoek alleen gebeurtenissen tussen begin en `gesloten` (socketgebeurtenissen via de poort), en het gat per constructie opgesplitst in VOOR (verbinden, versturen, body, ASGI, json, pydantic, FastAPI, handler tot `elapsed_s`) en NA (staart van `_run_generation` met bankwaarden en put, overdracht naar de aanroeper, postcommit met controle en history-encode, wachtrij van de postcommit, stats, berichtdelen, JSON-render, overig, versturen, ontvangst, sluiten). Hookkosten nu op het gat, met bootstrap-interval.
+
+**Offline getoetst** (geen server, geen model):
+
+- Nep-FastAPI-app met dezelfde functienamen en threadopbouw als de integratietak (model-thread, stream-worker, postcommit-taak) en bekende vertragingen, met client en server op verschillende Python-versies zoals echt: 12 van 12 verzoeken met fasetijden, klok consistent in 12/12, en alle ingebouwde vertragingen teruggevonden (bankwaarden 1,50, put 2,00, history-encode 3,2 tot 3,5, postcommit-wachtrij 4,0, stats 0,50 ms). Hookkosten op het gat: +0,1 tot +0,4 ms.
+- De echte `mtplx.server.openai` van de integratietak geïmporteerd (zonder model): alle namen aanwezig, `patch_module` zonder ontbrekende namen. De echte `_run_generation_dispatched` bereikt via de module-globals de gehookte `_submit_foreground_model_work` en `_run_generation` (met stubs voor het model): `request_received_monotonic_s` komt exact door, eerste en laatste token worden gezet. Echte `_generation_final_postcommit_compatibility` roept de gehookte `_history_ids_for_postcommit` aan (nestdiepte 1); `_public_mtplx_stats`, `_build_timings` en `_usage_payload` lopen met de hook.
+
+**Voorbereide metingen** (lokaal in `~/Dev/laya-nl/decode-onderzoek/`, elk als platform-script-taak onder 45 minuten; lader van minstens 60 W, anders stopt het script; controle op `requests_completed`, pid en tracebacks; stopt vóór 45 minuten):
+
+- `gatekosten.zsh`: `main` (1de2b1c0) tegen `main-gate` (e36f5ffb teruggedraaid, worktree `~/Dev/MTPLX-decode-gate`, gemaakt als hij ontbreekt), zes paren ABAB op verse servers, per run 6 × `decode_t0` en 6 × `decode_std` (korte prompt, 512 tokens). `gatekosten.py`: verify-tijd, verify-forward en decode-tijd per ronde, verschil met bootstrap-interval over paren en over verzoeken; `CONCLUSIE GATE` per werklast. Geschat 20 tot 25 minuten.
+- `meet52b.zsh`: integratietak, om en om met en zonder hook, drie paren (`h2`/`k2` tot `h4`/`k4`), `meet52.py` (chat ~2K en ~32K tokens, streaming en niet-streaming, 6 herhalingen plus opwarmen; completions-controle), daarna `analyse52.py`. Geschat 8 tot 12 minuten.
+
 ## Bestanden
 
-- `~/Dev/laya-nl/decode-onderzoek/`: `README.md` (opzet), `runall.zsh`, `bench60.py`, `meet52.py`, `analyse.py`; `runall.log` en `analyse.txt` (meting 27 sep avond); `logs/meting-*.log` (per verzoek), `resultaten/o1-oud.json`, `m1-main.json` (deels bruikbaar), `i1-integratie.json` (onbruikbaar) (meting 27 sep 18:30, mislukt door de stroomvoorziening); `resultaten/o1-oud.json`, `o2-oud.json`, `m1-main.json`, `d1-main-dense.json`, `g1-main-gate.json`, `b1-main-beide.json`, `i1-integratie.json`, `h1-52-hook.json`, `k1-52-kaal.json` (meting 27 sep avond, bruikbaar); `resultaten/i2-integratie.json`, `m2-main.json` (verstoord door een tweede meetscript, niet meegeteld).
+- `~/Dev/laya-nl/decode-onderzoek/`: `README.md` (opzet), `runall.zsh`, `bench60.py`, `meet52.py`, `analyse.py`; `runall.log` en `analyse.txt` (meting 27 sep avond); `logs/meting-*.log` (per verzoek), `resultaten/o1-oud.json`, `m1-main.json` (deels bruikbaar), `i1-integratie.json` (onbruikbaar) (meting 27 sep 18:30, mislukt door de stroomvoorziening); `resultaten/o1-oud.json`, `o2-oud.json`, `m1-main.json`, `d1-main-dense.json`, `g1-main-gate.json`, `b1-main-beide.json`, `i1-integratie.json`, `h1-52-hook.json`, `k1-52-kaal.json` (meting 27 sep avond, bruikbaar); `resultaten/i2-integratie.json`, `m2-main.json` (verstoord door een tweede meetscript, niet meegeteld). Voorbereid 27 sep laat (§6): `gemeen.zsh` (gedeelde controles), `gatekosten.zsh` en `gatekosten.py` (gate-kosten, `bench60.py --decode-herhalingen`), `hook52/sitecustomize.py` versie 2, `meet52b.zsh` en `analyse52.py` (vondst 52); `meet52.py` meet nu met `CLOCK_UPTIME_RAW`.
