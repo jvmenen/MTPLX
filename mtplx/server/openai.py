@@ -19579,6 +19579,10 @@ class _AdmissionGeometry:
     # a cache holds it dequantized, and decode keeps a working copy beside
     # the pages (the q8 bf16 mirror, the q4 head-major bank).
     kv_quantization: str = "off"
+    # (query heads, KV heads, key head dim, value head dim) of the attention
+    # layers: what the quantized-KV kernels' routes are decided on. None
+    # when the config does not say, which prices the route that builds most.
+    attention_shape: tuple[int, int, int, int] | None = None
 
     @property
     def resident_width(self) -> int:
@@ -19623,7 +19627,25 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
         aux_bytes_per_token=aux,
         kv_quantization=str(getattr(plan, "kv_quantization", "off") or "off"),
+        attention_shape=_attention_shape(runtime),
     )
+
+
+def _attention_shape(runtime: Any) -> tuple[int, int, int, int] | None:
+    """(query heads, KV heads, key dim, value dim) from the text config."""
+
+    args = _runtime_text_args(runtime)
+    try:
+        heads = int(getattr(args, "num_attention_heads", 0) or 0)
+        kv_heads = int(getattr(args, "num_key_value_heads", 0) or 0) or heads
+        head_dim = int(getattr(args, "head_dim", 0) or 0)
+        if not head_dim and heads:
+            head_dim = int(getattr(args, "hidden_size", 0) or 0) // heads
+    except (TypeError, ValueError):
+        return None
+    if heads <= 0 or kv_heads <= 0 or head_dim <= 0:
+        return None
+    return (heads, kv_heads, head_dim, head_dim)
 
 
 def _runtime_text_args(runtime: Any) -> Any:
@@ -19888,6 +19910,7 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
     if not isinstance(cache, (list, tuple)):
         return None
     capacities: list[int] = []
+    working: list[int] = []
     block_size = 0
     for layer in cache:
         if getattr(layer, "allocated_blocks", None) is None:
@@ -19897,6 +19920,10 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
             block_size = int(layer.block_size)
         except (AttributeError, TypeError, ValueError):
             continue
+        # Decode's working copy beside quantized pages (the q4 bank, the q8
+        # mirror): a lease extends the one it already holds.
+        rows_fn = getattr(layer, "kv_quant_working_rows", None)
+        working.append(int(rows_fn()) if callable(rows_fn) else 0)
     if not capacities:
         return {"paged": False}
     return {
@@ -19904,6 +19931,126 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
         "capacity_tokens": min(capacities),
         "paged_layers": len(capacities),
         "block_size": block_size,
+        "working_rows": min(working) if working else 0,
+    }
+
+
+def _admission_quant_working(
+    geometry: _AdmissionGeometry,
+    *,
+    bits: int,
+    prompt_tokens: int,
+    reused_tokens: int,
+    out_rows: int,
+    leased_paged: bool,
+    repages: bool,
+    capacity_tokens: int,
+    existing_rows: int,
+    block_size: int,
+    prefill_chunk_tokens: int | None,
+    verify_tokens: int,
+) -> tuple[int, dict[str, Any]]:
+    """What decode's working copy beside quantized pages adds for this
+    request, priced the way the cache builds it (the review of 23a94abf: the
+    whole prefix was charged whether the copy already existed or would never
+    be built; a 150K lease with its q4 bank was charged 2.75 GiB again, and
+    a one-token q8 extension on the kernel route 9.16 GiB of mirror).
+
+    The route latches at the request's first call on the quantized pages
+    (``cache_state.kv_quant_decode_route``): a lease's suffix prefill, from
+    the reused prefix; a repaged prompt's decode, from the prompt's end; a
+    prompt paged from the start, at its first chunk. q4 builds its
+    head-major bank only on the kernel route and keeps it across requests.
+    q8 builds its bf16 mirror on every call the kernel does not take (the
+    dequant route, or a call wider than the kernel's query rows: a suffix
+    prefill chunk, a verify burst), and a request that latches the kernel
+    releases the mirror it found. Growth follows the cache's own rule
+    (``kv_quant_working_copy_peak_rows``), so a copy that already holds the
+    request's reach adds nothing.
+    """
+
+    from mtplx.cache_state import (
+        kv_quant_decode_route,
+        kv_quant_kernel_q_len,
+        kv_quant_working_copy_peak_rows,
+    )
+
+    P = max(0, int(prompt_tokens))
+    R = min(P, max(0, int(reused_tokens)))
+    M = P - R
+    aux_w = max(0, int(geometry.aux_bytes_per_token))
+    if bits == 8:
+        width = max(0, int(geometry.live_bytes_per_token) - aux_w)
+    else:
+        width = max(0, int(geometry.paged_bytes_per_token) - aux_w)
+    verify = max(1, int(verify_tokens))
+    chunk = max(1, int(prefill_chunk_tokens)) if prefill_chunk_tokens else max(1, M)
+    reach = P + max(0, int(out_rows))
+    shape = geometry.attention_shape
+    if leased_paged:
+        # The suffix's body chunks, then its last token, on the pages.
+        body_q = min(max(0, M - 1), chunk)
+        route_offset = R + max(1, body_q)
+        prefill_offset: int | None = route_offset
+    elif repages:
+        # The prefill runs in the contiguous cache; decode is the first call.
+        body_q = 0
+        route_offset = P + verify
+        prefill_offset = None
+    else:
+        body_q = min(max(0, P - 1), chunk)
+        route_offset = max(1, body_q)
+        prefill_offset = route_offset
+    if shape is None:
+        # An unknown attention shape prices the route that builds most: the
+        # q4 bank (kernel), the q8 mirror (dequant).
+        route = "kernel" if bits == 4 else "dequant"
+    else:
+        route = kv_quant_decode_route(
+            bits, route_offset=route_offset, attention_shape=shape
+        )
+    kernel_q = (
+        kv_quant_kernel_q_len(bits, shape)
+        if route == "kernel" and shape is not None
+        else 0
+    )
+    detail: dict[str, Any] = {"route": route, "kernel_q_len": int(kernel_q)}
+    if bits == 4:
+        if route != "kernel":
+            return 0, {**detail, "builds": None, "rows": 0}
+        # Kernel calls (decode's, a lease's one-token tail) build the bank
+        # from the prompt's end and extend it through the reservation.
+        existing, first, last = int(existing_rows), P, reach
+        builds = "q4_head_major_bank"
+    elif route == "dequant":
+        existing = int(existing_rows)
+        first = prefill_offset if prefill_offset is not None else P + verify
+        last = reach
+        builds = "q8_bf16_mirror"
+    else:
+        prefill_declined = body_q > kernel_q
+        decode_declined = verify > kernel_q
+        if not (prefill_declined or decode_declined):
+            return 0, {**detail, "builds": None, "rows": 0}
+        # The latch released any earlier mirror; the declined calls rebuild
+        # it: through the prompt for a wide suffix chunk, through the
+        # reservation for a wide verify.
+        existing = 0
+        first = prefill_offset if prefill_declined and prefill_offset else P + verify
+        last = reach if decode_declined else P
+        builds = "q8_bf16_mirror"
+    rows = kv_quant_working_copy_peak_rows(
+        existing_rows=existing,
+        first_offset=first,
+        last_offset=last,
+        capacity_rows=max(int(capacity_tokens), 0),
+        block_size=max(1, int(block_size)),
+    )
+    return int(rows) * width, {
+        **detail,
+        "builds": builds,
+        "rows": int(rows),
+        "existing_rows": int(existing),
     }
 
 
@@ -19920,6 +20067,8 @@ def _admission_growth(
     scratch_bytes: int,
     lease: Mapping[str, Any] | None = None,
     context_transient_bytes_per_token: int | None = None,
+    prefill_chunk_tokens: int | None = None,
+    verify_tokens: int = 1,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -19942,7 +20091,9 @@ def _admission_growth(
                     snapshot reads the cache's ``state``, which dequantizes
                     to full width: 15.3 GiB for a 250K-token 27B prompt,
                     not the 4.9 GiB of its q4 pages (the review of
-                    9c96dd9c).
+                    9c96dd9c). The working copy is charged only when
+                    this request builds or grows it
+                    (``_admission_quant_working``).
 
     Nothing already resident is added again: the restore source's own
     snapshot is inside the measured bytes, and a pure lease writes into the
@@ -20025,12 +20176,33 @@ def _admission_growth(
     repage = live_prefill + paged_copy if repages else 0
     quant = str(geometry.kv_quantization or "off").lower()
     quantized = paged_live and quant in {"q4", "q8"}
-    aux_w = max(0, int(geometry.aux_bytes_per_token))
     quant_working = 0
+    quant_detail: dict[str, Any] = {}
     if quantized:
-        kv_live_w = max(0, live_w - aux_w)
-        kv_paged_w = max(0, paged_w - aux_w)
-        quant_working = P * (kv_live_w if quant == "q8" else kv_paged_w)
+        if leased_paged and lease_capacity_after is not None:
+            capacity = int(lease_capacity_after)
+        elif leased_paged and lease is not None and lease.get("capacity_tokens"):
+            capacity = int(lease["capacity_tokens"])
+        else:
+            capacity = P + out_rows
+        quant_working, quant_detail = _admission_quant_working(
+            geometry,
+            bits=8 if quant == "q8" else 4,
+            prompt_tokens=P,
+            reused_tokens=R,
+            out_rows=out_rows,
+            leased_paged=leased_paged,
+            repages=repages,
+            capacity_tokens=capacity,
+            existing_rows=(
+                int(lease.get("working_rows") or 0)
+                if leased_paged and lease is not None
+                else 0
+            ),
+            block_size=int((lease or {}).get("block_size") or 16),
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            verify_tokens=verify_tokens,
+        )
     if repages:
         live_decode = paged_copy + quant_working
         live_total = paged_copy
@@ -20057,6 +20229,7 @@ def _admission_growth(
         "repage_copy_bytes": int(paged_copy),
         "output_reserve_bytes": int(out_rows * paged_w),
         "quant_working_bytes": int(quant_working),
+        "quant_working": quant_detail or None,
         "publish_copy_bytes": int(publish_copy),
         "lease_capacity_tokens": (
             int(lease["capacity_tokens"])
@@ -20572,6 +20745,8 @@ def _run_prefill_admission(
             scratch_bytes=scratch,
             lease=lease,
             context_transient_bytes_per_token=transient_per_token,
+            prefill_chunk_tokens=width,
+            verify_tokens=max(1, int(mtp_depth or 0) + 1),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)

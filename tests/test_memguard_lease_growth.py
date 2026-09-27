@@ -169,7 +169,9 @@ class TestTheAdmissionReadsTheLease:
         entry = SimpleNamespace(
             cache_ref=[SimpleNamespace(keys=None)] * 48 + [_PagedLayer(12_288)] * 16
         )
-        assert srv._lease_cache_shape(entry) == _lease(196_608)
+        # These layers hold no quantized working copy (no q8 mirror, no q4
+        # bank), so a lease of them extends none.
+        assert srv._lease_cache_shape(entry) == {**_lease(196_608), "working_rows": 0}
         assert srv._lease_cache_shape(SimpleNamespace(cache_ref=None)) is None
         assert srv._lease_cache_shape(
             SimpleNamespace(cache_ref=[SimpleNamespace(keys=None)])
