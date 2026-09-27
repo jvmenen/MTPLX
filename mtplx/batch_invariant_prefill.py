@@ -52,7 +52,7 @@ from typing import Any
 
 import mlx.core as mx
 from mlx import nn
-from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU, _gather_sort
 
 from .attention_context import current_attention_phase
 
@@ -254,12 +254,37 @@ class BatchInvariantQuantizedLinear(nn.QuantizedLinear):
 class BatchInvariantSwitchGLU(SwitchGLU):
     """``SwitchGLU`` that always runs the sorted tiled expert kernel in prefill."""
 
+    def _min_sorted_tokens(self, top_k: int) -> int:
+        experts = int(self.gate_proj["weight"].shape[0])
+        return -(-_MIN_ROWS_PER_EXPERT * experts // int(top_k))
+
+    def sorted_route_applies(self, x: mx.array, top_k: int) -> bool:
+        """Whether this prefill forward runs the sorted kernel without padding,
+        so ``sorted_experts`` may hand out its expert-sorted output."""
+
+        tokens = 1
+        for dim in x.shape[:-1]:
+            tokens *= int(dim)
+        return _in_prefill() and tokens >= self._min_sorted_tokens(top_k)
+
+    def sorted_experts(self, x: mx.array, indices: mx.array) -> tuple[mx.array, mx.array]:
+        """The stock sorted chain without its final unsort, for a forward that
+        ``sorted_route_applies`` to: ``([tokens * top_k, dims]`` expert outputs
+        in expert-sorted order, the inverse permutation to token order)."""
+
+        x = mx.expand_dims(x, (-2, -3))
+        x, idx, inv_order = _gather_sort(x, indices)
+        x_up = self.up_proj(x, idx, sorted_indices=True)
+        x_gate = self.gate_proj(x, idx, sorted_indices=True)
+        y = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=True)
+        return y.reshape(-1, int(y.shape[-1])), inv_order
+
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         if not _in_prefill():
             return super().__call__(x, indices)
         experts = int(self.gate_proj["weight"].shape[0])
         top_k = int(indices.shape[-1])
-        min_tokens = -(-_MIN_ROWS_PER_EXPERT * experts // top_k)
+        min_tokens = self._min_sorted_tokens(top_k)
         tokens = x.reshape(-1, int(x.shape[-1]))
         token_count = int(tokens.shape[0])
         if token_count >= min_tokens:
