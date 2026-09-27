@@ -1438,6 +1438,42 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertTrue(logged, "the Logs window records why nothing launched")
     }
 
+    // MARK: Codex final review, finding 3: a pid that now belongs to another process
+
+    /// The app adopted a daemon whose /health named pid X. The daemon then
+    /// exited and the kernel gave X to an unrelated process. Here /health
+    /// reports the pid of an unrelated `sleep` from the start, which is the
+    /// same situation. Stop used to signal X. It now signals only a process
+    /// that carries the daemon's launch id.
+    @MainActor
+    func testStopNeverSignalsAProcessThatNowHoldsTheAdoptedDaemonsPID() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        let unrelated = Process()
+        unrelated.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        unrelated.arguments = ["60"]
+        try unrelated.run()
+        addTeardownBlock { if unrelated.isRunning { unrelated.terminate() } }
+        try daemon.setReportedPID(unrelated.processIdentifier)
+        _ = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let store = daemon.makeStore(configuration: MTPLXAppConfiguration(), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running, "adopted")
+        XCTAssertEqual(store.health?.startup?.pid, Int(unrelated.processIdentifier))
+
+        await store.stopDaemon()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertTrue(unrelated.isRunning, "Stop never signals a process it cannot confirm as the app's daemon")
+        let logged = await logsMention(store, "not signalling pid \(unrelated.processIdentifier)")
+        XCTAssertTrue(logged, "the Logs window records the pid it left alone")
+    }
+
     // MARK: Closing the window during a model load
 
     /// Closing the main window cancels its launch task. The start runs on a

@@ -450,6 +450,35 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
     }
 
+    /// Whether `pid` is still the daemon this supervisor holds (#528): the
+    /// owned root while its Process runs, or a live process whose
+    /// environment carries the held launch id. A pid alone proves nothing
+    /// once its process has exited: the kernel hands the number out again.
+    public func pidRunsHeldDaemon(_ pid: pid_t) -> Bool {
+        let held = lock.withLock { () -> (process: Process?, launchID: String?) in
+            (process, adoptedProcessID != nil ? adoptedLaunchID : ownedLaunchID)
+        }
+        if let process = held.process, process.processIdentifier == pid {
+            return process.isRunning
+        }
+        guard pid > 1, let launchID = held.launchID, Self.pidIsAlive(pid) else { return false }
+        return Self.appLaunchID(ofProcess: pid) == launchID
+    }
+
+    /// Whether the daemon this supervisor holds still runs (#528). An
+    /// adopted daemon gives no exit callback, so this is the only way to
+    /// learn that it is gone while something else answers on its port.
+    public func heldDaemonIsRunning() -> Bool {
+        let held = lock.withLock { (process: process, adoptedPID: adoptedProcessID) }
+        if let process = held.process {
+            return process.isRunning
+        }
+        if let adoptedPID = held.adoptedPID {
+            return pidRunsHeldDaemon(adoptedPID)
+        }
+        return false
+    }
+
     /// The daemon root pid this supervisor owns or adopted, for liveness
     /// checks that must not depend on HTTP answering (issue #487).
     public func daemonProcessIdentifier() -> pid_t? {
@@ -1230,6 +1259,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             waitsForLaunch: Bool,
             process: Process?,
             adoptedPID: pid_t?,
+            adoptedLaunchID: String?,
             lifecycleEpoch: Int,
             launchID: String?
         )? in
@@ -1261,6 +1291,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             // root PID after the launch barrier opens.
             let currentProcess = expectedProcess ?? process
             let currentAdoptedPID = adoptedProcessID
+            let currentAdoptedLaunchID = adoptedLaunchID
             let currentLaunchID = ownedLaunchID
             let currentLifecycleEpoch = lifecycleEpoch
             state = .stopping
@@ -1268,6 +1299,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 launchInProgress,
                 currentProcess,
                 currentAdoptedPID,
+                currentAdoptedLaunchID,
                 currentLifecycleEpoch,
                 currentLaunchID
             )
@@ -1280,15 +1312,41 @@ public final class DaemonSupervisor: @unchecked Sendable {
         if stopContext.waitsForLaunch {
             await waitForLaunchCompletion()
         }
+        // Signal only processes confirmed as this lifecycle's daemon (#528).
+        // A pid is a number the kernel hands out again once its process has
+        // exited and been reaped: an adopted daemon that exited while the
+        // Mac slept, or a pid from an older /health answer, can name an
+        // unrelated process by the time Stop runs. The owned root is
+        // confirmed by its Process object while it runs. Any other pid is
+        // confirmed only when the process holding it carries this
+        // lifecycle's launch id in its environment, read from the kernel as
+        // for #503. A pid that cannot be confirmed is never signalled.
         var rootPIDs: [pid_t] = []
-        if let currentPID = stopContext.process?.processIdentifier {
-            rootPIDs.append(currentPID)
+        if let owned = stopContext.process,
+           owned.processIdentifier > 1,
+           owned.isRunning {
+            rootPIDs.append(owned.processIdentifier)
         }
-        if let adopted = stopContext.adoptedPID {
-            rootPIDs.append(adopted)
+        let confirmingLaunchID = stopContext.adoptedPID != nil
+            ? stopContext.adoptedLaunchID
+            : stopContext.launchID
+        var unconfirmedPIDs: [pid_t] = []
+        let otherPIDs = ([stopContext.adoptedPID].compactMap { $0 } + additionalProcessIDs)
+            .filter { $0 > 1 }
+        for pid in otherPIDs where !rootPIDs.contains(pid) && !unconfirmedPIDs.contains(pid) {
+            if let confirmingLaunchID, Self.appLaunchID(ofProcess: pid) == confirmingLaunchID {
+                rootPIDs.append(pid)
+            } else if Self.pidIsAlive(pid) {
+                unconfirmedPIDs.append(pid)
+            }
         }
-        rootPIDs.append(contentsOf: additionalProcessIDs)
-        rootPIDs = rootPIDs.filter { $0 > 1 }
+        if !unconfirmedPIDs.isEmpty {
+            let list = unconfirmedPIDs.map(String.init).joined(separator: ",")
+            await logStore.append(
+                "stop: not signalling pid \(list): the process there does not carry this daemon's launch id (the daemon exited and the pid now belongs to another process)",
+                stream: .system
+            )
+        }
         // A daemon can exit after Stop has claimed the lifecycle but before
         // pgrep expands its descendants. Those descendants then reparent and
         // are no longer discoverable by PPID, so include the exact inherited
