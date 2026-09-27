@@ -364,6 +364,7 @@ def block_prefix_restore_enabled() -> bool:
 DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
 BLOCK_PREFIX_MIN_MATCH_ENV = "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS"
 SHARED_PREFIX_EDGE_ENV = "MTPLX_SESSION_SHARED_PREFIX_EDGE"
+SESSION_HEAD_ANCHOR_ENV = "MTPLX_SESSION_HEAD_ANCHOR"
 STORE_ON_PREFILL_MIN_SUFFIX_ENV = "MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX"
 DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX = 1024
 #: Token block a block-prefix restore rewinds to (the last full block under
@@ -450,6 +451,18 @@ def shared_prefix_edge_enabled() -> bool:
     """
 
     return env_bool(SHARED_PREFIX_EDGE_ENV, default=False)
+
+
+def session_head_anchor_enabled() -> bool:
+    """``MTPLX_SESSION_HEAD_ANCHOR``, default OFF.
+
+    When on, a prefill records recurrent state exactly where the prompt's
+    fixed head (tools and system turn) ends, and boundary thinning never
+    drops that record, so a new session with the same head restores all of
+    it (see ``mtplx.session_head_anchor``).
+    """
+
+    return env_bool(SESSION_HEAD_ANCHOR_ENV, default=False)
 
 
 def session_prefix_min_match_env(tokens: int) -> dict[str, str]:
