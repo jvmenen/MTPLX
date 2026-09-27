@@ -125,6 +125,7 @@ from .runtime_options import (
     near_prefix_min_match_tokens,
     prefix_block_size,
     qwen4_opdiet_enabled,
+    session_head_anchor_enabled,
     shared_prefix_edge_enabled,
     store_on_prefill_min_suffix,
 )
@@ -1487,9 +1488,11 @@ def _predicted_first_prefill_span(
         # Boundaries recorded inside the forwards: the loop runs the plain
         # grid whatever the tail looks like.
         return plain[0]
-    cold_edges: tuple[int, ...] = ()
-    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
-        cold_edges = (int(stable_prefix_len),)
+    cold_edges = _mandatory_prefill_edges(
+        stable_prefix_len,
+        _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice),
+        limit=body_len,
+    )
     grid = _prefill_spans_with_tail_grid(
         body_len,
         tail_interval=_gdn_boundary_tail_interval(),
@@ -4194,15 +4197,18 @@ def _prefill_restored_prompt_suffix(
     # the fused single-forward cannot capture interior boundaries, so it
     # defers to the chunked path in that case (same tokens, one extra
     # launch; no re-evaluation).
-    _stable_edge_rel: int | None = None
-    if (
-        stable_prefix_len is not None
-        and gdn_boundary_sink is not None
-        and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
-    ):
-        _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    _stable_edges_rel = (
+        _mandatory_prefill_edges(
+            stable_prefix_len,
+            _sink_anchors(gdn_boundary_sink),
+            limit=len(suffix) - 1,
+            offset=int(cached_tokens),
+        )
+        if gdn_boundary_sink is not None
+        else ()
+    )
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _stable_edges_rel:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -4272,9 +4278,7 @@ def _prefill_restored_prompt_suffix(
             capture_boundaries=capture_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=(
-                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-            ),
+            mandatory_edges=_stable_edges_rel,
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -4612,6 +4616,7 @@ def _restore_near_prefix_prompt_state(
         return None
     max_gap = near_prefix_max_token_gap()
     min_match = near_prefix_min_match_tokens()
+    head_anchors = _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
     block_prefix_enabled = (
         block_prefix_restore_enabled()
         if allow_block_prefix is None
@@ -4892,7 +4897,9 @@ def _restore_near_prefix_prompt_state(
             # an empty suffix. (Only reachable when a boundary coincides with
             # a fully-contained prompt — fall through to other candidates.)
             continue
-        inherited_boundaries = _inherited_gdn_boundaries(entry, restore_point)
+        inherited_boundaries = _inherited_gdn_boundaries(
+            entry, restore_point, head_anchors
+        )
         restored = SimpleNamespace(
             entry=SimpleNamespace(prefix_len=restore_point),
             cache=cache,
@@ -4938,7 +4945,7 @@ def _restore_near_prefix_prompt_state(
                 restore_served=served_truth,
             )
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
+            GdnBoundarySink(inherited_boundaries, anchors=head_anchors)
             if _gdn_boundary_capture_enabled()
             else None
         )
@@ -5091,7 +5098,7 @@ def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
 
 
 def _thin_gdn_boundary_records(
-    records: list[tuple[int, Any, Any]], cap: int
+    records: list[tuple[int, Any, Any]], cap: int, keep: Sequence[int] = ()
 ) -> list[tuple[int, Any, Any]]:
     """Thin boundary records to `cap` with geometric distance-from-tail coverage.
 
@@ -5109,7 +5116,10 @@ def _thin_gdn_boundary_records(
       - one record per power-of-two bucket of distance-from-newest
         (256..512, 512..1024, ... tokens), preferring the record CLOSEST to
         the newest inside each bucket,
-      - the oldest record (deep-divergence anchor).
+      - the oldest record (deep-divergence anchor),
+      - every record at a ``keep`` position (the session-head anchor: a new
+        session with the same head restores there, however far from the
+        tail it lies).
     Coverage invariant (unit-tested): for any matched position covered by the
     original records, restoring at the nearest kept boundary at or below it
     re-prefills at most ~3x the true divergence distance from the tail (plus
@@ -5123,6 +5133,10 @@ def _thin_gdn_boundary_records(
     oldest = ordered[0]
     newest_pos = int(newest[0])
     kept: dict[int, tuple[int, Any, Any]] = {int(newest[0]): newest, int(oldest[0]): oldest}
+    protected = {int(position) for position in keep}
+    kept.update(
+        (int(record[0]), record) for record in ordered if int(record[0]) in protected
+    )
     # Walk from the tail toward the head (distance from newest increasing).
     # Keep the first record past each doubling floor — one keeper per
     # distance scale, geometric spacing by construction regardless of how
@@ -5149,6 +5163,75 @@ def _thin_gdn_boundary_records(
             next_floor *= 2
         idx -= 1
     return sorted(kept.values(), key=lambda record: int(record[0]))
+
+
+class GdnBoundarySink(list):
+    """The boundary records a prefill appends to, plus its anchors.
+
+    Anchors are prompt positions the prefill must end a span at (so a record
+    lands exactly there) and that retention never thins away. A plain list
+    is a sink without anchors.
+    """
+
+    def __init__(self, records: Sequence[Any] = (), *, anchors: Sequence[int] = ()):
+        super().__init__(records)
+        self.anchors = tuple(int(position) for position in anchors)
+
+
+def _sink_anchors(sink: Any) -> tuple[int, ...]:
+    return tuple(getattr(sink, "anchors", ()))
+
+
+def _thin_boundary_sink(sink: list[tuple[int, Any, Any]]) -> None:
+    """Keep the sink within the boundary cap, never dropping an anchor."""
+
+    cap = _gdn_boundary_max_count()
+    if len(sink) > cap:
+        sink[:] = _thin_gdn_boundary_records(sink, cap, keep=_sink_anchors(sink))
+
+
+def _mandatory_prefill_edges(
+    stable_prefix_len: int | None,
+    anchors: Sequence[int],
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[int, ...]:
+    """Span ends a capturing prefill must hit, relative to ``offset``.
+
+    The caller's stable prompt prefix and the session-head anchors, each kept
+    only strictly inside ``(0, limit)`` of the span being planned.
+    """
+
+    positions = [int(position) for position in anchors]
+    if stable_prefix_len is not None:
+        positions.append(int(stable_prefix_len))
+    return tuple(
+        sorted({p - offset for p in positions if 0 < p - offset < int(limit)})
+    )
+
+
+def _session_head_anchors(
+    rt: Any, prompt_ids: Sequence[int], *, vision_splice: Any = None
+) -> tuple[int, ...]:
+    """Where the prompt's fixed head ends, as boundary anchors (switch on).
+
+    Empty when ``MTPLX_SESSION_HEAD_ANCHOR`` is off, for image prompts, for a
+    tokenizer without ChatML turns, and when the head is shorter than the
+    block-restore minimum (no restore could use it).
+    """
+
+    if vision_splice is not None or not session_head_anchor_enabled():
+        return ()
+    from .session_head_anchor import session_head_length, turn_markers
+
+    markers = turn_markers(getattr(rt, "tokenizer", None))
+    if markers is None:
+        return ()
+    head = session_head_length(prompt_ids, markers)
+    if head is None or head < block_prefix_min_match_tokens():
+        return ()
+    return (head,)
 
 
 def _capture_gdn_boundary(
@@ -5180,9 +5263,7 @@ def _capture_gdn_boundary(
         sink.append(
             (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
         )
-        cap = _gdn_boundary_max_count()
-        if len(sink) > cap:
-            sink[:] = _thin_gdn_boundary_records(sink, cap)
+        _thin_boundary_sink(sink)
     except Exception:
         # Boundary capture is an accelerator for future restores; never let it
         # break the cold prefill that is running right now.
@@ -5467,9 +5548,7 @@ def _append_gdn_boundary_record(
     """Append one boundary record and keep the geometric retention."""
 
     sink.append((int(tokens_done), snapshot, hidden_leaf))
-    cap = _gdn_boundary_max_count()
-    if len(sink) > cap:
-        sink[:] = _thin_gdn_boundary_records(sink, cap)
+    _thin_boundary_sink(sink)
 
 
 def _record_inforward_gdn_boundary(
@@ -5595,7 +5674,9 @@ def _bank_inforward_boundaries(
     return banked
 
 
-def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
+def _inherited_gdn_boundaries(
+    entry: Any, restore_point: int, anchors: Sequence[int] = ()
+) -> list:
     """Boundaries carried over from a restored SessionBank entry.
 
     A boundary record (position, recurrent snapshot[, hidden]) describes the
@@ -5608,6 +5689,9 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
     last completed postcommit (measured 2026-07-04: rounds pinned at a stale
     6.5k prefix while prompts grew to 12.5k, and the follow-up turn went
     fully cold with `no_snapshot_coverage`).
+
+    ``anchors`` are the new request's session-head anchors: a record there
+    survives the thinning.
     """
     records = list(getattr(entry, "gdn_boundaries", None) or [])
     kept = [record for record in records if int(record[0]) <= int(restore_point)]
@@ -5616,7 +5700,7 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
         # Geometric retention, mirroring _capture_gdn_boundary — the old
         # oldest+dense-tail pop(1) here was the second churn site that
         # hollowed out mid-prefix coverage on clone/lease chains.
-        kept = _thin_gdn_boundary_records(kept, cap)
+        kept = _thin_gdn_boundary_records(kept, cap, keep=anchors)
     return kept
 
 
@@ -6243,6 +6327,9 @@ def restore_or_prefill_prompt_state(
         bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
         if stable_prefix_len is None and vision_splice is None:
             stable_prefix_len = _shared_prefix_edge(session_bank, prompt_ids)
+        head_anchors = _session_head_anchors(
+            rt, prompt_ids, vision_splice=vision_splice
+        )
         exact_prefix_len = 0
         try:
             longest_prefix = getattr(session_bank, "longest_prefix", None)
@@ -6348,7 +6435,7 @@ def restore_or_prefill_prompt_state(
             _check_postcommit_abort(abort_check)
             suffix = list(prompt_ids[restored.entry.prefix_len :])
             inherited_boundaries = _inherited_gdn_boundaries(
-                restored.entry, restored.entry.prefix_len
+                restored.entry, restored.entry.prefix_len, head_anchors
             )
             exact_served: dict[str, Any] = {
                 "entry_prefix_len": int(restored.entry.prefix_len),
@@ -6418,7 +6505,7 @@ def restore_or_prefill_prompt_state(
                 ssd_suffix_tokens=len(suffix),
             )
             suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-                list(inherited_boundaries)
+                GdnBoundarySink(inherited_boundaries, anchors=head_anchors)
                 if session_bank is not None
                 and vision_splice is None
                 and _gdn_boundary_capture_enabled()
@@ -6512,7 +6599,9 @@ def restore_or_prefill_prompt_state(
     # whenever the result will be banked — they are what make sub-prefix
     # restores on hybrid models exact instead of approximate.
     gdn_boundary_sink: list[tuple[int, Any]] | None = (
-        []
+        GdnBoundarySink(
+            anchors=_session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
+        )
         if session_bank is not None
         and vision_splice is None
         and _gdn_boundary_capture_enabled()
@@ -7623,13 +7712,13 @@ def _prefill(
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
         body_array = mx.array([body])
-        _cold_edges: tuple[int, ...] = ()
-        if (
-            stable_prefix_len is not None
-            and capture_boundaries
-            and 0 < int(stable_prefix_len) < len(body)
-        ):
-            _cold_edges = (int(stable_prefix_len),)
+        _cold_edges = (
+            _mandatory_prefill_edges(
+                stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+            )
+            if capture_boundaries
+            else ()
+        )
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if capture_boundaries
@@ -7769,13 +7858,13 @@ def _prefill_committed_mtp_history_streaming(
             pad_prefix_counts.append(
                 pad_prefix_counts[-1] + (1 if token == pad_id else 0)
             )
-    _cold_edges: tuple[int, ...] = ()
-    if (
-        stable_prefix_len is not None
-        and capture_boundaries
-        and 0 < int(stable_prefix_len) < len(body)
-    ):
-        _cold_edges = (int(stable_prefix_len),)
+    _cold_edges = (
+        _mandatory_prefill_edges(
+            stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+        )
+        if capture_boundaries
+        else ()
+    )
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if capture_boundaries
