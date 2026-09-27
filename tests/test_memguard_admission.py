@@ -534,6 +534,49 @@ class Test499FortyEightGigSeat:
         assert receipt.get("refused") is not True
         assert receipt["projected_bytes_after"] <= 36 * GIB
 
+    def test_with_the_heads_history_the_turn_is_refused_at_the_limit(self, monkeypatch):
+        """The plan now carries the MTP head's committed history (4,096 B a
+        token on the 27B). Priced with it the turn projects 39.47 GiB, the
+        trace's measured 39.5 GiB peak, and even without the banked prompt
+        copy it needs 36.03 GiB against the 36 GiB limit: a structured 507
+        before prefill, where 2.12.0 ran it past the limit and produced no
+        tokens before the client gave up."""
+
+        plan = self._plan()
+        plan.mtp_history_bytes_per_token = 4_096
+        row = Q27_KV + 4_096
+        cap = per_session_play_ceiling_bytes(plan)
+        manager = _manager(max_bytes=14 * GIB, per_session_max_bytes=cap)
+        conversation = tuple(range(96_170))
+        _put(manager.bank, conversation, session_id="opencode", row_bytes=row, live_cache=True)
+        session = manager.get_or_create("opencode")
+        assert session.try_begin_generation()
+        machine = _Machine(
+            manager.bank, base_gib=Q27_WEIGHTS / GIB + 0.5, cache_gib=0.3, host_gib=3.0
+        )
+        _install(monkeypatch, machine)
+        state = _state(manager, plan=plan, runtime=_q27_runtime(), limit_gib=36, total_gib=48)
+        prompt = list(conversation) + list(range(3_000_000, 3_003_185))
+        try:
+            receipt = _admit(
+                state,
+                prompt_ids=prompt,
+                session_bank=manager.bank,
+                session_id="opencode",
+                commit_prompt_prefix=True,
+            )
+        finally:
+            session.end_generation()
+        assert 39.4 * GIB < receipt["projected_bytes"] < 39.5 * GIB
+        assert receipt["prompt_publish_skipped"] is True
+        assert receipt["refused"] is True
+        assert receipt["refusal_reason"] == "projected_over_limit_after_reclamation"
+        assert 0 < receipt["projected_bytes_after"] - 36 * GIB < 0.05 * GIB
+        # What is left is this conversation's own restore source, which the
+        # turn needs: a shorter prompt, not a retry, fits.
+        assert receipt["retry_can_succeed"] is False
+        assert receipt["retry_when"] == "not_without_a_shorter_prompt"
+
     def test_the_banked_prompt_copy_is_priced_while_it_fits_the_cap(self, monkeypatch):
         plan = self._plan()
         cap = per_session_play_ceiling_bytes(plan)
