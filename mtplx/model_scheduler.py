@@ -168,6 +168,7 @@ class ModelWorkScheduler:
         self._idle: deque[_WorkItem] = deque()
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
+        self._persistence_cancelled = 0
         # Idle-pump budget (issue #290): the persistence band is normally
         # reachable only while the idle deque is COMPLETELY empty, so any
         # self-chaining idle_postcommit occupant (each completion enqueues
@@ -418,6 +419,7 @@ class ModelWorkScheduler:
                 "idle_pending": len(self._idle),
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
+                "persistence_cancelled": self._persistence_cancelled,
                 "persistence_pump_budget": self._persistence_pump_budget,
                 "persistence_pumped": self._persistence_pumped,
                 "active_kind": self._active_kind,
@@ -552,6 +554,35 @@ class ModelWorkScheduler:
             earliest_start_s=time.monotonic() + self.idle_grace_s,
             coalesce_key=coalesce_key,
         )
+
+    def cancel_idle_persistence(self, coalesce_key: str) -> int:
+        """Drop PENDING persistence work filed under ``coalesce_key``.
+
+        The memory guard releases an idle session's bank entries when a
+        request cannot otherwise fit. A queued SSD encode for that session
+        holds its entry's snapshot arrays until it runs, so the release
+        frees nothing while the closure sits here. Same reach as the
+        newest-wins coalescing in ``_submit``: only queued items (a running
+        item was popped from the deque and is never cancelled), and removing
+        one only means that entry is not written. Entries already on disk are
+        untouched: the cold tier writes an entry under a temporary name and
+        renames it into place before its manifest row lands, so a cancelled
+        job never leaves a partial entry behind.
+        """
+
+        if not coalesce_key:
+            return 0
+        cancelled = 0
+        with self._condition:
+            for stale in list(self._persistence):
+                if stale.coalesce_key == coalesce_key:
+                    self._persistence.remove(stale)
+                    stale.future.cancel()
+                    cancelled += 1
+            self._persistence_cancelled += cancelled
+            if cancelled:
+                self._condition.notify_all()
+        return cancelled
 
     def shutdown(
         self,

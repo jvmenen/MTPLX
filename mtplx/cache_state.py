@@ -658,14 +658,26 @@ def _paged_gqa_sdpa(
     )
 
 
-def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int:
+def _dynamic_paged_num_blocks(
+    *,
+    block_size: int,
+    configured_blocks: int,
+    request_tokens: int | None = None,
+) -> int:
+    """Blocks a paged cache is installed (or re-configured) with for the
+    running request. ``request_tokens`` stands in for the request's
+    ``MTPLX_DYNAMIC_PAGED_KV_TOKENS`` when the admission asks before the
+    request's environment is applied."""
+
     if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
         return int(configured_blocks)
     min_blocks = max(
         int(configured_blocks),
         _env_int("MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS", int(configured_blocks)),
     )
-    request_tokens = max(0, _env_int("MTPLX_DYNAMIC_PAGED_KV_TOKENS", 0))
+    if request_tokens is None:
+        request_tokens = _env_int("MTPLX_DYNAMIC_PAGED_KV_TOKENS", 0)
+    request_tokens = max(0, int(request_tokens))
     previous_high_water = max(
         0,
         _env_int("MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER", 0),
@@ -679,24 +691,16 @@ def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int
     return max(min_blocks, required_blocks)
 
 
-def _dynamic_paged_growth_blocks(
-    *, block_size: int, current_blocks: int, required_tokens: int
-) -> int | None:
-    """Block count a paged KV store grows to so ``required_tokens`` rows fit.
+def paged_grown_blocks(current_blocks: int, required_tokens: int, block_size: int) -> int:
+    """The block count a paged cache grows to when ``required_tokens`` do
+    not fit (``VllmMetalPagedKVCache._grow_to_capacity``): what is required,
+    or 1.5 times the current count, and never less than one block more.
+    Geometric growth must not overshoot the serving context window (#150:
+    the 1.5x step at 100k+ ctx allocates GiBs of blocks no request can ever
+    address); a genuinely larger requirement still wins, correctness over
+    the clamp. The admission prices a lease's growth with the same rule."""
 
-    None when dynamic growth is off (``MTPLX_DYNAMIC_PAGED_KV`` unset): the
-    caller must refuse the write rather than run past its buffers. The eager
-    pages (``_grow_to_capacity``) and the promoted tensor-offset adapters
-    (``ensure_capacity``) share this policy so both grow the same way:
-    geometric 1.5x, never below the requirement, and clamped to the serving
-    context window when the requirement fits inside it (#150: the 1.5x step
-    at 100k+ ctx allocated GiBs of blocks no request can ever address). A
-    genuinely larger requirement still wins — correctness over the clamp.
-    """
-
-    if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
-        return None
-    block_size = int(block_size)
+    block_size = max(1, int(block_size))
     current_blocks = int(current_blocks)
     required_blocks = (int(required_tokens) + block_size - 1) // block_size
     grown_blocks = max(
@@ -710,6 +714,24 @@ def _dynamic_paged_growth_blocks(
         if window_blocks >= required_blocks:
             grown_blocks = min(grown_blocks, max(window_blocks, current_blocks))
     return int(grown_blocks)
+
+
+def _dynamic_paged_growth_blocks(
+    *, block_size: int, current_blocks: int, required_tokens: int
+) -> int | None:
+    """Block count a paged KV store grows to so ``required_tokens`` rows fit.
+
+    None when dynamic growth is off (``MTPLX_DYNAMIC_PAGED_KV`` unset): the
+    caller must refuse the write rather than run past its buffers. The eager
+    pages (``_grow_to_capacity``) and the promoted tensor-offset adapters
+    (``ensure_capacity``) share this policy so both grow the same way; the
+    arithmetic is ``paged_grown_blocks``, which the admission also uses to
+    price a lease's growth.
+    """
+
+    if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
+        return None
+    return paged_grown_blocks(int(current_blocks), int(required_tokens), int(block_size))
 
 
 def _concrete_offset(value: Any) -> int | None:
@@ -727,6 +749,40 @@ def _concrete_offset(value: Any) -> int | None:
         if is_compile_trace_error(exc):
             return None
         raise
+
+
+def paged_lease_capacity_after(
+    capacity_tokens: int,
+    block_size: int,
+    *,
+    prompt_tokens: int,
+    reserved_tokens: int,
+    repages: bool,
+) -> int:
+    """The capacity a leased paged cache ends a prefill with. The prefill's
+    writes grow it when the prompt does not fit (``_write_tail``); the
+    repage after the prefill re-installs it with the request's reservation
+    (``install_vllm_metal_paged_attention_kv_cache``), growing it again when
+    that asks for more. Unchanged when both fit."""
+
+    block_size = max(1, int(block_size))
+    capacity = int(capacity_tokens)
+    if int(prompt_tokens) > capacity:
+        capacity = block_size * paged_grown_blocks(
+            capacity // block_size, int(prompt_tokens), block_size
+        )
+    if repages and _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
+        configured = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024")
+        wanted = block_size * _dynamic_paged_num_blocks(
+            block_size=block_size,
+            configured_blocks=configured,
+            request_tokens=int(reserved_tokens),
+        )
+        if wanted > capacity:
+            capacity = block_size * paged_grown_blocks(
+                capacity // block_size, wanted, block_size
+            )
+    return int(capacity)
 
 
 def _paged_attention_requires_external_ops(
@@ -2963,26 +3019,34 @@ def _admit_paged_growth(transient_bytes: int, *, detail: str) -> None:
     import mlx.core as mx
 
     from .system_memory import (
+        admission_floors,
         admission_shortfall_bytes,
         read_system_memory,
-        system_memory_floors,
     )
 
+    # The same two lines the prefill admission holds: a growth that would
+    # leave less than the shed floor first gets the engine's own reusable
+    # memory back (the allocator pool) and reads the Mac again; one that
+    # would still leave less than the abort floor is refused.
     reading = read_system_memory()
     shortfall = admission_shortfall_bytes(
-        reading,
-        growth_bytes=int(transient_bytes),
-        reclaimable_bytes=int(mx.get_cache_memory()),
+        reading, growth_bytes=int(transient_bytes), floor="shed"
     )
+    if shortfall > 0:
+        mx.clear_cache()
+        reading = read_system_memory()
+        shortfall = admission_shortfall_bytes(
+            reading, growth_bytes=int(transient_bytes), floor="abort"
+        )
     if shortfall <= 0:
         return
-    shed_floor, _abort_floor = system_memory_floors(reading.total_bytes)
+    _shed_floor, abort_floor = admission_floors(reading, int(transient_bytes))
     gib = float(1024**3)
     raise PagedKVGrowthRefused(
         f"insufficient memory to grow the paged KV cache: {detail} needs "
         f"{transient_bytes / gib:.2f} GiB while this Mac has "
         f"{reading.available_bytes / gib:.2f} GiB available and keeps "
-        f"{shed_floor / gib:.2f} GiB free for the desktop; refusing before "
+        f"{abort_floor / gib:.2f} GiB free for the desktop; refusing before "
         "any row is written"
     )
 

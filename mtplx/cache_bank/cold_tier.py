@@ -1388,15 +1388,9 @@ class SessionBankColdTier:
             pass
         self._writer.join(timeout=5.0)
 
-    def _metadata_for_entry(
-        self,
-        entry: Any,
-        *,
-        capabilities: list[str] | tuple[str, ...],
-        payload_nbytes: int,
-    ) -> dict[str, Any]:
-        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
-        identity = {
+    @staticmethod
+    def _entry_identity(entry: Any) -> dict[str, Any]:
+        return {
             "model_path": str(getattr(entry, "model_path", "")),
             "mtp_enabled": bool(getattr(entry, "mtp_enabled", False)),
             "hidden_variant": getattr(entry, "hidden_variant", None),
@@ -1406,12 +1400,42 @@ class SessionBankColdTier:
             "policy_fingerprint": getattr(entry, "policy_fingerprint", None),
             "session_id": getattr(entry, "session_id", None),
         }
+
+    def entry_id_for(self, entry: Any) -> str:
+        """The id a bank entry is written under: its tokens, identity and
+        commit epochs, so the same entry always maps to the same record."""
+
+        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
         digest = hashlib.sha256()
         digest.update(token_hash(token_ids).encode("utf-8"))
-        digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        digest.update(
+            json.dumps(
+                self._entry_identity(entry), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        )
         digest.update(str(int(getattr(entry, "snapshot_epoch", 0) or 0)).encode("ascii"))
         digest.update(str(int(getattr(entry, "mtp_snapshot_epoch", 0) or 0)).encode("ascii"))
-        entry_id = digest.hexdigest()[:32]
+        return digest.hexdigest()[:32]
+
+    def is_published(self, entry: Any) -> bool:
+        """Whether a restore can find this entry on disk: its manifest row
+        has landed. A write still in the writer's queue, or one that failed,
+        is not published; only the manifest row makes a record restorable."""
+
+        if self.mode == "off":
+            return False
+        return self._entry_in_manifest(self.entry_id_for(entry))
+
+    def _metadata_for_entry(
+        self,
+        entry: Any,
+        *,
+        capabilities: list[str] | tuple[str, ...],
+        payload_nbytes: int,
+    ) -> dict[str, Any]:
+        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
+        identity = self._entry_identity(entry)
+        entry_id = self.entry_id_for(entry)
         block_identity = {
             key: value
             for key, value in identity.items()

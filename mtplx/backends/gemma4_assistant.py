@@ -735,6 +735,94 @@ def _broadcast_batch_vector(value: Any, batch: int, limit: int) -> Any:
     return mx.clip(vector, 0, limit)
 
 
+def _config_int(config: Any, name: str) -> int:
+    try:
+        return int(getattr(config, name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _gemma4_cache_layers(config: Any) -> tuple[int, int]:
+    """(full-attention layers, sliding layers) that own a KV cache: the
+    layers before the KV-shared tail (``Gemma4TargetAdapter.make_cache``)."""
+
+    layer_types = list(getattr(config, "layer_types", None) or ())
+    shared = _config_int(config, "num_kv_shared_layers")
+    owners = layer_types[: max(0, len(layer_types) - shared)]
+    full = sum(1 for kind in owners if str(kind) == "full_attention")
+    return full, len(owners) - full
+
+
+def gemma4_resident_kv_bytes_per_token(config: Any) -> int:
+    """KV bytes a token keeps once decode has trimmed the sliding caches to
+    their window: the full-attention layers' keys and values (bf16). With
+    ``attention_k_eq_v`` the values are the keys, but ``KVCache`` stores
+    both. On the 31B: 10 layers x 2 x 4 heads x 512 x 2 B = 81,920."""
+
+    full, _sliding = _gemma4_cache_layers(config)
+    head_dim = _config_int(config, "global_head_dim") or _config_int(config, "head_dim")
+    kv_heads = _config_int(config, "num_key_value_heads")
+    if bool(getattr(config, "attention_k_eq_v", False)):
+        kv_heads = _config_int(config, "num_global_key_value_heads") or kv_heads
+    return full * 2 * kv_heads * head_dim * 2
+
+
+def gemma4_window_cache_bytes(config: Any) -> int:
+    """The sliding caches at their window, whatever the prompt's length: on
+    the 31B, 50 layers x 2 x 16 heads x 256 x 2 B x 1,024 = 0.84 GB."""
+
+    _full, sliding = _gemma4_cache_layers(config)
+    return (
+        sliding
+        * 2
+        * _config_int(config, "num_key_value_heads")
+        * _config_int(config, "head_dim")
+        * 2
+        * _config_int(config, "sliding_window")
+    )
+
+
+# Cold prefill peaks measured on the 31B (4-bit, M5 Max 128 GB,
+# 2026-09-27; the MLX allocator peak above the 16.5 GiB warm baseline):
+# 6,026 tokens +8.7 GiB, 12,026 +26.5 GiB, 24,026 +75.6 GiB, with the time
+# to first token growing the same way. Both grow with the square of the
+# prompt: the sliding layers attend with an array mask, and one layer's
+# scores for every head are materialized beside it (32 heads x bf16 = 64 B
+# per query-key pair). With the rows at full width (983,040 B a token) and
+# the layers' activations from the geometry, 80 B per pair bounds all three
+# points (+53, +13 and +5 percent); a 32K cold prompt comes to 129 GiB.
+GEMMA4_PREFILL_PAIR_BYTES = 80
+GEMMA4_PREFILL_CALIBRATION = (
+    "gemma4-31b-4bit cold prefill peaks at 6,026 / 12,026 / 24,026 tokens, 2026-09-27"
+)
+
+
+def gemma4_prefill_attention_pairs(config: Any, rows: int, cached_tokens: int) -> int:
+    """Query-key pairs one prefill forward of ``rows`` tokens attends over
+    with an array mask: the sliding layers
+    (``Gemma4RollbackRotatingKVCache.make_mask``) build one once the rows and
+    the cached window pass the window, rows x (cached window + rows)."""
+
+    window = _config_int(config, "sliding_window")
+    rows = max(0, int(rows))
+    _full, sliding = _gemma4_cache_layers(config)
+    if sliding <= 0 or window <= 0 or rows <= 1:
+        return 0
+    cached = min(window - 1, max(0, int(cached_tokens)))
+    if cached + rows <= window:
+        return 0
+    return rows * (cached + rows)
+
+
+def gemma4_prefill_attention_bytes(config: Any, rows: int, cached_tokens: int) -> int:
+    """The part of one prefill forward that grows with the square of its
+    rows: the mask and a layer's scores, measured (GEMMA4_PREFILL_PAIR_BYTES)."""
+
+    return GEMMA4_PREFILL_PAIR_BYTES * gemma4_prefill_attention_pairs(
+        config, rows, cached_tokens
+    )
+
+
 class Gemma4TargetAdapter:
     """Wrap the loaded MLX-LM Gemma 4 target and expose shared-KV hooks."""
 
@@ -1481,6 +1569,52 @@ class Gemma4AssistantRuntime:
 
     def make_cache(self):
         return self.target.make_cache()
+
+    # What the server's memory admission asks every runtime before a
+    # prefill (mtplx/server/openai.py, _run_prefill_admission). This backend
+    # builds its own caches and runs its own prefill, so it answers for
+    # itself instead of the generation loop's settings.
+
+    # Whenever a session bank is present, the prompt cache is cloned before
+    # decode (_clone_gemma4_prompt_cache), whatever store-on-prefill says.
+    keeps_prompt_snapshot_with_bank = True
+
+    # The reserve the chunked families are held to (3 GiB a 2,048-row chunk,
+    # measured on the 27B) does not describe one forward over the whole
+    # prompt. This backend's scratch is its geometry's activations, a fixed
+    # part and its measured attention (GEMMA4_PREFILL_PAIR_BYTES); receipts
+    # carry the calibration they were priced with.
+    prefill_scratch_calibration = GEMMA4_PREFILL_CALIBRATION
+
+    def text_args(self) -> Any:
+        """The target's text config, for the admission's geometry."""
+
+        return getattr(self.target.text_model, "config", None)
+
+    def prefill_forward_widths(
+        self, prompt_tokens: int, requested: int | None
+    ) -> list[int | None]:
+        """_gemma4_prefill_prompt forwards every uncached token in one call;
+        no chunk setting reaches it."""
+
+        del prompt_tokens, requested
+        return [None]
+
+    def prefill_cache_layout(self, context_tokens: int) -> str:
+        """Full-attention KV caches and sliding windows, kept as they are
+        through decode: nothing repages them."""
+
+        del context_tokens
+        return "contiguous_dense_decode"
+
+    def prefill_attention_bytes(self, rows: int, cached_tokens: int) -> int:
+        return gemma4_prefill_attention_bytes(self.text_args(), rows, cached_tokens)
+
+    def resident_kv_bytes_per_token(self) -> int:
+        return gemma4_resident_kv_bytes_per_token(self.text_args())
+
+    def window_cache_bytes(self) -> int:
+        return gemma4_window_cache_bytes(self.text_args())
 
     def forward_target(
         self,
@@ -2589,18 +2723,27 @@ def _restore_or_prefill_gemma4_prompt(
     session_draft_head_identity: str | None = None,
     session_policy_fingerprint: str | None = None,
     require_shared_kv: bool,
+    abort_check: Any | None = None,
 ) -> Gemma4PromptState:
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty for Gemma 4 generation")
+    from mtplx.generation import _check_postcommit_abort
+
+    def forward(tokens: list[int], cache: Any) -> tuple[Gemma4TargetOutput, float]:
+        # The request's abort site (the per-chunk memory check, the
+        # sustained-pressure abort, a client disconnect). This backend runs
+        # the uncached part of the prompt as one forward, so it asks before
+        # that forward allocates and again before decode starts.
+        _check_postcommit_abort(abort_check)
+        result = _gemma4_prefill_prompt(runtime, tokens, cache=cache, phase="prefill")
+        _check_postcommit_abort(abort_check)
+        return result
+
+    _check_postcommit_abort(abort_check)
 
     def cold_prefill(reason: str | None = None) -> Gemma4PromptState:
         cache = runtime.make_cache()
-        output, elapsed = _gemma4_prefill_prompt(
-            runtime,
-            prompt_ids,
-            cache=cache,
-            phase="prefill",
-        )
+        output, elapsed = forward(list(prompt_ids), cache)
         return Gemma4PromptState(
             cache=cache,
             logits=output.logits[:, -1, :],
@@ -2696,12 +2839,7 @@ def _restore_or_prefill_gemma4_prompt(
                     # speaking this contract. Fail closed to the next one.
                     continue
                 seed = restore_point - 1
-                output, _suffix_elapsed = _gemma4_prefill_prompt(
-                    runtime,
-                    list(prompt_ids[seed:]),
-                    cache=cache,
-                    phase="prefill",
-                )
+                output, _suffix_elapsed = forward(list(prompt_ids[seed:]), cache)
                 entry.hits += 1
                 entry.last_access_s = time.time()
                 return Gemma4PromptState(
@@ -2721,12 +2859,7 @@ def _restore_or_prefill_gemma4_prompt(
 
     suffix = list(prompt_ids[restored.entry.prefix_len :])
     if suffix:
-        output, suffix_elapsed = _gemma4_prefill_prompt(
-            runtime,
-            suffix,
-            cache=restored.cache,
-            phase="prefill",
-        )
+        output, suffix_elapsed = forward(suffix, restored.cache)
         return Gemma4PromptState(
             cache=restored.cache,
             logits=output.logits[:, -1, :],
@@ -2785,6 +2918,7 @@ def generate_gemma4_ar(
     session_policy_fingerprint: str | None = None,
     capture_final_state: bool = False,
     first_token_logprobs_top_k: int | None = None,
+    abort_check: Any | None = None,
 ):
     """Generate with the Gemma target only, using the local target adapter."""
 
@@ -2835,6 +2969,7 @@ def generate_gemma4_ar(
         session_draft_head_identity=session_draft_head_identity,
         session_policy_fingerprint=session_policy_fingerprint,
         require_shared_kv=False,
+        abort_check=abort_check,
     )
     if prefill_callback is not None:
         try:
@@ -3046,6 +3181,7 @@ def generate_gemma4_assistant(
     repetition_stop: bool = False,
     requested_speculative_depth: int | None = None,
     first_token_logprobs_top_k: int | None = None,
+    abort_check: Any | None = None,
 ):
     """Generate with the external Gemma assistant using target-prefix exactness."""
 
@@ -3102,6 +3238,7 @@ def generate_gemma4_assistant(
         session_draft_head_identity=session_draft_head_identity,
         session_policy_fingerprint=session_policy_fingerprint,
         require_shared_kv=True,
+        abort_check=abort_check,
     )
     if prefill_callback is not None:
         try:

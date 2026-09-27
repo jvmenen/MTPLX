@@ -1979,13 +1979,23 @@ def _forward_ar_optional_hidden(
     )
 
 
-def _prefill_chunk_size() -> int:
+def _prefill_chunk_size(context_tokens: int | None = None) -> int:
+    """Rows per prefill forward.
+
+    ``context_tokens`` resolves the ``auto`` width for a prompt of that length
+    instead of the one being prefilled now (the admission guard prices a
+    request before its prefill sets ``MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS``).
+    """
     override = _PREFILL_CHUNK_SIZE_OVERRIDE.get()
     if override is not None:
         return max(1, int(override))
     raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
     if raw == "auto":
-        layout = _sustained_prefill_layout()
+        layout = (
+            _sustained_prefill_layout()
+            if context_tokens is None
+            else _sustained_prefill_layout(context_tokens)
+        )
         if layout == "contiguous_dense_decode":
             return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
         return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
@@ -2074,7 +2084,13 @@ def _iter_prefill_chunk_spans(
     )
 
 
-def _sustained_prefill_layout() -> str:
+def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
+    """The prefill cache layout for the prompt being prefilled.
+
+    ``context_tokens`` asks for a prompt of that length instead (the
+    admission guard prices the layout a request will get before its prefill
+    runs); unset, the length is the one the running prefill published.
+    """
     layout = (
         os.environ.get("MTPLX_SUSTAINED_PREFILL_LAYOUT", "")
         .strip()
@@ -2091,11 +2107,48 @@ def _sustained_prefill_layout() -> str:
 
     if paged_kv_quant_mode_from_env() != "off":
         return "contiguous_then_repage"
-    context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    if context_tokens is None:
+        context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
     dense_max = _dense_decode_max_context()
     if context_tokens > 0 and context_tokens <= dense_max:
         return "contiguous_dense_decode"
     return "contiguous_then_repage"
+
+
+def prefill_forward_widths(
+    rt: Any, prompt_tokens: int, requested: int | None
+) -> list[int | None]:
+    """The rows one prefill forward of this runtime may run, widest first.
+
+    ``None`` is the uncached part of the prompt in one forward. A backend
+    that runs its own prefill answers for itself
+    (``rt.prefill_forward_widths``: Gemma 4 forwards the whole prompt). This
+    module's prefill loops forward the whole prompt unless sustained prefill
+    is on, and then run ``requested`` (a caller's chunk,
+    ``--prefill-chunk-tokens``, the Flash-Next wide chunk) or the profile's
+    chunk when that is narrower: the width a request can be narrowed to
+    (``prefill_chunk_size_override``).
+    """
+
+    own = getattr(rt, "prefill_forward_widths", None)
+    if callable(own):
+        return list(own(int(prompt_tokens), requested))
+    if not _sustained_prefill_enabled():
+        return [None]
+    default = max(1, int(_prefill_chunk_size(prompt_tokens)))
+    first = max(1, int(requested)) if requested else default
+    return [first, default] if default < first else [first]
+
+
+def prefill_cache_layout(rt: Any, context_tokens: int) -> str:
+    """The cache layout a prefill of ``context_tokens`` gets on this runtime:
+    the backend's own answer when it builds its own caches
+    (``rt.prefill_cache_layout``), else the sustained-prefill layout."""
+
+    own = getattr(rt, "prefill_cache_layout", None)
+    if callable(own):
+        return str(own(int(context_tokens)))
+    return _sustained_prefill_layout(context_tokens)
 
 
 _DENSE_AUTO_ANNOUNCED: Any = False
@@ -8499,6 +8552,7 @@ def generate_ar(
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
             first_token_logprobs_top_k=first_token_logprobs_top_k,
+            abort_check=abort_check,
         )
     counter_start = _runtime_counter_snapshot(rt)
     first_logprobs: FirstTokenLogprobs | None = None
@@ -9796,6 +9850,7 @@ def generate_mtpk(
             repetition_stop=repetition_stop,
             requested_speculative_depth=requested_block_size,
             first_token_logprobs_top_k=first_token_logprobs_top_k,
+            abort_check=abort_check,
         )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
