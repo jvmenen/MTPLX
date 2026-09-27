@@ -101,10 +101,18 @@ struct ReconnectFakeDaemon {
     /// A daemon the app did not launch in this session: an app-owned one
     /// from an earlier session (with a launch id) or `mtplx serve` typed in
     /// a terminal (without one).
-    func launchOutsideTheApp(launchID: String?) throws -> Process {
+    /// With `apiKey`, the daemon requires that key on every request (a
+    /// server whose key the app does not have answers 401).
+    func launchOutsideTheApp(launchID: String?, apiKey: String? = nil) throws -> Process {
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["serve", "--port", String(port), "--model", modelDirectory.path]
+        var arguments = ["serve", "--port", String(port), "--model", modelDirectory.path]
+        if let apiKey {
+            let keyFile = root.appendingPathComponent("outside-key-\(UUID().uuidString)")
+            try Data(apiKey.utf8).write(to: keyFile)
+            arguments += ["--api-key-file", keyFile.path]
+        }
+        process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "MTPLX_APP_LAUNCH_ID")
         if let launchID {
@@ -115,8 +123,38 @@ struct ReconnectFakeDaemon {
         return process
     }
 
-    func waitUntilHealthy(timeout: TimeInterval = 10) async throws -> HealthPayload {
-        let client = MTPLXAPIClient(baseURL: baseURL)
+    /// Waits until something answers HTTP on the port, whatever it says.
+    func waitUntilAnswering(timeout: TimeInterval = 10) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        let url = baseURL.appendingPathComponent("health")
+        while Date() < deadline {
+            if let (_, response) = try? await URLSession.shared.data(from: url),
+               response is HTTPURLResponse {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw DaemonSupervisorError.healthTimeout
+    }
+
+    /// /health reports this pid instead of the daemon's own, or its own
+    /// again with `nil`.
+    func setReportedPID(_ pid: pid_t?) throws {
+        let url = root.appendingPathComponent("report-pid")
+        if let pid {
+            try Data(String(pid).utf8).write(to: url)
+        } else if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// /health answers 200 with a body that is not a health payload.
+    func setHealthUndecodable(_ undecodable: Bool) throws {
+        try setFlag("health-undecodable", undecodable)
+    }
+
+    func waitUntilHealthy(timeout: TimeInterval = 10, apiKey: String? = nil) async throws -> HealthPayload {
+        let client = MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let health = try? await client.health(), health.ok {
@@ -165,7 +203,8 @@ struct ReconnectFakeDaemon {
         configuration: MTPLXAppConfiguration,
         supervisor: DaemonSupervisor = DaemonSupervisor(),
         fans: FanCallRecorder,
-        openCodeConfigURL: URL? = nil
+        openCodeConfigURL: URL? = nil,
+        beforeStaticStateAnswersAreRead: (@Sendable () async -> Void)? = nil
     ) -> MTPLXBackendStore {
         // HOME inside the fixture: a failed launch writes the runtime
         // import-recheck marker under the builder's Application Support.
@@ -192,7 +231,8 @@ struct ReconnectFakeDaemon {
             fanModeSetter: { _, mode, _, _ in
                 await fans.set(mode)
                 return FanModeResponse(verified: true, currentMode: mode)
-            }
+            },
+            beforeStaticStateAnswersAreRead: beforeStaticStateAnswersAreRead
         )
     }
 
@@ -275,6 +315,12 @@ struct ReconnectFakeDaemon {
         LAUNCH_ID = arg("--app-launch-id") or os.environ.get("MTPLX_APP_LAUNCH_ID") or None
         PID = os.getpid()
         PARENT = os.getppid()
+        # Like `mtplx serve`: the key is read once at startup from the file
+        # the app hands over, and every request must carry it.
+        API_KEY = None
+        if arg("--api-key-file"):
+            with open(arg("--api-key-file"), encoding="utf-8") as key_file:
+                API_KEY = key_file.read().strip() or None
 
         def control(name):
             return os.path.join(CONTROL, name)
@@ -398,12 +444,32 @@ struct ReconnectFakeDaemon {
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
+            def _authorized(self):
+                return API_KEY is None or self.headers.get("Authorization") == "Bearer " + API_KEY
+
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                if not self._authorized():
+                    return self._empty(401)
                 if path == "/health":
                     if flag("health-down"):
                         return self._empty(503)
-                    return self._json(HEALTH)
+                    if flag("health-undecodable"):
+                        body = b"<html>not an MTPLX health payload</html>"
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    payload = dict(HEALTH)
+                    if os.path.exists(control("report-pid")):
+                        # The pid this daemon claims on /health: a stand-in
+                        # for a pid the kernel has since given to another
+                        # process.
+                        with open(control("report-pid"), encoding="utf-8") as handle:
+                            payload["startup"] = dict(HEALTH["startup"], pid=int(handle.read().strip()))
+                    return self._json(payload)
                 if path == "/v1/mtplx/metrics/stream":
                     if flag("stream-down"):
                         return self._empty(503)
@@ -449,6 +515,8 @@ struct ReconnectFakeDaemon {
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 if length:
                     self.rfile.read(length)
+                if not self._authorized():
+                    return self._empty(401)
                 if path == "/v1/mtplx/settings":
                     return self._json(SETTINGS)
                 return self._empty(404)
@@ -475,6 +543,22 @@ actor FanCallRecorder {
 
     func set(_ mode: String) {
         modes.append(mode)
+    }
+}
+
+/// Runs an action set by the test at most once, the first time `run` is
+/// called after it was set; before that, `run` does nothing.
+actor OneShotAction {
+    private var action: (@MainActor @Sendable () async -> Void)?
+
+    func set(_ action: @escaping @MainActor @Sendable () async -> Void) {
+        self.action = action
+    }
+
+    func run() async {
+        guard let action else { return }
+        self.action = nil
+        await action()
     }
 }
 
@@ -1251,6 +1335,42 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertNil(store.configurationChangeFailure)
         XCTAssertEqual(store.daemonState, .running)
         XCTAssertEqual(daemon.spawns().count, 1)
+    }
+
+    // MARK: Codex final review, finding 1: a stale answer from the replaced daemon
+
+    /// Refresh's answers come from daemon A, and a restart replaces A with
+    /// B before they are read. A's answer carries A's launch id, which is
+    /// not B's: read against B it looked like another server on the port,
+    /// and the app reaped its own replacement daemon. It is now dropped.
+    @MainActor
+    func testAStaleRefreshAnswerFromTheReplacedDaemonIsDropped() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let restartInTheWindow = OneShotAction()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .default),
+            fans: FanCallRecorder(),
+            beforeStaticStateAnswersAreRead: { await restartInTheWindow.run() }
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let first = try XCTUnwrap(store.health?.startup)
+        await restartInTheWindow.set { @MainActor in
+            try? await store.applyConfiguration(store.configuration, restartIfRunning: true)
+        }
+
+        await store.refresh()
+
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 2, "A and its replacement B")
+        let replacement = try XCTUnwrap(spawns.last)
+        XCTAssertNotEqual(replacement.launchID, first.launchId)
+        XCTAssertEqual(store.daemonState, .running, "the app's replacement daemon was not reaped")
+        XCTAssertEqual(kill(pid_t(replacement.pid), 0), 0, "B is still running")
+        XCTAssertEqual(store.health?.startup?.launchId, replacement.launchID)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
     }
 
     // MARK: Closing the window during a model load

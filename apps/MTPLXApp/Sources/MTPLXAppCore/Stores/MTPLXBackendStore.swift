@@ -2012,8 +2012,9 @@ public final class MTPLXBackendStore: ObservableObject {
 
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
+        let holdBeforeProbe = supervisor.currentHold()
         if let existing = try? await apiClient.health(), existing.ok {
-            try refuseAnotherServersAnswer(existing)
+            try refuseAnotherServersAnswer(existing, askedOf: holdBeforeProbe)
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
                 ?? currentFanMode
@@ -2036,8 +2037,9 @@ public final class MTPLXBackendStore: ObservableObject {
             throw BenchmarkDaemonReadinessError.startupFailed(reason)
         }
 
+        let holdAfterStart = supervisor.currentHold()
         if let ready = try? await apiClient.health(), ready.ok {
-            try refuseAnotherServersAnswer(ready)
+            try refuseAnotherServersAnswer(ready, askedOf: holdAfterStart)
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
                 ?? currentFanMode
@@ -2235,6 +2237,7 @@ public final class MTPLXBackendStore: ObservableObject {
         isCurrent: (() -> Bool)? = nil,
         markUnreachableOnTransportFailure: Bool = true
     ) async throws {
+        let hold = supervisor.currentHold()
         let client = apiClient
         do {
             async let health = client.health()
@@ -2245,12 +2248,17 @@ public final class MTPLXBackendStore: ObservableObject {
             let fetchedSessions = try await sessions
             await beforeStaticStateAnswersAreRead()
             guard isCurrent?() ?? true else { return }
-            if case .anotherServer(let held) = source(of: fetchedHealth) {
+            switch source(of: fetchedHealth, askedOf: hold) {
+            case .stale:
+                return
+            case .anotherServer(let held):
                 releaseDaemonToAnotherServer(fetchedHealth, held: held)
                 throw DaemonSupervisorError.portOccupied(
                     pid: fetchedHealth.startup?.pid,
                     launchID: fetchedHealth.startup?.launchId
                 )
+            case .heldDaemon, .unattributed:
+                break
             }
             self.health = fetchedHealth
             self.capabilities = fetchedCapabilities
@@ -3127,14 +3135,23 @@ public final class MTPLXBackendStore: ObservableObject {
         case anotherServer(HeldDaemon)
         /// No daemon is held yet, or the held one has no launch id.
         case unattributed
+        /// The supervisor holds something else than when the request went
+        /// out (a restart, a stop or an adoption landed meanwhile). The
+        /// answer describes a daemon that is no longer the app's: dropped,
+        /// never acted on.
+        case stale
     }
 
     /// `health` supplies the pid that Stop and the reap path signal and the
     /// watchdog's process evidence, so only an answer carrying the held
     /// daemon's launch id may become `health`. A server that took the port
-    /// answers /health too.
-    private func source(of payload: HealthPayload) -> HealthSource {
-        guard case .held(let held) = supervisor.currentHold(),
+    /// answers /health too. `hold` is what the supervisor held when the
+    /// request went out: an answer from the daemon a restart replaced names
+    /// the old launch id, and read against the replacement it looked like
+    /// another server, which made the app reap its own new daemon.
+    private func source(of payload: HealthPayload, askedOf hold: DaemonHold) -> HealthSource {
+        guard supervisor.currentHold() == hold else { return .stale }
+        guard case .held(let held) = hold,
               let heldLaunchID = held.launchID
         else { return .unattributed }
         return payload.startup?.launchId == heldLaunchID ? .heldDaemon : .anotherServer(held)
@@ -3198,8 +3215,8 @@ public final class MTPLXBackendStore: ObservableObject {
 
     /// The benchmark's readiness check: another server's answer is not a
     /// ready daemon.
-    private func refuseAnotherServersAnswer(_ payload: HealthPayload) throws {
-        guard case .anotherServer(let held) = source(of: payload) else { return }
+    private func refuseAnotherServersAnswer(_ payload: HealthPayload, askedOf hold: DaemonHold) throws {
+        guard case .anotherServer(let held) = source(of: payload, askedOf: hold) else { return }
         releaseDaemonToAnotherServer(payload, held: held)
         if case .degraded(let reason) = daemonState {
             throw BenchmarkDaemonReadinessError.startupFailed(reason)
@@ -3382,6 +3399,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     tracker.recordAnswer()
                     continue
                 }
+                let holdAtProbe = self.supervisor.currentHold()
                 let liveness = await probeClient.livenessWithinDeadline(
                     seconds: Self.watchdogProbeDeadlineSeconds
                 )
@@ -3390,12 +3408,19 @@ public final class MTPLXBackendStore: ObservableObject {
                 else { return }
                 switch liveness {
                 case .healthy(let health) where health.ok:
-                    if case .anotherServer(let held) = self.source(of: health) {
+                    switch self.source(of: health, askedOf: holdAtProbe) {
+                    case .stale:
+                        // The daemon this probe asked is no longer the one
+                        // held; the next round asks the current one.
+                        continue
+                    case .anotherServer(let held):
                         // The answer is not this app's daemon: an adopted
                         // daemon exited and another server took its port
                         // (#528). Its pid must never become `health`.
                         self.releaseDaemonToAnotherServer(health, held: held)
                         return
+                    case .heldDaemon, .unattributed:
+                        break
                     }
                     tracker.recordAnswer()
                     loggedBusy = false
