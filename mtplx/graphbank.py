@@ -1185,9 +1185,7 @@ def promote_kv_cache_offsets(
                     # shapes/dtypes for the compiled graph). Fail-closed:
                     # geometry the packed-quant kernel refuses, or the env
                     # kill-switch, keeps the historical eager refusal.
-                    if not _env_enabled(
-                        "MTPLX_GRAPHBANK_QUANTIZED_PAGED", default=True
-                    ):
+                    if not quantized_paged_bank_enabled():
                         failures["quantized_paged_kv_cache"] = (
                             failures.get("quantized_paged_kv_cache", 0) + 1
                         )
@@ -1254,6 +1252,16 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def quantized_paged_bank_enabled() -> bool:
+    """Whether KV-quantized pages keep the compiled verify bank (default on).
+
+    MTPLX_GRAPHBANK_QUANTIZED_PAGED=0 restores the old eager refusal. One
+    reader for the promotion and for the health payload, so the two never
+    disagree about a spelling.
+    """
+    return _env_enabled("MTPLX_GRAPHBANK_QUANTIZED_PAGED", default=True)
 
 
 def cache_array_tree(cache: Any) -> list[Any]:

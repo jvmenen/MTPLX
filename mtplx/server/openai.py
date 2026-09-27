@@ -18120,31 +18120,60 @@ def _effective_ram_session_cache_settings(
 def _paged_kv_quantization_detail() -> dict[str, Any]:
     """Honest contract surface for the KV-quantization mode.
 
-    KV quant is a decode-memory feature with real tradeoffs: it detaches the
-    compiled-verify graph bank and the dense two-pass/dense-prefill layouts,
-    and prefill still runs unquantized (peak prefill memory is unchanged).
-    Hiding those tradeoffs made the toggle look free; state them where the
-    app and dashboard read health.
+    KV quant is a decode-memory feature with real tradeoffs, stated where the
+    app and dashboard read health so the toggle never looks free. Prefill
+    runs unquantized (peak prefill memory is unchanged) and decode always
+    runs on paged pages, so the dense decode layout and the two-pass kernel
+    over unquantized pages are not used. An eager decode call reads the
+    quantized pages directly when its request started at or past the
+    two-pass threshold (q8 through sdpa_2pass_paged_q8, q4 through
+    sdpa_gqa_packed_quant over its quant bank); a request that starts below
+    it dequantizes instead. The compiled verify bank keeps running on the
+    quantized pages, and its attention dequantizes them on each verify step.
+    Every value here comes from the reader the runtime itself uses.
     """
 
     mode = _effective_paged_kv_quantization()
     if mode == "off":
         return {"mode": "off"}
-    q8_kernel_enabled = (
-        os.environ.get("MTPLX_KV_QUANT_2PASS_KERNEL") or "1"
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    from mtplx.cache_state import VllmMetalPagedKVCache
+    from mtplx.graphbank import quantized_paged_bank_enabled
+
+    kernel = None
+    if VllmMetalPagedKVCache._kv_quant_kernel_enabled():
+        if mode == "q8":
+            kernel = "sdpa_2pass_paged_q8"
+        elif VllmMetalPagedKVCache._kv_quant_q4_kernel_enabled():
+            kernel = "sdpa_gqa_packed_quant"
+    threshold = int(
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1024")
+        or "1024"
+    )
+    dequant = (
+        "a bf16 working mirror of the pages"
+        if mode == "q8"
+        else "dequantized in bounded chunks"
+    )
+    bank_kept = quantized_paged_bank_enabled()
+    detached = ["dense_two_pass_paged", "dense_decode_prefill_layout"]
+    if not bank_kept:
+        detached.insert(0, "compiled_verify_graphbank")
     return {
         "mode": mode,
-        "decode_kernel": (
-            "sdpa_2pass_paged_q8"
-            if mode == "q8" and q8_kernel_enabled
-            else "dequant_fallback_memoized"
+        "decode_kernel": kernel or "none",
+        "decode": (
+            f"requests that start at or past {threshold} tokens read the "
+            f"quantized pages with {kernel}; shorter ones use {dequant}"
+            if kernel is not None
+            else f"the kernel switch is off, so every request uses {dequant}"
         ),
-        "detached_fast_paths": [
-            "compiled_verify_graphbank",
-            "dense_two_pass_paged",
-            "dense_decode_prefill_layout",
-        ],
+        "compiled_verify": (
+            "kept on the quantized pages; its attention dequantizes them on "
+            "each verify step"
+            if bank_kept
+            else "off for quantized pages (MTPLX_GRAPHBANK_QUANTIZED_PAGED=0)"
+        ),
+        "detached_fast_paths": detached,
         "prefill": "unquantized (peak prefill memory unchanged)",
         "contract": "decode-memory feature; long-context decode KV bytes shrink",
     }
