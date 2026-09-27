@@ -2019,6 +2019,13 @@ def _prefill_chunk_size(context_tokens: int | None = None) -> int:
         return 2048
 
 
+def current_prefill_chunk_override() -> int | None:
+    """The request-local width ``prefill_chunk_size_override`` installed, if
+    any (a caller's chunk, or the one the memory admission narrowed to)."""
+
+    return _PREFILL_CHUNK_SIZE_OVERRIDE.get()
+
+
 @contextmanager
 def prefill_chunk_size_override(chunk_size: int | None):
     """Apply a request-local prefill chunk override.
@@ -2136,7 +2143,8 @@ def prefill_forward_widths(
 
     ``None`` is the uncached part of the prompt in one forward. A backend
     that runs its own prefill answers for itself
-    (``rt.prefill_forward_widths``: Gemma 4 forwards the whole prompt). This
+    (``rt.prefill_forward_widths``: Gemma 4 chunks at the same widths
+    whatever the sustained-prefill switch says). This
     module's prefill loops forward the whole prompt unless sustained prefill
     is on, and then run ``requested`` (a caller's chunk,
     ``--prefill-chunk-tokens``, the Flash-Next wide chunk) or the profile's
