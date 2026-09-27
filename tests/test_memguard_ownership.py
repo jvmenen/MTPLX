@@ -134,3 +134,67 @@ class TestTheRecord:
         session.last_access_s = time.time() - 7_200.0
         assert manager.evict_stale() == 1
         assert manager.get_or_create("conv") is not session
+
+
+class TestTheSlotAndItsFlag:
+    """The review of 23a94abf (finding 5): the slot was taken before the
+    flag went up, and stale eviction read only the flag, without the guard
+    the slot is taken under. Paused in that interval, the record was
+    dropped and a replacement created and taken: two held slots for one
+    session id."""
+
+    def test_a_request_between_its_slot_and_its_flag_keeps_the_record(self):
+        manager = _manager()
+        session = manager.get_or_create("conv")
+        lock = _GappedLock()
+        session._lock = lock
+        lock.pause_next = True
+        results: list[bool] = []
+        # A waiting acquire (a handoff poll): it takes the slot outside the
+        # guard, and its flag follows.
+        request = threading.Thread(
+            target=lambda: results.append(session.try_begin_generation(timeout_s=1.0))
+        )
+        request.start()
+        assert lock.in_gap.wait(2)
+        try:
+            # The slot is taken and the flag is not up; the record has aged
+            # past its TTL.
+            session.last_access_s = time.time() - 7_200.0
+            assert manager.evict_stale() == 0
+            assert manager.get_or_create("conv") is session
+        finally:
+            lock.resume.set()
+            request.join(3)
+        assert results == [True]
+        # One record, one slot: a second request finds it taken.
+        assert not manager.get_or_create("conv").try_begin_generation()
+        session.end_generation()
+
+    def test_a_release_taking_the_slot_keeps_the_record(self):
+        manager = _manager()
+        session = manager.get_or_create("conv")
+        lock = _GappedLock()
+        session._lock = lock
+        lock.pause_next = True
+        held: list[bool] = []
+        release = threading.Thread(target=lambda: held.append(session.begin_release_hold()))
+        release.start()
+        assert lock.in_gap.wait(2)
+        session.last_access_s = time.time() - 7_200.0
+        evicted: list[int] = []
+        sweeper = threading.Thread(target=lambda: evicted.append(manager.evict_stale()))
+        sweeper.start()
+        # The sweep waits for the release to finish taking the slot.
+        sweeper.join(0.3)
+        lock.resume.set()
+        release.join(3)
+        sweeper.join(3)
+        try:
+            assert held == [True]
+            assert evicted == [0]
+            assert manager.get_or_create("conv") is session
+            assert session.release_held is True
+        finally:
+            session.end_release_hold()
+        assert session.slot_in_use() is False
