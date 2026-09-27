@@ -19,6 +19,17 @@ three more ways the generic model misread it:
 
 Plus the audit of the 4B: the generic loop, its own geometry, the profile's
 chunk. No model is loaded: the runtimes carry the real configs.
+
+Since the chunked prefill (the 31B's cold peaks, 2026-09-27: 25 / 43 / 92 GiB
+at 6,026 / 12,026 / 24,026 tokens, one forward's score blocks growing with the
+square of the prompt), Gemma 4 forwards the uncached rows in chunks of the
+house prefill width and answers the admission with them: a chunk's rows at the
+width the chunked prefill keeps (the full-attention KV and the drafter's row
+of the sliding KV, 98,304 B a token on the 31B), the chunk's widest score block
+(the full-attention layers attend every cached key: rows x prompt), and the
+sliding caches as they end a prefill (the window before the last chunk plus
+its rows). ``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole`` restores the one
+forward, priced as before.
 """
 
 from __future__ import annotations
@@ -65,6 +76,13 @@ GEMMA31B_TEXT = dict(
 GEMMA_PLANNED_KV = dense_kv_bytes_per_token_from_config({"text_config": GEMMA31B_TEXT})
 GEMMA_RESIDENT = 10 * 2 * 4 * 512 * 2
 GEMMA_WINDOWS = 50 * 2 * 16 * 256 * 2 * 1024
+# The chunked prefill: the drafter's row of the last sliding layer's KV beside
+# the full-attention KV, and the sliding caches at the window before the last
+# 2,048-row chunk plus that chunk.
+GEMMA_DRAFTER_ROW = 2 * 16 * 256 * 2
+GEMMA_CHUNKED_ROW = GEMMA_RESIDENT + GEMMA_DRAFTER_ROW
+GEMMA_CHUNK_WINDOWS = 50 * 2 * 16 * 256 * 2 * (1023 + 2048)
+GEMMA_WHOLE = "MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS"
 GEMMA_ROW = 2 * (5376 + 3 * 21504)  # the MLP, the widest layer
 GEMMA_WEIGHTS = int(17.5 * GIB)
 
@@ -97,6 +115,7 @@ def _served_profile(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
     monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    monkeypatch.delenv(GEMMA_WHOLE, raising=False)
     monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
     monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
     monkeypatch.delenv("MTPLX_HOST_MEMORY_ALLOWANCE_BYTES", raising=False)
@@ -158,13 +177,13 @@ def _roomy(monkeypatch, manager):
 
 def _gemma_scratch(rows: int, cached: int) -> int:
     """Its layers' activations, the fixed part and its measured attention:
-    the chunked families' 3 GiB per 2,048 rows does not describe one
-    whole-prompt forward."""
+    the chunked families' 3 GiB per 2,048 rows does not describe Gemma's
+    forward. The widest score block is a full-attention layer's, which
+    attends every cached key: rows x (cached + rows)."""
 
     per_row = srv._ADMISSION_LIVE_LAYERS * GEMMA_ROW
     fixed = max(srv._ADMISSION_FIXED_FLOOR_BYTES, 3 * GIB - per_row * 2048)
-    window = min(1023, cached)
-    pairs = rows * (window + rows) if window + rows > 1024 else 0
+    pairs = rows * (cached + rows) if rows > 1 else 0
     return fixed + per_row * rows + gemma4.GEMMA4_PREFILL_PAIR_BYTES * pairs
 
 
@@ -192,15 +211,37 @@ class TestGemmaGeometry:
         assert GEMMA_PLANNED_KV == 983_040
         assert gemma4.gemma4_resident_kv_bytes_per_token(args) == GEMMA_RESIDENT == 81_920
         assert gemma4.gemma4_window_cache_bytes(args) == GEMMA_WINDOWS == 838_860_800
+        assert gemma4.gemma4_drafter_window_kv_bytes_per_token(args) == GEMMA_DRAFTER_ROW
+        assert gemma4.gemma4_window_cache_bytes(args, 1023 + 2048) == GEMMA_CHUNK_WINDOWS
         pairs = gemma4.gemma4_prefill_attention_pairs
         assert pairs(args, 65_536, 0) == 65_536 * 65_536
-        # Inside the window no array mask is built.
-        assert pairs(args, 1024, 0) == 0
-        # A warm suffix sees at most the window's worth of cached keys.
+        # Head sizes 256 and 512 have no fused prefill attention in MLX:
+        # scores are materialized inside the window too.
+        assert pairs(args, 1024, 0) == 1024 * 1024
+        # The full-attention layers attend every cached key: a warm suffix
+        # (or a prefill chunk) builds rows x (cached + rows), not the
+        # sliding layers' rows x (window + rows).
+        assert pairs(args, 600, 30_000) == 600 * 30_600
+        assert pairs(args, 2048, 30_000) == 2048 * 32_048
+        assert gemma4.gemma4_prefill_attention_bytes(args, 600, 30_000) == 80 * 600 * 30_600
+        # A sliding-only model keeps to its window.
+        args.layer_types = ["sliding_attention"] * 60
         assert pairs(args, 600, 30_000) == 600 * (1023 + 600)
-        assert gemma4.gemma4_prefill_attention_bytes(args, 600, 30_000) == (
-            80 * 600 * (1023 + 600)
-        )
+
+    def test_what_its_runtime_answers(self, monkeypatch):
+        """Chunked (the default): the prefill keeps a chunk's rows at the
+        full-attention KV plus the drafter's sliding row, and the windows at
+        the window before the last chunk plus its rows. Whole: what the
+        whole-prompt forward was priced at."""
+
+        runtime = _gemma_runtime()
+        assert runtime.prefill_kv_bytes_per_token() == GEMMA_CHUNKED_ROW == 98_304
+        assert runtime.resident_kv_bytes_per_token() == GEMMA_CHUNKED_ROW
+        assert runtime.window_cache_bytes() == GEMMA_CHUNK_WINDOWS
+        monkeypatch.setenv(GEMMA_WHOLE, "whole")
+        assert runtime.prefill_kv_bytes_per_token() is None
+        assert runtime.resident_kv_bytes_per_token() == GEMMA_RESIDENT
+        assert runtime.window_cache_bytes() == GEMMA_WINDOWS
 
 
 class TestGemmaCalibration:
@@ -228,11 +269,44 @@ class TestGemmaCalibration:
 
 
 class TestGemmaAdmission:
-    def test_a_cold_prompt_is_one_forward_over_every_uncached_token(self, monkeypatch):
-        """16,384 cold tokens: priced before as a 2,048-row chunk with a
-        3 GiB flat scratch; the backend runs one 16,384-row forward, with
-        its sliding mask, and never repages."""
+    def test_a_cold_prompt_is_priced_at_its_chunk(self, monkeypatch):
+        """16,384 cold tokens run as eight 2,048-row forwards: the bill is a
+        chunk's rows, the last chunk's score block (2,048 x 16,384), every
+        row at the chunked prefill's width and the windows as it leaves
+        them: 9.3 GiB, where the one forward it replaced (16,384 x 16,384
+        pairs, 983,040 B a row) was priced at 46.3 GiB."""
 
+        manager = _manager()
+        _roomy(monkeypatch, manager)
+        pricing: dict = {}
+        srv._prefill_admission_shed(
+            _gemma_state(manager),
+            prompt_ids=list(range(16_384)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=None,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        growth = pricing["growth"]
+        scratch = _gemma_scratch(2048, 16_384 - 2048)
+        assert growth["prefill_chunk_tokens"] == 2048
+        assert growth["scratch_rows"] == 2048
+        assert growth["scratch_source"] == "geometry_calibrated+attention"
+        assert growth["scratch_bytes"] == scratch
+        assert growth["layout"] == "contiguous_dense_decode"
+        assert growth["repage_copy_bytes"] == 0
+        assert growth["chunk_bytes"] == 2048 * GEMMA_CHUNKED_ROW + scratch
+        assert growth["live_prefill_bytes"] == 16_384 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        assert growth["publish_copy_bytes"] == 16_384 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        assert growth["growth_bytes"] < 10 * GIB
+
+    def test_the_whole_prompt_forward_is_priced_as_one_forward(self, monkeypatch):
+        """``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole`` (the 2.12.0 prefill):
+        16,384 cold tokens in one forward, with its score block, every
+        layer's rows, and no repage."""
+
+        monkeypatch.setenv(GEMMA_WHOLE, "whole")
         manager = _manager()
         _roomy(monkeypatch, manager)
         pricing: dict = {}
@@ -254,16 +328,19 @@ class TestGemmaAdmission:
         assert growth["layout"] == "contiguous_dense_decode"
         assert growth["repage_copy_bytes"] == 0
         assert growth["chunk_bytes"] == 16_384 * GEMMA_PLANNED_KV + _gemma_scratch(16_384, 0)
+        assert growth["live_prefill_bytes"] == 16_384 * GEMMA_PLANNED_KV + GEMMA_WINDOWS
         # The pre-decode clone copies what decode keeps, not every layer.
         assert growth["publish_copy_bytes"] == 16_384 * GEMMA_RESIDENT + GEMMA_WINDOWS
 
     def test_a_warm_turn_is_charged_what_the_restored_cache_keeps(self):
         """A 30,000-token conversation restored by clone for a 600-token
-        turn: the restore copies the full-attention KV and the windows
-        (3.3 GB), not 30,000 rows of every layer (29.5 GB)."""
+        turn: the restore copies the full-attention KV, the drafter's
+        sliding row and the windows (5.1 GB), not 30,000 rows of every layer
+        (29.5 GB)."""
 
         geometry = srv._admission_geometry(_gemma_state(_manager()))
-        assert geometry.resident_width == GEMMA_RESIDENT
+        assert geometry.resident_width == GEMMA_CHUNKED_ROW
+        assert geometry.live_bytes_per_token == GEMMA_CHUNKED_ROW
         growth = srv._admission_growth(
             geometry,
             prompt_tokens=30_600,
@@ -275,12 +352,12 @@ class TestGemmaAdmission:
             publish=True,
             scratch_bytes=_gemma_scratch(600, 30_000),
         )
-        assert growth["restore_copy_bytes"] == 30_000 * GEMMA_RESIDENT + GEMMA_WINDOWS
+        assert growth["restore_copy_bytes"] == 30_000 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
         assert growth["live_prefill_bytes"] == (
-            30_000 * GEMMA_RESIDENT + GEMMA_WINDOWS + 600 * GEMMA_PLANNED_KV
+            30_000 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS + 600 * GEMMA_CHUNKED_ROW
         )
-        assert growth["publish_copy_bytes"] == 30_600 * GEMMA_RESIDENT + GEMMA_WINDOWS
-        assert growth["growth_bytes"] < 10 * GIB
+        assert growth["publish_copy_bytes"] == 30_600 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        assert growth["growth_bytes"] < 12 * GIB
 
     def test_skipping_store_on_prefill_saves_nothing_here(self, monkeypatch):
         """The clone does not follow store-on-prefill: turning it off must
@@ -299,16 +376,42 @@ class TestGemmaAdmission:
             restore_mode="clone",
             pricing=pricing,
         )
-        assert pricing["growth"]["publish_copy_bytes"] == 4_096 * GEMMA_RESIDENT + GEMMA_WINDOWS
+        assert pricing["growth"]["publish_copy_bytes"] == (
+            4_096 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
+        )
+
+    def test_a_65k_cold_prompt_fits_in_chunks(self, monkeypatch):
+        """65,536 cold tokens, refused as one forward on any Mac (below), fit
+        a 96 GiB limit in 2,048-row chunks: 6 GiB of rows, 2.3 GiB of
+        windows and a 10 GiB score block in the last chunk."""
+
+        manager = _manager()
+        _roomy(monkeypatch, manager)
+        pricing: dict = {}
+        receipt = srv._prefill_admission_shed(
+            _gemma_state(manager),
+            prompt_ids=list(range(65_536)),
+            session_bank=manager.bank,
+            session_id="gemma",
+            prefill_chunk_tokens=None,
+            restore_mode="clone",
+            pricing=pricing,
+        )
+        assert receipt is None
+        growth = pricing["growth"]
+        assert growth["prefill_chunk_tokens"] == 2048
+        assert growth["scratch_bytes"] == _gemma_scratch(2048, 65_536 - 2048)
+        assert growth["growth_bytes"] < 30 * GIB
 
     def test_a_prompt_the_backend_cannot_hold_is_refused_before_it_starts(
         self, monkeypatch
     ):
-        """65,536 cold tokens: every layer holds all of them when the forward
-        ends (64 GB at 983,040 B a token) plus the forward's scratch and its
-        4.3 GB mask. Past a 96 GiB limit on any Mac: refused up front
-        instead of running into the wall."""
+        """65,536 cold tokens in one forward (``whole``): every layer holds
+        all of them when the forward ends (64 GB at 983,040 B a token) plus
+        the forward's scratch and its score block. Past a 96 GiB limit on
+        any Mac: refused up front instead of running into the wall."""
 
+        monkeypatch.setenv(GEMMA_WHOLE, "whole")
         manager = _manager()
         _roomy(monkeypatch, manager)
         receipt = srv._prefill_admission_shed(
@@ -349,7 +452,7 @@ class TestGemmaAbortSite:
             def __getitem__(self, _key):
                 return self
 
-        def fake_prefill(_runtime, prompt_ids, *, cache, phase):
+        def fake_prefill(_runtime, prompt_ids, *, cache, phase, abort_check=None):
             forwards.append(len(prompt_ids))
             return (
                 SimpleNamespace(
@@ -461,10 +564,18 @@ class TestTheGenericLoop:
         assert generation.prefill_cache_layout(runtime, 30_000) == "contiguous_dense_decode"
         assert generation.prefill_cache_layout(runtime, 200_000) == "contiguous_then_repage"
 
-    def test_a_backend_answers_for_itself(self):
+    def test_a_backend_answers_for_itself(self, monkeypatch):
+        """Gemma 4 chunks whatever the sustained-prefill switch says: the
+        request's width, then its default; ``whole`` is one forward."""
+
         runtime = _gemma_runtime()
-        assert generation.prefill_forward_widths(runtime, 30_000, 4096) == [None]
+        monkeypatch.delenv("MTPLX_SUSTAINED_PREFILL", raising=False)
+        assert generation.prefill_forward_widths(runtime, 30_000, 4096) == [4096, 2048]
+        assert generation.prefill_forward_widths(runtime, 30_000, None) == [2048]
+        assert generation.prefill_forward_widths(runtime, 30_000, 1024) == [1024]
         assert generation.prefill_cache_layout(runtime, 200_000) == "contiguous_dense_decode"
+        monkeypatch.setenv(GEMMA_WHOLE, "whole")
+        assert generation.prefill_forward_widths(runtime, 30_000, 4096) == [None]
 
 
 class TestThe4B:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -767,19 +768,29 @@ def gemma4_resident_kv_bytes_per_token(config: Any) -> int:
     return full * 2 * kv_heads * head_dim * 2
 
 
-def gemma4_window_cache_bytes(config: Any) -> int:
-    """The sliding caches at their window, whatever the prompt's length: on
-    the 31B, 50 layers x 2 x 16 heads x 256 x 2 B x 1,024 = 0.84 GB."""
+def gemma4_window_cache_bytes(config: Any, rows: int | None = None) -> int:
+    """The sliding caches at ``rows`` rows each (their window by default),
+    whatever the prompt's length: on the 31B, 50 layers x 2 x 16 heads x
+    256 x 2 B x 1,024 = 0.84 GB."""
 
     _full, sliding = _gemma4_cache_layers(config)
-    return (
-        sliding
-        * 2
-        * _config_int(config, "num_key_value_heads")
-        * _config_int(config, "head_dim")
-        * 2
-        * _config_int(config, "sliding_window")
-    )
+    held = _config_int(config, "sliding_window") if rows is None else max(0, int(rows))
+    return sliding * _gemma4_window_row_bytes(config) * held
+
+
+def _gemma4_window_row_bytes(config: Any) -> int:
+    """One sliding layer's keys and values for one token (bf16)."""
+
+    return 2 * _config_int(config, "num_key_value_heads") * _config_int(config, "head_dim") * 2
+
+
+def gemma4_drafter_window_kv_bytes_per_token(config: Any) -> int:
+    """What the drafter's sliding-layer KV costs a token when a chunked
+    prefill hands it the whole prompt's rows (``_gemma4_prefill_prompt``):
+    one sliding layer's keys and values. On the 31B: 2 x 16 x 256 x 2 B =
+    16,384. The full-attention KV it reads is a view of the cache."""
+
+    return _gemma4_window_row_bytes(config)
 
 
 # Cold prefill peaks measured on the 31B (4-bit, M5 Max 128 GB,
@@ -791,6 +802,9 @@ def gemma4_window_cache_bytes(config: Any) -> int:
 # per query-key pair). With the rows at full width (983,040 B a token) and
 # the layers' activations from the geometry, 80 B per pair bounds all three
 # points (+53, +13 and +5 percent); a 32K cold prompt comes to 129 GiB.
+# A chunked prefill's widest block (the last chunk's full-attention layers,
+# rows x prompt) is charged the same bytes a pair until its own peak is
+# measured.
 GEMMA4_PREFILL_PAIR_BYTES = 80
 GEMMA4_PREFILL_CALIBRATION = (
     "gemma4-31b-4bit cold prefill peaks at 6,026 / 12,026 / 24,026 tokens, 2026-09-27"
@@ -798,20 +812,30 @@ GEMMA4_PREFILL_CALIBRATION = (
 
 
 def gemma4_prefill_attention_pairs(config: Any, rows: int, cached_tokens: int) -> int:
-    """Query-key pairs one prefill forward of ``rows`` tokens attends over
-    with an array mask: the sliding layers
-    (``Gemma4RollbackRotatingKVCache.make_mask``) build one once the rows and
-    the cached window pass the window, rows x (cached window + rows)."""
+    """Query-key pairs in the widest score block one prefill forward of
+    ``rows`` tokens materializes over ``cached_tokens`` already cached.
 
-    window = _config_int(config, "sliding_window")
+    MLX's fused attention takes query blocks only at head sizes 64, 80 and
+    128 (``ScaledDotProductAttention::use_fallback``, MLX 0.31); Gemma 4's
+    are 256 on the sliding layers and 512 on the full-attention layers, so
+    every layer computes its scores as an array, one layer at a time: rows x
+    (cached + rows) on a full-attention layer, which attends to every cached
+    key, and rows x (cached window + rows) on a sliding layer, which keeps
+    ``sliding_window - 1`` rows before the forward. The full-attention block
+    is the widest; a chunked prefill's last chunk is rows x the prompt."""
+
     rows = max(0, int(rows))
-    _full, sliding = _gemma4_cache_layers(config)
-    if sliding <= 0 or window <= 0 or rows <= 1:
+    if rows <= 1:
         return 0
-    cached = min(window - 1, max(0, int(cached_tokens)))
-    if cached + rows <= window:
-        return 0
-    return rows * (cached + rows)
+    cached = max(0, int(cached_tokens))
+    kinds = {str(kind) for kind in (getattr(config, "layer_types", None) or ())}
+    keys = 0
+    if "full_attention" in kinds:
+        keys = cached + rows
+    window = _config_int(config, "sliding_window")
+    if "sliding_attention" in kinds and window > 0:
+        keys = max(keys, min(window - 1, cached) + rows)
+    return rows * keys
 
 
 def gemma4_prefill_attention_bytes(config: Any, rows: int, cached_tokens: int) -> int:
@@ -821,6 +845,64 @@ def gemma4_prefill_attention_bytes(config: Any, rows: int, cached_tokens: int) -
     return GEMMA4_PREFILL_PAIR_BYTES * gemma4_prefill_attention_pairs(
         config, rows, cached_tokens
     )
+
+
+# Rows per Gemma 4 prefill forward. Unset or "auto": the house prefill chunk
+# (generation._prefill_chunk_size: the request's own width, which is how the
+# admission narrows one, then MTPLX_PREFILL_CHUNK_SIZE, 2,048 by default). A
+# number: Gemma's own default width (a request's width still applies). "whole"
+# (or 0): one forward over every uncached token, the 2.12.0 path, whose
+# score blocks grow with the square of the prompt.
+GEMMA4_PREFILL_CHUNK_ENV = "MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS"
+_GEMMA4_WHOLE_PREFILL = frozenset({"0", "whole", "off", "none", "false", "no"})
+
+
+def gemma4_prefill_chunk_tokens(context_tokens: int) -> int | None:
+    """The rows one prefill forward runs for a prompt of ``context_tokens``,
+    or ``None`` for the whole uncached span in one forward. Never under two
+    rows: a one-row forward takes the sliding caches' decode path."""
+
+    import os
+
+    from mtplx.generation import _prefill_chunk_size, current_prefill_chunk_override
+
+    raw = str(os.environ.get(GEMMA4_PREFILL_CHUNK_ENV) or "auto").strip().lower()
+    if raw in _GEMMA4_WHOLE_PREFILL:
+        return None
+    width = None
+    if current_prefill_chunk_override() is None and raw != "auto":
+        try:
+            width = int(raw)
+        except ValueError:
+            width = None
+    if width is None or width <= 0:
+        width = _prefill_chunk_size(int(context_tokens))
+    return max(2, int(width))
+
+
+def gemma4_prefill_spans(rows: int, width: int | None) -> list[tuple[int, int]]:
+    """The [start, end) row spans one Gemma 4 prefill forwards in order.
+
+    ``rows`` within one width (or no width) is one forward, as before. A
+    longer span runs full-width chunks that end at the last row, with the
+    remainder first: the sliding caches keep their window plus the last
+    chunk's rows once the prefill ends, and a full last chunk is what lets
+    the session bank trim a banked prompt boundary up to width - 1 rows back
+    (``Gemma4RollbackRotatingKVCache.trim``). A one-row remainder rides with
+    the first full chunk, so every forward carries at least two rows and
+    takes the sliding caches' concat path."""
+
+    rows = max(0, int(rows))
+    if rows == 0:
+        return []
+    if width is None or rows <= max(2, int(width)):
+        return [(0, rows)]
+    width = max(2, int(width))
+    head = rows % width
+    if head == 1:
+        head += width
+    edges = [0, *range(head or width, rows + 1, width)]
+    return list(zip(edges, edges[1:]))
 
 
 class Gemma4TargetAdapter:
@@ -884,6 +966,26 @@ class Gemma4TargetAdapter:
             if hasattr(item, "_idx"):
                 return item._idx
         return 0
+
+    def windowed_shared_kv_types(self, cache: Any) -> set[str]:
+        """The layer types whose ``shared_kv_states`` entry comes from a cache
+        that keeps a window (the sliding layers' rotating caches), found the
+        way ``forward_with_state`` finds them: the last layer of each type,
+        or the layer whose KV it shares. A forward over such a cache returns
+        its kept window plus the new rows, not every row."""
+
+        layers = list(getattr(self.text_model, "layers"))
+        previous = list(getattr(self.text_model, "previous_kvs"))
+        caches = list(cache or ())
+        producers: dict[str, Any] = {}
+        for idx, layer in enumerate(layers):
+            source = int(previous[idx])
+            producers[str(layer.layer_type)] = caches[source] if source < len(caches) else None
+        return {
+            kind
+            for kind, item in producers.items()
+            if item is not None and getattr(item, "max_size", None) is not None
+        }
 
     def forward_with_state(
         self,
@@ -1168,13 +1270,17 @@ class Gemma4RollbackRotatingKVCache:
         self._idx = 0
         self._last_update: dict[str, Any] | None = None
         self._replaying_prefix = False
+        # Off while a chunked prefill runs (``_gemma4_committed_updates``):
+        # nothing rolls a prefill chunk back, and the record would hold the
+        # previous buffer and the chunk's rows beside the new buffer.
+        self._record_updates = True
 
     def _clear_last_update(self) -> None:
         if not self._replaying_prefix:
             self._last_update = None
 
     def _save_concat_update(self, keys: Any, values: Any) -> None:
-        if self._replaying_prefix:
+        if self._replaying_prefix or not self._record_updates:
             return
         self._last_update = {
             "kind": "concat",
@@ -1188,7 +1294,7 @@ class Gemma4RollbackRotatingKVCache:
         }
 
     def _save_in_place_update(self, keys: Any, values: Any, *, start: int) -> None:
-        if self._replaying_prefix:
+        if self._replaying_prefix or not self._record_updates:
             return
         mx = _require_mlx_core()
         length = int(keys.shape[2])
@@ -1579,11 +1685,12 @@ class Gemma4AssistantRuntime:
     # decode (_clone_gemma4_prompt_cache), whatever store-on-prefill says.
     keeps_prompt_snapshot_with_bank = True
 
-    # The reserve the chunked families are held to (3 GiB a 2,048-row chunk,
-    # measured on the 27B) does not describe one forward over the whole
-    # prompt. This backend's scratch is its geometry's activations, a fixed
-    # part and its measured attention (GEMMA4_PREFILL_PAIR_BYTES); receipts
-    # carry the calibration they were priced with.
+    # The reserve the other families are held to (3 GiB a 2,048-row chunk,
+    # measured on the 27B, whose fused attention builds no score block) does
+    # not describe this backend's forward. Its scratch is its geometry's
+    # activations, a fixed part and its widest score block at the measured
+    # bytes a pair (GEMMA4_PREFILL_PAIR_BYTES); receipts carry the
+    # calibration they were priced with.
     prefill_scratch_calibration = GEMMA4_PREFILL_CALIBRATION
 
     def text_args(self) -> Any:
@@ -1594,11 +1701,18 @@ class Gemma4AssistantRuntime:
     def prefill_forward_widths(
         self, prompt_tokens: int, requested: int | None
     ) -> list[int | None]:
-        """_gemma4_prefill_prompt forwards every uncached token in one call;
-        no chunk setting reaches it."""
+        """The rows one ``_gemma4_prefill_prompt`` forward runs, widest first,
+        answered the way the generation loop answers for its own chunked
+        prefill: the request's width, then this backend's default when that
+        is narrower (the lever the admission pulls before it evicts anyone's
+        state or refuses). ``[None]``: every uncached token in one forward
+        (``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole``)."""
 
-        del prompt_tokens, requested
-        return [None]
+        default = gemma4_prefill_chunk_tokens(int(prompt_tokens))
+        if default is None:
+            return [None]
+        first = max(2, int(requested)) if requested else default
+        return [first, default] if default < first else [first]
 
     def prefill_cache_layout(self, context_tokens: int) -> str:
         """Full-attention KV caches and sliding windows, kept as they are
@@ -1610,11 +1724,41 @@ class Gemma4AssistantRuntime:
     def prefill_attention_bytes(self, rows: int, cached_tokens: int) -> int:
         return gemma4_prefill_attention_bytes(self.text_args(), rows, cached_tokens)
 
+    def prefill_kv_bytes_per_token(self) -> int | None:
+        """What each prompt row a chunked prefill writes keeps through the
+        prefill: the full-attention KV and the drafter's row of the sliding
+        KV (``resident_kv_bytes_per_token``); the sliding caches hold a fixed
+        window (``window_cache_bytes``). ``None`` for the whole-prompt
+        forward, whose sliding layers hold every row until decode trims
+        them: the planner's width for every layer."""
+
+        if gemma4_prefill_chunk_tokens(0) is None:
+            return None
+        return self.resident_kv_bytes_per_token()
+
     def resident_kv_bytes_per_token(self) -> int:
-        return gemma4_resident_kv_bytes_per_token(self.text_args())
+        """The full-attention KV a token keeps, plus, after a chunked
+        prefill, the drafter's row of the sliding KV that the pre-decode
+        state holds (``gemma4_drafter_window_kv_bytes_per_token``)."""
+
+        args = self.text_args()
+        resident = gemma4_resident_kv_bytes_per_token(args)
+        if gemma4_prefill_chunk_tokens(0) is None:
+            return resident
+        return resident + gemma4_drafter_window_kv_bytes_per_token(args)
 
     def window_cache_bytes(self) -> int:
-        return gemma4_window_cache_bytes(self.text_args())
+        """The sliding caches as a chunked prefill leaves them and the
+        pre-decode clone keeps them: the window before the last chunk plus
+        its rows (sliding_window - 1 + the chunk width each). The window
+        alone for the whole-prompt forward, as it was priced."""
+
+        args = self.text_args()
+        width = gemma4_prefill_chunk_tokens(0)
+        if width is None:
+            return gemma4_window_cache_bytes(args)
+        window = _config_int(args, "sliding_window")
+        return gemma4_window_cache_bytes(args, max(0, window - 1) + int(width))
 
     def forward_target(
         self,
@@ -2671,9 +2815,36 @@ def _gemma4_prefill_prompt(
     *,
     cache: Any,
     phase: str,
+    abort_check: Any | None = None,
 ) -> tuple[Gemma4TargetOutput, float]:
+    """Forward the uncached rows of a prompt; return the last row's logits
+    and hidden, the drafter's shared KV and the cache offset.
+
+    Rows within one prefill width (``gemma4_prefill_chunk_tokens``) are one
+    forward. A longer span runs in chunks (``gemma4_prefill_spans``): each
+    layer's attention materializes its scores (``gemma4_prefill_attention_pairs``),
+    and one forward over N rows builds N x N of them, 92 GiB at 24,026 tokens
+    on the 31B. A chunk's block is chunk x (cached + chunk) instead. The
+    caches carry across chunks the way they carry across turns; every
+    chunk is evaluated, the request's abort check runs between chunks, and
+    MLX's buffer pool is emptied after each (a chunk's score buffers are
+    larger than the last chunk's, so the pool could never reuse them).
+    """
+
     mx = _require_mlx_core()
     started = time.perf_counter()
+    width = gemma4_prefill_chunk_tokens(runtime.target.cache_offset(cache) + len(prompt_ids))
+    spans = gemma4_prefill_spans(len(prompt_ids), width)
+    if len(spans) > 1:
+        output = _gemma4_prefill_chunks(
+            runtime,
+            prompt_ids,
+            spans,
+            cache=cache,
+            phase=phase,
+            abort_check=abort_check,
+        )
+        return output, time.perf_counter() - started
     output = runtime.forward_target(
         mx.array([prompt_ids], dtype=mx.int32),
         cache=cache,
@@ -2694,6 +2865,110 @@ def _gemma4_prefill_prompt(
         ),
         time.perf_counter() - started,
     )
+
+
+@contextmanager
+def _gemma4_committed_updates(cache: Any):
+    """Hold the sliding caches' rollback records off while a chunked prefill
+    runs: nothing rolls a prefill chunk back (a speculative round records
+    its own update), and a record keeps the previous buffer and the chunk's
+    rows alive beside the new buffer, for every sliding layer."""
+
+    windows = [item for item in cache or () if isinstance(item, Gemma4RollbackRotatingKVCache)]
+    for item in windows:
+        item._record_updates = False
+    try:
+        yield
+    finally:
+        for item in windows:
+            item._record_updates = True
+
+
+def _gemma4_cache_arrays(cache: Any) -> list[Any]:
+    arrays: list[Any] = []
+    for item in cache or ():
+        for name in ("keys", "values"):
+            value = getattr(item, name, None) if item is not None else None
+            if value is not None:
+                arrays.append(value)
+    return arrays
+
+
+def _gemma4_prefill_chunks(
+    runtime: Gemma4AssistantRuntime,
+    prompt_ids: list[int],
+    spans: list[tuple[int, int]],
+    *,
+    cache: Any,
+    phase: str,
+    abort_check: Any | None,
+) -> Gemma4TargetOutput:
+    """``_gemma4_prefill_prompt`` over more than one span.
+
+    The drafter reads the shared KV one forward over the whole span would
+    return (``propose_block``; its sliding mask is placed by the length of
+    that KV). A full-attention cache returns every row, so the last chunk's
+    return is already that. A sliding cache returns its kept window plus the
+    chunk's rows, so the drafter's copy is built as the chunks run: the first
+    chunk's return, then each later chunk's own rows, written into one array
+    sized for the span. That is one sliding layer's rows, beside the
+    full-attention KV the cache holds anyway.
+    """
+
+    from mtplx.generation import _check_postcommit_abort
+
+    mx = _require_mlx_core()
+    total = len(prompt_ids)
+    windowed = runtime.target.windowed_shared_kv_types(cache)
+    drafter_kv: dict[str, tuple[Any, Any]] = {}
+    filled: dict[str, int] = {}
+    with _gemma4_committed_updates(cache):
+        for index, (start, end) in enumerate(spans):
+            if index:
+                _check_postcommit_abort(abort_check)
+            output = runtime.forward_target(
+                mx.array([prompt_ids[start:end]], dtype=mx.int32),
+                cache=cache,
+                phase=phase,
+                compute_logits=False,
+            )
+            for kind in windowed:
+                keys, values = output.shared_kv_states[kind]
+                if index == 0:
+                    rest = (*keys.shape[:-2], total - end, keys.shape[-1])
+                    drafter_kv[kind] = (
+                        mx.concatenate([keys, mx.zeros(rest, dtype=keys.dtype)], axis=2),
+                        mx.concatenate([values, mx.zeros(rest, dtype=values.dtype)], axis=2),
+                    )
+                    filled[kind] = int(keys.shape[-2])
+                    continue
+                rows = end - start
+                row = filled[kind]
+                kept_keys, kept_values = drafter_kv[kind]
+                kept_keys[..., row : row + rows, :] = keys[..., -rows:, :]
+                kept_values[..., row : row + rows, :] = values[..., -rows:, :]
+                filled[kind] = row + rows
+            drafter_arrays = [array for pair in drafter_kv.values() for array in pair]
+            if end == total:
+                final = output
+                break
+            mx.eval(_gemma4_cache_arrays(cache) + drafter_arrays)
+            output = None
+            mx.clear_cache()
+    last_hidden = final.hidden[:, -1:, :]
+    last_logits = runtime.target.logits_from_hidden(last_hidden)
+    mx.eval(last_logits, last_hidden, *drafter_arrays)
+    result = Gemma4TargetOutput(
+        logits=last_logits,
+        hidden=last_hidden,
+        shared_kv_states={**final.shared_kv_states, **drafter_kv},
+        cache_offset=final.cache_offset,
+        attention_phase=final.attention_phase,
+        cache_counters=dict(final.cache_counters),
+    )
+    final = output = None
+    mx.clear_cache()
+    return result
 
 
 def _clone_gemma4_prompt_cache(
@@ -2731,11 +3006,12 @@ def _restore_or_prefill_gemma4_prompt(
 
     def forward(tokens: list[int], cache: Any) -> tuple[Gemma4TargetOutput, float]:
         # The request's abort site (the per-chunk memory check, the
-        # sustained-pressure abort, a client disconnect). This backend runs
-        # the uncached part of the prompt as one forward, so it asks before
-        # that forward allocates and again before decode starts.
+        # sustained-pressure abort, a client disconnect): asked before the
+        # prefill allocates, between its chunks, and before decode starts.
         _check_postcommit_abort(abort_check)
-        result = _gemma4_prefill_prompt(runtime, tokens, cache=cache, phase="prefill")
+        result = _gemma4_prefill_prompt(
+            runtime, tokens, cache=cache, phase="prefill", abort_check=abort_check
+        )
         _check_postcommit_abort(abort_check)
         return result
 

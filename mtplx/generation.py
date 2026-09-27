@@ -2004,6 +2004,13 @@ def _prefill_chunk_size(context_tokens: int | None = None) -> int:
         return 2048
 
 
+def current_prefill_chunk_override() -> int | None:
+    """The request-local width ``prefill_chunk_size_override`` installed, if
+    any (a caller's chunk, or the one the memory admission narrowed to)."""
+
+    return _PREFILL_CHUNK_SIZE_OVERRIDE.get()
+
+
 @contextmanager
 def prefill_chunk_size_override(chunk_size: int | None):
     """Apply a request-local prefill chunk override.

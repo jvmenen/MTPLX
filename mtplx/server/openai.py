@@ -19410,9 +19410,12 @@ class _AdmissionGeometry:
     the KV term misses (QSA streams, the MTP head's KV).
     ``resident_bytes_per_token`` and ``resident_fixed_bytes`` are what a
     contiguous cache keeps per token once decode runs, when the backend says
-    it is less than what the prefill writes: Gemma 4's sliding layers hold
-    every prompt row after a prefill forward but only their window once
-    decode trims them (unset: the live width, nothing fixed).
+    it is less than what the prefill writes, and the part it keeps whatever
+    the prompt's length: Gemma 4's sliding layers keep a window (unset: the
+    live width, nothing fixed). A backend that says what its own prefill
+    writes a row (Gemma 4's chunked prefill: the full-attention KV and the
+    drafter's sliding row, its windows being the fixed part) sets the live
+    width instead of the planner's every-layer figure.
     """
 
     live_bytes_per_token: int
@@ -19462,6 +19465,10 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
     resident_fn = getattr(runtime, "resident_kv_bytes_per_token", None)
     window_fn = getattr(runtime, "window_cache_bytes", None)
     resident = int(resident_fn()) + aux if callable(resident_fn) else None
+    prefill_fn = getattr(runtime, "prefill_kv_bytes_per_token", None)
+    prefill_row = prefill_fn() if callable(prefill_fn) else None
+    if prefill_row is not None:
+        kv_live = int(prefill_row)
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
         paged_bytes_per_token=kv_paged + aux,
@@ -19638,9 +19645,10 @@ def _admission_scratch_bytes(
         flat - per_row * _ADMISSION_FLAT_TRANSIENT_ROWS,
     )
     if getattr(runtime, "prefill_scratch_calibration", None):
-        # A backend whose one forward covers the whole prompt (Gemma 4): the
-        # chunked families' per-2,048-row reserve does not describe it; its
-        # activations, the fixed part and its measured attention do.
+        # A backend whose attention builds score blocks (Gemma 4): the
+        # per-2,048-row reserve measured on a fused-attention family does not
+        # describe it; its activations, the fixed part and its measured
+        # attention do.
         return fixed + per_row * rows + attention, "geometry_calibrated" + suffix
     return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
 
@@ -19801,10 +19809,14 @@ def _admission_growth(
         live_prefill = grown * page_w + (M + out_rows) * aux_w
     elif contiguous and not leased_paged:
         # A restored prefix is what the banked cache keeps (the resident
-        # width); the rows this prefill writes are at full width.
+        # width); the rows this prefill writes are at the live width. The
+        # part a backend's caches keep whatever the length (Gemma 4's
+        # windows) comes with a restore, or with the prefill's own caches.
         row_width = geometry.resident_width
-        restore_fixed = int(geometry.resident_fixed_bytes) if restore_rows else 0
-        live_prefill = restore_rows * row_width + restore_fixed + M * live_w
+        fixed = int(geometry.resident_fixed_bytes)
+        restore_fixed = fixed if restore_rows else 0
+        prefill_fixed = fixed if M and not restore_rows else 0
+        live_prefill = restore_rows * row_width + restore_fixed + prefill_fixed + M * live_w
     else:
         row_width = paged_w
         restore_fixed = 0
