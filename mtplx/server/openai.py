@@ -3522,6 +3522,11 @@ class ServerState:
         # and stops refusing prompts; the plan still reports the
         # overcommit honestly and the pressure guard keeps shedding.
         self.allow_swap = _allow_swap_enabled(args)
+        if self.allow_swap:
+            # The paged KV cache admits its own growth against the same line
+            # (cache_state._admit_paged_growth); env is the plumbing because
+            # cache_state has no server handle, as for the context window.
+            os.environ["MTPLX_ALLOW_SWAP"] = "1"
         # Machine memory plan (issue #305): weights are a disk scan, RAM a
         # sysctl, so the machine's largest safe window is knowable BEFORE
         # any request — and it shapes the default window below. Five

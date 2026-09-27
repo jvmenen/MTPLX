@@ -285,6 +285,13 @@ class SpecDecodeGraphBank:
                     self.stats.promotion_failures.get(reason, 0) + count
                 )
             stamp_rope_delta(cache, self._rope_delta)
+            # A compiled replay writes the promoted paged adapters at their
+            # traced offset with no Python on the path, and MLX does not
+            # clamp that write: reserve the window here, before the dispatch
+            # (the dense adapters were topped up by the promotion above).
+            from .cache_state import reserve_paged_window
+
+            reserve_paged_window(cache, length)
         if cache_has_python_offsets(cache):
             return "python_cache_offsets"
         return None
@@ -1062,64 +1069,28 @@ class TensorOffsetQSACache:
 
 
 def ensure_eager_window_capacity(cache: Any, window_tokens: int) -> int:
-    """Grow every promoted full-attention entry so one eager forward of
+    """Grow every ``TensorOffsetKVCache`` entry so one eager forward of
     ``window_tokens`` rows fits; returns how many entries grew.
 
     The eager copy-block route writes ``1 + block`` rows into these fixed
-    buffers outside the bank's own reservation, and every bank fallback runs
-    the eager forward on whatever adapters an earlier call promoted. The
-    growth has to happen before the forward: the attention mask is built
-    once per forward from the first full-attention layer's capacity, so a
-    buffer that grows inside a layer's update no longer matches the mask.
-    Every dense layer holds the same token count, so its offset is read once.
-
-    Promoted paged adapters (plain and quantized, ``cache_state``) are fixed
-    buffers too, and before this they had no reservation at all: MLX does not
-    clamp a dynamic ``slice_update``, so a window past their capacity wrote
-    its rows into the next head's first rows of the head-major quantized
-    banks and past the end of the allocations while the offset ran past the
-    capacity (issue #526, all-NaN logits under q4/q8 KV). They grow with the
-    eager pages' own policy; when dynamic paged growth is off the window
-    cannot be served, and this refuses before any row is written — the same
-    refusal the stock paged writer makes.
+    buffers outside the bank's own reservation. The growth has to happen
+    before the forward: the attention mask is built once per forward from
+    the first full-attention layer's capacity, so a buffer that grows inside
+    a layer's update no longer matches the mask. Every full-attention layer
+    holds the same token count, so the offset is read once.
     """
 
-    from .cache_state import TensorOffsetVllmMetalPagedKVCache
-
-    window = max(1, int(window_tokens))
     grown = 0
     size = None
-    paged = []
     for entry in cache or []:
-        if isinstance(entry, TensorOffsetVllmMetalPagedKVCache):
-            if entry.key_cache is not None:
-                paged.append(entry)
-            continue
         if not isinstance(entry, TensorOffsetKVCache) or entry.keys is None:
             continue
         if size is None:
             size = entry.size()
-        needed = size + window
+        needed = size + max(1, int(window_tokens))
         if needed > int(entry.keys.shape[2]):
             entry.ensure_capacity(needed)
             grown += 1
-    if paged:
-        # One sync for every paged offset (they may still be pending outputs
-        # of the last compiled verify), then plain host reads below.
-        mx.eval(*(entry.cache[2] for entry in paged))
-    for entry in paged:
-        offset = entry.size()
-        needed = offset + window
-        if needed <= int(entry.capacity):
-            continue
-        if not entry.ensure_capacity(needed):
-            raise ValueError(
-                f"paged KV window of {window} rows at offset {offset} does not "
-                f"fit the promoted {type(entry).__name__}'s {int(entry.capacity)} "
-                "rows, and dynamic paged KV growth (MTPLX_DYNAMIC_PAGED_KV) is "
-                "off; refusing before any row is written"
-            )
-        grown += 1
     return grown
 
 def promote_kv_cache_offsets(
@@ -1142,6 +1113,7 @@ def promote_kv_cache_offsets(
     densify paged KV (e.g. ``CompiledVerifyBank``) pass ``True`` explicitly.
     """
     promoted = 0
+    paged_promoted = False
     failures: dict[str, int] = {}
     if cache is None:
         return promoted, failures
@@ -1228,9 +1200,11 @@ def promote_kv_cache_offsets(
                         entry
                     )
                     promoted += 1
+                    paged_promoted = True
                     continue
                 cache[idx] = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(entry)
                 promoted += 1
+                paged_promoted = True
                 continue
         offset = getattr(entry, "offset", None)
         if not isinstance(offset, int):
@@ -1264,6 +1238,10 @@ def promote_kv_cache_offsets(
             ),
         )
         promoted += 1
+    if paged_promoted:
+        from .cache_state import link_paged_window_group
+
+        link_paged_window_group(cache)
     return promoted, failures
 
 
@@ -1720,6 +1698,30 @@ def set_paged_offsets_context_ok(allowed: bool):
 def paged_offsets_context_ok() -> bool:
     """Read the current request's fence stamp (receipts/trace)."""
     return _PAGED_OFFSETS_CONTEXT_OK.get()
+
+
+def materialize_paged_offsets(entries: Any) -> None:
+    """Evaluate every paged entry's offset in one ``mx.eval`` (#318).
+
+    Only under the batching switch and the per-request long-context fence
+    above; otherwise the offsets stay as they are and each reader's
+    ``size()``/``.item()`` syncs its own, the pre-#318 behaviour. ``mx.eval``
+    cannot change a value, so either way the offsets read the same. Inside an
+    ``mx.compile`` trace the eval raises MLX's trace refusal, which the
+    reservation path reads as "traced".
+    """
+
+    if not (_BATCH_PAGED_OFFSETS and _PAGED_OFFSETS_CONTEXT_OK.get()):
+        return
+    offsets = []
+    for entry in entries or []:
+        entry_state = getattr(entry, "cache", None)
+        if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
+            entry_offset = entry_state[2]
+            if isinstance(entry_offset, mx.array):
+                offsets.append(entry_offset)
+    if offsets:
+        mx.eval(*offsets)
 
 
 def _ccopy_bank_max_len() -> int:
@@ -2186,7 +2188,6 @@ class CompiledVerifyBank:
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
             "growth_demotions": 0,
-            "eager_window_growths": 0,
             "growth_handoff_materializations": 0,
             "growth_handoff_state_leaves": 0,
             "growth_handoff_materialize_time_s": 0.0,
@@ -4224,24 +4225,15 @@ class CompiledVerifyBank:
 
     def _resolve_bucket(self, cache: Any, length: int) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
-        if _BATCH_PAGED_OFFSETS and _PAGED_OFFSETS_CONTEXT_OK.get():
-            # One eval for every paged offset instead of a serial sync per
-            # entry inside size() below (#318; helper docstring has the
-            # mechanism). Mirrors this loop's own iteration exactly.
-            paged_offsets = []
-            for spec_idx, spec_kind, _n in self._spec or []:
-                if spec_kind != VERIFY_SPEC_KIND_FULL_ATTN:
-                    continue
-                spec_entry = cache[spec_idx]
-                if not hasattr(spec_entry, "capacity"):
-                    continue
-                entry_state = getattr(spec_entry, "cache", None)
-                if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
-                    entry_offset = entry_state[2]
-                    if isinstance(entry_offset, mx.array):
-                        paged_offsets.append(entry_offset)
-            if paged_offsets:
-                mx.eval(*paged_offsets)
+        # One eval for every paged offset instead of a serial sync per entry
+        # inside size() below (#318; helper docstring has the mechanism).
+        # Mirrors this loop's own iteration exactly.
+        materialize_paged_offsets(
+            cache[spec_idx]
+            for spec_idx, spec_kind, _n in self._spec or []
+            if spec_kind == VERIFY_SPEC_KIND_FULL_ATTN
+            and hasattr(cache[spec_idx], "capacity")
+        )
         max_needed = 0
         min_capacity: int | None = None
         for idx, kind, _n in self._spec or []:
@@ -4786,18 +4778,6 @@ class CompiledVerifyBank:
             )
         if growth_transition:
             self._growth_budget_fallback_reported = True
-        # The eager forward below runs on whatever containers the cache holds,
-        # including adapters an earlier call promoted, whose buffers never
-        # grow on their own. Reserve the window before the forward builds its
-        # mask — for every reason, not only "capacity_overflow": a long
-        # extended window ("length_outside_bank") can cross the edge too.
-        shape = getattr(input_ids, "shape", None)
-        if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
-            grown = ensure_eager_window_capacity(cache, int(shape[1]))
-            if grown:
-                self.stats["eager_window_growths"] = (
-                    int(self.stats.get("eager_window_growths", 0)) + grown
-                )
         return self._runtime_forward(
             input_ids,
             cache=cache,
