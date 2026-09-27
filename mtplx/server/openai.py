@@ -18726,6 +18726,27 @@ def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
         pass
 
 
+class _AllocatorReadingError(RuntimeError):
+    """MLX's allocator account could not be read (MLX unavailable, or its
+    active-memory accessor raised). The guard cannot price the engine's own
+    line without it, so the step that needed it is reported degraded."""
+
+
+def _allocator_reading_failure(stats: Mapping[str, Any]) -> str | None:
+    """Why ``_mlx_memory_stats_live()`` gave no allocator account, or None.
+
+    A reading that fails is not a reading of zero: the review of 23a94abf
+    found a failed read treated as zero active memory, which skipped the
+    admission (None) and the per-chunk check's engine line, with
+    ``guard_degraded`` false."""
+
+    if not stats.get("ok", False):
+        return str(stats.get("error") or "the MLX allocator reading failed")
+    if stats.get("active_memory_bytes") is None:
+        return "MLX's active-memory accessor gave no value"
+    return None
+
+
 def _note_guard_health(
     state: Any, *, where: str, error: BaseException | None
 ) -> None:
@@ -19129,8 +19150,17 @@ class _PrefillSystemGuard:
         self.checks += 1
         reserve = self.chunk_reserve_bytes
         stats = _mlx_memory_stats_live()
-        active = int(stats.get("active_memory_bytes") or 0)
-        pool = int(stats.get("cache_memory_bytes") or 0)
+        failure = _allocator_reading_failure(stats)
+        # Without the allocator's account the engine line cannot run; the
+        # Mac's lines below still do, and the gap is reported, never passed
+        # as a healthy check.
+        _note_guard_health(
+            self.state,
+            where="prefill_system_check",
+            error=None if failure is None else _AllocatorReadingError(failure),
+        )
+        active = 0 if failure is not None else int(stats.get("active_memory_bytes") or 0)
+        pool = 0 if failure is not None else int(stats.get("cache_memory_bytes") or 0)
         reason = None
         engine = None
         fields: dict[str, Any] = {}
@@ -20448,6 +20478,12 @@ def _run_prefill_admission(
         # warm allocator for nothing. The Mac is read again as well: what
         # the engine gives back lands in the free pages.
         stats = _mlx_memory_stats_live()
+        failure = _allocator_reading_failure(stats)
+        if failure is not None:
+            # Fail-open like any guard step that cannot run: the caller
+            # admits, reports guard_degraded, and the per-chunk check runs
+            # with its fallback reservation and the Mac's own lines.
+            raise _AllocatorReadingError(failure)
         active = int(stats.get("active_memory_bytes") or 0)
         cache = int(stats.get("cache_memory_bytes") or 0)
         live, fields = _footprint_floor(
