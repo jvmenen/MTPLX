@@ -29,6 +29,7 @@ class FakeAddedToken:
     lstrip: bool = False
     rstrip: bool = False
     single_word: bool = False
+    special: bool = True
 
 
 class TurnTokenizer:
@@ -118,6 +119,7 @@ def test_turns_are_encoded_separately_and_memoized(memo):
         FakeAddedToken("<|im_start|>", lstrip=True),
         FakeAddedToken("<|im_start|>", rstrip=True),
         FakeAddedToken("<|im_start|>", single_word=True),
+        FakeAddedToken("<|im_start|>", special=False),
         FakeAddedToken("<|im_end|>"),
     ],
 )
@@ -164,9 +166,10 @@ def test_whole_word_turn_marker_keeps_single_call_ids(memo):
     assert oa._encode_rendered_chat_turns(tok, render, {}) == single_call
 
 
-def _chatml_backend(*more_special: str, pattern: str = r"\w+|[^\w\s]|\s"):
+def _chatml_backend(*more_special, pattern: str = r"\w+|[^\w\s]|\s"):
     """A Rust tokenizer with ``<|im_start|>`` as an atomic special token
-    (id 8) and ``more_special`` added after it."""
+    (id 8) and ``more_special`` (contents, or AddedTokens with their own
+    flags) added after it."""
     tokenizers = pytest.importorskip("tokenizers")
     vocab = {"[UNK]": 0}
     for word in ["abc", "hi", "<", "|", "im_start", ">", "\n"]:
@@ -179,8 +182,10 @@ def _chatml_backend(*more_special: str, pattern: str = r"\w+|[^\w\s]|\s"):
     )
     backend.add_special_tokens(
         [
-            tokenizers.AddedToken(content, normalized=False, special=True)
-            for content in ("<|im_start|>", *more_special)
+            token
+            if isinstance(token, tokenizers.AddedToken)
+            else tokenizers.AddedToken(token, normalized=False, special=True)
+            for token in ("<|im_start|>", *more_special)
         ]
     )
     return backend
@@ -236,10 +241,54 @@ def test_overlapping_added_token_keeps_single_call_ids(memo):
 
     enabled, reason = oa._chat_turn_segments_proven(tok)
     assert not enabled
-    assert "gives other ids when cut" in reason
+    assert "'abc<|im_start|>' contains <|im_start|> or runs into it" in reason
+    assert oa._chat_turn_probe_failure(tok) is not None  # the probes agree
     obs: dict = {}
     assert oa._encode_rendered_chat_turns(tok, render, obs) == single_call
     assert "chat_segment_memo" not in obs
+
+
+def test_marker_prefixed_token_with_lstrip_keeps_single_call_ids(memo):
+    """``<|im_start|>developer`` with lstrip starts at the cut and takes the
+    space before it in one call; the cut leaves that space in the previous
+    segment. The probe renders passed this tokenizer; the structure rule
+    (no other added token contains the marker) does not."""
+    tokenizers = pytest.importorskip("tokenizers")
+    developer = tokenizers.AddedToken(
+        "<|im_start|>developer", normalized=False, special=True, lstrip=True
+    )
+    tok = _chatml_fast_tokenizer(developer)
+    render = "<|im_start|>hi <|im_start|>developer"
+    single_call = oa._encode_rendered_chat_text(tok, render)
+    assert single_call == [8, 2, 9]
+    assert _cut(tok, render) == [8, 2, 0, 9]
+    assert oa._chat_turn_open_is_atomic(tok)
+
+    enabled, reason = oa._chat_turn_segments_proven(tok)
+    assert not enabled
+    assert "'<|im_start|>developer' contains <|im_start|>" in reason
+    obs: dict = {}
+    assert oa._encode_rendered_chat_turns(tok, render, obs) == single_call
+    assert "chat_segment_memo" not in obs
+
+
+def test_probes_put_whitespace_around_tokens_that_contain_the_marker(memo):
+    """The probe renders, the second check, now also catch that token: it
+    is probed with a space, newline or tab on either side."""
+    tokenizers = pytest.importorskip("tokenizers")
+    developer = tokenizers.AddedToken(
+        "<|im_start|>developer", normalized=False, special=True, lstrip=True
+    )
+    tok = _chatml_fast_tokenizer(developer)
+    probes = oa._chat_turn_segment_probes(tok)
+    for left, right in [(" ", ""), ("", " "), ("\n", "\n"), ("\t", "")]:
+        assert (
+            f"<|im_start|>hi{left}<|im_start|>developer{right}hi<|im_start|>"
+            in probes
+        )
+    failure = oa._chat_turn_probe_failure(tok)
+    assert failure is not None
+    assert "gives other ids when cut" in failure
 
 
 @pytest.mark.parametrize(
@@ -253,24 +302,50 @@ def test_overlapping_added_token_keeps_single_call_ids(memo):
 def test_token_running_into_the_marker_is_probed_from_the_added_tokens(
     memo, token, render
 ):
-    """None of the fixed probes contains these texts; the proof builds a
-    probe from every added token that could span a cut."""
+    """These tokens run into the marker, so the structure rule refuses them;
+    and although none of the fixed probes contains their text, the probes
+    built from the added tokens catch them too."""
     assert all(token not in probe for probe in oa._CHAT_TURN_SEGMENT_PROBES)
     tok = _chatml_fast_tokenizer(token)
     single_call = oa._encode_rendered_chat_text(tok, render)
     assert _cut(tok, render) != single_call
 
+    assert oa._chat_turn_open_conflicts(token)
+    assert oa._chat_turn_probe_failure(tok) is not None
     assert not oa._chat_turn_segments_proven(tok)[0]
     assert oa._encode_rendered_chat_turns(tok, render, {}) == single_call
 
 
-def test_overlaps_are_the_tokens_that_run_into_the_marker():
+@pytest.mark.parametrize(
+    ("content", "conflicts"),
+    [
+        ("abc<|im_start|>", True),
+        ("<|im_start|>user", True),  # contains it at position zero
+        ("<|im_start|>developer", True),
+        ("\n<|im_start|>", True),
+        ("zz<|im", True),  # runs into it
+        ("a<|im_start|>b<|im", True),
+        ("<|im_start|>", False),
+        ("<|im_end|>", False),
+        ("|>x", False),  # starts inside it: the marker starts first
+        ("<|im", False),  # part of it: the marker is longer
+        ("hello", False),
+    ],
+)
+def test_conflicting_tokens_contain_or_run_into_the_marker(content, conflicts):
+    assert oa._chat_turn_open_conflicts(content) is conflicts
+
+
+def test_probe_pieces_put_each_touching_token_against_a_marker():
+    assert oa._chat_turn_open_overlaps("<|im_start|>developer") == [
+        "<|im_start|>developer"
+    ]
     assert oa._chat_turn_open_overlaps("abc<|im_start|>") == ["abc<|im_start|>"]
     assert oa._chat_turn_open_overlaps("zz<|im") == ["zz<|im_start|>"]
-    assert oa._chat_turn_open_overlaps("<|im_start|>user") == []
+    assert oa._chat_turn_open_overlaps("|>x") == ["<|im_start|>x"]
+    assert oa._chat_turn_open_overlaps("<|im") == ["<|im"]
     assert oa._chat_turn_open_overlaps("<|im_start|>") == []
     assert oa._chat_turn_open_overlaps("<|im_end|>") == []
-    assert oa._chat_turn_open_overlaps("|>x") == []
     assert oa._chat_turn_open_overlaps("a<|im_start|>b<|im") == [
         "a<|im_start|>b<|im",
         "a<|im_start|>b<|im_start|>",

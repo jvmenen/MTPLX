@@ -14924,12 +14924,12 @@ def _chat_turn_segments_proven(
     """Whether cutting before every ``<|im_start|>`` is proven to give the
     single-call ids on this tokenizer, and why.
 
-    The metadata check alone admits two counterexamples: a tokenizer that
-    encodes special tokens as plain text (``split_special_tokens``), and an
-    added token that runs into the marker (``abc<|im_start|>``: the single
-    call matches it across the place the cut would go). So the tokenizer
-    has to pass the metadata check, keep special tokens atomic, and give the
-    single-call ids on every probe render when cut.
+    The marker's own metadata admits wrong cuts: a tokenizer that encodes
+    special tokens as plain text (``split_special_tokens``), an added token
+    that runs into the marker (``abc<|im_start|>`` matches across the
+    cut), and one that starts with it and strips whitespace on its left
+    (``<|im_start|>developer`` with lstrip). _prove_chat_turn_segments
+    states the conditions that rule those out, then runs the probes.
 
     Proven on first use per tokenizer object and encoding configuration
     (the fingerprint the encode caches use; callers pass the one their
@@ -14964,14 +14964,60 @@ def _chat_turn_segments_proven(
 
 
 def _prove_chat_turn_segments(tokenizer: Any) -> tuple[bool, str]:
+    """Structural conditions that make the cut exact, then the probes.
+
+    A fast tokenizer splits added tokens out of the raw text first, leftmost
+    and longest match first, with each match's lstrip, rstrip and
+    single_word applied; normalization, pre-tokenization and the model then
+    see the pieces between them one at a time. So cutting right before
+    every ``<|im_start|>`` gives the single-call ids when:
+
+    1. the marker is a special added token matched as written (not
+       normalized, no lstrip, rstrip or single_word);
+    2. special tokens are not encoded as plain text on any layer;
+    3. no other added token contains the marker, at any position, or runs
+       into it (a proper suffix of it is a prefix of the marker). Such a
+       token can match across the cut, or match at the cut and, with
+       lstrip, take whitespace the cut leaves in the previous segment:
+       ``<|im_start|>developer`` with lstrip turns "hi <|im_start|>developer"
+       into [hi, developer] in one call and [hi, " ", developer] when cut.
+
+    Tokens that only start inside the marker or are part of it cannot move
+    a boundary: the marker starts earlier or is longer, so it wins. The
+    probe renders stay as a second check on what the added-token pass does
+    not cover (a pre-tokenizer or a slow tokenizer that treats the start of
+    each encode call specially).
+    """
     if not _chat_turn_open_is_atomic(tokenizer):
         return False, (
-            f"{_CHAT_TURN_OPEN} is not an added token that matches anywhere "
-            "unchanged"
+            f"{_CHAT_TURN_OPEN} is not a special added token matched as "
+            "written (normalized, lstrip, rstrip and single_word all off)"
         )
     if _chat_tokenizer_splits_special_tokens(tokenizer):
         return False, "special tokens are encoded as plain text (split_special_tokens)"
+    for content in _chat_added_token_contents(tokenizer):
+        if _chat_turn_open_conflicts(content):
+            return False, (
+                f"added token {content[:80]!r} contains {_CHAT_TURN_OPEN} or "
+                "runs into it"
+            )
     probes = _chat_turn_segment_probes(tokenizer)
+    failure = _chat_turn_probe_failure(tokenizer, probes)
+    if failure is not None:
+        return False, failure
+    return True, (
+        f"structure holds and all {len(probes)} probe renders give the "
+        "single-call ids when cut"
+    )
+
+
+def _chat_turn_probe_failure(
+    tokenizer: Any, probes: list[str] | None = None
+) -> str | None:
+    """The first probe render whose cut ids differ from its single-call ids
+    (or that cannot be encoded), described; None when they all match."""
+    if probes is None:
+        probes = _chat_turn_segment_probes(tokenizer)
     for index, probe in enumerate(probes):
         try:
             single_call = _encode_rendered_chat_text(tokenizer, probe)
@@ -14981,57 +15027,84 @@ def _prove_chat_turn_segments(tokenizer: Any) -> tuple[bool, str]:
                 cut.extend(_encode_rendered_chat_text(tokenizer, probe[start:boundary]))
                 start = boundary
         except Exception as exc:  # noqa: BLE001 - reported as the decision
-            return False, f"probe {index} could not be encoded: {exc!r}"
+            return f"probe {index} could not be encoded: {exc!r}"
         if cut != single_call:
-            return False, (
+            return (
                 f"probe {index} {probe[:80]!r} gives other ids when cut before "
                 f"{_CHAT_TURN_OPEN}"
             )
-    return True, f"all {len(probes)} probe renders give the single-call ids when cut"
+    return None
 
 
-def _chat_turn_segment_probes(tokenizer: Any) -> list[str]:
-    """The fixed probes plus, for every added token that could span a cut,
-    that token's text between two turns, glued to words and set apart by
-    a space and by a newline."""
-    probes = list(_CHAT_TURN_SEGMENT_PROBES)
+def _chat_added_token_contents(tokenizer: Any) -> list[str]:
     try:
-        added = [
+        return [
             str(getattr(token, "content", token))
             for token in tokenizer.added_tokens_decoder.values()
         ]
     except (AttributeError, TypeError):
-        added = []
-    for content in added:
+        return []
+
+
+def _chat_turn_segment_probes(tokenizer: Any) -> list[str]:
+    """The fixed probes plus, for every other added token that shares text
+    with the marker (contains it, runs into it, starts inside it or is part
+    of it), that token between two turns: glued to words, and with a space,
+    newline or tab before it, after it, or both."""
+    probes = list(_CHAT_TURN_SEGMENT_PROBES)
+    for content in _chat_added_token_contents(tokenizer):
         for piece in _chat_turn_open_overlaps(content):
-            for pad in ("hi", " ", "\n"):
-                probes.append(f"{_CHAT_TURN_OPEN}{pad}{piece}{pad}{_CHAT_TURN_OPEN}")
+            for left in ("", " ", "\n", "\t"):
+                for right in ("", " ", "\n"):
+                    probes.append(
+                        f"{_CHAT_TURN_OPEN}hi{left}{piece}{right}hi{_CHAT_TURN_OPEN}"
+                    )
     return probes
 
 
-def _chat_turn_open_overlaps(content: str) -> list[str]:
-    """Texts in which the added token ``content`` would span a cut before
-    ``<|im_start|>``. It has to start before the marker and run into it:
-    some proper suffix of it either starts with the marker or is a prefix
-    of the marker. Each text is the token with the marker completed."""
-    pieces: list[str] = []
+def _chat_turn_open_conflicts(content: str) -> bool:
+    """True for an added token other than the marker that contains the
+    marker at any position or runs into it."""
+    if content == _CHAT_TURN_OPEN:
+        return False
+    if _CHAT_TURN_OPEN in content:
+        return True
     start = content.find(_CHAT_TURN_OPEN[0], 1)
     while start > 0:
-        tail = content[start:]
-        piece = None
-        if tail.startswith(_CHAT_TURN_OPEN):
-            piece = content
-        elif _CHAT_TURN_OPEN.startswith(tail):
-            piece = content[:start] + _CHAT_TURN_OPEN
-        if piece is not None and piece not in pieces:
-            pieces.append(piece)
+        if _CHAT_TURN_OPEN.startswith(content[start:]):
+            return True
         start = content.find(_CHAT_TURN_OPEN[0], start + 1)
+    return False
+
+
+def _chat_turn_open_overlaps(content: str) -> list[str]:
+    """Texts that put the added token ``content`` against a marker, for the
+    probe renders: the token itself when it contains the marker or is part
+    of it, the token with the marker completed where it runs into it or
+    starts inside it. Empty when the token shares no text with the marker."""
+    marker = _CHAT_TURN_OPEN
+    if not content or content == marker:
+        return []
+    pieces: list[str] = []
+
+    def add(piece: str) -> None:
+        if piece not in pieces:
+            pieces.append(piece)
+
+    if marker in content or content in marker:
+        add(content)
+    for start in range(1, len(content)):
+        if marker.startswith(content[start:]):
+            add(content[:start] + marker)
+    for size in range(1, min(len(content), len(marker))):
+        if marker.endswith(content[:size]):
+            add(marker + content[size:])
     return pieces
 
 
 def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:
-    """True when ``<|im_start|>`` is an added token the tokenizer never
-    normalizes or strips around, so encoding stops and restarts at it.
+    """True when ``<|im_start|>`` is a special added token the tokenizer
+    never normalizes or strips around, so encoding stops and restarts at it.
 
     It must also match anywhere, not only as a whole word: a ``single_word``
     marker glued to a word (``abc<|im_start|>`` in a message) stays plain
@@ -15044,6 +15117,7 @@ def _chat_turn_open_is_atomic(tokenizer: Any) -> bool:
         return False
     return any(
         getattr(token, "content", None) == _CHAT_TURN_OPEN
+        and getattr(token, "special", False) is True
         and getattr(token, "normalized", True) is False
         and getattr(token, "lstrip", True) is False
         and getattr(token, "rstrip", True) is False
