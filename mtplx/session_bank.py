@@ -12,6 +12,7 @@ import hashlib
 import os
 import sys
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -408,6 +409,138 @@ def cold_persistence_key(entry: Any) -> str:
     return f"ssd_cold:hash:{getattr(entry, 'token_hash', '')}"
 
 
+def _near_prefix_knobs() -> dict[str, int]:
+    """The near-prefix lane's matching knobs, read as the restore reads them
+    (generation._restore_near_prefix_prompt_state)."""
+
+    def env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        try:
+            return int(str(raw).strip()) if raw is not None and str(raw).strip() else default
+        except ValueError:
+            return default
+
+    block = max(1, env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", DEFAULT_PREFIX_BLOCK_SIZE))
+    return {
+        "gap_limit": max(0, env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8)),
+        "min_match": max(1, env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64)),
+        "block": block,
+        "block_min_match": max(
+            block,
+            env_int(
+                "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
+                DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
+            ),
+        ),
+    }
+
+
+def _near_prefix_candidate_len(
+    entry: Any,
+    tokens: tuple[int, ...],
+    *,
+    gap_limit: int,
+    min_match: int,
+    block: int,
+    block_min_match: int,
+    allow_block_prefix: bool,
+) -> int | None:
+    """The restore point one RAM entry offers a prompt on the near-prefix
+    lane, or None: the tiny-gap path (tokenizer drift at the stored end),
+    else the block path (token-granular for entries that can restore at any
+    offset, block-aligned for recurrent entries without boundaries)."""
+
+    prefix = entry.token_ids
+    if not prefix:
+        return None
+    matched = common_prefix_len(tokens, prefix)
+    gap = len(prefix) - matched
+    required_match = min(min_match, max(1, len(prefix) - gap_limit))
+    # A stored prefix may include assistant output after the exact prompt
+    # boundary; a prompt wholly contained in it is not a tiny-gap restore.
+    if 0 <= gap <= gap_limit and matched >= required_match and matched < len(tokens):
+        return int(matched)
+    if not allow_block_prefix:
+        return None
+    safe_block = min(
+        block_aligned_prefix_len(matched, block_size=block), len(prefix), len(tokens)
+    )
+    exact_capable = (not entry.has_recurrent) or bool(
+        entry.gdn_boundaries or getattr(entry, "gdn_boundary_loader", None)
+    )
+    candidate_len = matched if exact_capable else safe_block
+    if candidate_len < block_min_match or candidate_len < 2 or candidate_len > matched:
+        return None
+    return int(candidate_len)
+
+
+def _recurrent_restore_point(entry: Any, matched: int) -> int:
+    """Where a partial restore of a recurrent entry lands: the newest stored
+    recurrent boundary at or below ``matched``. Boundaries still behind the
+    SSD loader are not read here (no disk I/O on the admission path); such an
+    entry is taken to reach ``matched``, which only ever protects more."""
+
+    records = list(getattr(entry, "gdn_boundaries", None) or ())
+    if not records:
+        return int(matched) if getattr(entry, "gdn_boundary_loader", None) else 0
+    best = 0
+    for record in records:
+        boundary = int(record[0])
+        if boundary <= int(matched):
+            best = max(best, boundary)
+    return best
+
+
+def _near_candidate_serves(
+    entry: Any,
+    matched: int,
+    *,
+    floor: int,
+    identity: dict[str, Any],
+) -> bool:
+    """Mirror the restore's gates for one near-prefix candidate
+    (generation._restore_near_prefix_prompt_state), reading only RAM."""
+
+    matched = int(matched)
+    if matched <= int(floor):
+        return False
+    if matched < 2 or matched >= int(entry.prefix_len):
+        return False
+    if entry.live_ref_only and entry.cache_ref is None:
+        return False  # a lease a restore already consumed
+    if not _restore_identity_compatible(entry, **identity):
+        return False
+    has_mtp = (
+        entry.mtp_history_snapshot is not None
+        or getattr(entry, "mtp_history_cache_ref", None) is not None
+    )
+    if _policy_uses_committed_history(identity.get("mtp_history_policy")) and not has_mtp:
+        return False
+    if (
+        entry.mtp_snapshot_epoch is not None
+        and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
+    ):
+        return False
+    if entry.has_recurrent and _recurrent_restore_point(entry, matched) <= int(floor):
+        return False
+    return True
+
+
+def _exact_restore_serves(entry: Any, identity: dict[str, Any]) -> bool:
+    """Mirror restore()'s gates for the exact-prefix entry."""
+
+    if entry.live_ref_only and entry.cache_ref is None:
+        return False
+    if not _restore_identity_compatible(entry, **identity):
+        return False
+    if (
+        entry.mtp_snapshot_epoch is not None
+        and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
+    ):
+        return False
+    return True
+
+
 @dataclass
 class SessionBankEntry:
     token_ids: tuple[int, ...]
@@ -711,6 +844,11 @@ class SessionBank:
         # when it releases an idle session whose newest entry is not on disk
         # yet, because the queued job holds that entry's arrays until it runs.
         self.cold_enqueue_cancel: Callable[[str], int] | None = None
+        # The entry each coalesce key's PENDING persistence job was filed
+        # for (the dispatcher keeps only the newest job per key). A release
+        # cancels a key only when this entry is among the ones it frees, so
+        # a kept sibling never loses its scheduled durable copy.
+        self._persistence_pending: dict[str, "weakref.ref[SessionBankEntry]"] = {}
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
@@ -1401,42 +1539,30 @@ class SessionBank:
             ):
                 best_diag = diag
 
-            required_match = min(min_match, max(1, len(prefix) - gap_limit))
             # A stored prefix may include assistant output after the exact
             # prompt boundary. If the requested prompt is wholly contained in
             # that longer continuation, restoring at `matched` can leave decode
-            # sitting on a post-answer/EOS boundary. Treat that as unsafe for
-            # the tiny-gap path; long prompts can still use a block-aligned
-            # restore below and re-prefill the tail to the real prompt end.
-            if (
-                gap >= 0
-                and gap <= gap_limit
-                and matched >= required_match
-                and matched < len(tokens)
-            ):
-                matches.append((entry, matched))
-                continue
-
-            if not allow_block_prefix:
-                continue
-            # kvcache-v2 token-granularity: entries that can restore exactly at
-            # any offset (pure-attention models) or that carry interior
-            # recurrent boundaries no longer quantize the match to block edges
-            # — KV trims to any token and the boundary-true restore picks the
-            # actual recurrent-safe point. Legacy hybrid entries without
-            # boundaries keep the block-aligned value (restore fails closed on
-            # them when boundary-true is on).
-            exact_capable = (not entry.has_recurrent) or bool(
-                entry.gdn_boundaries or getattr(entry, "gdn_boundary_loader", None)
+            # sitting on a post-answer/EOS boundary: unsafe for the tiny-gap
+            # path, while long prompts can still use a block-aligned restore
+            # and re-prefill the tail to the real prompt end. kvcache-v2
+            # token-granularity: entries that can restore exactly at any
+            # offset (pure-attention models) or that carry interior recurrent
+            # boundaries no longer quantize the match to block edges; legacy
+            # hybrid entries without boundaries keep the block-aligned value
+            # (restore fails closed on them when boundary-true is on). One
+            # matcher (_near_prefix_candidate_len) serves this lane and the
+            # memory guard's restore-source selection.
+            candidate_len = _near_prefix_candidate_len(
+                entry,
+                tokens,
+                gap_limit=gap_limit,
+                min_match=min_match,
+                block=block,
+                block_min_match=block_min_match,
+                allow_block_prefix=allow_block_prefix,
             )
-            candidate_len = matched if exact_capable else safe_block
-            if candidate_len < block_min_match:
-                continue
-            if candidate_len < 2:
-                continue
-            if candidate_len > matched:
-                continue
-            matches.append((entry, candidate_len))
+            if candidate_len is not None:
+                matches.append((entry, candidate_len))
 
         # Serve-equivalent RESIDENT twins of possible cold rows, built ONLY
         # from the computed matches above and only from candidates that
@@ -2379,7 +2505,6 @@ class SessionBank:
             # request/stream tail.
             dispatch_started = time.perf_counter()
             try:
-                job = lambda: self._cold_enqueue_job(entry, put_entry)  # noqa: E731
                 # Stable logical key for newest-wins coalescing of PENDING
                 # persistence work: each queued job pins its entry's
                 # GB-scale snapshot until it runs, and under continuous
@@ -2387,8 +2512,9 @@ class SessionBank:
                 # Per-session, only the newest entry's encode stays queued.
                 # Attribute-carried so legacy dispatch wirings that ignore
                 # it keep their exact behavior.
-                job.coalesce_key = cold_persistence_key(entry)
-                dispatch(job)
+                self._dispatch_persistence(
+                    entry, lambda: self._cold_enqueue_job(entry, put_entry)
+                )
                 if cold is not None:
                     cold["deferred"] = True
                     cold["dispatch_elapsed_s"] = (
@@ -2491,14 +2617,13 @@ class SessionBank:
             # tensor boundary. Re-dispatch the same job for the next quiet
             # window — the coalesce key keeps at most one pending copy, and a
             # newer commit for the same session supersedes it (newest-wins).
-            dispatch = self.cold_enqueue_dispatch
-            if dispatch is not None:
-                job = lambda: self._cold_enqueue_job(entry, put_entry)  # noqa: E731
-                # Same key expression as the original dispatch site so the
-                # retry coalesces with (and is superseded by) newer commits.
-                job.coalesce_key = cold_persistence_key(entry)
+            if self.cold_enqueue_dispatch is not None:
+                # Same key as the original dispatch so the retry coalesces
+                # with (and is superseded by) newer commits.
                 try:
-                    dispatch(job)
+                    self._dispatch_persistence(
+                        entry, lambda: self._cold_enqueue_job(entry, put_entry)
+                    )
                 except Exception:
                     pass
             return
@@ -2528,9 +2653,7 @@ class SessionBank:
         cold = self.cold_tier
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
-        dispatch = self.cold_enqueue_dispatch
-        coalesce_key = cold_persistence_key(entry)
-        if dispatch is None:
+        if self.cold_enqueue_dispatch is None:
             self.eviction_log.append(
                 {
                     "reason": "ssd_spill_no_dispatch",
@@ -2542,10 +2665,10 @@ class SessionBank:
             return
         token_ids = tuple(entry.token_ids)
         epoch = int(entry.snapshot_epoch)
-        job = lambda: self.run_live_ref_spill(token_ids, epoch)  # noqa: E731
-        job.coalesce_key = coalesce_key
         try:
-            dispatch(job)
+            self._dispatch_persistence(
+                entry, lambda: self.run_live_ref_spill(token_ids, epoch)
+            )
         except BaseException as exc:
             self.eviction_log.append(
                 {
@@ -2620,14 +2743,12 @@ class SessionBank:
             # A foreground request arrived mid-encode. Re-dispatch for the
             # next quiet window; the coalesce key keeps at most one pending
             # spill per session and newer commits supersede it.
-            dispatch = self.cold_enqueue_dispatch
-            if dispatch is not None:
-                job = lambda: self.run_live_ref_spill(  # noqa: E731
-                    token_ids, snapshot_epoch
-                )
-                job.coalesce_key = cold_persistence_key(entry)
+            if self.cold_enqueue_dispatch is not None:
                 try:
-                    dispatch(job)
+                    self._dispatch_persistence(
+                        entry,
+                        lambda: self.run_live_ref_spill(token_ids, snapshot_epoch),
+                    )
                 except Exception:
                     pass
             return False
@@ -3151,39 +3272,121 @@ class SessionBank:
             evicted += 1
         return evicted
 
-    def restore_source_key(
-        self, protect_tokens: list[int] | tuple[int, ...] | None
-    ) -> tuple[int, ...] | None:
-        """The RAM entry a prompt would restore from, or None.
+    def restore_plan(
+        self,
+        prompt_tokens: list[int] | tuple[int, ...] | None,
+        *,
+        model_path: str | None = None,
+        mtp_enabled: bool | None = None,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+        near_prefix: bool = True,
+    ) -> dict[str, Any]:
+        """What the prompt's restore would read from RAM, by its own rules.
 
-        An entry qualifies when it is an exact prefix of the prompt, or when
-        the prefix it shares rounds down to at least the block restore floor
-        (``DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS`` on
-        ``DEFAULT_PREFIX_BLOCK_SIZE`` blocks), the same reuse the server's
-        admission estimate credits. The longest usable prefix wins. Before
-        this rule the admission walk protected the entry with the greatest
-        common prefix even when that prefix was a single token.
+        The restore (generation.restore_or_prefill_prompt_state) tries, in
+        order: a near-prefix candidate that restores more than the exact
+        prefix, then the exact prefix (``restore``), then, only when the
+        exact prefix does not serve, any near-prefix candidate. Each lane
+        has its gates: identity and policy
+        compatibility, snapshot epochs, a lease not already consumed, the
+        draft head's committed history when the policy needs it, and for a
+        recurrent entry the newest stored boundary at or below the match
+        (``_near_candidate_serves``). The entries of the lanes that would
+        run and pass are returned as ``keys`` (reclamation spares every one
+        of them, at most two); ``reuse_tokens`` is the most the restore reaches and
+        ``source`` the entry that reaches it. RAM only: no SSD lookup, no
+        boundary load, no diagnostic state. Identity fields left None match
+        anything, which only ever protects more.
+
+        Replaces a token-overlap rule that protected the entry with the
+        longest block-rounded common prefix: a longer recurrent entry with
+        no usable boundary displaced the valid shorter exact prefix, which
+        the release then evicted (the 2026-09-27 review's reproduction).
         """
 
-        if not protect_tokens:
-            return None
-        tokens = tuple(int(token) for token in protect_tokens)
-        best_key: tuple[int, ...] | None = None
-        best_usable = 0
-        for key in list(self._entries):
-            if len(key) <= len(tokens) and tokens[: len(key)] == key:
-                usable = len(key)
-            else:
-                usable = block_aligned_prefix_len(
-                    common_prefix_len(tokens, key),
-                    block_size=DEFAULT_PREFIX_BLOCK_SIZE,
-                )
-                if usable < DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS:
-                    usable = 0
-            if usable > best_usable:
-                best_usable = usable
-                best_key = key
-        return best_key
+        keys: set[tuple[int, ...]] = set()
+        plan: dict[str, Any] = {
+            "keys": keys,
+            "reuse_tokens": 0,
+            "source": None,
+            "mode": "none",
+        }
+        if not prompt_tokens:
+            return plan
+        tokens = tuple(int(token) for token in prompt_tokens)
+        identity = {
+            "model_path": model_path,
+            "mtp_enabled": mtp_enabled,
+            "hidden_variant": hidden_variant,
+            "template_hash": template_hash,
+            "mtp_history_policy": mtp_history_policy,
+            "draft_head_identity": draft_head_identity,
+            "policy_fingerprint": policy_fingerprint,
+        }
+
+        def take(entry: SessionBankEntry, reuse: int, mode: str) -> None:
+            keys.add(entry.token_ids)
+            if int(reuse) > int(plan["reuse_tokens"]):
+                plan["reuse_tokens"] = int(reuse)
+                plan["source"] = entry
+                plan["mode"] = mode
+
+        exact = self.longest_prefix(tokens)
+        exact_len = int(exact.prefix_len) if exact is not None else 0
+        exact_serves = exact is not None and _exact_restore_serves(exact, identity)
+        if exact_serves:
+            take(exact, exact_len, "exact")
+        if not near_prefix or len(tokens) < 2:
+            return plan
+        knobs = _near_prefix_knobs()
+        matches: list[tuple[SessionBankEntry, int]] = []
+        for entry in list(self._entries.values()):
+            candidate = _near_prefix_candidate_len(
+                entry, tokens, allow_block_prefix=True, **knobs
+            )
+            if candidate is not None:
+                matches.append((entry, candidate))
+        matches.sort(key=lambda item: (item[1], item[0].prefix_len), reverse=True)
+        # First lane: only a candidate that beats the exact prefix (tried
+        # when the exact prefix is shorter than the prompt). Last lane: any
+        # candidate, reached only when the exact restore does not serve.
+        floors: list[int] = []
+        if exact_len < len(tokens):
+            floors.append(exact_len)
+        if not exact_serves:
+            floors.append(0 if exact_len < len(tokens) else exact_len)
+        for floor in floors:
+            for entry, candidate in matches:
+                if _near_candidate_serves(
+                    entry, candidate, floor=floor, identity=identity
+                ):
+                    reach = (
+                        _recurrent_restore_point(entry, candidate)
+                        if entry.has_recurrent
+                        else int(candidate)
+                    )
+                    take(entry, reach, "near_prefix")
+                    break
+        return plan
+
+    def restore_source_keys(
+        self, protect_tokens: list[int] | tuple[int, ...] | None, **identity: Any
+    ) -> set[tuple[int, ...]]:
+        """The RAM entries the prompt's restore may read (``restore_plan``)."""
+
+        return set(self.restore_plan(protect_tokens, **identity)["keys"])
+
+    def restore_source_key(
+        self, protect_tokens: list[int] | tuple[int, ...] | None, **identity: Any
+    ) -> tuple[int, ...] | None:
+        """The entry the restore reaches furthest with, or None."""
+
+        source = self.restore_plan(protect_tokens, **identity)["source"]
+        return None if source is None else source.token_ids
 
     def has_session_entries(self, session_id: str | None) -> bool:
         """Whether any RAM entry belongs to ``session_id``."""
@@ -3194,69 +3397,259 @@ class SessionBank:
             entry.session_id == session_id for entry in list(self._entries.values())
         )
 
+    def session_coverage_tokens(
+        self, session_id: str | None, prompt_tokens: list[int] | tuple[int, ...]
+    ) -> int:
+        """How much of the prompt this session's RAM entries still cover:
+        the longest exact prefix, or the furthest near-prefix restore point.
+        A session record keeps its committed tokens after the bank lets go of
+        the state behind them; the admission estimate reads this instead."""
+
+        if not session_id or not prompt_tokens:
+            return 0
+        tokens = tuple(int(token) for token in prompt_tokens)
+        knobs = _near_prefix_knobs()
+        best = 0
+        for key, entry in list(self._entries.items()):
+            if entry.session_id != session_id:
+                continue
+            if entry.live_ref_only and entry.cache_ref is None:
+                continue
+            if len(key) <= len(tokens) and tokens[: len(key)] == key:
+                best = max(best, len(key))
+                continue
+            candidate = _near_prefix_candidate_len(
+                entry, tokens, allow_block_prefix=True, **knobs
+            )
+            if candidate is None:
+                continue
+            reach = (
+                _recurrent_restore_point(entry, candidate)
+                if entry.has_recurrent
+                else int(candidate)
+            )
+            best = max(best, reach)
+        return int(best)
+
+    def held_by_session(self) -> list[dict[str, Any]]:
+        """What each session's RAM entries hold, largest first (the 507's
+        holder list and the admission receipt read it)."""
+
+        rows: dict[str, dict[str, Any]] = {}
+        for entry in list(self._entries.values()):
+            group = entry.session_id or f"anon:{entry.token_hash}"
+            row = rows.setdefault(
+                group,
+                {
+                    "session_id": entry.session_id,
+                    "entries": 0,
+                    "held_bytes": 0,
+                    "leases": 0,
+                    "live_cache_refs": 0,
+                    "longest_prefix_tokens": 0,
+                },
+            )
+            row["entries"] += 1
+            row["held_bytes"] += int(entry.held_nbytes)
+            row["leases"] += int(bool(entry.live_ref_only))
+            row["live_cache_refs"] += int(entry.cache_ref is not None)
+            row["longest_prefix_tokens"] = max(
+                int(row["longest_prefix_tokens"]), int(entry.prefix_len)
+            )
+        return sorted(rows.values(), key=lambda row: -int(row["held_bytes"]))
+
+    def _dispatch_persistence(
+        self, entry: SessionBankEntry, body: Callable[[], Any]
+    ) -> None:
+        """File one idle-lane persistence job for ``entry`` (raises what the
+        dispatcher raises). The job is keyed by ``cold_persistence_key``, so
+        the dispatcher keeps only the newest per session, and the pending
+        map records which entry that newest job is for."""
+
+        key = cold_persistence_key(entry)
+        # A weak reference: the map must not pin what the job itself does
+        # not (a lease spill job carries only token ids and an epoch).
+        entry_ref = weakref.ref(entry)
+
+        def job() -> Any:
+            if self._persistence_pending.get(key) is entry_ref:
+                self._persistence_pending.pop(key, None)
+            return body()
+
+        job.coalesce_key = key
+        dispatch = self.cold_enqueue_dispatch
+        if dispatch is None:
+            raise RuntimeError("no idle-lane dispatcher")
+        dispatch(job)
+        self._persistence_pending[key] = entry_ref
+
+    def _cancel_queued_persistence(self, released: set[int]) -> tuple[int, set[str]]:
+        """Cancel the pending persistence jobs filed for released entries.
+
+        ``released`` holds ``id()`` of the entries a release frees. A key is
+        cancelled only when its pending job is for one of them, never for a
+        kept sibling's. Cancelling touches only a job that has not started:
+        a running encode finishes, and a cold-tier write lands in a temporary
+        directory that is renamed into place with its manifest row, so an
+        SSD copy is whole or absent. Returns (jobs cancelled, keys cancelled).
+        """
+
+        cancel = self.cold_enqueue_cancel
+        cancelled = 0
+        keys: set[str] = set()
+        for key, entry_ref in list(self._persistence_pending.items()):
+            entry = entry_ref()
+            if entry is None:
+                # Nothing holds it: the job ran or was dropped.
+                self._persistence_pending.pop(key, None)
+                continue
+            if id(entry) not in released:
+                continue
+            self._persistence_pending.pop(key, None)
+            keys.add(key)
+            if not callable(cancel):
+                continue
+            try:
+                cancelled += int(cancel(key) or 0)
+            except Exception as exc:
+                self.eviction_log.append(
+                    {
+                        "reason": "release_persistence_cancel_error",
+                        "session_id": entry.session_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        return cancelled, keys
+
+    def cancel_session_persistence(self, session_id: str | None) -> int:
+        """Cancel the queued SSD encode filed under ``session_id``'s key when
+        that session's entries are gone from RAM (the superseded clear): a
+        queued job holds its entry's arrays until it runs."""
+
+        if not session_id:
+            return 0
+        key = f"ssd_cold:{session_id}"
+        entry_ref = self._persistence_pending.get(key)
+        entry = entry_ref() if entry_ref is not None else None
+        if entry is None or self._entries.get(entry.token_ids) is entry:
+            return 0
+        cancelled, _keys = self._cancel_queued_persistence({id(entry)})
+        return cancelled
+
+    def entry_is_durable(self, entry: SessionBankEntry) -> bool:
+        """Whether the cold tier has PUBLISHED this entry (its manifest row
+        landed), so a restore finds it on disk. An encode that returned, a
+        write still in the writer's queue, or a write that failed are not."""
+
+        tier = self.cold_tier
+        published = getattr(tier, "is_published", None) if tier is not None else None
+        if not callable(published):
+            return False
+        try:
+            return bool(published(entry))
+        except Exception:
+            return False
+
     def release_sessions(
         self,
         target_bytes: int | None,
         *,
         keep_session_ids: Any = (),
+        only_session_ids: Any = None,
         protect_tokens: list[int] | tuple[int, ...] | None = None,
+        restore_identity: dict[str, Any] | None = None,
+        hold_session: Callable[[str], Callable[[], None] | None] | None = None,
         reason: str = "idle_session_release",
     ) -> dict[str, Any]:
         """Release whole sessions' RAM state until ``target_bytes`` is freed.
 
         The last reclamation step before the server refuses a prompt that
-        does not fit. A session's entries (durable snapshots, snapshots that
-        also hold a live cache reference, live-reference leases) all go,
-        except for sessions in ``keep_session_ids`` (the caller's in-flight
-        and incoming sessions) and the entry this prompt restores from
-        (``restore_source_key``). Idle sessions go least recently used first
-        and entries already written to SSD before the rest, so a released
-        conversation restores from disk when it comes back. An entry not on
-        disk yet is dropped: its queued SSD encode (which holds the entry's
-        arrays until it runs) is cancelled through ``cold_enqueue_cancel``,
-        and the receipt counts it, because that conversation re-prefills if
-        it is resumed. Writing it out here instead would stage its bytes
-        through the page cache and hash them on the request path, exactly
-        while the Mac is short of memory.
+        does not fit. A chosen session gives up every RAM entry it owns
+        (durable snapshots, snapshots that also hold a live cache reference,
+        live-reference leases), whatever the byte target, so nothing is left
+        that advertises a prefix the rest no longer backs. Never a session in
+        ``keep_session_ids`` (the caller's in-flight and incoming sessions)
+        and never an entry the prompt's restore may read (``restore_plan``
+        with ``restore_identity``). Sessions whose every entry the cold tier
+        has published go first, least recently used first, so a released
+        conversation restores from disk when it comes back; then the rest,
+        least recently used first, their entries dropped. An entry not
+        published yet loses its queued SSD encode when that job is its own
+        (``_cancel_queued_persistence``); writing it out here instead would
+        stage its bytes through the page cache and hash them on the request
+        path, exactly while the Mac is short of memory. When a kept entry of
+        the same session had its job coalesced away, it is filed again.
+
+        ``hold_session(session_id)`` makes the eviction atomic with request
+        ownership: it returns a releaser once the caller holds that session
+        (its generation slot), or None when the session is busy and must be
+        skipped. ``only_session_ids`` limits the release to those sessions
+        (the caller's own conversation, whose non-source entries go last).
 
         Bytes are the entries' ``held_nbytes``: what the bank believes it
         gives back. The caller re-measures the allocator afterwards; only
         that measurement decides admission. ``target_bytes=None`` releases
-        every idle session (the caller's second round, when the measurement
-        after the first still does not fit).
+        every idle session.
         """
 
         target = None if target_bytes is None else max(0, int(target_bytes))
         kept = {str(session_id) for session_id in (keep_session_ids or ()) if session_id}
-        protected = self.restore_source_key(protect_tokens)
+        only = (
+            None
+            if only_session_ids is None
+            else {str(session_id) for session_id in only_session_ids if session_id}
+        )
+        plan = self.restore_plan(protect_tokens, **(restore_identity or {}))
+        protected_keys: set[tuple[int, ...]] = set(plan["keys"])
 
         def group_of(entry: SessionBankEntry) -> str:
             return entry.session_id or f"anon:{entry.token_hash}"
 
         groups: dict[str, list[SessionBankEntry]] = {}
         for key, entry in list(self._entries.items()):
-            if key == protected:
-                continue
             if entry.session_id and entry.session_id in kept:
                 continue
+            if only is not None and entry.session_id not in only:
+                continue
             groups.setdefault(group_of(entry), []).append(entry)
+        durable = {
+            id(entry): self.entry_is_durable(entry)
+            for members in groups.values()
+            for entry in members
+        }
 
-        def last_active(group: str) -> float:
-            return max(float(entry.last_access_s) for entry in groups[group])
+        def order_key(group: str) -> tuple[bool, float]:
+            members = [e for e in groups[group] if e.token_ids not in protected_keys]
+            all_durable = all(durable[id(e)] for e in members)
+            last = max(float(e.last_access_s) for e in groups[group])
+            return (not all_durable, last)
 
-        order = sorted(groups, key=last_active)
-        released = 0
-        rows: dict[str, dict[str, Any]] = {}
-        cancelled_keys: set[str] = set()
-        persistence_cancelled = 0
-
-        def release(entry: SessionBankEntry, *, durable: bool) -> None:
-            nonlocal released, persistence_cancelled
-            group = group_of(entry)
-            row = rows.setdefault(
-                group,
-                {
-                    "session_id": entry.session_id,
+        released_bytes = 0
+        rows: list[dict[str, Any]] = []
+        skipped_busy: list[str] = []
+        released_ids: set[int] = set()
+        released_groups: dict[str, list[SessionBankEntry]] = {}
+        for group in sorted(groups, key=order_key):
+            if target is not None and released_bytes >= target:
+                break
+            members = [
+                entry
+                for entry in groups[group]
+                if entry.token_ids not in protected_keys
+                and self._entries.get(entry.token_ids) is entry
+            ]
+            if not members:
+                continue
+            session_id = members[0].session_id
+            releaser = None
+            if hold_session is not None and session_id:
+                releaser = hold_session(str(session_id))
+                if releaser is None:
+                    skipped_busy.append(str(session_id))
+                    continue
+            try:
+                row = {
+                    "session_id": session_id,
                     "entries": 0,
                     "held_bytes": 0,
                     "on_ssd_entries": 0,
@@ -3264,72 +3657,89 @@ class SessionBank:
                     "leases": 0,
                     "live_cache_refs": 0,
                     "longest_prefix_tokens": 0,
-                },
-            )
-            held = int(entry.held_nbytes)
-            row["entries"] += 1
-            row["held_bytes"] += held
-            row["on_ssd_entries" if durable else "dropped_entries"] += 1
-            row["leases"] += int(bool(entry.live_ref_only))
-            row["live_cache_refs"] += int(entry.cache_ref is not None)
-            row["longest_prefix_tokens"] = max(
-                int(row["longest_prefix_tokens"]), int(entry.prefix_len)
-            )
-            if not durable:
-                key = cold_persistence_key(entry)
-                cancel = self.cold_enqueue_cancel
-                if key not in cancelled_keys and callable(cancel):
-                    cancelled_keys.add(key)
-                    try:
-                        persistence_cancelled += int(cancel(key) or 0)
-                    except Exception as exc:
-                        self.eviction_log.append(
-                            {
-                                "reason": "idle_release_cancel_error",
-                                "session_id": entry.session_id,
-                                "error": f"{type(exc).__name__}: {exc}",
-                            }
-                        )
-            self._evict_entry(entry, reason=reason)
-            released += held
-
-        def satisfied() -> bool:
-            return target is not None and released >= target
-
-        for durable_pass in (True, False):
-            for group in order:
-                if satisfied():
-                    break
-                for entry in sorted(
-                    groups[group], key=lambda item: -int(item.held_nbytes)
-                ):
-                    if satisfied():
-                        break
+                    "kept_restore_sources": sum(
+                        1 for entry in groups[group] if entry.token_ids in protected_keys
+                    ),
+                }
+                for entry in members:
                     if self._entries.get(entry.token_ids) is not entry:
                         continue
-                    on_disk = entry.cold_encode_completed_at is not None
-                    if on_disk != durable_pass:
-                        continue
-                    release(entry, durable=on_disk)
-        for row in rows.values():
+                    held = int(entry.held_nbytes)
+                    row["entries"] += 1
+                    row["held_bytes"] += held
+                    row["on_ssd_entries" if durable[id(entry)] else "dropped_entries"] += 1
+                    row["leases"] += int(bool(entry.live_ref_only))
+                    row["live_cache_refs"] += int(entry.cache_ref is not None)
+                    row["longest_prefix_tokens"] = max(
+                        int(row["longest_prefix_tokens"]), int(entry.prefix_len)
+                    )
+                    released_ids.add(id(entry))
+                    self._evict_entry(entry, reason=reason)
+                    released_bytes += held
+                    released_groups.setdefault(group, []).append(entry)
+                rows.append(row)
+            finally:
+                if releaser is not None:
+                    releaser()
+        persistence_cancelled, cancelled_keys = self._cancel_queued_persistence(
+            released_ids
+        )
+        redispatched = 0
+        if cancelled_keys and self.cold_enqueue_dispatch is not None:
+            # A kept entry whose own job was coalesced away by the released
+            # sibling's newer one gets its durable copy filed again.
+            for group in released_groups:
+                survivors = [
+                    entry
+                    for entry in self._entries.values()
+                    if group_of(entry) == group
+                    and cold_persistence_key(entry) in cancelled_keys
+                    and not entry.live_ref_only
+                    and not self.entry_is_durable(entry)
+                ]
+                if not survivors:
+                    continue
+                newest = max(survivors, key=lambda entry: float(entry.created_at_s))
+                put_entry = getattr(self.cold_tier, "put_entry", None)
+                if not callable(put_entry):
+                    continue
+                try:
+                    # Idle lane only: no synchronous encode on the request
+                    # path while the Mac is short of memory.
+                    self._dispatch_persistence(
+                        newest,
+                        lambda entry=newest, put=put_entry: self._cold_enqueue_job(
+                            entry, put
+                        ),
+                    )
+                    redispatched += 1
+                except Exception as exc:
+                    self.eviction_log.append(
+                        {
+                            "reason": "release_persistence_redispatch_error",
+                            "session_id": newest.session_id,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+        for row in rows:
             session_id = row["session_id"]
             if session_id and not self.has_session_entries(session_id):
                 # A released session must not keep its activity pin: the
                 # pin exists to protect state that is about to be extended.
                 self._session_last_active.pop(str(session_id), None)
+        source = plan["source"]
         return {
-            "sessions": sorted(
-                rows.values(), key=lambda row: -int(row["held_bytes"])
-            ),
-            "entries": int(sum(row["entries"] for row in rows.values())),
-            "held_bytes": int(released),
-            "dropped_entries": int(
-                sum(row["dropped_entries"] for row in rows.values())
-            ),
+            "sessions": sorted(rows, key=lambda row: -int(row["held_bytes"])),
+            "entries": int(sum(row["entries"] for row in rows)),
+            "held_bytes": int(released_bytes),
+            "dropped_entries": int(sum(row["dropped_entries"] for row in rows)),
             "persistence_cancelled": int(persistence_cancelled),
+            "persistence_redispatched": int(redispatched),
             "protected_restore_source_tokens": (
-                None if protected is None else len(protected)
+                None if source is None else int(source.prefix_len)
             ),
+            "protected_restore_sources": len(protected_keys),
+            "skipped_busy_sessions": skipped_busy,
             "kept_sessions": sorted(kept),
         }
 
@@ -3355,19 +3765,17 @@ class SessionBank:
         ``prefix_len`` entry — the one the protected-terminal order guards).
         Phase 2, only if the deficit stands, takes remaining entries in the
         take-anything order of real memory pressure (active sessions last).
-        Both phases spare the entry the imminent prompt restores from
-        (``protect_tokens``, validated by ``restore_source_key``: an entry
-        that shares one token with the prompt is not a restore source), and
+        Both phases spare the entries the imminent prompt may restore from
+        (``protect_tokens``, validated by ``restore_source_keys``: the exact
+        prefix and the best block-restorable entry; an entry that shares one
+        token with the prompt is not a restore source), and
         every eviction is RAM-only: the SSD cold tier still restores a walked
         entry, so the worst case is a disk read on some session's next turn,
         not this request's abort.
         Returns ``(non_terminal_evicted, terminal_evicted)``.
         """
         target = max(0, int(target_bytes))
-        protected_keys: set[tuple[int, ...]] = set()
-        source_key = self.restore_source_key(protect_tokens)
-        if source_key is not None:
-            protected_keys.add(source_key)
+        protected_keys = self.restore_source_keys(protect_tokens)
 
         def _walk(candidates_fn, order_key) -> int:
             evicted = 0
