@@ -678,6 +678,56 @@ def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int
     return max(min_blocks, required_blocks)
 
 
+def _dynamic_paged_growth_blocks(
+    *, block_size: int, current_blocks: int, required_tokens: int
+) -> int | None:
+    """Block count a paged KV store grows to so ``required_tokens`` rows fit.
+
+    None when dynamic growth is off (``MTPLX_DYNAMIC_PAGED_KV`` unset): the
+    caller must refuse the write rather than run past its buffers. The eager
+    pages (``_grow_to_capacity``) and the promoted tensor-offset adapters
+    (``ensure_capacity``) share this policy so both grow the same way:
+    geometric 1.5x, never below the requirement, and clamped to the serving
+    context window when the requirement fits inside it (#150: the 1.5x step
+    at 100k+ ctx allocated GiBs of blocks no request can ever address). A
+    genuinely larger requirement still wins — correctness over the clamp.
+    """
+
+    if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
+        return None
+    block_size = int(block_size)
+    current_blocks = int(current_blocks)
+    required_blocks = (int(required_tokens) + block_size - 1) // block_size
+    grown_blocks = max(
+        required_blocks,
+        int((current_blocks * 3 + 1) // 2),
+        current_blocks + 1,
+    )
+    window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
+    if window_tokens > 0:
+        window_blocks = (int(window_tokens) + block_size - 1) // block_size
+        if window_blocks >= required_blocks:
+            grown_blocks = min(grown_blocks, max(window_blocks, current_blocks))
+    return int(grown_blocks)
+
+
+def _concrete_offset(value: Any) -> int | None:
+    """Host int of a scalar cache offset, or None while ``mx.compile`` traces it.
+
+    Inside a trace ``.item()`` raises ValueError ("Attempting to eval an array
+    during function transformations"); ``graphbank.TensorOffsetKVCache`` tells
+    its eager path from the traced one with the same probe. On the eager path
+    this is one scalar sync.
+    """
+
+    if isinstance(value, int):
+        return int(value)
+    try:
+        return int(value.item())
+    except ValueError:
+        return None
+
+
 def _paged_attention_requires_external_ops(
     *,
     turboquant_config: Any | None = None,
@@ -927,29 +977,17 @@ class VllmMetalPagedKVCache:
         )
 
     def _grow_to_capacity(self, required_tokens: int) -> bool:
-        if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
-            return False
         allocated_blocks = self.allocated_blocks
         current_blocks = (
             int(self.num_blocks) if allocated_blocks is None else int(allocated_blocks)
         )
-        required_blocks = (int(required_tokens) + self.block_size - 1) // self.block_size
-        grown_blocks = max(
-            required_blocks,
-            int((current_blocks * 3 + 1) // 2),
-            int(current_blocks) + 1,
+        grown_blocks = _dynamic_paged_growth_blocks(
+            block_size=self.block_size,
+            current_blocks=current_blocks,
+            required_tokens=required_tokens,
         )
-        window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
-        if window_tokens > 0:
-            # Geometric growth must not overshoot the serving context window
-            # (#150: the 1.5x step at 100k+ ctx allocates GiBs of blocks no
-            # request can ever address). A genuinely larger requirement still
-            # wins — correctness over the clamp.
-            window_blocks = (int(window_tokens) + self.block_size - 1) // self.block_size
-            if window_blocks >= required_blocks:
-                grown_blocks = min(
-                    grown_blocks, max(window_blocks, int(current_blocks))
-                )
+        if grown_blocks is None:
+            return False
         if grown_blocks <= current_blocks:
             self.num_blocks = int(current_blocks)
             return True
@@ -2885,6 +2923,7 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         self.static_max_offset: int | None = None
         self.update_calls = 0
         self.paged_attention_calls = 0
+        self.grow_events = 0
         self.cache_write_time_s = 0.0
         self.attention_time_s = 0.0
 
@@ -2928,7 +2967,81 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
 
     @property
     def capacity(self) -> int:
-        return int(self.block_size) * int(self.num_blocks)
+        # The live buffers, not the num_blocks claim (#310): the compiled
+        # bank's bucket check and the capacity-wide mask both read this, and
+        # a claim above the real rows would let a write run past the buffer.
+        rows = self._physical_rows()
+        return int(self.block_size) * int(self.num_blocks) if rows is None else rows
+
+    def _physical_rows(self) -> int | None:
+        """Logical rows the live page buffers hold (None before allocation)."""
+        pages = self.cache[0]
+        if pages is None:
+            return None
+        return int(pages.shape[0]) * int(pages.shape[1])
+
+    def ensure_capacity(self, needed: int) -> bool:
+        """Grow the live buffers so ``needed`` rows fit; False when growth is off.
+
+        Promoted paged adapters are fixed-shape: nothing on their write path
+        grows them, and a dynamic ``slice_update`` past the end is not clamped
+        by MLX — it lands in the next head's first rows (head-major banks) and
+        past the end of the allocation. Callers reserve BEFORE the forward
+        (``graphbank.ensure_eager_window_capacity``) because the attention mask
+        is built once per forward from this capacity. Growth follows the eager
+        pages' policy (``_dynamic_paged_growth_blocks``) and appends zeroed
+        whole blocks, so every existing row keeps its index and bytes.
+        """
+        rows = self._physical_rows()
+        if rows is None:
+            return False
+        if int(needed) <= rows:
+            return True
+        current_blocks = rows // int(self.block_size)
+        grown_blocks = _dynamic_paged_growth_blocks(
+            block_size=self.block_size,
+            current_blocks=current_blocks,
+            required_tokens=int(needed),
+        )
+        if grown_blocks is None:
+            return False
+        self._append_zero_blocks(int(grown_blocks) - current_blocks)
+        self.num_blocks = int(grown_blocks)
+        self.grow_events += 1
+        return True
+
+    def _append_zero_blocks(self, extra_blocks: int) -> None:
+        import mlx.core as mx
+
+        grown = []
+        for slot in (0, 1):
+            pages = self.cache[slot]
+            pages = mx.concatenate(
+                [pages, mx.zeros((extra_blocks, *pages.shape[1:]), dtype=pages.dtype)],
+                axis=0,
+            )
+            self.cache[slot] = pages
+            grown.append(pages)
+        mx.eval(*grown)
+
+    def _require_eager_capacity(self, steps: int) -> None:
+        """Refuse an eager write that does not fit, before anything is written.
+
+        Traced writes (the compiled verify bank's shadow twins) skip this: the
+        bank only dispatches a bucket whose offset + window fits the capacity.
+        """
+        offset = _concrete_offset(self.cache[2])
+        if offset is None:
+            return
+        rows = self._physical_rows()
+        if rows is not None and offset + int(steps) > rows:
+            raise ValueError(
+                "paged KV cache capacity exceeded on a promoted "
+                f"{type(self).__name__}: rows {offset}:{offset + int(steps)} "
+                f"do not fit {rows} rows. Reserve with ensure_capacity() before "
+                "the forward: MLX does not clamp a dynamic slice update, so "
+                "the rows would land outside this cache's buffers"
+            )
 
     @property
     def compile_state(self):
@@ -2946,6 +3059,7 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         import mlx.core as mx
 
         steps = int(keys.shape[2])
+        self._require_eager_capacity(steps)
         started = time.perf_counter()
         k_3d = mx.contiguous(keys[0].transpose(1, 0, 2))
         v_3d = mx.contiguous(values[0].transpose(1, 0, 2))
@@ -3182,6 +3296,7 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             "static_max_offset": int(self._static_attention_max_offset() or self.capacity),
             "updates": int(self.update_calls),
             "paged_attention_calls": int(self.paged_attention_calls),
+            "grow_events": int(self.grow_events),
             "bytes": int(self.nbytes),
             "cache_write_time_s": float(self.cache_write_time_s),
             "attention_time_s": float(self.attention_time_s),
@@ -3329,12 +3444,42 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             head_dims=(int(entry._shape[1]), int(entry._shape[2])),
         )
 
+    def _physical_rows(self) -> int | None:
+        """Rows of the head-major banks, (1, H_kv, rows, width) (None if empty)."""
+        bank = self.cache[0]
+        return None if bank is None else int(bank.shape[2])
+
+    def _append_zero_blocks(self, extra_blocks: int) -> None:
+        # All four leaves grow together along the row axis: payloads and both
+        # fp32 scale planes. Zero payload with a zero scale dequantizes to 0,
+        # the same as a freshly allocated page row.
+        import mlx.core as mx
+
+        extra_rows = int(extra_blocks) * int(self.block_size)
+        grown = []
+        for slot in (0, 1, 3, 4):
+            bank = self.cache[slot]
+            bank = mx.concatenate(
+                [
+                    bank,
+                    mx.zeros(
+                        (int(bank.shape[0]), int(bank.shape[1]), extra_rows, int(bank.shape[3])),
+                        dtype=bank.dtype,
+                    ),
+                ],
+                axis=2,
+            )
+            self.cache[slot] = bank
+            grown.append(bank)
+        mx.eval(*grown)
+
     def update_without_fetch(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
 
         from .kv_quant import quantize_symmetric
 
         steps = int(keys.shape[2])
+        self._require_eager_capacity(steps)
         started = time.perf_counter()
         bits = self.kv_bits
         # Head-major incoming (1, H, steps, D): quantizing here yields the

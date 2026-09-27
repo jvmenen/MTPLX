@@ -36,6 +36,19 @@ from .sdpa_gqa_packed import (  # shared, proven pieces
 )
 
 
+def _concrete_offset(offset) -> int | None:
+    """The host value of an array offset, or None while ``mx.compile`` traces.
+
+    ``.item()`` inside a trace raises ValueError; eagerly it is one scalar
+    sync (the same probe ``cache_state._concrete_offset`` uses).
+    """
+
+    try:
+        return int(offset.item())
+    except ValueError:
+        return None
+
+
 def _static_blocks(capacity: int, max_offset: int | None) -> int:
     """Block-lane count from the STATIC attention ceiling.
 
@@ -443,6 +456,19 @@ def sdpa_gqa_packed_tail_quant(
     if isinstance(offset, mx.array):
         if offset.size != 1:
             return _bail("offset_shape")
+        # The integer branch below bails past the buffers; an array offset
+        # used to reach the kernel unchecked, and its walk reads offset rows
+        # of k_q/v_q and both scale planes whatever their size. An eager
+        # offset past the capacity means the cache already outran its
+        # buffers, so this refuses loudly instead of reading past them. A
+        # traced offset cannot be read here; the compiled verify bank only
+        # dispatches a bucket whose offset + window fits the capacity.
+        concrete = _concrete_offset(offset)
+        if concrete is not None and concrete > capacity:
+            raise ValueError(
+                f"packed-quant attention offset {concrete} is past the KV "
+                f"buffers' {capacity} rows; the cache wrote beyond its capacity"
+            )
         offset_arr = offset.astype(mx.int32).reshape(1)
     else:
         offset_int = int(offset)

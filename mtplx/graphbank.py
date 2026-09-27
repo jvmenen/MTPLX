@@ -1062,28 +1062,64 @@ class TensorOffsetQSACache:
 
 
 def ensure_eager_window_capacity(cache: Any, window_tokens: int) -> int:
-    """Grow every ``TensorOffsetKVCache`` entry so one eager forward of
+    """Grow every promoted full-attention entry so one eager forward of
     ``window_tokens`` rows fits; returns how many entries grew.
 
     The eager copy-block route writes ``1 + block`` rows into these fixed
-    buffers outside the bank's own reservation. The growth has to happen
-    before the forward: the attention mask is built once per forward from
-    the first full-attention layer's capacity, so a buffer that grows inside
-    a layer's update no longer matches the mask. Every full-attention layer
-    holds the same token count, so the offset is read once.
+    buffers outside the bank's own reservation, and every bank fallback runs
+    the eager forward on whatever adapters an earlier call promoted. The
+    growth has to happen before the forward: the attention mask is built
+    once per forward from the first full-attention layer's capacity, so a
+    buffer that grows inside a layer's update no longer matches the mask.
+    Every dense layer holds the same token count, so its offset is read once.
+
+    Promoted paged adapters (plain and quantized, ``cache_state``) are fixed
+    buffers too, and before this they had no reservation at all: MLX does not
+    clamp a dynamic ``slice_update``, so a window past their capacity wrote
+    its rows into the next head's first rows of the head-major quantized
+    banks and past the end of the allocations while the offset ran past the
+    capacity (issue #526, all-NaN logits under q4/q8 KV). They grow with the
+    eager pages' own policy; when dynamic paged growth is off the window
+    cannot be served, and this refuses before any row is written — the same
+    refusal the stock paged writer makes.
     """
 
+    from .cache_state import TensorOffsetVllmMetalPagedKVCache
+
+    window = max(1, int(window_tokens))
     grown = 0
     size = None
+    paged = []
     for entry in cache or []:
+        if isinstance(entry, TensorOffsetVllmMetalPagedKVCache):
+            if entry.key_cache is not None:
+                paged.append(entry)
+            continue
         if not isinstance(entry, TensorOffsetKVCache) or entry.keys is None:
             continue
         if size is None:
             size = entry.size()
-        needed = size + max(1, int(window_tokens))
+        needed = size + window
         if needed > int(entry.keys.shape[2]):
             entry.ensure_capacity(needed)
             grown += 1
+    if paged:
+        # One sync for every paged offset (they may still be pending outputs
+        # of the last compiled verify), then plain host reads below.
+        mx.eval(*(entry.cache[2] for entry in paged))
+    for entry in paged:
+        offset = entry.size()
+        needed = offset + window
+        if needed <= int(entry.capacity):
+            continue
+        if not entry.ensure_capacity(needed):
+            raise ValueError(
+                f"paged KV window of {window} rows at offset {offset} does not "
+                f"fit the promoted {type(entry).__name__}'s {int(entry.capacity)} "
+                "rows, and dynamic paged KV growth (MTPLX_DYNAMIC_PAGED_KV) is "
+                "off; refusing before any row is written"
+            )
+        grown += 1
     return grown
 
 def promote_kv_cache_offsets(
@@ -2150,6 +2186,7 @@ class CompiledVerifyBank:
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
             "growth_demotions": 0,
+            "eager_window_growths": 0,
             "growth_handoff_materializations": 0,
             "growth_handoff_state_leaves": 0,
             "growth_handoff_materialize_time_s": 0.0,
@@ -4749,6 +4786,18 @@ class CompiledVerifyBank:
             )
         if growth_transition:
             self._growth_budget_fallback_reported = True
+        # The eager forward below runs on whatever containers the cache holds,
+        # including adapters an earlier call promoted, whose buffers never
+        # grow on their own. Reserve the window before the forward builds its
+        # mask — for every reason, not only "capacity_overflow": a long
+        # extended window ("length_outside_bank") can cross the edge too.
+        shape = getattr(input_ids, "shape", None)
+        if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
+            grown = ensure_eager_window_capacity(cache, int(shape[1]))
+            if grown:
+                self.stats["eager_window_growths"] = (
+                    int(self.stats.get("eager_window_growths", 0)) + grown
+                )
         return self._runtime_forward(
             input_ids,
             cache=cache,
