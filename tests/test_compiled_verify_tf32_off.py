@@ -28,6 +28,7 @@ PARITY_TESTS = (
     "tests/test_compiled_verify_evaluated_weights.py",
     "tests/test_attention_gate_exactness.py",
     "tests/test_qsa_fixed_bank_score_scale.py",
+    "tests/test_qwen4_ple_gate_exactness.py",
 )
 
 

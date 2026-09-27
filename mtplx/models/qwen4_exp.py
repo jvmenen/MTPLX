@@ -64,6 +64,7 @@ from mlx_lm.models.qwen3_next import (
 
 from mtplx import nax_detect
 from mtplx.attention_context import current_attention_phase
+from mtplx.attention_math import attention_gate
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
 
 
@@ -5836,7 +5837,12 @@ class PLELayer(nn.Module):
         query = query.reshape(*query.shape[:-1], self.hc_count, self.hidden_size)
         gate = (key * query).sum(axis=-1, keepdims=True) / math.sqrt(self.hidden_size)
         gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
-        gated = mx.sigmoid(gate) * value[..., None, :]
+        # value * sigmoid(gate) under the verify gate contract: inside the
+        # compiled verifier's trace this sigmoid fuses with the multiply, and
+        # MLX 0.32.2's fused bfloat16 sigmoid differs from its standalone one
+        # at -6.84375 (mtplx/attention_math.py); a verify forward's eager
+        # reference must take the same lowering.
+        gated = attention_gate(value[..., None, :], gate)
         gated = gated.reshape(*hidden.shape)
         return gated + self._short_conv(self.norm_conv(gated), cache, capture)
 
