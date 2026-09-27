@@ -18557,6 +18557,7 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_guard_events": list(
             getattr(dashboard, "memory_guard_events", ()) or ()
         )[-8:],
+        "memory_guard": _memory_guard_health(state),
         "settings": _mtplx_current_settings(state),
         "scheduler": _mtplx_scheduler_state(state),
         "machine": _machine_info(),
@@ -18682,6 +18683,54 @@ def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
         events.append({"ts": time.time(), **payload})
     except Exception:
         pass
+
+
+def _note_guard_health(
+    state: Any, *, where: str, error: BaseException | None
+) -> None:
+    """Whether the memory guard's last check ran (never raises).
+
+    A guard step that raises must not cost the request (it is admitted and
+    the runtime backstops still apply: the per-chunk check with its
+    reservation and the engine limit, the sustained-pressure abort, the
+    allocation-failure shed), but it must not pass silently either: until a
+    later check of the same step runs cleanly, /health and the dashboard
+    stream report ``guard_degraded`` with the exception, and the error stays
+    readable after that."""
+
+    try:
+        dashboard = state.dashboard
+        health = getattr(dashboard, "memory_guard_health", None)
+        if not isinstance(health, dict):
+            health = {"degraded": {}, "errors": 0, "last_error": None}
+            dashboard.memory_guard_health = health
+        if error is None:
+            health["degraded"].pop(where, None)
+            return
+        record = {"where": where, "error": repr(error), "ts": time.time()}
+        health["degraded"][where] = record
+        health["errors"] = int(health.get("errors") or 0) + 1
+        health["last_error"] = record
+    except Exception:
+        pass
+
+
+def _memory_guard_health(state: Any) -> dict[str, Any]:
+    """The guard's own health for /health and the dashboard stream."""
+
+    health = getattr(getattr(state, "dashboard", None), "memory_guard_health", None)
+    if not isinstance(health, dict):
+        return {"guard_degraded": False, "degraded": [], "errors": 0, "last_error": None}
+    degraded = sorted(
+        (dict(record) for record in dict(health.get("degraded") or {}).values()),
+        key=lambda record: record.get("ts") or 0.0,
+    )
+    return {
+        "guard_degraded": bool(degraded),
+        "degraded": degraded,
+        "errors": int(health.get("errors") or 0),
+        "last_error": health.get("last_error"),
+    }
 
 
 def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
@@ -20180,7 +20229,7 @@ def _prefill_admission_shed(
     if not _prefill_admission_shed_enabled():
         return None
     try:
-        return _run_prefill_admission(
+        receipt = _run_prefill_admission(
             state,
             prompt_ids=prompt_ids,
             session_bank=session_bank,
@@ -20194,16 +20243,23 @@ def _prefill_admission_shed(
             restore_identity=restore_identity,
             pricing=pricing,
         )
+        _note_guard_health(state, where="prefill_admission", error=None)
+        return receipt
     except Exception as exc:  # noqa: BLE001
         # An admission guard that raises must not cost the request (the
-        # runtime backstops still apply: the per-chunk supply check, the
-        # sustained-pressure abort, the allocation-failure shed), but it must
-        # not pass silently either: the receipt rides the request log and
-        # the guard events, and the console names it.
+        # runtime backstops still apply: the per-chunk check, armed with the
+        # widest forward's reservation and the engine limit when there is no
+        # admission bill, the sustained-pressure abort, the allocation-failure
+        # shed), but it must not pass silently either: /health and the
+        # dashboard stream report guard_degraded with the exception, the
+        # receipt rides the request log and the guard events, and the console
+        # names it.
+        _note_guard_health(state, where="prefill_admission", error=exc)
         receipt = {
             "action": "prefill_admission_shed_error",
             "error": repr(exc),
             "admitted_unchecked": True,
+            "guard_degraded": True,
         }
         _record_guard_event(state, receipt)
         try:
@@ -27661,11 +27717,19 @@ def _run_generation(
             except Exception as _reserve_exc:  # noqa: BLE001
                 # Like the admission itself: a guard that cannot price the
                 # chunk must not cost the request, and must not pass
-                # silently. The check still runs, reserving nothing.
-                prefill_chunk_reserve = 0
+                # silently. The check still runs, with the engine limit and
+                # the planner's flat runtime reserve (3 GiB) held for each
+                # chunk, the figure every plan budgets for a forward.
+                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+                prefill_chunk_reserve = int(RUNTIME_TRANSIENTS_BYTES)
+                _note_guard_health(
+                    state, where="prefill_chunk_reserve", error=_reserve_exc
+                )
                 _reserve_error = {
                     "action": "prefill_chunk_reserve_error",
                     "error": repr(_reserve_exc),
+                    "guard_degraded": True,
                 }
                 _record_guard_event(state, _reserve_error)
                 try:
@@ -27675,6 +27739,8 @@ def _run_generation(
                     )
                 except Exception:
                     pass
+            else:
+                _note_guard_health(state, where="prefill_chunk_reserve", error=None)
             prefill_system_guard = _PrefillSystemGuard(
                 state, chunk_reserve_bytes=prefill_chunk_reserve
             )
@@ -32634,6 +32700,7 @@ def create_app(state: ServerState) -> FastAPI:
             "paged_kv_quantization": _effective_paged_kv_quantization(),
             "paged_kv_quantization_detail": _paged_kv_quantization_detail(),
             "kernel_selfcheck": _kernel_selfcheck_health_payload(),
+            "memory_guard": _memory_guard_health(state),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,
