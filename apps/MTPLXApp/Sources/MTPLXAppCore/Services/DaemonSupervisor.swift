@@ -416,6 +416,20 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
     }
 
+    /// Where the daemon this supervisor runs, adopted or is launching
+    /// listens, or `nil` when it holds none (#528). The app reaches its
+    /// daemon here rather than at the configured address: a port fallback
+    /// (#503) or settings reloaded from disk change where the next launch
+    /// listens, not where the running one does.
+    public func activeBaseURL() -> URL? {
+        lock.withLock {
+            guard process != nil || adoptedProcessID != nil || launchInProgress else {
+                return nil
+            }
+            return heldBaseURL
+        }
+    }
+
     /// The launch id of the daemon this supervisor runs, adopted or is
     /// launching, or `nil` when it holds none (#528). A /health answer
     /// speaks for that daemon only when it carries this id: another server

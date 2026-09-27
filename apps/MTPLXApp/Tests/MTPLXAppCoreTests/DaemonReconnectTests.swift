@@ -731,6 +731,55 @@ final class DaemonReconnectTests: XCTestCase {
         try await assertAnotherServerAfterACleanStreamEnd(strangerLaunchID: "other-session-\(UUID().uuidString)")
     }
 
+    // MARK: A launch on a fallback port, then the window reopens
+
+    /// The configured port is taken by `mtplx serve` from a terminal, so the
+    /// app launches on the next free port and settings keep the configured
+    /// one (#503). Reopening the window reloads settings from disk. Every
+    /// later request must still reach the daemon where it listens, not the
+    /// reloaded port, where the other server answers.
+    @MainActor
+    func testFallbackPortDaemonStaysReachableAfterTheWindowReopens() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let occupant = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if occupant.isRunning { occupant.terminate() } }
+        let occupantHealth = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let store = daemon.makeStore(configuration: MTPLXAppConfiguration(), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        let fallbackPort = try XCTUnwrap(store.baseURL.port)
+        XCTAssertNotEqual(fallbackPort, daemon.port, "the launch moved off the occupied port")
+        XCTAssertNotNil(store.portFallbackNotice)
+        let launched = try XCTUnwrap(store.health?.startup)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+
+        // The window reopens: its launch task reloads settings and starts.
+        store.loadPersistedSettings()
+        XCTAssertEqual(store.configuration.port, daemon.port, "settings keep the configured port")
+        await store.startDaemon()
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(store.baseURL.port, fallbackPort)
+        XCTAssertEqual(
+            store.apiClient.baseURL.port, fallbackPort,
+            "requests go where the daemon listens, not to the reloaded port"
+        )
+        let answer = try await store.apiClient.health()
+        XCTAssertEqual(answer.startup?.launchId, launched.launchId, "the app's daemon answers, not the occupant")
+        XCTAssertNotEqual(answer.startup?.pid, occupantHealth.startup?.pid)
+        XCTAssertEqual(daemon.spawns().count, 2, "the occupant and one app daemon")
+        XCTAssertNotNil(store.portFallbackNotice, "the fallback banner stays while that daemon runs")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+
+        await store.stopDaemon()
+        XCTAssertTrue(occupant.isRunning, "Stop never signals the server on the configured port")
+    }
+
     // MARK: Live stats drop while the daemon stays healthy
 
     @MainActor

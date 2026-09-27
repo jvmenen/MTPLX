@@ -833,7 +833,7 @@ public final class MTPLXBackendStore: ObservableObject {
             activeLaunchID = launchID
             let startupHealth = try await supervisor.restart(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: next.apiKey,
                 probeHealth: true,
                 timeoutSeconds: daemonStartupTimeoutSeconds,
@@ -939,7 +939,7 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             guard let adoptedHealth = try await supervisor.adoptExistingIfAppOwned(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: configuration.apiKey,
                 requireActualFanRamp: requiresStartupFanRamp(configuration)
             ) else {
@@ -1160,7 +1160,7 @@ public final class MTPLXBackendStore: ObservableObject {
             activeLaunchID = launchID
             let startupHealth = try await supervisor.start(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: configuration.apiKey,
                 probeHealth: true,
                 timeoutSeconds: daemonStartupTimeoutSeconds,
@@ -1301,7 +1301,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // daemon (stop/start, or the predecessor of an in-app update)
         // clears on its own and must never cost the user their port.
         let occupant = await PortPreflight.classifySettled(
-            baseURL: baseURL,
+            baseURL: configuredBaseURL,
             apiKey: configuration.apiKey,
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
@@ -1446,7 +1446,7 @@ public final class MTPLXBackendStore: ObservableObject {
     ) async -> Bool {
         let occupiedPort = configuration.port
         let occupant = await PortPreflight.classifySettled(
-            baseURL: baseURL,
+            baseURL: configuredBaseURL,
             apiKey: configuration.apiKey,
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
@@ -3070,19 +3070,10 @@ public final class MTPLXBackendStore: ObservableObject {
         // The panels describe a running engine. Read from the port while the
         // engine starts, is degraded or is stopped, they show whatever
         // answers there, and a failed read during a model load reached the
-        // unreachable-daemon path and reaped the loading daemon. The same
-        // read at an address the running daemon does not use (settings read
-        // from disk can move the port) would reap a healthy one.
-        guard daemonState == .running, configuredAddressReachesHeldDaemon else { return }
+        // unreachable-daemon path and reaped the loading daemon.
+        guard daemonState == .running else { return }
         try? await refreshStaticState()
         try? await refreshSnapshot()
-    }
-
-    /// False when the configured address is not the one the held daemon's
-    /// health was verified at, so nothing there speaks for this daemon.
-    private var configuredAddressReachesHeldDaemon: Bool {
-        guard case .held(let held) = supervisor.currentHold() else { return true }
-        return held.baseURL == baseURL
     }
 
     /// Who answered a healthy /health (#528).
@@ -3191,12 +3182,9 @@ public final class MTPLXBackendStore: ObservableObject {
     ///   watchdog decides that a silent one is gone (#487).
     func reconcileHeldDaemon(clearingFailedRequest: Bool = false) async {
         await awaitDaemonTeardown()
-        // Settings read from disk can name another port or host than the one
-        // the daemon was started on. A probe there says nothing about this
-        // daemon, and transports restarted there would lose it.
-        guard case .held(let held) = supervisor.currentHold(),
-              held.baseURL == baseURL
-        else { return }
+        // The probe and any restarted transport go to the address the held
+        // daemon was verified at, which is `baseURL` while it is held.
+        guard case .held(let held) = supervisor.currentHold() else { return }
         let stateBefore = daemonState
         // A model swap replaces the daemon; its own outcome is the one to show.
         guard stateBefore != .stopping else { return }
@@ -4659,7 +4647,20 @@ public final class MTPLXBackendStore: ObservableObject {
     /// startup health wait, and the watchdog all fail against a healthy LAN
     /// daemon (issue #109). The verbatim bind host still flows to `--host`
     /// via MTPLXCommandBuilder.
+    ///
+    /// While a daemon runs (or is launching), this is where it listens, not
+    /// what the configuration says now (#528). A port fallback (#503) runs a
+    /// launch on another port while settings keep the configured one, and
+    /// reopening the window reloads settings from disk; the chat, the
+    /// dashboard, the watchdog and every other request used to follow the
+    /// reloaded port to whatever held it.
     public var baseURL: URL {
+        supervisor.activeBaseURL() ?? configuredBaseURL
+    }
+
+    /// Where the next launch will listen: the configured bind host and port,
+    /// connectable. Launches, adoption and the port preflight use this.
+    public var configuredBaseURL: URL {
         MTPLXServerURLs.baseURL(
             bindHost: configuration.host,
             port: configuration.port
@@ -4682,7 +4683,7 @@ public final class MTPLXBackendStore: ObservableObject {
             do {
                 self.startupPhase = .waitingForOwnedHealth
                 let recoveredHealth = try await self.supervisor.waitForExistingHealth(
-                    healthBaseURL: self.baseURL,
+                    healthBaseURL: self.configuredBaseURL,
                     apiKey: self.configuration.apiKey,
                     timeoutSeconds: self.daemonStartupTimeoutSeconds,
                     expectedLaunchID: launchID,
