@@ -7,8 +7,13 @@ from typing import Any
 
 import mlx.core as mx
 
-from .attention_context import current_attention_phase
+from .attention_context import (
+    current_attention_phase,
+    format_kv_attention_record,
+    note_kv_attention_record,
+)
 from .attention_math import attention_gate
+from .compile_state import in_compiled_step_body, is_compile_trace_error
 from .rope_origin import (
     cache_owns_rotary_origin,
     note_unowned_rotary_origin,
@@ -29,16 +34,14 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
 #   MTPLX_KV_ATTENTION_TRACE=1          one line per full-attention call here
 #   MTPLX_KV_ATTENTION_TRACE=nonfinite  every call's output is checked; only
 #                                       non-finite ones print
-#   unset                               no device read and no sync: each layer
-#                                       keeps a host-only record of its latest
-#                                       call, and the server prints the first
-#                                       layer's record when the sampler reports
-#                                       non-finite logits (last_kv_attention_line)
+#   unset                               no device read and no sync
 #
-# Checking an output costs a sync per layer, which is why it is opt-in. A
-# compiled verify call runs this Python body at trace time only, so its line
-# says offset=traced and finite=traced.
-_KV_ATTENTION_LAST: dict[int, tuple[Any, ...]] = {}
+# In every mode each trunk layer's latest call is recorded, host facts only,
+# in the current request's record (attention_context), and a request that
+# fails with non-finite logits reports the first layer's record. Checking an
+# output costs a sync per layer, which is why it is opt-in. A compiled step
+# runs this Python body at trace time only: its record is kept as a trace
+# and its printed line says offset=traced and finite=traced.
 
 
 def _kv_attention_trace_mode() -> str:
@@ -86,23 +89,13 @@ def _kv_mask_kind(mask: Any) -> str:
 
 
 def _host_value(value: Any) -> Any:
-    """``value.item()`` eagerly; None while ``mx.compile`` traces (ValueError)."""
+    """``value.item()`` eagerly; None while ``mx.compile`` traces it."""
     try:
         return value.item()
-    except ValueError:
-        return None
-
-
-def _format_kv_attention(record: tuple[Any, ...], *, offset: Any, finite: str) -> str:
-    (layer, phase, cache_name, bits, route, q_dtype, _recorded_offset, capacity,
-     q_len, mask_kind, fallback) = record
-    return (
-        f"mtplx_kv_attention layer={layer} phase={phase} cache={cache_name} "
-        f"bits={bits} route={route} "
-        f"q_dtype={str(q_dtype).removeprefix('mlx.core.')} offset={offset} "
-        f"capacity={'-' if capacity is None else capacity} q_len={q_len} "
-        f"mask={mask_kind} fallback={fallback or '-'} finite={finite}"
-    )
+    except ValueError as exc:
+        if is_compile_trace_error(exc):
+            return None
+        raise
 
 
 def _note_kv_attention(
@@ -115,7 +108,25 @@ def _note_kv_attention(
     fallback: str,
 ) -> None:
     layer = int(getattr(attn, "_mtplx_full_attention_index", -1))
+    if layer < 0:
+        # Not a trunk full-attention layer (a draft head sharing the class):
+        # its call never feeds the target logits a failure reports.
+        return
     offset = getattr(cache, "offset", None) if cache is not None else None
+    shown_offset: Any = (
+        offset if isinstance(offset, int) else ("array" if isinstance(offset, mx.array) else "-")
+    )
+    traced = in_compiled_step_body()
+    finite = "unchecked"
+    mode = _kv_attention_trace_mode()
+    if mode:
+        verdict = _host_value(mx.all(mx.isfinite(output)))
+        if verdict is None:
+            traced = True
+        finite = "traced" if verdict is None else str(int(bool(verdict)))
+        if isinstance(offset, mx.array):
+            value = _host_value(offset)
+            shown_offset = "traced" if value is None else int(value)
     record = (
         layer,
         current_attention_phase(),
@@ -123,54 +134,18 @@ def _note_kv_attention(
         _kv_cache_bits(cache),
         route,
         queries.dtype,
-        offset
-        if isinstance(offset, int)
-        else ("array" if isinstance(offset, mx.array) else "-"),
+        shown_offset,
         _kv_cache_capacity(cache),
         int(queries.shape[2]),
         _kv_mask_kind(mask),
         fallback,
+        finite,
     )
-    mode = _kv_attention_trace_mode()
-    if not mode:
-        _KV_ATTENTION_LAST[layer] = record
-        return
-    finite = _host_value(mx.all(mx.isfinite(output)))
-    if mode == "nonfinite" and finite is not False:
-        return
-    shown_offset: Any = record[6]
-    if isinstance(offset, mx.array):
-        shown_offset = _host_value(offset)
-        shown_offset = "traced" if shown_offset is None else int(shown_offset)
-    import sys as _sys
+    note_kv_attention_record(layer, record, traced=traced)
+    if mode == "all" or (mode == "nonfinite" and finite == "0"):
+        import sys as _sys
 
-    print(
-        _format_kv_attention(
-            record,
-            offset=shown_offset,
-            finite="traced" if finite is None else str(int(bool(finite))),
-        ),
-        file=_sys.stderr,
-        flush=True,
-    )
-
-
-def last_kv_attention_line() -> str | None:
-    """The first full-attention layer's latest call, from host data only.
-
-    For the non-finite-logits failure path: no device read, so it is safe
-    after the generation that produced the NaN has unwound. Offsets held in
-    an array (tensor-offset adapters) print as ``array``; rerun with
-    ``MTPLX_KV_ATTENTION_TRACE=nonfinite`` for per-layer values and verdicts.
-    """
-
-    # A copy, not a live walk: the model thread of another request may be
-    # adding a layer's record while the server thread formats this one.
-    records = dict(_KV_ATTENTION_LAST)
-    if not records:
-        return None
-    record = records[min(records)]
-    return _format_kv_attention(record, offset=record[6], finite="unchecked")
+        print(format_kv_attention_record(record), file=_sys.stderr, flush=True)
 
 
 def _paged_route_label(cache: Any) -> str:

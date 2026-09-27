@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from .attention_context import current_attention_phase
+from .compile_state import is_compile_trace_error
 from .rope_origin import RotaryOrigin
 
 SUPPORTED_DETACH_MODES = {
@@ -709,24 +710,6 @@ def _dynamic_paged_growth_blocks(
         if window_blocks >= required_blocks:
             grown_blocks = min(grown_blocks, max(window_blocks, current_blocks))
     return int(grown_blocks)
-
-
-_COMPILE_TRACE_REFUSAL = "during function transformations"
-
-
-def is_compile_trace_error(exc: BaseException) -> bool:
-    """True for MLX's refusal to read an array while ``mx.compile`` traces it.
-
-    ``.item()`` and ``mx.eval`` on a tracer raise ValueError("[eval]
-    Attempting to eval an array during function transformations like compile
-    or vmap is not allowed."). The tensor-offset adapters tell a traced call
-    from an eager one by that refusal alone; any other ValueError is a real
-    fault and propagates. tests/test_promoted_paged_capacity_526.py pins the
-    text against the installed MLX, so a reworded refusal fails there rather
-    than turning every traced call into an error.
-    """
-
-    return isinstance(exc, ValueError) and _COMPILE_TRACE_REFUSAL in str(exc)
 
 
 def _concrete_offset(value: Any) -> int | None:

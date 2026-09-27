@@ -19,7 +19,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from .attention_context import attention_phase
+from .attention_context import attention_phase, note_compiled_replay
+from .compile_state import compiled_step_body
 from .demotions import note as _note_demotion, note_bank_fallback as _note_bank_fallback
 from .gdn_capture import resolve_gdn_capture_backend
 from .rope_origin import RotaryOrigin, as_rope_delta, stamp_rope_delta
@@ -213,6 +214,7 @@ class SpecDecodeGraphBank:
                         hidden_variant=hidden_variant,
                     )
                 self._compiled[key] = fn
+            note_compiled_replay()
             result = fn(input_ids)
             self.stats.compiled_calls += 1
             self.stats.elapsed_s += time.perf_counter() - started
@@ -337,12 +339,13 @@ class SpecDecodeGraphBank:
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
-            return self.runtime.forward_ar(
-                input_ids,
-                cache=cache,
-                return_hidden=return_hidden,
-                hidden_variant=hidden_variant,
-            )
+            with compiled_step_body():
+                return self.runtime.forward_ar(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
 
         return mx.compile(
             verify_fn,
@@ -361,12 +364,13 @@ class SpecDecodeGraphBank:
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
-            return self._runtime_forward_ar_capture(
-                input_ids,
-                cache=cache,
-                return_hidden=return_hidden,
-                hidden_variant=hidden_variant,
-            )
+            with compiled_step_body():
+                return self._runtime_forward_ar_capture(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
 
         return mx.compile(
             verify_fn,
@@ -2615,6 +2619,7 @@ class CompiledVerifyBank:
         t2 = clock()
         # Argument order is the trace's contract (``_make_verify_step``):
         # ids, the auxiliary, the rotary delta of an image request, the state.
+        note_compiled_replay()
         outputs = dispatch["fn"](
             input_ids, compiled_aux, *dispatch["rope_args"], *state_in
         )
@@ -3595,6 +3600,7 @@ class CompiledVerifyBank:
             # Same positional contract as the installed replay: ids, the
             # auxiliary when the runtime prepares one, the rotary delta of an
             # image request, the state leaves.
+            note_compiled_replay()
             outputs = (
                 fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
                 if compiled_aux is not None
@@ -4540,7 +4546,7 @@ class CompiledVerifyBank:
                         entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
             # (2) The existing runtime forward, on shadow containers only.
-            with attention_phase("decode_verify"):
+            with attention_phase("decode_verify"), compiled_step_body():
                 result = live._runtime_forward(
                     input_ids,
                     cache=shadow,

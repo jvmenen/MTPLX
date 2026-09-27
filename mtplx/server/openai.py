@@ -3930,6 +3930,7 @@ def _submit_foreground_model_work(
     batch_key: str | None = None,
     **kwargs: Any,
 ) -> Any:
+    fn = _with_kv_attention_scope(fn)
     scheduler = getattr(state, "model_scheduler", None)
     if scheduler is not None and hasattr(scheduler, "submit_foreground"):
         return scheduler.submit_foreground(fn, *args, batch_key=batch_key, **kwargs)
@@ -3937,6 +3938,23 @@ def _submit_foreground_model_work(
     if executor is None:
         raise RuntimeError("state has no model work executor")
     return executor.submit(fn, *args, **kwargs)
+
+
+def _with_kv_attention_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Run one model-work item with a KV attention record of its own.
+
+    The record says which cache and attention route served a request's last
+    full-attention call when that request fails with non-finite logits; a
+    fresh one per item keeps a request from reporting another's (issue #526).
+    """
+
+    from mtplx.attention_context import kv_attention_request_scope
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        with kv_attention_request_scope():
+            return fn(*args, **kwargs)
+
+    return run
 
 
 def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
@@ -18632,11 +18650,11 @@ def _non_finite_logits_failure(
         session_id or "-",
         exc,
     )
-    # Which attention route and KV cache served the last full-attention call
-    # (host data recorded at the call site; no device read here).
-    from mtplx.attention_split import last_kv_attention_line
-
-    kv_attention = last_kv_attention_line()
+    # Which attention route and KV cache served the failing request's last
+    # full-attention call: host data the error captured where it was raised
+    # (sampling.NonFiniteLogitsError), so another request's attention since
+    # then cannot stand in for it.
+    kv_attention = getattr(exc, "kv_attention", None)
     if kv_attention is not None:
         logging.getLogger("mtplx.server").error(
             "non-finite logits request_id=%s %s", request_id, kv_attention
