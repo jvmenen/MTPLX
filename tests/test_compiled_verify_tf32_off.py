@@ -29,6 +29,10 @@ PARITY_TESTS = (
     "tests/test_attention_gate_exactness.py",
     "tests/test_qsa_fixed_bank_score_scale.py",
     "tests/test_qwen4_ple_gate_exactness.py",
+    "tests/test_float32_operand.py",
+    "tests/test_qwen4_yarn_amplitude.py",
+    "tests/test_qwen4_fixed_m4_verify_exactness.py",
+    "tests/test_qwen4_fixed_m4_float32_admission.py",
 )
 
 
