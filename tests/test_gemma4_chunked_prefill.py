@@ -173,6 +173,50 @@ def _close(got, want, atol: float, what: str) -> None:
     )
 
 
+def _same_bits(got, want, what: str) -> None:
+    got, want = _np(got), _np(want)
+    assert got.shape == want.shape, what
+    assert np.array_equal(got, want), (
+        f"{what}: not bit-equal, max abs diff {float(np.max(np.abs(got - want)))}"
+    )
+
+
+def _span_loop_prefill(runtime, prompt, spans):
+    """A chunked prefill written out: one ``forward_target`` a span on a
+    fresh cache, nothing evaluated between spans, the last row's logits from
+    its hidden, and the drafter's sliding KV as the first span's return
+    followed by each later span's own rows. On the CPU in float32 the
+    backend's chunked prefill is this bit for bit. The one forward the old
+    code ran over every row differs from it in the last bits (the attention
+    sums group differently), so a comparison against it fails there, at the
+    numbers, rather than at a count of forwards."""
+
+    cache = runtime.make_cache()
+    # The tiny pair's sliding layers are the ones whose shared KV comes from
+    # a windowed (rotating) cache.
+    windowed = ("sliding_attention",)
+    outputs, start = [], 0
+    for rows in spans:
+        ids = mx.array([list(prompt[start : start + rows])], dtype=mx.int32)
+        outputs.append(
+            runtime.forward_target(ids, cache=cache, phase="prefill", compute_logits=False)
+        )
+        start += rows
+    assert start == len(prompt)
+    last = outputs[-1]
+    hidden = last.hidden[:, -1:, :]
+    shared = dict(last.shared_kv_states)
+    for kind in windowed:
+        parts = [outputs[0].shared_kv_states[kind]] + [
+            tuple(part[..., -rows:, :] for part in out.shared_kv_states[kind])
+            for out, rows in zip(outputs[1:], spans[1:])
+        ]
+        shared[kind] = tuple(
+            mx.concatenate([part[index] for part in parts], axis=2) for index in (0, 1)
+        )
+    return cache, runtime.target.logits_from_hidden(hidden), hidden, shared
+
+
 def _held_rows(item) -> tuple[mx.array, mx.array]:
     """The rows a cache holds, oldest first (what its next forward reads)."""
 
@@ -273,29 +317,73 @@ def test_the_admission_prices_the_width_the_prefill_runs(monkeypatch, knob, requ
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("window", "rows", "width", "spans"),
-    [
-        # Window inside the chunk; the width does not divide the prompt.
-        (16, 300, 64, [44, 64, 64, 64, 64]),
-        # Window wider than the chunk.
-        (128, 300, 64, [44, 64, 64, 64, 64]),
-        # A one-row remainder: two rows, then a chunk one row short.
-        (64, 2049, 512, [2, 511, 512, 512, 512]),
-        (32, 1000, 96, [40] + [96] * 10),
-    ],
-)
+EXACTNESS_CASES = [
+    # Window inside the chunk; the width does not divide the prompt.
+    (16, 300, 64, [44, 64, 64, 64, 64]),
+    # Window wider than the chunk.
+    (128, 300, 64, [44, 64, 64, 64, 64]),
+    # A one-row remainder: two rows, then a chunk one row short.
+    (64, 2049, 512, [2, 511, 512, 512, 512]),
+    (32, 1000, 96, [40] + [96] * 10),
+]
+
+
+@pytest.mark.parametrize(("window", "rows", "width", "spans"), EXACTNESS_CASES)
+def test_a_chunked_prefill_forwards_its_spans(
+    tiny_pair, monkeypatch, cpu, window, rows, width, spans
+):
+    """The structure alone: one forward a span (the old code: one forward
+    over every row), in the prefill and in a generation's."""
+
+    runtime = tiny_pair(window)
+    prompt = _prompt(rows)
+    _cache, _output, whole_forwards = _prefill(runtime, prompt, "whole", monkeypatch)
+    _cache, _output, forwards = _prefill(runtime, prompt, width, monkeypatch)
+    assert whole_forwards == [rows]
+    assert forwards == spans
+    calls = _spy_forwards(runtime)
+    gemma4.generate_gemma4_ar(
+        runtime, prompt, max_tokens=2, sampler=GREEDY, seed=0, stop_token_ids=set()
+    )
+    del runtime.forward_target
+    assert [n for phase, _offset, n in calls if phase == "prefill"] == spans
+
+
+@pytest.mark.parametrize(("window", "rows", "width", "spans"), EXACTNESS_CASES)
+def test_a_chunked_prefill_is_the_span_loop_bit_for_bit(
+    tiny_pair, monkeypatch, cpu, window, rows, width, spans
+):
+    """The numbers the prefill hands on (last logits and hidden, the
+    drafter's shared KV, every cache's held rows) are those of the chunked
+    prefill written out (``_span_loop_prefill``), to the bit."""
+
+    runtime = tiny_pair(window)
+    prompt = _prompt(rows)
+    cache, chunked, _forwards = _prefill(runtime, prompt, width, monkeypatch)
+    loop_cache, logits, hidden, shared = _span_loop_prefill(runtime, prompt, spans)
+    _same_bits(chunked.logits, logits, "last logits")
+    _same_bits(chunked.hidden, hidden, "last hidden")
+    assert set(chunked.shared_kv_states) == set(shared)
+    for kind, (keys, values) in shared.items():
+        _same_bits(chunked.shared_kv_states[kind][0], keys, f"{kind} shared keys")
+        _same_bits(chunked.shared_kv_states[kind][1], values, f"{kind} shared values")
+    for index, (item, reference) in enumerate(zip(cache, loop_cache)):
+        assert item.offset == reference.offset == rows
+        for got, want, what in zip(_held_rows(item), _held_rows(reference), ("keys", "values")):
+            _same_bits(got, want, f"cache {index} {what}")
+
+
+@pytest.mark.parametrize(("window", "rows", "width", "spans"), EXACTNESS_CASES)
 def test_a_chunked_prefill_is_the_whole_prompt_prefill(
     tiny_pair, monkeypatch, cpu, window, rows, width, spans
 ):
+    """Chunked and whole-prompt prefills agree to rounding (the module
+    docstring has the measured differences)."""
+
     runtime = tiny_pair(window)
     prompt = _prompt(rows)
-    whole_cache, whole, whole_forwards = _prefill(runtime, prompt, "whole", monkeypatch)
-    cache, chunked, forwards = _prefill(runtime, prompt, width, monkeypatch)
-
-    # It ran in chunks (the old code: one forward over every row).
-    assert whole_forwards == [rows]
-    assert forwards == spans
+    whole_cache, whole, _whole_forwards = _prefill(runtime, prompt, "whole", monkeypatch)
+    cache, chunked, _forwards = _prefill(runtime, prompt, width, monkeypatch)
 
     assert chunked.cache_offset == whole.cache_offset == rows
     _close(chunked.logits, whole.logits, OUTPUT_ATOL, "last logits")
@@ -313,7 +401,7 @@ def test_a_chunked_prefill_is_the_whole_prompt_prefill(
         _close(got_keys, keys, STATE_ATOL, f"{kind} shared keys")
         _close(got_values, values, STATE_ATOL, f"{kind} shared values")
 
-    last = forwards[-1]
+    last = spans[-1]
     assert len(cache) == len(whole_cache) == 4
     for index, (item, reference) in enumerate(zip(cache, whole_cache)):
         assert type(item) is type(reference)
@@ -366,12 +454,21 @@ def test_only_prompts_longer_than_one_chunk_are_split(tiny_pair, monkeypatch, cp
 def test_decode_after_a_chunked_prefill_is_token_identical(
     tiny_pair, monkeypatch, cpu, window, rows, width, spans
 ):
-    """40 tokens target-only (greedy) and through the assistant (greedy and
-    sampled at temperature 1.0 with a seed): the same tokens, the same
-    acceptance, after either prefill."""
+    """Decode starts from the chunked prefill written out, to the bit; then
+    40 tokens target-only (greedy) and through the assistant (greedy and
+    sampled at temperature 1.0 with a seed) are the same tokens, with the
+    same acceptance, after either prefill."""
 
     runtime = tiny_pair(window, seed=1)
     prompt = _prompt(rows, seed=1)
+    monkeypatch.setenv(CHUNK_ENV, str(width))
+    state = gemma4._restore_or_prefill_gemma4_prompt(runtime, prompt, require_shared_kv=True)
+    _loop_cache, logits, hidden, shared = _span_loop_prefill(runtime, prompt, spans)
+    _same_bits(state.logits, logits[:, -1, :], "the logits decode starts from")
+    _same_bits(state.hidden, hidden, "the hidden decode starts from")
+    for kind, (keys, values) in shared.items():
+        _same_bits(state.shared_kv_states[kind][0], keys, f"{kind} shared keys")
+        _same_bits(state.shared_kv_states[kind][1], values, f"{kind} shared values")
 
     def run(chunk, loop, sampler):
         monkeypatch.setenv(CHUNK_ENV, str(chunk))
@@ -395,10 +492,8 @@ def test_decode_after_a_chunked_prefill_is_token_identical(
         return list(out.tokens), out.stats, prefill
 
     for loop, sampler in (("ar", GREEDY), ("mtp", GREEDY), ("mtp", SAMPLED)):
-        whole_tokens, whole_stats, whole_prefill = run("whole", loop, sampler)
-        tokens, stats, prefill = run(width, loop, sampler)
-        assert whole_prefill == [rows]
-        assert prefill == spans
+        whole_tokens, whole_stats, _whole_prefill = run("whole", loop, sampler)
+        tokens, stats, _prefill_rows = run(width, loop, sampler)
         assert len(tokens) == 40
         assert tokens == whole_tokens, (loop, sampler.temperature)
         assert stats.accepted_drafts == whole_stats.accepted_drafts
@@ -408,21 +503,36 @@ def test_decode_after_a_chunked_prefill_is_token_identical(
 def test_the_drafter_proposes_the_same_block_after_either_prefill(
     tiny_pair, monkeypatch, cpu
 ):
+    """The drafter's first block after a chunked prefill is its block after
+    the chunked prefill written out, to the bit, and proposes the tokens it
+    proposes after the whole-prompt prefill."""
+
     runtime = tiny_pair(16, seed=2)
     prompt = _prompt(300, seed=2)
-    blocks = {}
-    for width in ("whole", 64):
-        _cache, output, forwards = _prefill(runtime, prompt, width, monkeypatch)
-        assert len(forwards) == (1 if width == "whole" else 5)
-        blocks[width] = runtime.propose_block(
+
+    def propose(hidden, shared_kv_states, kv_offset):
+        return runtime.propose_block(
             last_token_id=int(prompt[-1]),
-            hidden=output.hidden,
-            shared_kv_states=output.shared_kv_states,
-            kv_offset=output.cache_offset,
+            hidden=hidden,
+            shared_kv_states=shared_kv_states,
+            kv_offset=kv_offset,
             sampler=GREEDY,
             rng=np.random.default_rng(0),
             draft_block_size=6,
         )
+
+    blocks = {}
+    for width in ("whole", 64):
+        _cache, output, _forwards = _prefill(runtime, prompt, width, monkeypatch)
+        blocks[width] = propose(output.hidden, output.shared_kv_states, output.cache_offset)
+    _loop_cache, _logits, hidden, shared = _span_loop_prefill(
+        runtime, prompt, [44, 64, 64, 64, 64]
+    )
+    loop_block = propose(hidden, shared, len(prompt))
+    assert blocks[64].token_ids == loop_block.token_ids
+    for got, want in zip(blocks[64].steps, loop_block.steps, strict=True):
+        _same_bits(got.logits, want.logits, "drafter logits")
+        _same_bits(got.hidden, want.hidden, "drafter hidden")
     assert blocks[64].token_ids == blocks["whole"].token_ids
     assert len(blocks[64].steps) == 5
     for got, want in zip(blocks[64].steps, blocks["whole"].steps):
@@ -625,6 +735,82 @@ def test_the_abort_check_runs_between_chunks(tiny_pair, monkeypatch, cpu):
         )
     # The fourth question comes before the third chunk.
     assert [rows for _phase, _offset, rows in calls] == [44, 64]
+
+
+def test_an_abort_between_chunks_leaves_the_caches_and_the_bank_sound(
+    tiny_pair, monkeypatch, cpu
+):
+    """An abort between the chunks of a restored prompt's suffix raises the
+    abort and nothing else, turns the sliding caches' rollback records back
+    on (the next speculative round rolls back exactly through them), and
+    leaves the banked entry it restored from as it was: a restore after the
+    abort is the restore before it, to the bit."""
+
+    runtime = tiny_pair(16, seed=3)
+    first = _prompt(400, seed=3)
+    second = first + _prompt(300, seed=4)
+    monkeypatch.setenv(CHUNK_ENV, "64")
+    bank = _bank_cold_prompt(runtime, first, monkeypatch)
+    (entry,) = list(bank._entries.values())
+    before = _restore(runtime, second, bank)
+
+    made: list[list] = []
+    make_cache = runtime.make_cache
+
+    def recording_make_cache():
+        cache = make_cache()
+        made.append(cache)
+        return cache
+
+    monkeypatch.setattr(runtime, "make_cache", recording_make_cache)
+    asked: list[int] = []
+
+    def trips_on_fourth() -> bool:
+        asked.append(1)
+        return len(asked) >= 4
+
+    with pytest.raises(generation.PostcommitAbort):
+        gemma4._restore_or_prefill_gemma4_prompt(
+            runtime,
+            second,
+            session_bank=bank,
+            session_restore_mode="clone",
+            require_shared_kv=True,
+            abort_check=trips_on_fourth,
+        )
+    (cache,) = made
+    windows = [c for c in cache if isinstance(c, gemma4.Gemma4RollbackRotatingKVCache)]
+    # Restored 400 rows, then two chunks of the suffix (44 and 64 rows).
+    assert runtime.target.cache_offset(cache) == 400 + 44 + 64
+    assert windows and all(c._record_updates and c._last_update is None for c in windows)
+
+    # The bank: the same entry, and the same restore.
+    assert list(bank._entries.values()) == [entry]
+    monkeypatch.setattr(runtime, "make_cache", make_cache)
+    after = _restore(runtime, second, bank)
+    assert after.cache_hit and after.cached_tokens == before.cached_tokens == 400
+    _same_bits(after.logits, before.logits, "logits after the abort")
+    _same_bits(after.hidden, before.hidden, "hidden after the abort")
+    for kind, (keys, values) in before.shared_kv_states.items():
+        _same_bits(after.shared_kv_states[kind][0], keys, f"{kind} shared keys")
+        _same_bits(after.shared_kv_states[kind][1], values, f"{kind} shared values")
+
+    # The next speculative round on the aborted cache: a three-token verify
+    # forward records its update and rolls back exactly.
+    held = [(*(np.array(t) for t in _held_rows(c)), int(c.offset)) for c in cache]
+    runtime.forward_target(
+        mx.array([_prompt(3, seed=9)], dtype=mx.int32),
+        cache=cache,
+        phase="verify",
+        compute_logits=False,
+    )
+    assert all(c._last_update is not None for c in windows)
+    for item, (keys, values, offset) in zip(cache, held, strict=True):
+        assert int(item.trim(3)) == 3
+        assert int(item.offset) == offset
+        got_keys, got_values = _held_rows(item)
+        assert np.array_equal(np.array(got_keys), keys)
+        assert np.array_equal(np.array(got_values), values)
 
 
 def test_each_chunk_is_its_own_cache_delta(tiny_pair, monkeypatch, cpu):
