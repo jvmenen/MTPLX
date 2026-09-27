@@ -731,4 +731,42 @@ final class DaemonReconnectTests: XCTestCase {
         let logged = await logsMention(store, "joining it")
         XCTAssertTrue(logged, "the Logs window records that the second request joined the first")
     }
+
+    // MARK: Closing the window during a model load
+
+    /// Closing the main window cancels its launch task. The start runs on a
+    /// task the store owns, so the load carries on and the engine comes up.
+    /// Before, the cancellation reached the supervisor's health wait, which
+    /// stopped the loading daemon: "Degraded — CancellationError()".
+    @MainActor
+    func testClosingTheWindowDuringALoadStillReachesRunning() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let fans = FanCallRecorder()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let store = daemon.makeStore(configuration: MTPLXAppConfiguration(), fans: fans)
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        // The model is still loading: the port is open, /health is not ready.
+        try daemon.setHealthDown(true)
+        // The daemon half of the window's launch task.
+        let window = Task { @MainActor in
+            store.loadPersistedSettings()
+            await store.startDaemon()
+        }
+        try await pollUntil("daemon launched") { daemon.spawns().count == 1 }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        // The user closes the window.
+        window.cancel()
+        try await Task.sleep(nanoseconds: 500_000_000)
+        try daemon.setHealthDown(false)
+
+        try await pollUntil("the load finished", timeout: 10) { store.daemonState == .running }
+        await window.value
+        XCTAssertEqual(store.startupPhase, .ready)
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 1, "the loading daemon was kept, not relaunched")
+        XCTAssertEqual(store.health?.startup?.pid, spawns.first?.pid)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
 }

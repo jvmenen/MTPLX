@@ -432,13 +432,17 @@ public final class MTPLXBackendStore: ObservableObject {
     private var recoveredAutomaticRestartGeneration = 0
     private var lastAppliedSupervisionRevision = -1
     private var lastTerminalCleanupLifecycleEpoch = 0
-    /// A start request in flight, and the requests that arrived while it
-    /// ran (#528). They join it instead of racing it for the supervisor:
-    /// the loser used to get `alreadyRunning`, publish Degraded over the
-    /// daemon the winner launched, and replace the winner's launch id so
-    /// the winner could not finish either.
-    private var startInFlight = false
-    private var startJoiners: [CheckedContinuation<Void, Never>] = []
+    /// The start request running now (#528). It runs on a task this store
+    /// owns; the window's launch task, a menu item or Hermes only await it.
+    /// When the start ran on the caller's own task, closing the main window
+    /// during a model load cancelled that task, the cancellation reached
+    /// the supervisor's health wait, the supervisor stopped the loading
+    /// daemon, and the badge read "Degraded — CancellationError()".
+    /// Requests that arrive while it runs wait for it instead of racing it
+    /// for the supervisor: the loser used to get `alreadyRunning`, publish
+    /// Degraded over the daemon the winner launched, and replace the
+    /// winner's launch id so the winner could not finish either.
+    private var runningStart: (id: UUID, task: Task<Void, Never>)?
     /// The Degraded value a failed configuration change left on screen
     /// while the previous daemon kept serving. A reconnect leaves it in
     /// place so the failed change stays visible; an explicit start clears it.
@@ -953,28 +957,35 @@ public final class MTPLXBackendStore: ObservableObject {
     public func startDaemon(target: LaunchTarget?) async {
         // The window's launch task runs again when a window reopens, Start
         // can be pressed while a model loads, and Hermes or the benchmark
-        // ask for a ready daemon. A start already in flight owns the
-        // outcome; a second one joins it (#528).
-        if startInFlight {
-            // Checking the flag and registering must not be split by an
-            // await, or the start could finish in between and never resume
-            // this request. The log line goes out on its own task.
+        // ask for a ready daemon. A start already running owns the outcome;
+        // a second request waits for it (#528).
+        if let running = runningStart {
+            // Deciding to join and awaiting must not be split by another
+            // await; the log line goes out on its own task.
             Task { [supervisor] in
                 await supervisor.logs.append(
                     "start requested while another start is in flight; joining it",
                     stream: .system
                 )
             }
-            await withCheckedContinuation { startJoiners.append($0) }
+            await running.task.value
             return
         }
-        startInFlight = true
-        defer {
-            startInFlight = false
-            let joiners = startJoiners
-            startJoiners.removeAll()
-            joiners.forEach { $0.resume() }
+        let id = UUID()
+        // Not a child of the caller's task: cancelling the caller (a closed
+        // window) must not cancel the launch. Awaiting the value from a
+        // cancelled task still waits for it.
+        let task = Task { @MainActor [self] in
+            await runStartRequest(target: target)
+            if runningStart?.id == id {
+                runningStart = nil
+            }
         }
+        runningStart = (id, task)
+        await task.value
+    }
+
+    private func runStartRequest(target: LaunchTarget?) async {
         // A Stop or a reap may still be tearing the previous daemon down;
         // what the supervisor holds is only known once that has finished.
         await awaitDaemonTeardown()
