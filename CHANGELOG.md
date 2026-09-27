@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`MTPLX_AGENT_REWRITES=off` also stands down the tool-fed empty retry and the stalled-promise retry.** Both re-generate a streamed tool turn from the transcript plus an injected user message ("Complete the active coding task now..." / "Continue the active coding task now..."), which the #282 passthrough guarantee rules out; they kept running under `off`, while the read-only force-answer retry was already gated. The default posture and `on` are unchanged, and the inspection-empty retry and the reasoning-completion repair add no text and are not affected. Code and unit tests only, no model run.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
