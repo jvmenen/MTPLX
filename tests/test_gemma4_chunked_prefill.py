@@ -23,7 +23,7 @@ config gates are lifted; nothing under test depends on the sizes.
 
 Exactness is checked on the CPU in float32. Chunked and whole-prompt prefills
 agree to rounding there (measured max abs difference: 4e-4 on hidden states
-of magnitude 9, 1e-4 on logits, 5e-5 on keys and values), and every greedy and
+of magnitude 9, 1.2e-4 on logits, 1.3e-4 on keys and values), and every greedy and
 sampled continuation matches. They are not bit-equal: attention reduces the
 same terms over rows of different lengths and offsets (a whole-prompt sliding
 row carries every prompt key, a chunk's row its window plus the chunk), so
@@ -56,7 +56,8 @@ LAYERS = ("sliding_attention", "sliding_attention", "full_attention") * 2
 GREEDY = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
 SAMPLED = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
 
-# On the CPU in float32 (measured maxima in the module docstring, 10x margin).
+# On the CPU in float32 (measured maxima in the module docstring; at least
+# seven times the worst of them).
 STATE_ATOL = 1e-3
 OUTPUT_ATOL = 5e-3
 
