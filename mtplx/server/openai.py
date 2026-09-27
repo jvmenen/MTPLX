@@ -19414,8 +19414,10 @@ class _AdmissionGeometry:
     the prompt's length: Gemma 4's sliding layers keep a window (unset: the
     live width, nothing fixed). A backend that says what its own prefill
     writes a row (Gemma 4's chunked prefill: the full-attention KV and the
-    drafter's sliding row, its windows being the fixed part) sets the live
-    width instead of the planner's every-layer figure.
+    drafter's sliding row) sets the live width instead of the planner's
+    every-layer figure, and ``prefill_fixed_bytes`` to what its caches then
+    keep whatever the length (the windows). Unset, the live width counts
+    every layer's row, the windows' rows among them.
     """
 
     live_bytes_per_token: int
@@ -19425,6 +19427,7 @@ class _AdmissionGeometry:
     weights_bytes: int
     resident_bytes_per_token: int | None = None
     resident_fixed_bytes: int = 0
+    prefill_fixed_bytes: int = 0
     # The per-token working set outside the KV pages (QSA streams, the MTP
     # head's KV and committed history): what a leased paged cache still
     # grows by per new token when its pages already hold the rows.
@@ -19465,10 +19468,13 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
     resident_fn = getattr(runtime, "resident_kv_bytes_per_token", None)
     window_fn = getattr(runtime, "window_cache_bytes", None)
     resident = int(resident_fn()) + aux if callable(resident_fn) else None
+    fixed = int(window_fn()) if callable(window_fn) else 0
     prefill_fn = getattr(runtime, "prefill_kv_bytes_per_token", None)
     prefill_row = prefill_fn() if callable(prefill_fn) else None
+    prefill_fixed = 0
     if prefill_row is not None:
         kv_live = int(prefill_row)
+        prefill_fixed = fixed
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
         paged_bytes_per_token=kv_paged + aux,
@@ -19478,7 +19484,8 @@ def _admission_geometry(state: Any) -> _AdmissionGeometry:
         flat_transient_bytes=flat,
         weights_bytes=int(getattr(plan, "model_weights_bytes", 0) or 0),
         resident_bytes_per_token=resident,
-        resident_fixed_bytes=int(window_fn()) if callable(window_fn) else 0,
+        resident_fixed_bytes=fixed,
+        prefill_fixed_bytes=prefill_fixed,
         aux_bytes_per_token=aux,
         kv_quantization=str(getattr(plan, "kv_quantization", "off") or "off"),
     )
@@ -19809,13 +19816,13 @@ def _admission_growth(
         live_prefill = grown * page_w + (M + out_rows) * aux_w
     elif contiguous and not leased_paged:
         # A restored prefix is what the banked cache keeps (the resident
-        # width); the rows this prefill writes are at the live width. The
-        # part a backend's caches keep whatever the length (Gemma 4's
-        # windows) comes with a restore, or with the prefill's own caches.
+        # width), with the part it keeps whatever the length (Gemma 4's
+        # windows); the rows this prefill writes are at the live width. A
+        # prefill whose live width leaves that part out (Gemma 4's chunked
+        # prefill) builds it in its own caches when nothing is restored.
         row_width = geometry.resident_width
-        fixed = int(geometry.resident_fixed_bytes)
-        restore_fixed = fixed if restore_rows else 0
-        prefill_fixed = fixed if M and not restore_rows else 0
+        restore_fixed = int(geometry.resident_fixed_bytes) if restore_rows else 0
+        prefill_fixed = int(geometry.prefill_fixed_bytes) if M and not restore_rows else 0
         live_prefill = restore_rows * row_width + restore_fixed + prefill_fixed + M * live_w
     else:
         row_width = paged_w

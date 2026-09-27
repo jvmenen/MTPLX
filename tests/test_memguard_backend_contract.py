@@ -301,6 +301,9 @@ class TestGemmaAdmission:
         assert growth["live_prefill_bytes"] == 16_384 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
         assert growth["publish_copy_bytes"] == 16_384 * GEMMA_CHUNKED_ROW + GEMMA_CHUNK_WINDOWS
         assert growth["growth_bytes"] < 10 * GIB
+        geometry = srv._admission_geometry(_gemma_state(manager))
+        assert geometry.live_bytes_per_token == GEMMA_CHUNKED_ROW
+        assert geometry.prefill_fixed_bytes == GEMMA_CHUNK_WINDOWS
 
     def test_the_whole_prompt_forward_is_priced_as_one_forward(self, monkeypatch):
         """``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole`` (the 2.12.0 prefill):
@@ -329,9 +332,13 @@ class TestGemmaAdmission:
         assert growth["layout"] == "contiguous_dense_decode"
         assert growth["repage_copy_bytes"] == 0
         assert growth["chunk_bytes"] == 16_384 * GEMMA_PLANNED_KV + _gemma_scratch(16_384, 0)
-        assert growth["live_prefill_bytes"] == 16_384 * GEMMA_PLANNED_KV + GEMMA_WINDOWS
+        # Every layer's row, the sliding layers' among them: the windows are
+        # inside the planner's width, as 2.12.0 priced them.
+        assert growth["live_prefill_bytes"] == 16_384 * GEMMA_PLANNED_KV
         # The pre-decode clone copies what decode keeps, not every layer.
         assert growth["publish_copy_bytes"] == 16_384 * GEMMA_RESIDENT + GEMMA_WINDOWS
+        geometry = srv._admission_geometry(_gemma_state(manager))
+        assert geometry.live_bytes_per_token == GEMMA_PLANNED_KV
 
     def test_a_warm_turn_is_charged_what_the_restored_cache_keeps(self):
         """A 30,000-token conversation restored by clone for a 600-token
