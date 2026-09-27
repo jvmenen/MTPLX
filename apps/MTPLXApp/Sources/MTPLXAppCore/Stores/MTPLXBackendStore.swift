@@ -403,6 +403,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// performs external work. Production uses a no-op; lifecycle checks on
     /// both sides make delayed completions harmless.
     private let beforeClientHandoffLaunch: @Sendable (LaunchTarget) async -> Void
+    /// Test seam: after `refreshStaticState`'s requests have answered,
+    /// before the answers are read. Production uses the no-op.
+    private let beforeStaticStateAnswersAreRead: @Sendable () async -> Void
     /// Keeps the stale-handoff gate observable without asking package tests to
     /// start a real AppKit desktop client.
     private let cancelOpenCodeDesktop: (MTPLXDesktopHandoffIdentity) -> Bool
@@ -478,6 +481,7 @@ public final class MTPLXBackendStore: ObservableObject {
         beforePostStartRefresh: (@Sendable () async -> Void)? = nil,
         beforeThermalStatusRefresh: (@Sendable () async -> Void)? = nil,
         beforeClientHandoffLaunch: (@Sendable (LaunchTarget) async -> Void)? = nil,
+        beforeStaticStateAnswersAreRead: (@Sendable () async -> Void)? = nil,
         openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil,
         modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil,
         // Test seam for the browser sign-in ticket request. Production
@@ -510,6 +514,7 @@ public final class MTPLXBackendStore: ObservableObject {
         self.beforePostStartRefresh = beforePostStartRefresh ?? {}
         self.beforeThermalStatusRefresh = beforeThermalStatusRefresh ?? {}
         self.beforeClientHandoffLaunch = beforeClientHandoffLaunch ?? { _ in }
+        self.beforeStaticStateAnswersAreRead = beforeStaticStateAnswersAreRead ?? {}
         self.cancelOpenCodeDesktop = openCodeDesktopCanceller
             ?? { identity in openCodeIntegration.cancelLaunchedDesktop(identity) }
         self.supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
@@ -2238,6 +2243,7 @@ public final class MTPLXBackendStore: ObservableObject {
             let fetchedHealth = try await health
             let fetchedCapabilities = try await capabilities
             let fetchedSessions = try await sessions
+            await beforeStaticStateAnswersAreRead()
             guard isCurrent?() ?? true else { return }
             if case .anotherServer(let held) = source(of: fetchedHealth) {
                 releaseDaemonToAnotherServer(fetchedHealth, held: held)
