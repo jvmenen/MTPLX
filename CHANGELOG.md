@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_POSTCOMMIT_AFTER_RESPONSE=1` (opt-in): the chat response finishes before the session postcommit.** The terminal SSE frame or the JSON body is released before the generation-final history snapshot, whose history re-encode otherwise sits between the last token and the end of the response. The commit runs as a post-response tail; chat and completions admission waits for every tail (and for the stream worker to leave the generation slot) before it reads session or bank state, so a next turn never sees a half-committed session. Text output is unchanged; the response's `session_postcommit_snapshot` reads `after_response` and the real outcome lands in the request metrics. `/health` reports `post_response_tails`. `MTPLX_POSTCOMMIT_AFTER_RESPONSE_WAIT_S` bounds one wait on the tails. Default off.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
