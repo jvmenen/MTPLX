@@ -3284,10 +3284,12 @@ class GenerationStats:
     capture_commit_time_s: float = 0.0
     mtp_history_materialize_every: int = 0
     mtp_history_materialize_events: int = 0
-    # Lazy draft-history appends no draft forward read, evaluated before the
-    # next append or at the end of the generation (see generate_mtpk).
-    mtp_history_unread_evals: int = 0
-    mtp_history_unread_eval_time_s: float = 0.0
+    # Host time spent scheduling the draft history's unevaluated work (see
+    # settle_mtp_history in generate_mtpk): before each lazy append, inside
+    # the decode rounds and counted in draft_time_s; and once when the
+    # generation ends, after elapsed_s is taken, so outside every tok/s.
+    mtp_history_append_settle_time_s: float = 0.0
+    mtp_history_final_settle_time_s: float = 0.0
     clear_cache_every: int = 0
     clear_cache_events: int = 0
     clear_cache_time_s: float = 0.0
@@ -10679,17 +10681,8 @@ def generate_mtpk(
 
     mtp_history_tokens_since_materialize = 0
     mtp_history_materialize_events = 0
-    mtp_history_unread_evals = 0
-    mtp_history_unread_eval_time_s = 0.0
-    # The draft history's last lazy append while no draft forward has read
-    # it: (id of the cache, the drafted count at the append). The prompt's
-    # own history append is lazy too, so the generation starts with one.
-    unread_mtp_history: tuple[int, int] | None = (
-        (id(mtp_history_cache), 0)
-        if mtp_history_cache is not None
-        and _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND")
-        else None
-    )
+    mtp_history_append_settle_time_s = 0.0
+    mtp_history_final_settle_time_s = 0.0
     # Live history-cache bound (2026-08-28): in the committed-cache policies
     # the draft head's history cache (qwen4_exp: one QSA layer's KV + indexer
     # streams) grows one row per committed token during decode and nothing
@@ -11075,43 +11068,30 @@ def generate_mtpk(
     if live_output_detach_enabled:
         logits, hidden = own_live_logits_hidden(logits, hidden)
 
-    def settle_unread_mtp_history(mtp_cache, *, wait: bool) -> float:
-        """Evaluate the draft history's last lazy append if no draft read it.
+    def settle_mtp_history(mtp_cache) -> float:
+        """Schedule whatever the draft history cache still holds unevaluated.
 
-        ``MTPLX_LAZY_MTP_HISTORY_APPEND`` leaves each append unevaluated, and
-        the next draft forward, which reads the history, evaluates the append
-        together with itself. A context-copy round and a substituted draft
-        append without drafting, and a generation ends after its last append.
-        Left alone, such appends stack into one graph that keeps every
-        round's hidden rows alive, and on a QSA draft head also the Metal
-        shared event of each round that computed them, and the session bank
-        snapshots that graph with the final state (#544). An append no draft
-        has read is therefore evaluated before the next append and at the end
-        of the generation: at most one append is pending at any time, and
-        none when the state leaves the generation.
+        ``MTPLX_LAZY_MTP_HISTORY_APPEND`` leaves each append unevaluated so a
+        draft forward that reads the history evaluates the append together
+        with itself. Nothing guarantees such a reader: a context-copy round,
+        a substituted draft, a correction-cache proposal and a fresh draft
+        cache all append without evaluating the committed history, and a
+        state rebase installs a cache whose prefill append is still lazy.
+        Unread appends stack into one graph that keeps every round's rows
+        alive, and on a QSA draft head the Metal shared event of each round
+        that computed them; the session bank snapshots that graph with the
+        final state (#544). This runs before every lazy append and once when
+        the generation ends, so at most one append is pending at any time and
+        none leaves the generation unscheduled. When a draft has already
+        evaluated the history nothing is left to schedule, and
+        ``mx.async_eval`` returns without work.
         """
 
-        nonlocal unread_mtp_history
-        nonlocal mtp_history_unread_evals, mtp_history_unread_eval_time_s
-        if unread_mtp_history is None:
-            return 0.0
-        cache_id, drafted_then = unread_mtp_history
-        unread_mtp_history = None
-        # A draft forward since the append evaluated it; a replaced cache
-        # (live reset, rebase) took the append with it.
-        if drafted != drafted_then or cache_id != id(mtp_cache):
-            return 0.0
         started_settle = time.perf_counter()
         leaves = _tree_mx_arrays(mtp_cache)
         if leaves:
-            if wait:
-                mx.eval(*leaves)
-            else:
-                mx.async_eval(*leaves)
-        elapsed_settle = time.perf_counter() - started_settle
-        mtp_history_unread_evals += 1
-        mtp_history_unread_eval_time_s += elapsed_settle
-        return elapsed_settle
+            mx.async_eval(*leaves)
+        return time.perf_counter() - started_settle
 
     def append_mtp_history(
         mtp_cache,
@@ -11120,10 +11100,9 @@ def generate_mtpk(
     ) -> float:
         nonlocal mtp_history_tokens_since_materialize, mtp_history_materialize_events
         nonlocal trace_mtp_history_append_nbytes, trace_accounting_time_s
-        nonlocal mtp_history_live_appended, unread_mtp_history
+        nonlocal mtp_history_live_appended, mtp_history_append_settle_time_s
         if not token_ids:
             return 0.0
-        settled = settle_unread_mtp_history(mtp_cache, wait=False)
         if mtp_cache is mtp_history_cache:
             mtp_history_live_appended += len(token_ids)
         if trace.enabled:
@@ -11138,6 +11117,10 @@ def generate_mtpk(
             mtp_history_materialize_every > 0
             and mtp_history_tokens_since_materialize >= mtp_history_materialize_every
         )
+        settled = 0.0
+        if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
+            settled = settle_mtp_history(mtp_cache)
+            mtp_history_append_settle_time_s += settled
         elapsed = _append_mtp_history(
             rt,
             mtp_cache,
@@ -11151,11 +11134,6 @@ def generate_mtpk(
         if force_eval:
             mtp_history_materialize_events += 1
             mtp_history_tokens_since_materialize = 0
-        unread_mtp_history = (
-            (id(mtp_cache), drafted)
-            if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval
-            else None
-        )
         return settled + elapsed
 
     def reconcile_mtp_indexer_history(
@@ -15483,9 +15461,10 @@ def generate_mtpk(
                 file=sys.stderr,
             )
     if mtp_history_cache is not None:
-        # The last append of the generation has no draft after it; the
-        # session bank snapshots this cache next and a warm turn resumes it.
-        commit_time += settle_unread_mtp_history(mtp_history_cache, wait=True)
+        # The generation's last appends have no draft after them, and a rebase
+        # may have installed a cache with a lazy prefill append; the session
+        # bank snapshots this cache next and a warm turn resumes it.
+        mtp_history_final_settle_time_s = settle_mtp_history(mtp_history_cache)
 
     emit_trace(force=True, final=True)
     compiled_verify_report: dict[str, Any] | None = None
@@ -15701,8 +15680,8 @@ def generate_mtpk(
         capture_commit_time_s=capture_commit_time,
         mtp_history_materialize_every=mtp_history_materialize_every,
         mtp_history_materialize_events=mtp_history_materialize_events,
-        mtp_history_unread_evals=mtp_history_unread_evals,
-        mtp_history_unread_eval_time_s=mtp_history_unread_eval_time_s,
+        mtp_history_append_settle_time_s=mtp_history_append_settle_time_s,
+        mtp_history_final_settle_time_s=mtp_history_final_settle_time_s,
         clear_cache_every=clear_cache_every,
         clear_cache_events=clear_cache_events,
         clear_cache_time_s=clear_cache_time_s,

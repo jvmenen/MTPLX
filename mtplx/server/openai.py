@@ -17144,6 +17144,8 @@ def _token_window_rate_first(token_times: list[float], window: int) -> float | N
 MAINTENANCE_TIMING_STATS_KEYS = (
     "mtp_history_materialize_every",
     "mtp_history_materialize_events",
+    "mtp_history_append_settle_time_s",
+    "mtp_history_final_settle_time_s",
     "mtp_history_live_resets",
     "mtp_history_live_reset_threshold",
     "clear_cache_every",

@@ -137,6 +137,8 @@
  "mtp_depth": 3,
  "mtp_forward_calls": 0,
  "mtp_history_append_calls": 0,
+ "mtp_history_append_settle_time_s": "<float>",
+ "mtp_history_final_settle_time_s": "<float>",
  "mtp_history_live_reset_threshold": 0,
  "mtp_history_live_resets": 0,
  "mtp_history_materialize_events": 0,

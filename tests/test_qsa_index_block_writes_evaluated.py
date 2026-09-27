@@ -520,7 +520,6 @@ def test_history_appends_no_draft_reads_never_stack(tiny_pack, monkeypatch):
     # round before the fix; now every append starts from an evaluated
     # history, so at most one append is ever pending.
     assert at_append and max(at_append) == 0, at_append
-    assert out.stats.mtp_history_unread_evals >= 3
 
 
 def test_a_generation_ending_in_a_copy_streak_leaves_no_pending_history(
@@ -546,12 +545,11 @@ def test_a_generation_decodes_the_same_tokens_without_the_dependency(tiny_pack, 
 
 def test_evaluating_unread_appends_changes_no_token(tiny_pack, monkeypatch):
     lazy, _ = _copy_streak(tiny_pack, monkeypatch, max_tokens=40)
-    assert lazy.stats.mtp_history_unread_evals >= 3
     # Evaluating every append where it is made is the reference order.
     eager, _ = _copy_streak(
         tiny_pack, monkeypatch, max_tokens=40, lazy_history=False
     )
-    assert eager.stats.mtp_history_unread_evals == 0
+    assert lazy.stats.context_copy_rounds == eager.stats.context_copy_rounds == 3
     assert list(lazy.tokens) == list(eager.tokens)
     assert _same_bits(lazy.final_state.final_logits, eager.final_state.final_logits)
     lazy_head = _qsa_leaves(_qsa_entries(lazy.final_state.final_committed_mtp_cache))
