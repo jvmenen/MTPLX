@@ -82,6 +82,8 @@ from .graphbank import (
     CompiledVerifyBank,
     SpecDecodeGraphBank,
     _fixed_m4_initial_growth_reserve,
+    _float32_gdn_key_scale_head_dim,
+    _float32_gdn_key_scale_why,
     cache_array_tree,
     compiled_verify_mode,
     ensure_eager_window_capacity,
@@ -418,6 +420,18 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     if not_requested is not None:
         if receipt is not None:
             receipt["reason"] = not_requested
+        return False
+    head_k_dim = (
+        None if compiled_mode == "parity2" else _float32_gdn_key_scale_head_dim(rt)
+    )
+    if head_k_dim is not None:
+        # The same admission rule as CompiledVerifyBank's: a float32 stream
+        # whose GDN key scale a fused kernel rewrites verifies eagerly, here
+        # by not installing the lane (an installed lane may not fall back).
+        # parity2, the lane's own instrument, still installs to measure it.
+        if receipt is not None:
+            receipt["reason"] = "float32_gdn_key_scale"
+        _note_demotion("fixed_m4_lane_skipped", _float32_gdn_key_scale_why(head_k_dim))
         return False
     _retired = _fixed_m4_lane_retired_reason()
     if _retired is not None:
