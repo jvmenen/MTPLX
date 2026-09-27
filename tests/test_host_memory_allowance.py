@@ -12,6 +12,14 @@ GiB limit, a session the plan sized to fit sits near it, and 2 to 3 GiB of
 ordinary host memory on top reads 1.06 to 1.08 of the limit. That is
 CRITICAL at rest, which empties the warm session cache and arms the prefill
 abort. These tests pin the re-based floor and keep the strict one reachable.
+
+2026-09-27: the allowance is the fixed measured floor (8 GiB). It used to be
+the larger of that and RAM - system reserve - limit, which kept the guard's
+process ceiling at RAM minus the reserve whatever the limit (112 GiB on a
+128 GB Mac at 96, 90 or 88 GiB): lowering MTPLX_MEMORY_LIMIT_BYTES did not
+lower it, and 14 GiB of leaked host memory (#546) was forgiven up to 16 GiB.
+The seats that motivated the old rule (48 GB / 27B, 96 GB / Flash-Next) stay
+quiet on the floor alone.
 """
 
 from __future__ import annotations
@@ -64,43 +72,49 @@ def _no_inherited_override(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The allowance, seat by seat
+# The allowance is one measured floor, whatever the seat
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("total", "limit", "budget", "expected"),
-    [
-        # Default 128 GB seat: 128 - 16 reserve - 96 limit.
-        (128, 96, None, 16),
-        # 64 GB: 64 - 8 - 48.
-        (64, 48, None, 8),
-        # 48 GB: the plan leaves 4; the floor holds it at 8.
-        (48, 36, None, 8),
-        # Flash-Next on 96 GB: the limit IS RAM minus the reserve, so the
-        # plan leaves nothing and only the floor keeps a healthy daemon out
-        # of a standing WARNING.
-        (96, 84, None, 8),
-        # An operator's explicit limit above RAM minus the reserve.
-        (128, 118, None, 8),
-        # --memory-budget 48G on a 128 GB Mac is a 48 GB seat.
-        (128, 36, 48, 8),
-    ],
-)
-def test_allowance_by_seat(total, limit, budget, expected):
-    state = _state(total_gib=total, limit_gib=limit, budget_gib=budget)
-    assert srv._host_memory_allowance_bytes(state, int(limit * GIB)) == expected * GIB
+def test_the_allowance_is_the_measured_floor():
+    assert srv._host_memory_allowance_bytes() == 8 * GIB
 
 
 def test_an_explicit_allowance_wins(monkeypatch):
     monkeypatch.setenv("MTPLX_HOST_MEMORY_ALLOWANCE_BYTES", "12G")
-    state = _state(total_gib=128, limit_gib=96)
-    assert srv._host_memory_allowance_bytes(state, 96 * GIB) == 12 * GIB
+    assert srv._host_memory_allowance_bytes() == 12 * GIB
 
 
-def test_a_seat_with_no_recorded_ram_falls_back_to_the_floor():
-    state = SimpleNamespace(metal_memory_caps={"memory_limit_bytes": 36 * GIB})
-    assert srv._host_memory_allowance_bytes(state, 36 * GIB) == 8 * GIB
+@pytest.mark.parametrize("limit_gib", [96, 90, 88])
+def test_the_process_ceiling_follows_the_limit(monkeypatch, limit_gib):
+    """The footprint that first reads CRITICAL is 1.02 x limit + 8 GiB.
+
+    Before, the allowance grew by exactly what the limit shrank, so that
+    footprint stayed at 1.02 x limit + (128 - 16 - limit) GiB: 113.9 GiB at
+    96, 90 and 88 alike.
+    """
+
+    state = _state(total_gib=128, limit_gib=limit_gib)
+    ceiling = int(1.02 * limit_gib * GIB) + 8 * GIB
+    _pin(monkeypatch, allocator_gib=60, footprint_gib=(ceiling - GIB) / GIB)
+    assert srv._allocator_pressure_level(state)[0] < 4
+    _pin(monkeypatch, allocator_gib=60, footprint_gib=(ceiling + GIB) / GIB)
+    assert srv._allocator_pressure_level(state)[0] == 4
+
+
+def test_lowering_the_limit_makes_the_same_process_read_higher(monkeypatch):
+    """One process, 80 GiB in MLX's account and a 102 GiB footprint.
+
+    Old rule: the allowance was 16 GiB at a 96 GiB limit and 22 GiB at 90,
+    so both limits read level 1 (86/96 and 80/90). Now the 14 GiB charged
+    reads WARNING at 96 and CRITICAL at 90.
+    """
+
+    _pin(monkeypatch, allocator_gib=80, footprint_gib=102)
+    at_96 = srv._allocator_pressure_level(_state(total_gib=128, limit_gib=96))
+    at_90 = srv._allocator_pressure_level(_state(total_gib=128, limit_gib=90))
+    assert at_96 == (2, pytest.approx(94 / 96))
+    assert at_90 == (4, pytest.approx(94 / 90))
 
 
 # --------------------------------------------------------------------------
@@ -136,17 +150,19 @@ def test_flash_next_on_96gb_does_not_sit_in_warning(monkeypatch):
 
 
 def test_footprint_beyond_the_allowance_is_charged(monkeypatch):
-    state = _state(total_gib=128, limit_gib=96)  # allowance 16 GiB
+    state = _state(total_gib=128, limit_gib=96)  # allowance 8 GiB
 
-    _pin(monkeypatch, allocator_gib=80, footprint_gib=106)  # overhang 26, charged 10
+    _pin(monkeypatch, allocator_gib=80, footprint_gib=90)  # overhang 10, charged 2
     level, fraction = srv._allocator_pressure_level(state)
     assert level == 1
-    assert fraction == pytest.approx(90 / 96)
+    assert fraction == pytest.approx(82 / 96)
 
-    _pin(monkeypatch, allocator_gib=80, footprint_gib=120)  # overhang 40, charged 24
+    # Overhang 26, charged 18. Under the old 16 GiB allowance only 10 was
+    # charged and this read level 1 (90/96): the leak was forgiven.
+    _pin(monkeypatch, allocator_gib=80, footprint_gib=106)
     level, fraction = srv._allocator_pressure_level(state)
     assert level == 4
-    assert fraction == pytest.approx(104 / 96)
+    assert fraction == pytest.approx(98 / 96)
 
 
 def test_a_failed_probe_changes_nothing(monkeypatch):
@@ -194,7 +210,7 @@ def test_admission_does_not_refuse_a_request_the_plan_sized_to_fit(monkeypatch):
 
 def test_the_admission_receipt_explains_what_it_charged(monkeypatch):
     state = _state(total_gib=128, limit_gib=96)
-    _pin(monkeypatch, allocator_gib=70, footprint_gib=110)  # overhang 40, charged 24
+    _pin(monkeypatch, allocator_gib=70, footprint_gib=110)  # overhang 40, charged 32
 
     receipt = srv._prefill_admission_shed(
         state, prompt_ids=list(range(40_000)), session_bank=_EmptyBank(), session_id="pi"
@@ -202,9 +218,9 @@ def test_the_admission_receipt_explains_what_it_charged(monkeypatch):
     assert receipt is not None
     assert receipt["phys_footprint_bytes"] == 110 * GIB
     assert receipt["host_overhang_bytes"] == 40 * GIB
-    assert receipt["host_allowance_bytes"] == 16 * GIB
-    assert receipt["host_overhang_charged_bytes"] == 24 * GIB
+    assert receipt["host_allowance_bytes"] == 8 * GIB
+    assert receipt["host_overhang_charged_bytes"] == 32 * GIB
     assert receipt["active_bytes"] == 70 * GIB
     # Still over the limit after reclamation, on the footprint alone.
     assert receipt["refused"] is True
-    assert receipt["host_overhang_charged_bytes_after"] == 24 * GIB
+    assert receipt["host_overhang_charged_bytes_after"] == 32 * GIB
