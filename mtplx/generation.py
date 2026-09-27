@@ -6703,10 +6703,12 @@ def _point_mass_block_accept(
     exactly at any temperature. Row ``i`` of ``block_logits`` scores
     ``block[i]``.
 
-    The target distribution of every row comes from one device read
-    (``sparse_distribution_rows_from_mlx_logits``) instead of one read per
-    examined row, which a 24-token block used to pay up to 24 times. Row ``i``
-    is exactly the per-row reader's distribution for that row, the host
+    The target rows are read from the device a chunk at a time
+    (``sparse_distribution_rows_from_mlx_logits``: 8 rows at the Qwen 3.5+
+    vocabulary) instead of one read per examined row, which a 24-token block
+    used to pay up to 24 times; a fully accepted 24-token block now costs 3
+    reads, and a rejection stops the reading at its own chunk. Row ``i`` is
+    exactly the per-row reader's distribution for that row, the host
     arithmetic runs only for the rows examined, and the generator is drawn in
     the same order (one uniform per examined token, then the correction), so
     the accepted count, the correction and the generator state afterwards are

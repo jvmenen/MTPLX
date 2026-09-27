@@ -1,4 +1,4 @@
-"""Context-copy block acceptance reads the device once per round, exactly.
+"""Context-copy block acceptance reads the device once per chunk of rows, exactly.
 
 A copy round verifies ``[primary, c_0 .. c_{n-1}]`` and accepts the copied
 tokens in order, each as a point-mass proposal (accept with the target's own
@@ -7,11 +7,13 @@ rejection). The target distribution of each row used to be built and read
 from the device one row at a time, a full-vocabulary support build plus a
 host round trip per examined row, up to 24 per round on a 24-token block.
 
-``_point_mass_block_accept`` builds every row's distribution in one device
-call. These tests pin that the result is the per-row reader's, bit for bit:
-the same distributions, the same accepted count and correction, the same
-generator state afterwards, and the same emitted stream through the real
-decode loop on both copy lanes.
+``_point_mass_block_accept`` reads the rows a chunk at a time (8 rows at the
+248,320-entry vocabulary) and runs the host arithmetic only for the rows it
+examines. These tests pin that the result is the per-row reader's, bit for
+bit, on the Metal device: the same distributions, the same accepted count and
+correction, the same generator state afterwards, and the same emitted stream
+through the real decode loop on both copy lanes; that a row past the first
+rejection can neither warn nor raise; and how many reads a block costs.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import pytest
 
 import mtplx.generation as generation
 from mtplx.fast_sampling import (
+    _block_read_chunk_rows,
     sparse_distribution_from_mlx_logits,
     sparse_distribution_rows_from_mlx_logits,
     sparse_distributions_from_mlx_logits,
@@ -285,6 +288,51 @@ def test_an_examined_bad_row_fails_exactly_as_under_the_per_row_reader(metal):
                 accept(block_logits, block, FAMILY, np.random.default_rng(0))
         messages.append(str(raised.value))
     assert messages[0] == messages[1]
+
+
+def test_reads_are_one_per_chunk_at_the_qwen_vocabulary(metal, monkeypatch):
+    """How many device reads a 24-token block costs, stated honestly: one per
+    8-row chunk reached, where the per-row loop paid one per examined row."""
+
+    assert _block_read_chunk_rows(QWEN_VOCAB) == 8  # 32 MiB // (16 B x 248,320)
+    width = 24
+    draws = np.random.default_rng(4)
+    # Distinct background values: no tie at the top-k cutoff, so no row
+    # needs the exact tie resolver's extra read.
+    base = (draws.normal(size=(width + 1, QWEN_VOCAB)) * 0.1 - 4.0).astype(np.float32)
+    tokens = [int(t) for t in draws.integers(QWEN_VOCAB, size=width)]
+
+    reads = {"n": 0}
+    real_eval = mx.eval
+
+    def counting_eval(*args, **kwargs):
+        reads["n"] += 1
+        return real_eval(*args, **kwargs)
+
+    def counted(accept, rejected_at):
+        logits = base.copy()
+        block = list(tokens)
+        for row, token in enumerate(block):
+            logits[row, token] = 30.0  # the target is certain of the copy
+        if rejected_at is not None:
+            block[rejected_at] = (tokens[rejected_at] + 1) % QWEN_VOCAB  # p = 0
+        block_logits = mx.array(logits)
+        real_eval(block_logits)
+        with monkeypatch.context() as patch:
+            patch.setattr(mx, "eval", counting_eval)
+            reads["n"] = 0
+            result = accept(block_logits, block, FAMILY, np.random.default_rng(0))
+        return result, reads["n"]
+
+    for rejected_at, stock_reads, chunk_reads in (
+        (None, 24, 3),  # fully accepted: rows 0-23, chunks 0-2
+        (0, 1, 1),  # rejected at the first row: one read either way
+        (10, 11, 2),  # rejected in the second chunk
+    ):
+        stock, stock_n = counted(_per_row_block_accept, rejected_at)
+        new, new_n = counted(_point_mass_block_accept, rejected_at)
+        assert stock == new
+        assert (stock_n, new_n) == (stock_reads, chunk_reads), rejected_at
 
 
 def _accept_block(rng: np.random.Generator, vocab: int, width: int):

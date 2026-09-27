@@ -694,18 +694,40 @@ def sparse_distribution_from_mlx_logits_relaxed_ties(
     return _host_sparse_distribution(np.asarray(row, dtype=np.float32), config)
 
 
+#: Merge-sort scratch MLX's Metal ``argpartition`` allocates per element of
+#: its input: it sorts the whole axis, and the multi-block sort holds two
+#: value and two uint32 index buffers of the full input
+#: (``mlx/backend/metal/sort.cpp``, ``multi_block_sort``), 16 bytes at
+#: float32.
+_ARGPARTITION_SCRATCH_BYTES_PER_ELEMENT = 16
+#: Bound on that scratch for one chunk of a block read: 32 MiB is 8 rows of
+#: the 248,320-entry Qwen 3.5+ vocabulary (3.79 MiB a row), against 91 MiB
+#: for a whole 24-row copy block.
+_BLOCK_READ_SCRATCH_BYTES = 32 * 2**20
+
+
+def _block_read_chunk_rows(vocab_size: int) -> int:
+    """Rows read from the device together, from the sort scratch budget."""
+
+    per_row = _ARGPARTITION_SCRATCH_BYTES_PER_ELEMENT * max(1, int(vocab_size))
+    return max(1, _BLOCK_READ_SCRATCH_BYTES // per_row)
+
+
 class SparseDistributionRows:
     """Exact per-row sparse distributions for a block of logit rows.
 
     Row ``i`` is the distribution ``sparse_distribution_from_mlx_logits``
-    returns for ``logits[i]`` with no penalties, bit for bit, but every row's
-    device candidates are built and read in ONE ``_device_serial_candidates``
-    call, when the first row is read. Everything the device computes is
-    row-local (the float32 cast, the scale and the gathers are element-wise,
-    ``argpartition`` sorts each row on its own, and ``logsumexp`` reduces
-    each row in its own threadgroup with a kernel chosen by the row length
-    alone), so a row read from the block carries the same candidates as its
-    one-row read.
+    returns for ``logits[i]`` with no penalties, bit for bit. The device work
+    is done a chunk of rows at a time (``_block_read_chunk_rows``: 8 rows at
+    the Qwen 3.5+ vocabulary), when the caller first reaches a row of the
+    chunk: one host-device round trip per chunk instead of one per row, a
+    sort scratch that stays under ``_BLOCK_READ_SCRATCH_BYTES`` on every
+    Mac, and nothing built for the chunks past a caller that stops early.
+    Everything the device computes is row-local (the float32 cast, the scale
+    and the gathers are element-wise, ``argpartition`` sorts each row on its
+    own, and ``logsumexp`` reduces each row in its own threadgroup with a
+    kernel chosen by the row length alone), so a row read inside a chunk
+    carries the same candidates as its one-row read.
 
     The host arithmetic runs for the row being read only, with the per-row
     reader's own statements on a one-row slice: a row the caller never
@@ -715,12 +737,15 @@ class SparseDistributionRows:
     Rows are indexed from 0 to ``len(self) - 1``.
     """
 
-    __slots__ = ("_logits", "_config", "_candidates")
+    __slots__ = ("_logits", "_config", "_chunk_rows", "_chunk_index", "_chunk")
 
     def __init__(self, logits: mx.array, config: SamplerConfig) -> None:
         self._logits = logits.reshape(-1, logits.shape[-1])
         self._config = config
-        self._candidates: _SerialCandidates | None = None
+        self._chunk_rows = _block_read_chunk_rows(int(self._logits.shape[-1]))
+        # Only the chunk being walked is held: a caller reads rows in order.
+        self._chunk_index = -1
+        self._chunk: _SerialCandidates | None = None
 
     def __len__(self) -> int:
         return int(self._logits.shape[0])
@@ -729,11 +754,13 @@ class SparseDistributionRows:
         index = int(index)
         if not 0 <= index < len(self):
             raise IndexError(f"row {index} of {len(self)}")
-        if self._candidates is None:
-            self._candidates = _device_serial_candidates(
-                self._logits.astype(mx.float32), self._config
-            )
-        candidates = self._candidates.row(index)
+        chunk_index, row = divmod(index, self._chunk_rows)
+        if chunk_index != self._chunk_index or self._chunk is None:
+            start = chunk_index * self._chunk_rows
+            rows = self._logits[start : start + self._chunk_rows].astype(mx.float32)
+            self._chunk = _device_serial_candidates(rows, self._config)
+            self._chunk_index = chunk_index
+        candidates = self._chunk.row(row)
         token_rows, prob_rows = _serial_support_from_candidates(
             candidates, self._config
         )
@@ -754,7 +781,7 @@ def sparse_distribution_rows_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
 ) -> SparseDistributionRows | None:
-    """Per-row exact sparse distributions from one device read, or None.
+    """Per-row exact sparse distributions read a chunk at a time, or None.
 
     None exactly where ``sparse_distribution_from_mlx_logits`` returns None
     (greedy, or no top-k), so a caller falls back to its per-row reader there.
