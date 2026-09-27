@@ -10,6 +10,7 @@ harness), so the result-dict plumbing is exercised end to end.
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,8 @@ from mtplx.server import openai
 from mtplx.server.openai import create_app
 
 # Engine-shaped first-token result (mtplx.generation.FirstTokenLogprobs);
-# strings are whatever the fake state's tokenizer decodes these ids to.
+# strings are whatever the fake state's tokenizer decodes these ids to
+# (chr(id): 79 is "O").
 FIRST = SimpleNamespace(
     token_id=79,
     logprob=-0.25,
@@ -36,14 +38,18 @@ FIRST = SimpleNamespace(
 )
 
 
-def _logprobs_generator(calls: list[dict]):
+def _logprobs_generator(calls: list[dict], first=FIRST, text: str | None = None):
+    """One generated token, and the text and stats of that one token: the
+    max_tokens=1 shape every logprobs request has."""
     base = _fake_generation_output()
 
     def generate(*args, **kwargs):
         calls.append(kwargs)
         out = base(*args, **kwargs)
-        out.tokens = [FIRST.token_id]
-        out.first_token_logprobs = FIRST
+        out.tokens = [first.token_id]
+        out.text = chr(first.token_id) if text is None else text
+        out.stats = dataclasses.replace(out.stats, generated_tokens=1)
+        out.first_token_logprobs = first
         return out
 
     return generate
@@ -69,8 +75,11 @@ def test_completions_first_token_logprobs_openai_shape(monkeypatch):
     )
 
     assert response.status_code == 200
-    logprobs = response.json()["choices"][0]["logprobs"]
+    choice = response.json()["choices"][0]
+    logprobs = choice["logprobs"]
     sampled = _decode(state, 79)
+    assert choice["text"] == sampled
+    assert response.json()["usage"]["completion_tokens"] == 1
     assert logprobs["tokens"] == [sampled]
     assert logprobs["token_logprobs"] == [pytest.approx(-0.25)]
     assert logprobs["text_offset"] == [0]
@@ -188,10 +197,13 @@ def test_chat_first_token_logprobs_openai_shape(monkeypatch):
     )
 
     assert response.status_code == 200
-    logprobs = response.json()["choices"][0]["logprobs"]
+    choice = response.json()["choices"][0]
+    logprobs = choice["logprobs"]
     assert logprobs["refusal"] is None
     [entry] = logprobs["content"]
     sampled = _decode(state, 79)
+    assert choice["message"]["content"] == sampled
+    assert response.json()["usage"]["completion_tokens"] == 1
     assert entry["token"] == sampled
     assert entry["logprob"] == pytest.approx(-0.25)
     assert entry["bytes"] == list(sampled.encode("utf-8"))

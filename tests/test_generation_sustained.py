@@ -639,6 +639,42 @@ def test_generation_reports_raw_first_token_logprobs(lane, temperature):
     assert first.top[1][1] == pytest.approx(expected[0], abs=1e-5)
 
 
+@pytest.mark.parametrize("lane", ["ar", "mtpk"])
+def test_first_token_logprobs_leave_a_sampled_decode_unchanged(lane):
+    """At temperature 0.6 with the whole vocabulary in play the first token
+    is drawn at random (the argmax has p = 0.64). Asking for logprobs must
+    not move it for any seed, and the reported values stay the raw
+    distribution, not the tempered one the token was drawn from."""
+
+    rt = _runtime(TinyModel(), mtp_enabled=True)
+    generate = generate_ar if lane == "ar" else generate_mtpk
+    extra = {} if lane == "ar" else {"speculative_depth": 1}
+    sampler = SamplerConfig(temperature=0.6, top_p=1.0, top_k=0)
+    expected = _tiny_raw_logprobs()
+    drawn: set[int] = set()
+
+    for seed in range(16):
+        common = {
+            "max_tokens": 1,
+            "sampler": sampler,
+            "seed": seed,
+            "stop_token_ids": set(),
+            **extra,
+        }
+        plain = generate(rt, [0], **common)
+        with_logprobs = generate(rt, [0], first_token_logprobs_top_k=4, **common)
+
+        assert with_logprobs.tokens == plain.tokens
+        assert plain.first_token_logprobs is None
+        first = with_logprobs.first_token_logprobs
+        assert first.token_id == plain.tokens[0]
+        assert first.logprob == pytest.approx(expected[first.token_id], abs=1e-5)
+        assert first.top[0] == (1, pytest.approx(expected[1], abs=1e-5))
+        drawn.add(plain.tokens[0])
+
+    assert len(drawn) > 1  # the decode is sampled, not the argmax every time
+
+
 class _MaskTokenOneConstraint:
     """Grammar stand-in that forbids token 1 (TinyModel's argmax)."""
 
