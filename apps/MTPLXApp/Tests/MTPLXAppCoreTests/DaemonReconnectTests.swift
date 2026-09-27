@@ -481,6 +481,18 @@ final class DaemonReconnectTests: XCTestCase {
         DaemonStatusBadge(daemonState: store.daemonState, connectionState: store.connectionState)
     }
 
+    /// The Logs window is what a user pastes into a report; it must say why
+    /// a start request did not launch anything.
+    @MainActor
+    private func logsMention(_ store: MTPLXBackendStore, _ needle: String) async -> Bool {
+        for _ in 0..<50 {
+            await store.refreshLogs()
+            if store.logs.contains(where: { $0.message.contains(needle) }) { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return false
+    }
+
     // MARK: A second start against the app's own daemon
 
     @MainActor
@@ -512,6 +524,8 @@ final class DaemonReconnectTests: XCTestCase {
         try await pollUntil("live stats still open") { store.connectionState == .open }
         XCTAssertEqual(badge(store).label, "Running")
         XCTAssertEqual(badge(store).tone, .healthy)
+        let logged = await logsMention(store, "reconnecting to it instead of launching")
+        XCTAssertTrue(logged, "the Logs window records why no second launch happened")
     }
 
     // MARK: A second start against an adopted daemon
@@ -714,5 +728,7 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.health?.startup?.pid, spawns.first?.pid, "the loading daemon was kept, not replaced")
         XCTAssertEqual(store.health?.startup?.launchId, spawns.first?.launchID)
         try await pollUntil("live stats open") { store.connectionState == .open }
+        let logged = await logsMention(store, "joining it")
+        XCTAssertTrue(logged, "the Logs window records that the second request joined the first")
     }
 }

@@ -956,6 +956,15 @@ public final class MTPLXBackendStore: ObservableObject {
         // ask for a ready daemon. A start already in flight owns the
         // outcome; a second one joins it (#528).
         if startInFlight {
+            // Checking the flag and registering must not be split by an
+            // await, or the start could finish in between and never resume
+            // this request. The log line goes out on its own task.
+            Task { [supervisor] in
+                await supervisor.logs.append(
+                    "start requested while another start is in flight; joining it",
+                    stream: .system
+                )
+            }
             await withCheckedContinuation { startJoiners.append($0) }
             return
         }
@@ -970,16 +979,24 @@ public final class MTPLXBackendStore: ObservableObject {
         // what the supervisor holds is only known once that has finished.
         await awaitDaemonTeardown()
         switch supervisor.currentHold() {
-        case .held:
+        case .held(let held):
             // This app already runs a daemon: reconnect to it. Asking the
             // supervisor to start again threw `alreadyRunning`, which the
             // badge showed as "Degraded" over a healthy daemon until the
             // app was quit (#528). No launch, no fan change, no port change.
+            await supervisor.logs.append(
+                "start requested while daemon launch \(held.launchID ?? "unknown") is running; reconnecting to it instead of launching",
+                stream: .system
+            )
             await reconcileHeldDaemon(clearingFailedRequest: true)
             return
         case .settling:
             // An automatic restart, a model swap or a stop holds the
             // supervisor and publishes its own outcome.
+            await supervisor.logs.append(
+                "start requested while a launch, restart or stop is in progress; leaving it to finish",
+                stream: .system
+            )
             return
         case .none:
             break
