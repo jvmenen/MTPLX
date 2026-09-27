@@ -657,32 +657,172 @@ def test_several_growth_events_keep_every_row_and_logit(mode):
     assert bank.stats["fallback_reasons"].get("capacity_overflow") == 3
 
 
+class _PagedCountingModel:
+    """A model for ``generate_mtpk``: after token t it wants t + 1 (mod V).
+
+    Logits are MLX math on the ids, so the compiled verify bank can trace the
+    forward, and the MTP head always agrees, so every draft is accepted. One
+    attention layer over two KV heads writes paged KV through the mask it
+    builds from its cache, as a model forward does; its readout feeds the
+    hidden state with weight zero, so the buffers are read without changing
+    the tokens. Every call that runs Python (prefill, eager commits, traces)
+    is recorded as (rows, cache type, offset, capacity).
+    """
+
+    V, D = 16, 8
+
+    def __init__(self, mode: str, *, blocks: int) -> None:
+        from types import SimpleNamespace
+
+        self.mode = mode
+        self.blocks = blocks
+        self.mtp = SimpleNamespace(_mtplx_lora_targets=[])
+        mx.random.seed(3)
+        width = HEADS * HEAD_DIM
+        self.embed = mx.random.normal((self.V, self.D))
+        self.w_k, self.w_v, self.w_q = (0.3 * mx.random.normal((self.D, width)) for _ in range(3))
+        mx.eval(self.embed, self.w_k, self.w_v, self.w_q)
+        self.calls: list[tuple[int, str, int | None, int | None]] = []
+
+    def make_cache(self) -> list:
+        return [
+            VllmMetalPagedKVCache(
+                block_size=BLOCK, num_blocks=self.blocks, kv_quant_config=_config(self.mode)
+            )
+        ]
+
+    def make_mtp_cache(self) -> list:
+        return []
+
+    def mtp_update_cache(self, hidden_states, next_token_ids, **_kwargs):
+        return hidden_states
+
+    def _logits(self, ids):
+        wanted = (ids + 1) % self.V
+        return 10.0 * (mx.arange(self.V)[None, None, :] == wanted[..., None]).astype(mx.float32)
+
+    def __call__(self, input_ids, *, cache=None, return_hidden=False, hidden_variant=None,
+                 emit_logits=True, logits_keep=None, input_embeddings=None):
+        from mlx_lm.models.base import create_attention_mask
+
+        entry = cache[0]
+        offset = entry.offset if isinstance(entry.offset, int) else _concrete_offset(entry.cache[2])
+        self.calls.append(
+            (int(input_ids.shape[1]), type(entry).__name__, offset, getattr(entry, "capacity", None))
+        )
+        B, S = int(input_ids.shape[0]), int(input_ids.shape[1])
+        h = self.embed[input_ids]
+        create_attention_mask(h, entry)
+
+        def heads(w):
+            return (h @ w).reshape(B, S, HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+
+        keys, values = heads(self.w_k), heads(self.w_v)
+        if self.mode == "plain":
+            keys, values = keys.astype(mx.bfloat16), values.astype(mx.bfloat16)
+        k_buf, _v_buf = entry.update_and_fetch(keys, values)
+        read = mx.sum(heads(self.w_q) @ mx.swapaxes(k_buf, 2, 3).astype(mx.float32))
+        hidden = h + 0.0 * read
+        logits = self._logits(input_ids)
+        if logits_keep is not None:
+            logits = logits[:, -int(logits_keep):, :]
+        if not emit_logits:
+            logits = None
+        return (logits, hidden) if return_hidden else logits
+
+    def mtp_forward(self, hidden_states, next_token_ids, *, mtp_cache=None, concat_order=None,
+                    return_hidden=False, mtp_hidden_variant=None, position_offset=None):
+        logits = self._logits(next_token_ids)
+        hidden = mx.zeros((1, int(next_token_ids.shape[-1]), self.D))
+        return (logits, hidden) if return_hidden else logits
+
+
+def _generate_counting(mode: str, *, prompt_len: int, max_tokens: int, blocks: int, lazy: bool, monkeypatch):
+    from pathlib import Path
+
+    from mtplx.generation import generate_mtpk
+    from mtplx.mtp_patch import MTPContract
+    from mtplx.runtime import MTPLXRuntime
+    from mtplx.sampling import SamplerConfig
+
+    class _Tokenizer:
+        def decode(self, tokens, **_kwargs):
+            return " ".join(str(int(token)) for token in tokens)
+
+    monkeypatch.setenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
+    if lazy:
+        monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY", "1")
+        monkeypatch.setenv("MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH", "1")
+    else:
+        monkeypatch.delenv("MTPLX_LAZY_BONUS_VERIFY", raising=False)
+    model = _PagedCountingModel(mode, blocks=blocks)
+    rt = MTPLXRuntime(
+        model=model, tokenizer=_Tokenizer(), model_path=Path("tiny-paged"),
+        mtp_enabled=True, contract=MTPContract(),
+    )
+    prompt = [(i % (model.V - 1)) + 1 for i in range(prompt_len)]
+    out = generate_mtpk(
+        rt, prompt, max_tokens=max_tokens,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        speculative_depth=1, seed=0, stop_token_ids=set(),
+        verify_strategy="capture_commit", capture_final_state=True,
+    )
+    wanted = [(prompt[-1] + 1 + i) % model.V for i in range(max_tokens)]
+    return model, out, wanted
+
+
 @pytest.mark.parametrize("path", ["final_pending_commit", "lazy_bonus_commit"])
 @pytest.mark.parametrize("mode", MODES)
-def test_direct_one_token_forward_on_a_full_promoted_cache_reserves_its_row(mode, path):
-    """generation.py's final pending-token commit and its lazy-bonus commit
+def test_generation_commits_one_token_past_a_full_promoted_cache(mode, path, monkeypatch):
+    """generate_mtpk's final pending-token commit and its lazy-bonus commit
     call ``rt.forward_ar`` with one token on the promoted cache, outside any
-    bank. With the buffers exactly full, the old code raised the capacity
-    error there even with growth on; the forward's own mask now reserves."""
+    bank. Both run here through the production branches, sized so that the
+    one-row window starts on a promoted adapter whose 32 rows are exactly
+    full. The forward's own mask reserves the row: the cache grows to 48, the
+    turn stays safe to commit, and the result equals a run whose buffers were
+    48 rows from the start. On 150fb319 the final commit raised the capacity
+    error (caught: the turn became unsafe to commit, its session-bank entry
+    skipped) and the lazy-bonus commit failed the request."""
 
-    rt = TwoHeadPagedRuntime(mode)
-    bank = CompiledVerifyBank(rt)
-    cache = rt.make_cache()
-    _prefill(rt, cache, 28)
-    # Every row of the window accepted: the buffers are exactly full.
-    _l, _h, captures = _verify(bank, rt, cache, [1, 2, 3, 4])
-    assert commit_captured_prefix(cache, captures, keep_tokens=4, verified_tokens=4)
-    adapter = cache[1]
-    assert adapter.size() == adapter.capacity == 32
-    committed = _rows(adapter, 0, 32)
+    lazy = path == "lazy_bonus_commit"
+    # Prefill of 10 rows then 2 rows per round puts the final commit at 32;
+    # with lazy bonus verify (1-row verify, 1-row bonus commit) an 11-row
+    # prompt puts a bonus commit at 32.
+    shape = dict(prompt_len=11, max_tokens=30) if lazy else dict(prompt_len=10, max_tokens=23)
+    model, out, wanted = _generate_counting(mode, blocks=BLOCKS, lazy=lazy, monkeypatch=monkeypatch, **shape)
 
-    token = 3 if path == "final_pending_commit" else 4
-    logits, _hidden = rt.forward_ar(mx.array([[token]]), cache=cache, return_hidden=True)
-    mx.eval(logits)
-    assert adapter.size() == 33 and adapter.capacity == 48
-    _assert_same(_rows(adapter, 0, 32), committed, "committed rows")
-    _assert_same(_rows(adapter, 32, 33), _expected_rows(adapter, *rt.last_kv), "committed token")
-    assert np.isfinite(np.array(logits)).all()
+    adapter_name = _adapter_cls(mode).__name__
+    crossing = [
+        i for i, (rows, name, offset, capacity) in enumerate(model.calls)
+        if rows == 1 and name == adapter_name and offset == capacity == 32
+    ]
+    assert len(crossing) == 1, model.calls
+    if lazy:
+        lazy_rounds = [
+            e for e in out.stats.events
+            if isinstance(e, dict) and (e.get("lazy_bonus_verify") or {}).get("enabled")
+        ]
+        assert lazy_rounds and crossing[0] < len(model.calls) - 1
+        # The rounds after it ran on the grown buffers.
+        assert any(capacity == 48 for _r, _n, _o, capacity in model.calls[crossing[0] + 1:])
+    else:
+        assert crossing[0] == len(model.calls) - 1  # the last forward: the final commit
+    assert out.tokens == wanted
+    assert out.final_state is not None and out.final_state.safe_to_commit is True
+    assert not [e for e in out.stats.events if isinstance(e, dict) and "final_state_capture_error" in e]
+
+    ref_model, ref_out, _wanted = _generate_counting(
+        mode, blocks=3, lazy=lazy, monkeypatch=monkeypatch, **shape
+    )
+    assert ref_out.tokens == out.tokens
+    (got,) = out.final_state.final_trunk_cache
+    (want,) = ref_out.final_state.final_trunk_cache
+    assert got.offset == want.offset
+    for leaf, (g, w) in enumerate(zip(got.state, want.state)):
+        assert np.array_equal(np.array(g.astype(mx.float32)), np.array(w.astype(mx.float32))), leaf
 
 
 @pytest.mark.parametrize("mode", MODES)
