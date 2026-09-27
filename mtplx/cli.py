@@ -859,13 +859,14 @@ def _add_paged_kv_quant_args(parser: argparse.ArgumentParser) -> None:
             "supports it. Contract: decode-memory feature routed once per "
             "request from its starting offset. q8 at/past the two-pass "
             "threshold (default 1024 tokens) decodes through the inline-"
-            "dequant kernel with no bf16 working copy; below it q8 keeps a "
-            "context-sized bf16 working mirror, so its memory win starts at "
+            "dequant kernel with no unquantized working copy; below it q8 keeps "
+            "a context-sized unquantized working mirror, so its memory win starts at "
             "the threshold. q4 keeps no mirror and, at/past the same threshold, "
             "decodes through the packed-quant kernel; unsupported shapes use "
             "bounded chunked dequantization. Prefill runs unquantized (peak prefill "
-            "memory unchanged) and compiled-verify/dense-two-pass fast paths "
-            "detach while active."
+            "memory unchanged). The compiled verify step keeps running on the "
+            "quantized pages and dequantizes them in its attention; the dense "
+            "two-pass and dense-decode layouts are not used while active."
         ),
     )
 

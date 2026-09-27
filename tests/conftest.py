@@ -71,6 +71,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         # that boots it with --memory-budget would size every later test's
         # session bank against that budget instead of the machine's RAM.
         "MTPLX_MEMORY_BUDGET",
+        # Same for --allow-swap: a leaked value would switch it on for every
+        # later server the suite boots.
+        "MTPLX_ALLOW_SWAP",
     ):
         monkeypatch.delenv(name, raising=False)
     # `mtplx doctor` reads the app's failed-start report (#504). A developer

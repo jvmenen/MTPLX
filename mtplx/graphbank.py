@@ -19,7 +19,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from .attention_context import attention_phase
+from .attention_context import attention_phase, compiled_dispatch
+from .compile_state import compiled_step_body
 from .demotions import note as _note_demotion, note_bank_fallback as _note_bank_fallback
 from .gdn_capture import resolve_gdn_capture_backend
 from .rope_origin import RotaryOrigin, as_rope_delta, stamp_rope_delta
@@ -213,7 +214,8 @@ class SpecDecodeGraphBank:
                         hidden_variant=hidden_variant,
                     )
                 self._compiled[key] = fn
-            result = fn(input_ids)
+            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+                result = fn(input_ids)
             self.stats.compiled_calls += 1
             self.stats.elapsed_s += time.perf_counter() - started
             return result
@@ -275,9 +277,7 @@ class SpecDecodeGraphBank:
             return "length_outside_graphbank"
         if cache is None:
             return None
-        if self.allow_python_cache_capture:
-            return None
-        if self.promote_tensor_offsets:
+        if self.promote_tensor_offsets and not self.allow_python_cache_capture:
             promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=length)
             self.stats.promoted_cache_entries += promoted
             for reason, count in failures.items():
@@ -285,6 +285,17 @@ class SpecDecodeGraphBank:
                     self.stats.promotion_failures.get(reason, 0) + count
                 )
             stamp_rope_delta(cache, self._rope_delta)
+        # A compiled replay writes promoted paged adapters at their traced
+        # offset with no Python on the path, and MLX does not clamp that
+        # write. Reserve the window here, before the dispatch, for every
+        # promoted paged adapter in the list, whether this dispatcher promoted
+        # it or received it promoted (the dense adapters are topped up by the
+        # promotion above).
+        from .cache_state import reserve_paged_window
+
+        reserve_paged_window(cache, length)
+        if self.allow_python_cache_capture:
+            return None
         if cache_has_python_offsets(cache):
             return "python_cache_offsets"
         return None
@@ -330,12 +341,13 @@ class SpecDecodeGraphBank:
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
-            return self.runtime.forward_ar(
-                input_ids,
-                cache=cache,
-                return_hidden=return_hidden,
-                hidden_variant=hidden_variant,
-            )
+            with compiled_step_body():
+                return self.runtime.forward_ar(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
 
         return mx.compile(
             verify_fn,
@@ -354,12 +366,13 @@ class SpecDecodeGraphBank:
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
-            return self._runtime_forward_ar_capture(
-                input_ids,
-                cache=cache,
-                return_hidden=return_hidden,
-                hidden_variant=hidden_variant,
-            )
+            with compiled_step_body():
+                return self._runtime_forward_ar_capture(
+                    input_ids,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    hidden_variant=hidden_variant,
+                )
 
         return mx.compile(
             verify_fn,
@@ -1173,9 +1186,7 @@ def promote_kv_cache_offsets(
                     # shapes/dtypes for the compiled graph). Fail-closed:
                     # geometry the packed-quant kernel refuses, or the env
                     # kill-switch, keeps the historical eager refusal.
-                    if not _env_enabled(
-                        "MTPLX_GRAPHBANK_QUANTIZED_PAGED", default=True
-                    ):
+                    if not quantized_paged_bank_enabled():
                         failures["quantized_paged_kv_cache"] = (
                             failures.get("quantized_paged_kv_cache", 0) + 1
                         )
@@ -1228,6 +1239,9 @@ def promote_kv_cache_offsets(
             ),
         )
         promoted += 1
+    from .cache_state import link_paged_window_group
+
+    link_paged_window_group(cache)
     return promoted, failures
 
 
@@ -1236,6 +1250,16 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def quantized_paged_bank_enabled() -> bool:
+    """Whether KV-quantized pages keep the compiled verify bank (default on).
+
+    MTPLX_GRAPHBANK_QUANTIZED_PAGED=0 restores the old eager refusal. One
+    reader for the promotion and for the health payload, so the two never
+    disagree about a spelling.
+    """
+    return _env_enabled("MTPLX_GRAPHBANK_QUANTIZED_PAGED", default=True)
 
 
 def cache_array_tree(cache: Any) -> list[Any]:
@@ -1684,6 +1708,30 @@ def set_paged_offsets_context_ok(allowed: bool):
 def paged_offsets_context_ok() -> bool:
     """Read the current request's fence stamp (receipts/trace)."""
     return _PAGED_OFFSETS_CONTEXT_OK.get()
+
+
+def materialize_paged_offsets(entries: Any) -> None:
+    """Evaluate every paged entry's offset in one ``mx.eval`` (#318).
+
+    Only under the batching switch and the per-request long-context fence
+    above; otherwise the offsets stay as they are and each reader's
+    ``size()``/``.item()`` syncs its own, the pre-#318 behaviour. ``mx.eval``
+    cannot change a value, so either way the offsets read the same. Inside an
+    ``mx.compile`` trace the eval raises MLX's trace refusal, which the
+    reservation path reads as "traced".
+    """
+
+    if not (_BATCH_PAGED_OFFSETS and _PAGED_OFFSETS_CONTEXT_OK.get()):
+        return
+    offsets = []
+    for entry in entries or []:
+        entry_state = getattr(entry, "cache", None)
+        if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
+            entry_offset = entry_state[2]
+            if isinstance(entry_offset, mx.array):
+                offsets.append(entry_offset)
+    if offsets:
+        mx.eval(*offsets)
 
 
 def _ccopy_bank_max_len() -> int:
@@ -2577,9 +2625,11 @@ class CompiledVerifyBank:
         t2 = clock()
         # Argument order is the trace's contract (``_make_verify_step``):
         # ids, the auxiliary, the rotary delta of an image request, the state.
-        outputs = dispatch["fn"](
-            input_ids, compiled_aux, *dispatch["rope_args"], *state_in
-        )
+        identity = (id(dispatch["fn"]), tuple(getattr(input_ids, "shape", ())))
+        with compiled_dispatch(identity):
+            outputs = dispatch["fn"](
+                input_ids, compiled_aux, *dispatch["rope_args"], *state_in
+            )
         t3 = clock()
         host_split["aux"] += t1 - t0
         host_split["input_eval"] += t2 - t1
@@ -3557,11 +3607,12 @@ class CompiledVerifyBank:
             # Same positional contract as the installed replay: ids, the
             # auxiliary when the runtime prepares one, the rotary delta of an
             # image request, the state leaves.
-            outputs = (
-                fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
-                if compiled_aux is not None
-                else fn(input_ids, *self._rope_args(), *state_in)
-            )
+            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+                outputs = (
+                    fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
+                    if compiled_aux is not None
+                    else fn(input_ids, *self._rope_args(), *state_in)
+                )
             logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
             if donate:
                 # A2.1 commit-first ownership handoff — commit + schedule
@@ -4187,24 +4238,15 @@ class CompiledVerifyBank:
 
     def _resolve_bucket(self, cache: Any, length: int) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
-        if _BATCH_PAGED_OFFSETS and _PAGED_OFFSETS_CONTEXT_OK.get():
-            # One eval for every paged offset instead of a serial sync per
-            # entry inside size() below (#318; helper docstring has the
-            # mechanism). Mirrors this loop's own iteration exactly.
-            paged_offsets = []
-            for spec_idx, spec_kind, _n in self._spec or []:
-                if spec_kind != VERIFY_SPEC_KIND_FULL_ATTN:
-                    continue
-                spec_entry = cache[spec_idx]
-                if not hasattr(spec_entry, "capacity"):
-                    continue
-                entry_state = getattr(spec_entry, "cache", None)
-                if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
-                    entry_offset = entry_state[2]
-                    if isinstance(entry_offset, mx.array):
-                        paged_offsets.append(entry_offset)
-            if paged_offsets:
-                mx.eval(*paged_offsets)
+        # One eval for every paged offset instead of a serial sync per entry
+        # inside size() below (#318; helper docstring has the mechanism).
+        # Mirrors this loop's own iteration exactly.
+        materialize_paged_offsets(
+            cache[spec_idx]
+            for spec_idx, spec_kind, _n in self._spec or []
+            if spec_kind == VERIFY_SPEC_KIND_FULL_ATTN
+            and hasattr(cache[spec_idx], "capacity")
+        )
         max_needed = 0
         min_capacity: int | None = None
         for idx, kind, _n in self._spec or []:
@@ -4511,7 +4553,7 @@ class CompiledVerifyBank:
                         entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
             # (2) The existing runtime forward, on shadow containers only.
-            with attention_phase("decode_verify"):
+            with attention_phase("decode_verify"), compiled_step_body():
                 result = live._runtime_forward(
                     input_ids,
                     cache=shadow,

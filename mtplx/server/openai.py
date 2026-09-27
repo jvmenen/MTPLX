@@ -3529,6 +3529,11 @@ class ServerState:
         # and stops refusing prompts; the plan still reports the
         # overcommit honestly and the pressure guard keeps shedding.
         self.allow_swap = _allow_swap_enabled(args)
+        if self.allow_swap:
+            # The paged KV cache admits its own growth against the same line
+            # (cache_state._admit_paged_growth); env is the plumbing because
+            # cache_state has no server handle, as for the context window.
+            os.environ["MTPLX_ALLOW_SWAP"] = "1"
         # Machine memory plan (issue #305): weights are a disk scan, RAM a
         # sysctl, so the machine's largest safe window is knowable BEFORE
         # any request — and it shapes the default window below. Five
@@ -3932,6 +3937,7 @@ def _submit_foreground_model_work(
     batch_key: str | None = None,
     **kwargs: Any,
 ) -> Any:
+    fn = _with_kv_attention_scope(fn)
     scheduler = getattr(state, "model_scheduler", None)
     if scheduler is not None and hasattr(scheduler, "submit_foreground"):
         return scheduler.submit_foreground(fn, *args, batch_key=batch_key, **kwargs)
@@ -3939,6 +3945,23 @@ def _submit_foreground_model_work(
     if executor is None:
         raise RuntimeError("state has no model work executor")
     return executor.submit(fn, *args, **kwargs)
+
+
+def _with_kv_attention_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Run one model-work item with a KV attention record of its own.
+
+    The record says which cache and attention route served a request's last
+    full-attention call when that request fails with non-finite logits; a
+    fresh one per item keeps a request from reporting another's (issue #526).
+    """
+
+    from mtplx.attention_context import kv_attention_request_scope
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        with kv_attention_request_scope():
+            return fn(*args, **kwargs)
+
+    return run
 
 
 def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
@@ -18771,31 +18794,62 @@ def _effective_ram_session_cache_settings(
 def _paged_kv_quantization_detail() -> dict[str, Any]:
     """Honest contract surface for the KV-quantization mode.
 
-    KV quant is a decode-memory feature with real tradeoffs: it detaches the
-    compiled-verify graph bank and the dense two-pass/dense-prefill layouts,
-    and prefill still runs unquantized (peak prefill memory is unchanged).
-    Hiding those tradeoffs made the toggle look free; state them where the
-    app and dashboard read health.
+    KV quant is a decode-memory feature with real tradeoffs, stated where the
+    app and dashboard read health so the toggle never looks free. Prefill
+    runs unquantized (peak prefill memory is unchanged) and decode always
+    runs on paged pages, so the dense decode layout and the two-pass kernel
+    over unquantized pages are not used. An eager decode call reads the
+    quantized pages directly when its request started at or past the
+    two-pass threshold (q8 through sdpa_2pass_paged_q8, q4 through
+    sdpa_gqa_packed_quant over its quant bank); a request that starts below
+    it dequantizes instead. The compiled verify bank keeps running on the
+    quantized pages, and its attention dequantizes them on each verify step.
+    Every value here comes from the reader the runtime itself uses.
     """
 
     mode = _effective_paged_kv_quantization()
     if mode == "off":
         return {"mode": "off"}
-    q8_kernel_enabled = (
-        os.environ.get("MTPLX_KV_QUANT_2PASS_KERNEL") or "1"
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    from mtplx.cache_state import VllmMetalPagedKVCache
+    from mtplx.graphbank import quantized_paged_bank_enabled
+
+    kernel = None
+    if VllmMetalPagedKVCache._kv_quant_kernel_enabled():
+        if mode == "q8":
+            kernel = "sdpa_2pass_paged_q8"
+        elif VllmMetalPagedKVCache._kv_quant_q4_kernel_enabled():
+            kernel = "sdpa_gqa_packed_quant"
+    threshold = int(
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1024")
+        or "1024"
+    )
+    dequant = (
+        # The mirror holds the pages in the cache's source dtypes (bf16 or
+        # fp16, whichever the model runs), not a fixed bf16.
+        "an unquantized working mirror of the pages"
+        if mode == "q8"
+        else "dequantized in bounded chunks"
+    )
+    bank_kept = quantized_paged_bank_enabled()
+    detached = ["dense_two_pass_paged", "dense_decode_prefill_layout"]
+    if not bank_kept:
+        detached.insert(0, "compiled_verify_graphbank")
     return {
         "mode": mode,
-        "decode_kernel": (
-            "sdpa_2pass_paged_q8"
-            if mode == "q8" and q8_kernel_enabled
-            else "dequant_fallback_memoized"
+        "decode_kernel": kernel or "none",
+        "decode": (
+            f"requests that start at or past {threshold} tokens read the "
+            f"quantized pages with {kernel}; shorter ones use {dequant}"
+            if kernel is not None
+            else f"the kernel switch is off, so every request uses {dequant}"
         ),
-        "detached_fast_paths": [
-            "compiled_verify_graphbank",
-            "dense_two_pass_paged",
-            "dense_decode_prefill_layout",
-        ],
+        "compiled_verify": (
+            "kept on the quantized pages; its attention dequantizes them on "
+            "each verify step"
+            if bank_kept
+            else "off for quantized pages (MTPLX_GRAPHBANK_QUANTIZED_PAGED=0)"
+        ),
+        "detached_fast_paths": detached,
         "prefill": "unquantized (peak prefill memory unchanged)",
         "contract": "decode-memory feature; long-context decode KV bytes shrink",
     }
@@ -19301,6 +19355,15 @@ def _non_finite_logits_failure(
         session_id or "-",
         exc,
     )
+    # Which attention route and KV cache served the failing request's last
+    # full-attention call: host data the error captured where it was raised
+    # (sampling.NonFiniteLogitsError), so another request's attention since
+    # then cannot stand in for it.
+    kv_attention = getattr(exc, "kv_attention", None)
+    if kv_attention is not None:
+        logging.getLogger("mtplx.server").error(
+            "non-finite logits request_id=%s %s", request_id, kv_attention
+        )
     dropped = 0
     if session_id:
         try:
@@ -19316,6 +19379,7 @@ def _non_finite_logits_failure(
             "request_id": request_id,
             "session_id": session_id,
             "detail": str(exc),
+            "kv_attention": kv_attention,
             "bank_entries_dropped": dropped,
         },
     )
