@@ -2546,6 +2546,40 @@ def _qsa_cache_arrays(cache: "QSACache") -> list:
     ]
 
 
+def _after_index_block_writes(rows: mx.array, cache: "QSACache") -> mx.array:
+    """``rows`` ordered after the index-block writes held on ``cache``.
+
+    ``pooled`` and its fp32 mirror take one lazy slice update per completed
+    index block, but a forward reads them only past the selection budget, and
+    then only one of the two: the eager selector reads the mirror, the fused
+    selector reads ``pooled``, and a draft-head history append reads neither.
+    An unread buffer stacks its updates into one unevaluated graph for as long
+    as the cache lives. That graph keeps every written block alive, and with
+    it the Metal shared event of the ``mx.async_eval`` that computed the
+    block (MLX releases an event only when its array is read, reused as an
+    input after the event signalled, or freed). The session bank snapshots
+    lazily, so each banked final state kept one event per index write of its
+    request, and a long-running server ran out of Metal shared events (#544).
+
+    Every forward evaluates its new KV rows (attention reads the KV, and a
+    history append's caller evaluates the cache), so making them depend on
+    these buffers evaluates the block maintenance with the forward that did
+    it. Values are unchanged; only the evaluation order moves.
+
+    ``raw_keys`` stays out: the next completed block's pooling reads it, so
+    its backlog never outgrows one block, and a dependency would cost its
+    in-place update whenever a lazy history append and a draft forward are
+    evaluated together.
+    """
+
+    pending = [
+        value
+        for value in (cache.pooled, cache.pooled_f32_t)
+        if isinstance(value, mx.array)
+    ]
+    return mx.depends(rows, pending) if pending else rows
+
+
 # In-forward boundary capture (prefill). A restore boundary at prompt position
 # p needs the recurrent state AFTER token p - 1. Until now the only way to get
 # it was to END a forward at p, so the prefill loop cut the last chunk into
@@ -4517,6 +4551,10 @@ class Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
+        if not fixed:
+            # A fixed bank's leaves are inputs and outputs of every compiled
+            # replay, so they never build a backlog; see the helper.
+            k = _after_index_block_writes(k, cache)
         k, v = cache.kv.update_and_fetch(k, v)
         if _QSA_HISTORY_ONLY.get():
             # Draft-head history append: the cache holds this chunk now, and
