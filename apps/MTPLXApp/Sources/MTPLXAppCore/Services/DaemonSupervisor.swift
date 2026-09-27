@@ -188,6 +188,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private let restartSleeper: @Sendable (TimeInterval) async -> Void
     private let initialHealthProbe: @Sendable (URL, String?) async -> HealthPayload?
     private let healthWaitProbe: @Sendable (URL, String?) async -> HealthPayload?
+    private let beforeLaunchOwnershipCheck: @Sendable () async -> Void
     private let beforeProcessReservation: @Sendable () async -> Void
     private let beforeProcessRun: @Sendable () async -> Void
     private let beforePostRunLivenessCheck: @Sendable () async -> Void
@@ -231,6 +232,10 @@ public final class DaemonSupervisor: @unchecked Sendable {
         restartSleeper: (@Sendable (TimeInterval) async -> Void)? = nil,
         initialHealthProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
         healthWaitProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
+        // Test seam at the start of every owned launch (a start, or the start
+        // half of a restart), before it checks that no daemon is held.
+        // Production uses the no-op.
+        beforeLaunchOwnershipCheck: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before the atomic lifecycle reservation.
         beforeProcessReservation: (@Sendable () async -> Void)? = nil,
         // Test seam for the narrow period after ownership is published but
@@ -257,6 +262,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         self.restartSleeper = restartSleeper ?? DaemonSupervisor.defaultRestartSleeper
         self.initialHealthProbe = initialHealthProbe ?? DaemonSupervisor.defaultHealthProbe
         self.healthWaitProbe = healthWaitProbe ?? DaemonSupervisor.defaultHealthProbe
+        self.beforeLaunchOwnershipCheck = beforeLaunchOwnershipCheck ?? DaemonSupervisor.noSeam
         self.beforeProcessReservation = beforeProcessReservation ?? DaemonSupervisor.noSeam
         self.beforeProcessRun = beforeProcessRun ?? DaemonSupervisor.noSeam
         self.beforePostRunLivenessCheck = beforePostRunLivenessCheck ?? DaemonSupervisor.noSeam
@@ -504,6 +510,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         let expectedLaunchID = launch.expectedLaunchID
         let requireActualFanRamp = launch.requireActualFanRamp
         let onPhase = launch.onPhase
+        await beforeLaunchOwnershipCheck()
         let launchContext = try lock.withLock { () throws -> (generation: Int, lifecycleEpoch: Int) in
             if process != nil || adoptedProcessID != nil || launchInProgress {
                 throw DaemonSupervisorError.alreadyRunning

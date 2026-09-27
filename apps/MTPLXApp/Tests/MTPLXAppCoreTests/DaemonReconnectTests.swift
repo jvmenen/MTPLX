@@ -92,6 +92,12 @@ struct ReconnectFakeDaemon {
         try setFlag("stream-down", down)
     }
 
+    /// A daemon started while set exits with status 3 before it binds: a
+    /// start that genuinely fails.
+    func setExitOnStart(_ exit: Bool) throws {
+        try setFlag("exit-on-start", exit)
+    }
+
     /// A daemon the app did not launch in this session: an app-owned one
     /// from an earlier session (with a launch id) or `mtplx serve` typed in
     /// a terminal (without one).
@@ -161,9 +167,17 @@ struct ReconnectFakeDaemon {
         fans: FanCallRecorder,
         openCodeConfigURL: URL? = nil
     ) -> MTPLXBackendStore {
-        MTPLXBackendStore(
+        // HOME inside the fixture: a failed launch writes the runtime
+        // import-recheck marker under the builder's Application Support.
+        let environment = [
+            "PATH": root.appendingPathComponent("runtime").path + ":/usr/bin:/bin",
+            "HOME": root.path,
+            "MTPLX_APP_DISABLE_STANDARD_PATHS": "1",
+        ]
+        return MTPLXBackendStore(
             configuration: configuration,
             settingsStore: settingsStore,
+            commandBuilder: MTPLXCommandBuilder(environment: environment),
             supervisor: supervisor,
             openCodeIntegration: OpenCodeIntegration(
                 configURL: openCodeConfigURL
@@ -172,11 +186,7 @@ struct ReconnectFakeDaemon {
             ),
             runtimeUpdateService: MTPLXRuntimeUpdateService(
                 manifestURL: URL(string: "http://127.0.0.1:1/releases/latest.json")!,
-                environment: [
-                    "PATH": root.appendingPathComponent("runtime").path + ":/usr/bin:/bin",
-                    "HOME": root.path,
-                    "MTPLX_APP_DISABLE_STANDARD_PATHS": "1",
-                ]
+                environment: environment
             ),
             localFanRestorer: { await fans.restore() },
             fanModeSetter: { _, mode, _, _ in
@@ -274,6 +284,10 @@ struct ReconnectFakeDaemon {
 
         with open(control("spawns.log"), "a", encoding="utf-8") as handle:
             handle.write("%d %s\n" % (PID, LAUNCH_ID or "-"))
+
+        if flag("exit-on-start"):
+            sys.stderr.write("fake mtplx: exiting before it binds\n")
+            sys.exit(3)
 
         def guard():
             # Never outlive the test process, and never run for long.
@@ -464,19 +478,28 @@ actor FanCallRecorder {
     }
 }
 
-/// Holds the first call through it until the test opens it; later calls
-/// pass straight through. Put in front of the supervisor's first /health
-/// probe, it suspends a start at its first await, where a Stop can overtake
-/// it.
+/// Holds the first call through it after it is armed until the test opens
+/// it; every other call passes straight through. Put in front of the
+/// supervisor's first /health probe, it suspends a start at its first
+/// await, where a Stop can overtake it.
 actor FirstCallGate {
+    private var armed: Bool
     private var used = false
     private var entered = false
     private var opened = false
     private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
     private var release: CheckedContinuation<Void, Never>?
 
+    init(armed: Bool = true) {
+        self.armed = armed
+    }
+
+    func arm() {
+        armed = true
+    }
+
     func pass() async {
-        guard !used else { return }
+        guard armed, !used else { return }
         used = true
         entered = true
         enteredWaiters.forEach { $0.resume() }
@@ -996,6 +1019,182 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.health?.startup?.pid, spawns.first?.pid)
         try await pollUntil("live stats open") { store.connectionState == .open }
         XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: Races that reach the typed `alreadyRunning` handling
+
+    /// A start request checked that the supervisor held nothing, and an
+    /// adoption claimed it before the request's own launch did. The launch
+    /// gets `alreadyRunning`, which used to publish Degraded and restore the
+    /// fans. Now the request reconnects to the adopted daemon.
+    @MainActor
+    func testAStartThatLosesTheRaceToAnAdoptionReconnects() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let gate = FirstCallGate()
+        let supervisor = DaemonSupervisor(beforeLaunchOwnershipCheck: { await gate.pass() })
+        let fans = FanCallRecorder()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .max),
+            supervisor: supervisor,
+            fans: fans
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        let start = Task { @MainActor in await store.startDaemon() }
+        await gate.waitUntilEntered()
+        // Meanwhile a daemon from an earlier session comes up on the port
+        // and the app adopts it.
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        let priorHealth = try await daemon.waitUntilHealthy()
+        await store.attachExistingDaemonIfOwned()
+        XCTAssertEqual(store.health?.startup?.launchId, priorHealth.startup?.launchId)
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(store.daemonState, .running, "losing the race to an adoption is not a failure")
+        XCTAssertEqual(store.startupPhase, .ready)
+        XCTAssertEqual(store.health?.startup?.launchId, priorHealth.startup?.launchId)
+        XCTAssertEqual(daemon.spawns().count, 1, "only the adopted daemon")
+        let restores = await fans.restores
+        XCTAssertEqual(restores, 0, "the adopted daemon's max fans are not reset")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    /// The same race inside a configuration restart: after the restart
+    /// stopped the app's daemon and before it launched the new one, an
+    /// adoption claimed the supervisor.
+    @MainActor
+    func testAConfigurationRestartThatLosesTheRaceToAnAdoptionReconnects() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let gate = FirstCallGate(armed: false)
+        let supervisor = DaemonSupervisor(beforeLaunchOwnershipCheck: { await gate.pass() })
+        let fans = FanCallRecorder()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .default),
+            supervisor: supervisor,
+            fans: fans
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        await gate.arm()
+
+        let restart = Task { @MainActor () -> (any Error)? in
+            do {
+                try await store.applyConfiguration(store.configuration, restartIfRunning: true)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await gate.waitUntilEntered()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        let priorHealth = try await daemon.waitUntilHealthy()
+        await store.attachExistingDaemonIfOwned()
+        await gate.open()
+        let failure = await restart.value
+
+        XCTAssertEqual(
+            failure as? DaemonSupervisorError, .alreadyRunning,
+            "the caller still learns that its restart did not run"
+        )
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(store.startupPhase, .ready)
+        XCTAssertEqual(store.health?.startup?.launchId, priorHealth.startup?.launchId)
+        XCTAssertEqual(daemon.spawns().count, 2, "the app's first daemon and the adopted one")
+        let restores = await fans.restores
+        XCTAssertEqual(restores, 0)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: A stale Degraded heals when the live stats come back
+
+    /// Whatever left the badge Degraded over a daemon that still runs (on
+    /// 1de2b1c0, a second start did), the live stats reconnecting after a
+    /// drop re-check the daemon and clear it, with no restart.
+    @MainActor
+    func testStaleDegradedClearsWhenTheLiveStatsComeBack() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let launched = try XCTUnwrap(store.health?.startup)
+
+        store.setDaemonStateForTesting(.degraded("MTPLX is already running."))
+        try daemon.setStreamDown(true)
+        try await pollUntil("live stats reconnecting") {
+            if case .reconnecting = store.connectionState { return true }
+            return false
+        }
+        XCTAssertEqual(store.daemonState, .degraded("MTPLX is already running."))
+        try daemon.setStreamDown(false)
+
+        try await pollUntil("the engine reads Running again", timeout: 15) { store.daemonState == .running }
+        XCTAssertEqual(store.startupPhase, .ready)
+        XCTAssertEqual(store.health?.startup?.launchId, launched.launchId)
+        XCTAssertEqual(daemon.spawns().count, 1, "healed without a restart")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: Stop after a reconnect, and a start that really fails
+
+    /// Stop after a second start reconnected: the daemon is gone, the fans
+    /// are restored, and nothing keeps running.
+    @MainActor
+    func testStopAfterAReconnectStopsTheDaemonAndRestoresFans() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let fans = FanCallRecorder()
+        let supervisor = DaemonSupervisor()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .max),
+            supervisor: supervisor,
+            fans: fans
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        let startupPID = try XCTUnwrap(store.health?.startup?.pid)
+        let pid = pid_t(startupPID)
+        let restoresBefore = await fans.restores
+
+        await store.stopDaemon()
+
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertEqual(store.startupPhase, .idle)
+        XCTAssertFalse(supervisor.isRunning())
+        XCTAssertEqual(supervisor.currentHold(), .none)
+        XCTAssertFalse(store.hasActiveDaemonTransportForTesting)
+        try await pollUntil("the daemon process exited") { kill(pid, 0) != 0 }
+        let restoresAfter = await fans.restores
+        XCTAssertGreaterThan(restoresAfter, restoresBefore, "Stop restores the max fans")
+    }
+
+    /// A start that really fails still restores max fans and reads Degraded:
+    /// the typed handling of `alreadyRunning` left other failures alone.
+    @MainActor
+    func testAGenuinelyFailedStartStillRestoresFansAndDegrades() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        try daemon.setExitOnStart(true)
+        let fans = FanCallRecorder()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .max), fans: fans)
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.startDaemon()
+
+        guard case .degraded(let reason) = store.daemonState else {
+            return XCTFail("a failed start reads Degraded, got \(store.daemonState)")
+        }
+        XCTAssertTrue(reason.contains("exited before /health"), reason)
+        XCTAssertEqual(daemon.spawns().count, 1)
+        let restores = await fans.restores
+        XCTAssertGreaterThanOrEqual(restores, 1, "a failed start with max fans restores them")
     }
 
     // MARK: A configuration change that fails before its restart
