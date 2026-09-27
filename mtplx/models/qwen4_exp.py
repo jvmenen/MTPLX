@@ -2561,10 +2561,12 @@ def _after_index_block_writes(rows: mx.array, cache: "QSACache") -> mx.array:
     lazily, so each banked final state kept one event per index write of its
     request, and a long-running server ran out of Metal shared events (#544).
 
-    Every forward evaluates its new KV rows (attention reads the KV, and a
-    history append's caller evaluates the cache), so making them depend on
-    these buffers evaluates the block maintenance with the forward that did
-    it. Values are unchanged; only the evaluation order moves.
+    A forward's new KV rows are always evaluated: attention reads the KV,
+    and a lazy draft-history append is evaluated by the next draft forward,
+    or by the generation before its next append when no draft reads it
+    (``generate_mtpk``). Making the rows depend on these buffers therefore
+    evaluates the block maintenance with the forward that did it. Values
+    are unchanged; only the evaluation order moves.
 
     ``raw_keys`` stays out: the next completed block's pooling reads it, so
     its backlog never outgrows one block, and a dependency would cost its
@@ -2979,10 +2981,9 @@ class QSACache:
     @property
     def nbytes(self) -> int:
         total = self.kv.nbytes
-        if self.raw_keys is not None:
-            total += self.raw_keys.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        for buffer in (self.raw_keys, self.pooled, self.pooled_f32_t):
+            if buffer is not None:
+                total += buffer.nbytes
         return total
 
     @property
