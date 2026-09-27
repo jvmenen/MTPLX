@@ -4358,7 +4358,7 @@ def _prefill_restored_prompt_suffix(
     _check_postcommit_abort(abort_check)
     final_array = mx.array([[suffix[-1]]])
     final_embeddings = _suffix_chunk_embeddings(final_array)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         suffix_logits, suffix_hidden = _forward_ar_optional_hidden(
             rt,
             final_array,
@@ -4802,7 +4802,7 @@ def _restore_near_prefix_prompt_state(
             repair_time = 0.0
         else:
             started = time.perf_counter()
-            with attention_phase("prefill"):
+            with _final_token_prefill_phase():
                 logits, hidden = _forward_ar_optional_hidden(
                     rt,
                     mx.array([[int(prompt_ids[restore_point - 1])]]),
@@ -4998,6 +4998,22 @@ def _gdn_boundary_tail_interval() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return 256
+
+
+@contextmanager
+def _final_token_prefill_phase():
+    """Prefill phase for the forward of the lone final prompt token.
+
+    With the batch-invariant prefill lane this one row runs on the stock
+    kernels: padded to the lane's minimums (66 rows, 128 expert tokens) it
+    cost ~70 ms of TTFT on A3B, and no caller compares it with a wider
+    forward. Without the lane this is plain ``attention_phase("prefill")``.
+    """
+
+    from .batch_invariant_prefill import stock_prefill_kernels
+
+    with attention_phase("prefill"), stock_prefill_kernels():
+        yield
 
 
 def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
@@ -7584,7 +7600,7 @@ def _prefill(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         result = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7871,7 +7887,7 @@ def _prefill_committed_mtp_history_streaming(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7967,7 +7983,7 @@ def _prefill_with_hidden_sequence(
             "prompt body"
         )
     started = time.perf_counter()
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, final_hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
