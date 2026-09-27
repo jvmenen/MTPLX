@@ -1,10 +1,11 @@
 """Gemma 4's prefill runs in chunks, and a chunked prefill is the same prefill.
 
-Gemma 4 forwarded every uncached prompt token in one call. MLX's fused
-attention takes query blocks at head sizes up to 256 (MLX 0.32; 128 in 0.31),
-and Gemma 4's full-attention layers have 512-wide heads, so each of them
-computes its scores as an array: prompt x prompt for a cold prompt, beside
-the sliding layers' prompt x prompt mask. On the 31B (4-bit, 128 GB M5 Max,
+Gemma 4 forwarded every uncached prompt token in one call. MLX runs its
+prefill attention unfused (the fused query-block kernel stops at 256-wide
+heads and, in MLX 0.32, takes 256 only under a plain causal mask on a GPU with
+NAX), so each full-attention layer (512-wide heads) computes its scores as an
+array, prompt x prompt for a cold prompt, and each sliding layer as much under
+its window mask. On the 31B (4-bit, 128 GB M5 Max,
 2026-09-27) cold prompts of 6,026 / 12,026 / 24,026 tokens peaked at 25 / 43 /
 92 GiB of MLX memory with time to first token 13 / 41 / 174 s, and a 32K
 prompt would not fit a 128 GB Mac. The prefill now forwards the uncached rows
@@ -14,9 +15,9 @@ chunk x (cached + chunk).
 These tests run the backend's own code (``Gemma4TargetAdapter``,
 ``Gemma4RollbackRotatingKVCache``, MLX-LM's ``KVCache``, the assistant drafter,
 the session bank) on a tiny Gemma 4 built from MLX-LM's ``gemma4_text``: six
-layers, sliding and full attention at the 31B's head sizes (so the
-full-attention layers take the same unfused path as on the real pack; on the
-CPU every layer does), keys equal values on the full layers, and a KV-shared
+layers, sliding and full attention at the 31B's head sizes (so both layer
+types take the unfused paths they take on the real pack), keys equal values
+on the full layers, and a KV-shared
 tail (the last layer of each type reads an earlier layer's KV). The 31B-only
 config gates are lifted; nothing under test depends on the sizes.
 

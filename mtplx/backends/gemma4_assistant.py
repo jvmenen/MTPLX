@@ -816,16 +816,17 @@ def gemma4_prefill_attention_pairs(config: Any, rows: int, cached_tokens: int) -
     """Query-key pairs in the widest score block one prefill forward of
     ``rows`` tokens materializes over ``cached_tokens`` already cached.
 
-    MLX's fused attention takes query blocks at head sizes up to 256 (MLX
-    0.32; up to 128 in 0.31), so Gemma 4's full-attention layers, whose heads
-    are 512 wide, always take the unfused path
-    (``ScaledDotProductAttention::use_fallback``): each computes its scores
-    for every head as an array, rows x (cached + rows), since it attends to
-    every cached key. The sliding layers (256) attend over their kept window,
-    ``sliding_window - 1`` rows, plus the new rows: a rows x (cached window +
-    rows) mask, and on MLX 0.31 scores of that size too. The layers run one
-    after another; the full-attention block is the widest, and a chunked
-    prefill's last chunk makes it rows x the prompt."""
+    MLX runs Gemma 4's prefill attention unfused
+    (``ScaledDotProductAttention::use_fallback``). Its fused query-block
+    kernel stops at 256-wide heads, and MLX 0.32 takes 256 through it only
+    under a plain causal mask over 1,024 or more queries on a GPU with NAX
+    (MLX 0.31 never). So each full-attention layer (512-wide heads) computes
+    its scores for every head as an array, rows x (cached + rows), since it
+    attends to every cached key, and each sliding layer (256) computes rows x
+    (cached window + rows) under its window mask, an array once the prompt
+    passes the window, the window being ``sliding_window - 1`` kept rows. The
+    layers run one after another; the full-attention block is the widest,
+    and a chunked prefill's last chunk makes it rows x the prompt."""
 
     rows = max(0, int(rows))
     if rows <= 1:
