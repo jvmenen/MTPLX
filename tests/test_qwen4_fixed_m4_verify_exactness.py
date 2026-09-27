@@ -1,0 +1,200 @@
+"""Flash-Next's compiled fixed-M4 verifier against its eager verifier, round by round.
+
+The tiny random pack of ``scripts/qwen4exp_mtp_tiny_smoke.py`` (trunk and MTP
+head, bfloat16, one PLE layer, an M-RoPE contract: what the fixed-M4 lane
+needs), through the whole generation loop with MTPLX_COMPILED_VERIFY=parity2:
+the compiled lane stays authoritative and every round's logits, hidden
+states, recurrent states and captures are compared with the eager verifier.
+Each case plants one value where MLX 0.32.2's compiled graph and its eager
+kernels part ways:
+
+* the attention output gate at -6.84375, where the fused bfloat16 sigmoid
+  (fast exp) and the standalone one (precise exp) differ, on the dense-mask
+  and the rows-gather lanes;
+* a static-YaRN amplitude (factor 4: 0.1 * ln 4 + 1 = 1.1386294), which a
+  fused kernel would hold as a 7-significant-digit constant.
+
+The tiny pack's bfloat16 streams round a moved amplitude away before it
+reaches the logits, so the YaRN case here guards the route while
+tests/test_qwen4_yarn_amplitude.py is the one that fails on a 7-digit
+amplitude.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib.util
+import math
+import os
+from pathlib import Path
+
+import mlx.core as mx
+import mlx.utils
+import numpy as np
+import pytest
+
+import mtplx.generation as generation
+import mtplx.graphbank as graphbank
+from mtplx import demotions
+from mtplx.sampling import SamplerConfig
+
+pytestmark = pytest.mark.skipif(
+    not mx.metal.is_available(), reason="the compiled verifier's parity is a GPU property"
+)
+
+NATIVE = SamplerConfig(temperature=0.6, top_p=0.95, top_k=20)
+PROMPT = [3, 5, 7, 9, 11, 13] + list(range(20, 54))
+MAX_TOKENS = 24
+GATE = -6.84375
+YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16}
+
+
+def _smoke():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "qwen4exp_mtp_tiny_smoke.py"
+    spec = importlib.util.spec_from_file_location("qwen4exp_mtp_tiny_smoke", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(autouse=True)
+def _lane(monkeypatch):
+    import mlx_lm.models.cache as cache_module
+
+    import mtplx.models.qwen4_exp as qwen4_exp
+
+    for name in tuple(os.environ):
+        if name.startswith("MTPLX_QWEN4_") or name.startswith("MTPLX_QSA_GATHER") or name in {
+            "MTPLX_COMPILED_VERIFY",
+            "MTPLX_STATE_REBASE_EVERY",
+            "MTPLX_FAMILY_CAPTURE_COMMIT",
+        }:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
+    # A runtime load earlier in the session swaps mlx-lm's ArraysCache for the
+    # leak-free class; the bank looks the class up per call.
+    monkeypatch.setattr(qwen4_exp, "ArraysCache", cache_module.ArraysCache)
+    monkeypatch.setattr(graphbank, "_compiled_verify_bits_gate_ok", lambda _rt: True)
+    demotions.reset()
+    yield
+    demotions.reset()
+
+
+def _runtime(*, dtype=mx.bfloat16, rope=None, **overrides):
+    from mtplx.models.qwen4_exp import Model, ModelArgs, Qwen4ExpMTP
+    from mtplx.mtp_patch import validate_mtp_support
+    from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
+
+    smoke = _smoke()
+    mx.random.seed(0)
+    args = dataclasses.replace(
+        smoke._tiny_text_args(),
+        head_dim=32,
+        indexer_head_dim=32,
+        indexer_compress_ratio=4,
+        ple_layer_ids=[1],
+        rope_parameters={
+            "mrope_interleaved": True,
+            "mrope_section": [2, 1, 1],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+            **(rope or {}),
+        },
+        **overrides,
+    )
+    model = Model(ModelArgs(model_type="qwen4_exp", text_config=dataclasses.asdict(args)))
+    model.language_model.mtp = Qwen4ExpMTP(model.language_model.args)
+    if dtype != mx.float32:
+        model.update(
+            mlx.utils.tree_map(
+                lambda p: p.astype(dtype) if p.dtype == mx.float32 else p,
+                model.parameters(),
+            )
+        )
+    model.eval()
+    mx.eval(model.parameters())
+    assert validate_mtp_support(model)
+    rt = smoke._tiny_runtime(model)
+    install_qwen4_fixed_verify_route(rt)
+    return rt
+
+
+def _generate(rt, mode, monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY", mode)
+    return generation.generate_mtpk(
+        rt,
+        list(PROMPT),
+        max_tokens=MAX_TOKENS,
+        sampler=NATIVE,
+        draft_sampler=NATIVE,
+        speculative_depth=3,
+        seed=1234,
+        mtp_cache_policy="persistent",
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+    )
+
+
+def _bank(result) -> dict:
+    return (result.stats.graphbank or {}).get("compiled_verify") or {}
+
+
+def _assert_every_round_exact(result):
+    bank = _bank(result)
+    record = bank["fixed_m4_parity2"]
+    assert record["compiled_rounds"] == bank["compiled_calls"] > 0, record
+    assert record["divergent_rounds"] == 0, record["first_divergence"]
+    for name in (
+        "logits_max_abs_diff",
+        "hidden_max_abs_diff",
+        "state_max_abs_diff",
+        "capture_max_abs_diff",
+    ):
+        assert record[name] == 0.0, (name, record[name])
+
+
+def _plant_attention_gate(rt, monkeypatch, value):
+    """Every attention layer's gate half of q_proj reads ``value``."""
+
+    planted = 0
+    for layer in rt.model.language_model.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        real, heads = attn.q_proj, attn.n_heads
+
+        def q_proj(x, real=real, heads=heads):
+            out = real(x)
+            queries, _gate = mx.split(out.reshape(*out.shape[:-1], heads, -1), 2, axis=-1)
+            gate = mx.full(queries.shape, value, dtype=out.dtype)
+            return mx.concatenate([queries, gate], axis=-1).reshape(out.shape)
+
+        monkeypatch.setattr(attn, "q_proj", q_proj)
+        planted += 1
+    assert planted
+
+
+@pytest.mark.parametrize("lane", ["dense-mask", "rows-gather"])
+def test_the_attention_gate_matches_eager_every_round(monkeypatch, lane):
+    if lane == "rows-gather":
+        monkeypatch.setenv("MTPLX_QSA_GATHER", "1")
+        monkeypatch.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "1")
+    rt = _runtime()
+    _plant_attention_gate(rt, monkeypatch, GATE)
+    result = _generate(rt, "parity2", monkeypatch)
+    assert result.stats.fixed_m4_admission["reason"] == "admitted"
+    _assert_every_round_exact(result)
+
+
+def test_a_yarn_amplitude_matches_eager_every_round(monkeypatch):
+    from mtplx.models.qwen4_exp import _rope_inv_freq_and_scaling_for
+
+    rt = _runtime(rope=YARN)
+    _inv_freq, scaling = _rope_inv_freq_and_scaling_for(rt.model.language_model.args)
+    exact = np.float32(scaling)
+    assert scaling == pytest.approx(0.1 * math.log(4.0) + 1.0)
+    assert np.float32(float(f"{float(exact):.7g}")) != exact  # a 7-digit constant would move it
+    result = _generate(rt, "parity2", monkeypatch)
+    _assert_every_round_exact(result)

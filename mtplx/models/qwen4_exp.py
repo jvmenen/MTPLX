@@ -4377,7 +4377,14 @@ def _qsa_blocks_to_dense_mask(
 
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
-    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
+    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer.
+
+    Every lane applies the output gate through attention_gate: on a verify
+    forward an eager call takes the same sigmoid lowering as the compiled
+    verifier's trace (in bfloat16 MLX 0.32.2's fused and standalone sigmoid
+    differ at -6.84375; mtplx/attention_math.py); elsewhere it is
+    ``out * mx.sigmoid(gate)``. This class never reaches the dense attention
+    hook of mtplx/attention_split.py, which applies the same contract."""
 
     # The QSA indexer mask is part of this module's semantics (and __call__
     # takes (x, cache)): any generic dense-SDPA rewrite that replaces
@@ -4570,7 +4577,7 @@ class Attention(nn.Module):
                 self.scale,
             )
             out = out.reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash_prefill":
             # Large-S prefill consumes compact per-row block selections
@@ -4675,7 +4682,7 @@ class Attention(nn.Module):
             )
             if out is not None:
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-                return _linear(self.o_proj, out * mx.sigmoid(gate))
+                return _linear(self.o_proj, attention_gate(out, gate))
 
             # Static unsupported geometry falls back exactly.  Once the
             # supported kernel is dispatched, failures propagate instead of
@@ -4704,7 +4711,7 @@ class Attention(nn.Module):
                 _qsa_rows_gather_kv_route(cache, S),
             )
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if sel_mask is not None and sel_mask.ndim == 1:
             # QSA gather lane (decode): the indexer returned the selected
@@ -4735,7 +4742,7 @@ class Attention(nn.Module):
         else:
             out = _verify_sdpa(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return _linear(self.o_proj, out * mx.sigmoid(gate))
+        return _linear(self.o_proj, attention_gate(out, gate))
 
 
 _MASK64 = (1 << 64) - 1
