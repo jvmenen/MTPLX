@@ -670,27 +670,27 @@ final class DaemonReconnectTests: XCTestCase {
         }
 
         let strangerPID = try XCTUnwrap(strangerHealth.startup?.pid)
-        guard case .degraded(let reason) = store.daemonState else {
-            return XCTFail("another server on the port must stay visible as Degraded, got \(store.daemonState)")
-        }
-        XCTAssertEqual(
-            reason,
+        let expectedReason =
             "Another MTPLX server holds port \(daemon.port) (pid \(strangerPID)); this app is not connected to it."
+        XCTAssertEqual(
+            store.daemonState, .degraded(expectedReason),
+            "another server on the port must stay visible as Degraded, naming it"
         )
         let named = badge(store)
         XCTAssertEqual(named.tone, .failed)
         XCTAssertTrue(named.label.hasPrefix("Degraded — Another MTPLX server"), named.label)
-        XCTAssertEqual(named.help, "Degraded: \(reason)")
+        XCTAssertEqual(named.help, "Degraded: \(expectedReason)")
         XCTAssertNotEqual(
             store.health?.startup?.pid, strangerPID,
             "a stranger's pid must never become the app's, where Stop would signal it"
         )
         XCTAssertFalse(supervisor.isRunning(), "the app no longer claims a daemon it lost")
 
+        // Stop runs whatever the checks above found.
         await store.stopDaemon()
         XCTAssertTrue(stranger.isRunning, "Stop never signals the other server")
-        let stillThere = try await daemon.waitUntilHealthy()
-        XCTAssertEqual(stillThere.startup?.pid, strangerPID)
+        let stillThere = try? await daemon.waitUntilHealthy(timeout: 3)
+        XCTAssertEqual(stillThere?.startup?.pid, strangerPID, "the other server still answers after Stop")
         XCTAssertEqual(store.configuration.port, daemon.port)
     }
 
@@ -736,18 +736,19 @@ final class DaemonReconnectTests: XCTestCase {
         // More watchdog rounds (every 3 s) before Stop: nothing may publish
         // the other server's answer as the app's daemon meanwhile.
         try await Task.sleep(nanoseconds: 4_000_000_000)
-        guard case .degraded(let reason) = store.daemonState else {
-            return XCTFail("expected Degraded naming the other server, got \(store.daemonState)")
-        }
-        XCTAssertTrue(reason.contains("(pid \(strangerPID))"), reason)
-        XCTAssertNotEqual(store.health?.startup?.pid, strangerPID)
+        XCTAssertEqual(
+            store.daemonState,
+            .degraded("Another MTPLX server holds port \(daemon.port) (pid \(strangerPID)); this app is not connected to it.")
+        )
+        XCTAssertNotEqual(store.health?.startup?.pid, strangerPID, "the other server's pid never becomes `health`")
         XCTAssertTrue(badge(store).label.hasPrefix("Degraded — Another MTPLX server"), badge(store).label)
         XCTAssertFalse(supervisor.isRunning(), "the app let go of the daemon it lost")
 
+        // Stop runs whatever the checks above found.
         await store.stopDaemon()
         XCTAssertTrue(stranger.isRunning, "Stop must never signal another server")
-        let stillThere = try await daemon.waitUntilHealthy()
-        XCTAssertEqual(stillThere.startup?.pid, strangerPID)
+        let stillThere = try? await daemon.waitUntilHealthy(timeout: 3)
+        XCTAssertEqual(stillThere?.startup?.pid, strangerPID, "the other server still answers after Stop")
         XCTAssertEqual(daemon.spawns().count, 2, "the prior daemon and the stranger; the app launched nothing")
     }
 
