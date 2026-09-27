@@ -11,10 +11,10 @@ def prompt_scoring_forward_widths(
     runtime: Any, prompt_tokens: int, requested: int | None
 ) -> list[int | None]:
     """Scoring's target widths, independent of generation for generic models."""
-    from mtplx.generation import PROMPT_SCORING_CHUNK_SIZE
+    from mtplx.generation import prompt_score_forward_width
 
     if getattr(runtime, "backend_id", None) != "gemma4_assistant":
-        return [PROMPT_SCORING_CHUNK_SIZE]
+        return [prompt_score_forward_width(requested)]
     from mtplx.backends.gemma4_assistant import (
         GEMMA4_MIN_PREFILL_CHUNK,
         gemma4_prefill_chunk_tokens,
