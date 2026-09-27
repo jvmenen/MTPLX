@@ -20206,11 +20206,12 @@ def _admission_prefill_widths(
     as the runtime runs them (``generation.prefill_forward_widths``).
 
     ``None`` is the uncached part of the prompt forwarded whole: the
-    generation loop without chunked prefill, and Gemma 4 always. Chunked,
-    the request's own width comes first (the Flash-Next wide chunk, a
-    caller's override, ``--prefill-chunk-tokens``) and then the profile's
-    chunk when it is narrower: the width is a lever the admission pulls
-    before it evicts anyone's state or refuses.
+    generation loop without chunked prefill, and Gemma 4 under
+    ``MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS=whole``. Chunked (Gemma 4 always
+    otherwise), the request's own width comes first (the Flash-Next wide
+    chunk, a caller's override, ``--prefill-chunk-tokens``) and then the
+    profile's chunk when it is narrower: the width is a lever the admission
+    pulls before it evicts anyone's state or refuses.
     """
 
     from mtplx.generation import prefill_forward_widths

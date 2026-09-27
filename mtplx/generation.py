@@ -2128,7 +2128,8 @@ def prefill_forward_widths(
 
     ``None`` is the uncached part of the prompt in one forward. A backend
     that runs its own prefill answers for itself
-    (``rt.prefill_forward_widths``: Gemma 4 forwards the whole prompt). This
+    (``rt.prefill_forward_widths``: Gemma 4 chunks at the same widths
+    whatever the sustained-prefill switch says). This
     module's prefill loops forward the whole prompt unless sustained prefill
     is on, and then run ``requested`` (a caller's chunk,
     ``--prefill-chunk-tokens``, the Flash-Next wide chunk) or the profile's
