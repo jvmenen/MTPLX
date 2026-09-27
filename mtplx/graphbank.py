@@ -1402,8 +1402,45 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
 # fresh trace. Values are (compiled_fn, trace_host, runtime_ref), where the
 # host's WEAK bank reference is re-pointed before each dispatch so retraces
 # (mx.compile re-traces on leaf-shape changes) always use live scratch
-# containers. See CompiledVerifyBank._shared_or_new_verify_step.
+# containers, and the host counts the traces the program holds. See
+# CompiledVerifyBank._shared_or_new_verify_step.
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any], Any]] = {}
+
+# How many traces one shared program may hold before the next lookup replaces
+# it. MLX keeps every trace of a compiled function (its inputs, outputs and
+# the whole traced tape, one entry per input shape signature) until the
+# function object is destroyed, and a verify graph's state shapes follow the
+# request: the fixed-M4 capacity is prompt + reserve, and a dense bank's
+# capacity is offset + reserve. An agent session therefore adds one trace per
+# turn, 8.6 MiB each on the 48-layer Flash-Next graph (a tiny-width model of
+# the same depth, measured), and a program shared for the life of the process
+# grew host memory without bound (#546). 16 traces keep a recurring shape
+# (a retry, a benchmark ladder, several sessions at once) warm and bound one
+# program at about 140 MiB on that graph. Replacing a program erases its
+# traces from MLX's compile cache, but MLX 0.32.2 does not return all of a
+# trace's host memory then: about 60% of its graph objects stay allocated
+# (about 5 MiB of the 8.6 MiB on that graph), outside this process's Python
+# objects and compile caches, so the bound slows the growth rather than
+# ending it.
+_SHARED_VERIFY_TRACES_PER_PROGRAM = 16
+
+
+def _shared_verify_traces_per_program() -> int:
+    """Traces a shared verify program may hold before it is replaced.
+
+    ``MTPLX_COMPILED_VERIFY_TRACES_PER_PROGRAM`` overrides the default for
+    workloads that cycle through more distinct shapes than it keeps.
+    """
+
+    raw = str(
+        os.environ.get("MTPLX_COMPILED_VERIFY_TRACES_PER_PROGRAM", "")
+    ).strip()
+    if not raw:
+        return _SHARED_VERIFY_TRACES_PER_PROGRAM
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _SHARED_VERIFY_TRACES_PER_PROGRAM
 
 
 def _prewarm_enabled() -> bool:
@@ -2143,6 +2180,9 @@ class CompiledVerifyBank:
                 "compiled verify auxiliary preparation requires a compiled_aux input"
             )
         self._compiled: dict[tuple[int, str, int, int], Any] = {}
+        # Trace hosts of the shared programs in _compiled, by the same key
+        # (see _bind_program).
+        self._program_hosts: dict[tuple[int, str, int, int], dict[str, Any]] = {}
         self._spec: list[tuple[int, str, int]] | None = None
         self._shadow: list[Any] | None = None
         self._shadow_signature: tuple[Any, ...] | None = None
@@ -2192,6 +2232,9 @@ class CompiledVerifyBank:
             "promoted": 0,
             "demotions": 0,
             "traces": 0,
+            # Shared programs this bank found full and replaced; its first
+            # dispatch after one re-traced (see _shared_or_new_verify_step).
+            "shared_programs_retired": 0,
             "parity_checks": 0,
             "parity_failures": 0,
             "parity2_calls": 0,
@@ -2318,10 +2361,7 @@ class CompiledVerifyBank:
             raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
         route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
         key = self._verify_key(4, hidden_variant, route_key)
-        fn = self._compiled.get(key)
-        if fn is None:
-            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
-            self._compiled[key] = fn
+        fn = self._verify_program(key, 4, hidden_variant)
         pending_route_thresholds = tuple(
             entry.rows_gather_min_context
             for entry in qsa_entries
@@ -2373,6 +2413,7 @@ class CompiledVerifyBank:
         )
         self._fixed_m4_dispatch = {
             "fn": fn,
+            "host": self._program_hosts.get(key),
             "prepare_aux": prepare_aux,
             "aux_route": aux_route,
             "aux_inputs": aux_inputs,
@@ -2539,15 +2580,8 @@ class CompiledVerifyBank:
         self._ensure_shadow(cache)
         route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
         key = self._verify_key(4, dispatch["hidden_variant"], route_key)
-        fn = self._compiled.get(key)
-        if fn is None:
-            fn = self._shared_or_new_verify_step(
-                key,
-                4,
-                dispatch["hidden_variant"],
-            )
-            self._compiled[key] = fn
-        dispatch["fn"] = fn
+        dispatch["fn"] = self._verify_program(key, 4, dispatch["hidden_variant"])
+        dispatch["host"] = self._program_hosts.get(key)
         dispatch["capacity"] = min(entry.capacity for entry in qsa_entries)
         if capacity_changed:
             dispatch["growth_tokens"] = next_growth_tokens
@@ -2623,6 +2657,7 @@ class CompiledVerifyBank:
         if boundary in ("both", "pre"):
             mx.async_eval(compiled_aux, *state_in)
         t2 = clock()
+        self._bind_program(dispatch["host"])
         # Argument order is the trace's contract (``_make_verify_step``):
         # ids, the auxiliary, the rotary delta of an image request, the state.
         identity = (id(dispatch["fn"]), tuple(getattr(input_ids, "shape", ())))
@@ -3581,10 +3616,7 @@ class CompiledVerifyBank:
                 # explicit inputs before any read, so the held refs are dead.
                 self._clear_shadow_leaf_refs()
             key = self._verify_key(length, hidden_variant, bucket)
-            fn = self._compiled.get(key)
-            if fn is None:
-                fn = self._shared_or_new_verify_step(key, length, hidden_variant)
-                self._compiled[key] = fn
+            fn = self._verify_program(key, length, hidden_variant)
             state_in = self._read_state_leaves(cache)
             if state_in is None:
                 return self._fallback(
@@ -3840,16 +3872,12 @@ class CompiledVerifyBank:
             try:
                 self._apply_bucket(cache, bucket)
                 key = self._verify_key(length, hidden_variant, bucket)
-                fn = self._compiled.get(key)
-                if fn is None:
-                    # Shared-registry compile (F6): a bare per-bank
-                    # mx.compile primed the Metal pipelines but kept the
-                    # trace private to the warmup bank, so the first real
-                    # request at the same shapes re-traced every bucket
-                    # (~1s each) inside its measured row. The shared step
-                    # is exactly what organic dispatch consults.
-                    fn = self._shared_or_new_verify_step(key, length, hidden_variant)
-                    self._compiled[key] = fn
+                # Shared-registry compile (F6): a bare per-bank mx.compile
+                # primed the Metal pipelines but kept the trace private to the
+                # warmup bank, so the first real request at the same shapes
+                # re-traced every bucket (~1s each) inside its measured row.
+                # The shared step is exactly what organic dispatch consults.
+                fn = self._verify_program(key, length, hidden_variant)
                 bucket_started = time.perf_counter()
                 outputs = fn(input_ids, *self._rope_args(), *state_in)
                 # Synchronous eval: the compile cost is paid HERE, and no
@@ -3947,10 +3975,7 @@ class CompiledVerifyBank:
                     report["skipped"].append(f"m{length}:empty_state_leaf")
                     continue
                 key = self._verify_key(length, hidden_variant, bucket)
-                fn = self._compiled.get(key)
-                if fn is None:
-                    fn = self._shared_or_new_verify_step(key, length, hidden_variant)
-                    self._compiled[key] = fn
+                fn = self._verify_program(key, length, hidden_variant)
                 length_started = time.perf_counter()
                 outputs = fn(probe, *self._rope_args(), *state_in)
                 mx.eval(*outputs)
@@ -4053,6 +4078,7 @@ class CompiledVerifyBank:
             self._shadow_signature = None
             self._spec = None
             self._compiled.clear()
+            self._program_hosts.clear()
         return count
 
     def to_dict(self) -> dict[str, Any]:
@@ -4390,8 +4416,40 @@ class CompiledVerifyBank:
         self._shadow_signature = signature
         # New shadow objects invalidate closures compiled over the old ones.
         self._compiled.clear()
+        self._program_hosts.clear()
 
     # -- compiled function ------------------------------------------------------
+
+    def _verify_program(self, key, length: int, hidden_variant: str | None):
+        """This bank's compiled verify step for ``key``, bound to this bank.
+
+        The first call for a key takes the process-wide program, or compiles
+        one (``_shared_or_new_verify_step``), and the bank keeps it until its
+        state containers change. A program the registry retires meanwhile
+        stays this bank's program.
+        """
+
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(key, length, hidden_variant)
+            self._compiled[key] = fn
+        self._bind_program(self._program_hosts.get(key))
+        return fn
+
+    def _bind_program(self, host: dict[str, Any] | None) -> None:
+        """Point a shared program's trace host at this bank before a call.
+
+        A call at state shapes the program has not traced runs its Python
+        body, which takes the shadow containers and the stats sink from the
+        host. The registry points the host at the bank that looked the
+        program up last, which need not be the calling bank: another bank may
+        have looked it up since, that bank may have ended, and a retired
+        program is not looked up again at all. Binding before every call keeps
+        each trace on the calling bank's own containers.
+        """
+
+        if host is not None and host["bank_ref"]() is not self:
+            host["bank_ref"] = weakref.ref(self)
 
     def _shared_or_new_verify_step(self, key, length: int, hidden_variant: str | None):
         """Reuse one compiled verify callable per process for a logical key.
@@ -4405,9 +4463,16 @@ class CompiledVerifyBank:
         so callables are shared process-wide. The closure's shadow containers
         are trace-time scratch: the re-seed firewall assigns every leaf from
         the explicit inputs before any read, so a retrace under a different
-        bank/request is safe. `_TRACE_HOSTS` keeps each callable's shadow and
-        stats sink pointed at the LIVE bank so retraces never touch a dead
-        request's containers.
+        bank/request is safe. Each program's trace host points its shadow and
+        stats sink at the bank that calls it (``_bind_program``), so a retrace
+        never touches another request's containers.
+
+        MLX keeps every trace until the callable is destroyed, and the state
+        shapes change with nearly every request, so a callable that has
+        traced ``_shared_verify_traces_per_program()`` shapes is replaced
+        here. Banks still replaying it keep it until they end; then MLX
+        erases its traces. The replacement re-traces only the shapes that
+        recur, which are the only shapes the old traces could have served.
         """
 
         rope_delta_input = bool(key[3])
@@ -4447,14 +4512,19 @@ class CompiledVerifyBank:
             fn, host, runtime_ref = entry
             # id() can be recycled after a model swap frees the old runtime;
             # a stale callable would replay graphs bound to freed weights.
-            if runtime_ref() is self.runtime:
+            if runtime_ref() is not self.runtime:
+                _SHARED_VERIFY_STEPS.pop(global_key, None)
+            elif host["traces"] >= _shared_verify_traces_per_program():
+                _SHARED_VERIFY_STEPS.pop(global_key, None)
+                self.stats["shared_programs_retired"] += 1
+            else:
                 host["bank_ref"] = weakref.ref(self)
+                self._program_hosts[key] = host
                 return fn
-            _SHARED_VERIFY_STEPS.pop(global_key, None)
         # Programs may outlive requests. Keeping the bank here also keeps its
         # shadow KV and traced state alive after the request/session is gone.
         # The dispatch owns the bank; the process cache owns only the program.
-        host = {"bank_ref": weakref.ref(self)}
+        host = {"bank_ref": weakref.ref(self), "traces": 0}
         fn = mx.compile(
             self._make_verify_step(
                 length,
@@ -4473,6 +4543,7 @@ class CompiledVerifyBank:
         _SHARED_VERIFY_STEPS[global_key] = (
             fn, host, weakref.ref(self.runtime, release_program)
         )
+        self._program_hosts[key] = host
         return fn
 
     def _make_verify_step(
@@ -4500,7 +4571,7 @@ class CompiledVerifyBank:
                 "full-attention tensor-offset adapters carry a rotary origin"
             )
         layout = self._capture_layout()
-        static_host = {"bank_ref": weakref.ref(self)}
+        static_host = {"bank_ref": weakref.ref(self), "traces": 0}
         host = trace_host if trace_host is not None else static_host
 
         def verify_step(input_ids, *args):
@@ -4519,6 +4590,7 @@ class CompiledVerifyBank:
             else:
                 rope_delta = None
             live.stats["traces"] += 1
+            host["traces"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
             # (1) Re-seed firewall: every shadow leaf is assigned from the
