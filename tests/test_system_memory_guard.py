@@ -455,7 +455,16 @@ class _Bank:
     def touch_sessions(self, session_ids):
         pass
 
-    def shrink_to_bytes(self, target_bytes, *, reason="", protect_active=False):
+    def shrink_to_bytes(
+        self,
+        target_bytes,
+        *,
+        reason="",
+        protect_active=False,
+        protect_keys=None,
+        protect_session_ids=None,
+        cancel_queued_persistence=True,
+    ):
         self.shrink_calls.append((int(target_bytes), reason, protect_active))
         evicted = 1 if self.nbytes > int(target_bytes) else 0
         self.nbytes = min(self.nbytes, int(target_bytes))

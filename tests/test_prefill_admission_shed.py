@@ -90,11 +90,32 @@ class _Bank:
     def touch_sessions(self, session_ids):
         self.touched.extend(session_ids)
 
-    def shrink_to_bytes(self, target_bytes, *, reason="", protect_active=False):
+    def shrink_to_bytes(
+        self,
+        target_bytes,
+        *,
+        reason="",
+        protect_active=False,
+        protect_keys=None,
+        protect_session_ids=None,
+        cancel_queued_persistence=True,
+    ):
+        # The bank's interface: the admission hands over the restore plan's
+        # keys and the busy sessions, which a shrink never takes.
         self.shrink_calls.append((int(target_bytes), reason, protect_active))
+        keep_keys = {tuple(key) for key in (protect_keys or ())}
+        keep_sessions = set(protect_session_ids or ())
         evicted = 0
-        while self.entries and self.total_nbytes > int(target_bytes):
-            self.entries.pop(0)
+        while self.total_nbytes > int(target_bytes):
+            candidates = [
+                e
+                for e in self.entries
+                if tuple(getattr(e, "token_ids", ())) not in keep_keys
+                and getattr(e, "session_id", None) not in keep_sessions
+            ]
+            if not candidates:
+                break
+            self.entries.remove(candidates[0])
             evicted += 1
         return evicted
 
@@ -565,15 +586,28 @@ class _ChainBank(_Bank):
         super().__init__(entries)
         self.chain_calls: list[tuple[int, str]] = []
 
-    def shrink_to_bytes(self, target_bytes, *, reason="", protect_active=False):
+    def shrink_to_bytes(
+        self,
+        target_bytes,
+        *,
+        reason="",
+        protect_active=False,
+        protect_keys=None,
+        protect_session_ids=None,
+        cancel_queued_persistence=True,
+    ):
         self.shrink_calls.append((int(target_bytes), reason, protect_active))
         evicted = 0
         active = set(self.touched)
+        keep_keys = {tuple(key) for key in (protect_keys or ())}
+        keep_sessions = set(protect_session_ids or ())
         while self.entries and self.total_nbytes > int(target_bytes):
             candidates = [
                 e
                 for e in self.entries
                 if not (protect_active and e.session_id in active)
+                and tuple(e.token_ids) not in keep_keys
+                and e.session_id not in keep_sessions
             ]
             if not candidates:
                 break
@@ -581,9 +615,23 @@ class _ChainBank(_Bank):
             evicted += 1
         return evicted
 
-    def shrink_for_admission(self, target_bytes, *, protect_tokens=None, reason=""):
+    def shrink_for_admission(
+        self,
+        target_bytes,
+        *,
+        protect_tokens=None,
+        reason="",
+        protect_keys=None,
+        protect_session_ids=None,
+    ):
         self.chain_calls.append((int(target_bytes), reason))
-        protected = set()
+        keep_keys = {tuple(key) for key in (protect_keys or ())}
+        keep_sessions = set(protect_session_ids or ())
+        protected = {
+            id(e)
+            for e in self.entries
+            if tuple(e.token_ids) in keep_keys or e.session_id in keep_sessions
+        }
         if protect_tokens:
             tokens = tuple(int(t) for t in protect_tokens)
             best, best_common = None, 0
