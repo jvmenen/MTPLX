@@ -159,6 +159,7 @@ from mtplx.mlx_process_env import (
 )
 from mtplx.system_memory import (
     ReadingWindow as _SystemReadingWindow,
+    admission_floors as _system_admission_floors,
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
     memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
@@ -20252,7 +20253,11 @@ def _run_prefill_admission(
         "limit_bytes": int(limit),
     }
     if now["system"] is not None:
-        shed_floor, abort_floor = _system_reading_floors(now["system"])
+        # The floors the request is held to: the Mac's, once its growth is
+        # wired (system_memory.admission_floors).
+        shed_floor, abort_floor = _system_admission_floors(
+            now["system"], int(models[widths[0]]["growth_bytes"])
+        )
         receipt["system_available_bytes"] = int(now["system"].available_bytes)
         receipt["system_shed_floor_bytes"] = int(shed_floor)
         receipt["system_abort_floor_bytes"] = int(abort_floor)
@@ -20474,7 +20479,7 @@ def _run_prefill_admission(
         system_after.free_bytes if system_after is not None else None
     )
     if system_after is not None:
-        shed_after, abort_after = _system_reading_floors(system_after)
+        shed_after, abort_after = _system_admission_floors(system_after, growth_after)
         receipt["system_shed_floor_bytes_after"] = int(shed_after)
         receipt["system_abort_floor_bytes_after"] = int(abort_after)
     receipt["system_shortfall_bytes_after"] = int(short_after)

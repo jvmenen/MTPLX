@@ -372,6 +372,27 @@ def reading_floors(reading: SystemMemory) -> tuple[int, int]:
     return system_memory_floors(reading.total_bytes, reading.wired_bytes)
 
 
+def admission_floors(reading: SystemMemory, growth_bytes: int) -> tuple[int, int]:
+    """The floors a request is admitted against: the reading's, with the
+    request's own growth counted as wired.
+
+    What the engine allocates is wired memory in the kernel's accounting
+    (2026-09-27 validation, 128 GB, Flash-Next: wired went from 4.4 GB to
+    83.6 GB with the model loaded, swung between 85.9 and 93.2 GB across the
+    turns, and fell back to 4.4 GB when the server stopped), and the floors
+    grow with what is wired. By the end of a prefill the floor the per-chunk
+    check reads has risen by about the growth over 16, so the admission
+    holds the same line: a request admitted within that distance of the
+    abort floor would otherwise trip late in its own prefill. A reading
+    with no wired figure keeps its RAM-share floors.
+    """
+
+    wired = max(0, int(reading.wired_bytes or 0))
+    if wired > 0:
+        wired += max(0, int(growth_bytes))
+    return system_memory_floors(reading.total_bytes, wired)
+
+
 def _grew_fast(now: int | None, then: int | None, elapsed: float, rate: float) -> bool:
     if now is None or then is None or elapsed <= 0:
         return False
@@ -485,22 +506,25 @@ def admission_shortfall_bytes(
     estimate that was wrong, not a second copy of the request held in
     reserve (2026-09-27 validation, 128 GB, Flash-Next, 12 GB of apps open:
     a request-sized margin refused an 18K turn that left 9.4 GB free after
-    its growth, over a 6.0 GB abort floor). Zero means it fits, and an
-    unreadable machine never reports a shortfall.
+    its growth, over a 6.0 GB abort floor). The floors are the ones the Mac
+    will have once the growth is wired (``admission_floors``). Zero means it
+    fits, and an unreadable machine never reports a shortfall.
     """
 
     if floor not in {"shed", "abort"}:
         raise ValueError(f"floor must be 'shed' or 'abort', not {floor!r}")
     if reading is None:
         return 0
-    shed_floor, abort_floor = reading_floors(reading)
+    growth = max(0, int(growth_bytes))
+    shed_floor, abort_floor = admission_floors(reading, growth)
     line = shed_floor if floor == "shed" else abort_floor
-    return max(0, max(0, int(growth_bytes)) + int(line) - int(reading.available_bytes))
+    return max(0, growth + int(line) - int(reading.available_bytes))
 
 
 __all__ = [
     "ReadingWindow",
     "SystemMemory",
+    "admission_floors",
     "admission_shortfall_bytes",
     "memory_thrashing",
     "read_system_memory",

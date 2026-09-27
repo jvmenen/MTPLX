@@ -143,9 +143,11 @@ class TestReading:
             wired_bytes=88 * GIB,
         )
         assert sm.system_pressure_level(reading) == 2
+        # An 8 GiB request is held to the 12 GiB shed floor the Mac will
+        # have once those 8 GiB are wired.
         assert sm.admission_shortfall_bytes(
             reading, growth_bytes=8 * GIB, floor="shed"
-        ) == 8 * GIB + 11 * GIB - 9 * GIB
+        ) == 8 * GIB + 12 * GIB - 9 * GIB
 
     def test_purgeable_pages_are_free(self):
         page = 16384
@@ -381,23 +383,42 @@ class TestWiredFloorsAndDeathSignature:
 
     def test_a_request_between_the_floors_is_short_of_the_shed_line_only(self):
         reading = _machine(free_gib=4, file_gib=2, wired_gib=88)  # 6 GiB supply
-        shed, abort = sm.reading_floors(reading)
-        # 0.25 GiB of growth leaves 5.75 GiB: over the 5.5 GiB abort floor,
-        # under the 11 GiB shed floor.
+        shed, abort = sm.admission_floors(reading, GIB // 4)
+        assert (shed, abort) == (2 * (88.25 * GIB // 16), 88.25 * GIB // 16)
+        # 0.25 GiB of growth leaves 5.75 GiB: over the 5.52 GiB abort floor,
+        # under the 11.03 GiB shed floor.
         assert sm.admission_shortfall_bytes(reading, growth_bytes=GIB // 4, floor="abort") == 0
         assert sm.admission_shortfall_bytes(
             reading, growth_bytes=GIB // 4, floor="shed"
         ) == GIB // 4 + shed - 6 * GIB
-        # 1 GiB leaves 5 GiB: 0.5 GiB under the abort floor (the old margin
-        # rule said 1.5).
+        # 1 GiB leaves 5 GiB: 0.56 GiB under the 5.56 GiB abort floor (the
+        # old margin rule said 1.5).
+        _shed, abort = sm.admission_floors(reading, GIB)
         assert sm.admission_shortfall_bytes(
             reading, growth_bytes=GIB, floor="abort"
-        ) == GIB + abort - 6 * GIB
+        ) == GIB + abort - 6 * GIB == int(0.5625 * GIB)
+
+    def test_the_admission_holds_the_floor_the_prefill_will_read(self):
+        """What the engine allocates is wired, and the floors grow with what
+        is wired: after an 8 GiB prefill at 88 GiB wired the per-chunk check
+        reads a 6 GiB abort floor, not 5.5. A request that would leave 5.75
+        GiB was admitted against 5.5 and tripped late in its own prefill; it
+        is now short by 0.25 GiB before it starts."""
+
+        reading = _machine(free_gib=4, file_gib=9.75, wired_gib=88)  # 13.75 GiB
+        assert sm.reading_floors(reading)[1] == int(5.5 * GIB)
+        assert sm.admission_floors(reading, 8 * GIB) == (12 * GIB, 6 * GIB)
+        assert sm.admission_shortfall_bytes(
+            reading, growth_bytes=8 * GIB, floor="abort"
+        ) == GIB // 4
+        # A reading with no wired figure keeps its RAM-share floors.
+        unwired = _machine(free_gib=4, file_gib=9.75)
+        assert sm.admission_floors(unwired, 8 * GIB) == sm.reading_floors(unwired)
 
     def test_admission_counts_the_wired_floor(self):
         reading = _machine(free_gib=4, file_gib=10, wired_gib=88)
-        shed, _abort = sm.reading_floors(reading)
-        assert shed == 2 * (88 * GIB // 16)
+        shed, _abort = sm.admission_floors(reading, 8 * GIB)
+        assert shed == 2 * (96 * GIB // 16)
         assert sm.admission_shortfall_bytes(
             reading, growth_bytes=8 * GIB, floor="shed"
         ) == 8 * GIB + shed - 14 * GIB
@@ -577,8 +598,14 @@ class TestAdmission:
         receipt = srv._prefill_admission_shed(
             _state(), prompt_ids=PROMPT, session_bank=_Bank(0), session_id="pi"
         )
-        assert receipt["system_shed_floor_bytes"] == 2 * (88 * GIB // 16)
-        assert receipt["system_abort_floor_bytes"] == 88 * GIB // 16
+        # The Mac's floors once the request's growth is wired: at the
+        # requested chunk first, then at the chunk it runs.
+        first = receipt["growth_by_chunk"][str(receipt["prefill_chunk_requested"])]
+        assert receipt["system_abort_floor_bytes"] == (88 * GIB + first) // 16
+        assert receipt["system_shed_floor_bytes"] == 2 * ((88 * GIB + first) // 16)
+        after = receipt["growth_bytes_after"]
+        assert receipt["system_abort_floor_bytes_after"] == (88 * GIB + after) // 16
+        assert receipt["system_shed_floor_bytes_after"] == 2 * ((88 * GIB + after) // 16)
         assert receipt["system_memory"]["wired_bytes"] == 88 * GIB
 
     def test_a_short_prompt_between_the_floors_runs_after_reclamation(self, monkeypatch):

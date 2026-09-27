@@ -1264,6 +1264,8 @@ V_PROMPT = 18_113
 V_CACHED = 12_091
 V_ROWS = V_PROMPT * FN_ROW  # the rows the prefill writes, with the copy
 V_ABORT = V_WIRED // 16
+# The abort floor once the 2,048-row turn's growth is wired.
+V_ABORT_NARROW = (V_WIRED + V_ROWS + V_SCRATCH_NARROW) // 16
 
 
 def _v_reading(*, free: int, file_backed: int) -> sm.SystemMemory:
@@ -1323,9 +1325,11 @@ class TestValidationTurn:
     def test_the_refused_turn_runs_at_the_narrower_chunk(self, monkeypatch):
         """At c7c3c6f2 this is refused: 6.82 GB of growth plus the 5.97 GB
         abort floor plus a 5.97 GB request-sized margin against 16.19 GB.
-        At 4,096 rows it would leave 9.37 GB, under the 11.94 GB shed floor;
-        at 2,048 rows it leaves 12.10 GB, so it runs there and nothing is
-        taken from anyone."""
+        The floors are the Mac's once the growth is wired. At 4,096 rows it
+        would leave 9.37 GB, under a 12.79 GB shed floor; at 2,048 rows it
+        leaves 12.10 GB, over the 6.23 GB abort floor and just under the
+        12.45 GB shed floor, so the engine gives back its allocator pool and
+        runs it at 2,048 rows. The conversation's banked state stays."""
 
         receipt, manager, source = self._admit(
             monkeypatch, free=V_FREE, file_backed=V_FILE_BACKED
@@ -1333,12 +1337,32 @@ class TestValidationTurn:
         assert receipt.get("refused") is not True
         assert receipt["prefill_chunk_requested"] == 4096
         assert receipt["prefill_chunk_tokens"] == 2048
-        assert receipt["reclamation_steps"] == ["narrower_prefill_chunk"]
+        assert receipt["reclamation_steps"][0] == "allocator_pool"
         assert receipt["growth_by_chunk"] == {
             "4096": V_ROWS + V_SCRATCH_WIDE,
             "2048": V_ROWS + V_SCRATCH_NARROW,
         }
+        # The floors are computed after the growth: at the requested chunk,
+        # then at the one it runs.
+        wide_abort = (V_WIRED + V_ROWS + V_SCRATCH_WIDE) // 16
+        assert receipt["system_abort_floor_bytes"] == wide_abort
+        assert receipt["system_shed_floor_bytes"] == 2 * wide_abort
+        assert receipt["system_abort_floor_bytes_after"] == V_ABORT_NARROW
+        assert receipt["system_shed_floor_bytes_after"] == 2 * V_ABORT_NARROW
+        assert receipt["system_shortfall_bytes_after"] == 0
         assert receipt["growth"]["restore_copy_bytes"] == V_CACHED * FN_ROW
+        assert source.token_ids in manager.bank._entries
+
+    def test_a_turn_clear_of_both_floors_only_narrows(self, monkeypatch):
+        """With 0.5 GB more supply the 2,048-row chunk clears the shed floor
+        too: the narrower chunk is the whole answer, and the pool is not
+        touched."""
+
+        receipt, manager, source = self._admit(
+            monkeypatch, free=V_FREE + 500_000_000, file_backed=V_FILE_BACKED
+        )
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert receipt["reclamation_steps"] == ["narrower_prefill_chunk"]
         assert "cache_cleared" not in receipt
         assert source.token_ids in manager.bank._entries
 
@@ -1361,7 +1385,7 @@ class TestValidationTurn:
         growth against the abort floor (c7c3c6f2 reported 8.8 GB: the wide
         chunk, the floor and a margin the size of the request)."""
 
-        supply = V_ROWS + V_SCRATCH_NARROW + V_ABORT - 100_000_000
+        supply = V_ROWS + V_SCRATCH_NARROW + V_ABORT_NARROW - 100_000_000
         receipt, _manager_, _source = self._admit(
             monkeypatch, free=2_000_000_000, file_backed=supply - 2_000_000_000
         )
@@ -1369,7 +1393,23 @@ class TestValidationTurn:
         assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
         assert receipt["system_shortfall_bytes_after"] == 100_000_000
         assert receipt["prefill_chunk_tokens"] == 2048
-        assert receipt["system_abort_floor_bytes_after"] == V_ABORT
+        assert receipt["system_abort_floor_bytes_after"] == V_ABORT_NARROW
+
+    def test_a_turn_that_would_trip_late_is_refused_before_it_starts(self, monkeypatch):
+        """0.1 GB over the abort floor of the Mac as it is, and 0.16 GB under
+        the one it will have once the 4.09 GB of growth is wired (the floor
+        the per-chunk check reads by the end of the prefill): admitted by
+        54e01d1f to trip late in its own prefill, refused now before any
+        work is done."""
+
+        supply = V_ROWS + V_SCRATCH_NARROW + V_ABORT + 100_000_000
+        receipt, _manager_, _source = self._admit(
+            monkeypatch, free=2_000_000_000, file_backed=supply - 2_000_000_000
+        )
+        assert receipt["refused"] is True
+        assert receipt["system_shortfall_bytes_after"] == (
+            V_ABORT_NARROW - V_ABORT - 100_000_000
+        )
 
     def test_the_admission_hands_its_chunk_to_the_per_chunk_check(self, monkeypatch):
         """The per-chunk check reserves what the admission priced for one
