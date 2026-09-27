@@ -1543,7 +1543,28 @@ def _memory_budget_bytes(args: argparse.Namespace | None = None) -> int | None:
     return int(parsed)
 
 
-def _default_mlx_cache_limit_bytes(memory_budget: int | None = None) -> int | None:
+# A sixteenth of the machine is a twelfth of its default Metal limit (75% of
+# RAM): the RAM-sized allowances below, expressed against the limit, so an
+# operator who lowers MTPLX_MEMORY_LIMIT_BYTES lowers them with it.
+_ALLOWANCE_LIMIT_DIVISOR = 12
+
+
+def _explicit_memory_limit_bytes() -> int | None:
+    """MTPLX_MEMORY_LIMIT_BYTES as bytes when the operator set it, else None."""
+
+    raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        value = _parse_metal_memory_size_bytes(raw, 0)
+    except (TypeError, ValueError):
+        return None
+    return int(value) if value > 0 else None
+
+
+def _default_mlx_cache_limit_bytes(
+    memory_budget: int | None = None, explicit_limit: int | None = None
+) -> int | None:
     """RAM-tiered default for the MLX allocator's freed-buffer cache.
 
     MLX's own cache limit tracks the memory limit (~0.75x RAM high-water),
@@ -1554,19 +1575,36 @@ def _default_mlx_cache_limit_bytes(memory_budget: int | None = None) -> int | No
     prefill spikes still allocate whatever they need — so the bound trades a
     little reuse at the tail for a flat resident footprint. Tiers keep
     several GiB of hot-loop reuse on every box.
+
+    An explicit MTPLX_MEMORY_LIMIT_BYTES (``explicit_limit``) bounds it too,
+    at a twelfth of the limit: the tiers are a twelfth of each machine's
+    default limit, and a lowered limit left the cache at its RAM tier (8 GiB
+    of pooled buffers under a 48 GiB limit on a 128 GB Mac; the review of
+    9c96dd9c).
     """
+
+    def bounded(value: int) -> int:
+        if explicit_limit is None or int(explicit_limit) <= 0:
+            return int(value)
+        return min(
+            int(value),
+            max(1 * 1024**3, int(explicit_limit) // _ALLOWANCE_LIMIT_DIVISOR),
+        )
+
     if memory_budget is not None:
-        return max(1 * 1024**3, min(8 * 1024**3, memory_budget // 8))
+        return bounded(max(1 * 1024**3, min(8 * 1024**3, memory_budget // 8)))
     total = _total_ram_bytes()
     if total is None:
+        if explicit_limit:
+            return bounded(8 * 1024**3)
         return None  # unknown machine: leave MLX defaults untouched
     if total <= 36 * 1024**3:
-        return 2 * 1024**3
+        return bounded(2 * 1024**3)
     if total <= 72 * 1024**3:
-        return 4 * 1024**3
+        return bounded(4 * 1024**3)
     if total <= 100 * 1024**3:
-        return 6 * 1024**3
-    return 8 * 1024**3
+        return bounded(6 * 1024**3)
+    return bounded(8 * 1024**3)
 
 
 def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
@@ -1577,8 +1615,11 @@ def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
     requested = _parse_byte_limit(raw)
     if requested is None:
         budget = _memory_budget_bytes(args)
-        requested = _default_mlx_cache_limit_bytes(budget)
+        explicit_limit = _explicit_memory_limit_bytes()
+        requested = _default_mlx_cache_limit_bytes(budget, explicit_limit)
         source = "memory_budget" if budget is not None else "ram_tier_default"
+        if explicit_limit is not None:
+            source += "_bounded_by_memory_limit"
         if requested is None:
             return {"requested": raw, "configured": False, "source": source}
     import mlx.core as mx
@@ -19344,13 +19385,32 @@ def _host_memory_allowance_bytes(state: Any = None) -> int:
             return int(parsed)
     ram = _planning_ram_bytes(state) if state is not None else None
     if not ram:
-        return int(_HOST_MEMORY_ALLOWANCE_CAP_BYTES)
-    return int(
-        max(
-            _HOST_MEMORY_ALLOWANCE_MIN_BYTES,
-            min(_HOST_MEMORY_ALLOWANCE_CAP_BYTES, ram // _HOST_MEMORY_ALLOWANCE_RAM_DIVISOR),
+        allowance = int(_HOST_MEMORY_ALLOWANCE_CAP_BYTES)
+    else:
+        allowance = int(
+            max(
+                _HOST_MEMORY_ALLOWANCE_MIN_BYTES,
+                min(
+                    _HOST_MEMORY_ALLOWANCE_CAP_BYTES,
+                    ram // _HOST_MEMORY_ALLOWANCE_RAM_DIVISOR,
+                ),
+            )
         )
-    )
+    # An operator who lowers MTPLX_MEMORY_LIMIT_BYTES lowers this allowance
+    # with it (a twelfth of the limit, which is a sixteenth of the machine at
+    # the default limit): 4 GiB under a 48 GiB limit on a 128 GB Mac, not 8.
+    caps = getattr(state, "metal_memory_caps", None) if state is not None else None
+    if isinstance(caps, dict) and caps.get("memory_limit_source") == "env":
+        limit = caps.get("memory_limit_bytes")
+        if isinstance(limit, int) and limit > 0:
+            allowance = min(
+                allowance,
+                max(
+                    _HOST_MEMORY_ALLOWANCE_MIN_BYTES,
+                    int(limit) // _ALLOWANCE_LIMIT_DIVISOR,
+                ),
+            )
+    return int(allowance)
 
 
 def _footprint_floor(
