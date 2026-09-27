@@ -16,7 +16,8 @@ hands over. ``generate_mtpk`` therefore schedules the history at every commit,
 empty or not, and once more when it ends.
 
 Pinned here on the tiny Flash-Next pack, path by path, with the capture
-commit on as the Flash-Next server runs it:
+commit on as the Flash-Next server runs it (and off too for rejected
+correction-cache proposals):
 - when an append starts, the history holds no unevaluated work;
 - when a round's first draft starts, the history holds nothing beyond what
   the latest append left, and nothing at all after a round that appended
@@ -82,6 +83,7 @@ def _generate(
     env: dict[str, str] | None = None,
     lazy: bool = True,
     greedy: bool = False,
+    capture_commit: bool = True,
     copy_streak: bool = False,
     **kwargs,
 ):
@@ -104,7 +106,7 @@ def _generate(
         if name.startswith("MTPLX_QWEN4_") or name in _RESET:
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY", "1")
-    monkeypatch.setenv("MTPLX_FAMILY_CAPTURE_COMMIT", "1")
+    monkeypatch.setenv("MTPLX_FAMILY_CAPTURE_COMMIT", "1" if capture_commit else "0")
     monkeypatch.setenv("MTPLX_LAZY_MTP_HISTORY_APPEND", "1" if lazy else "0")
     for name, value in (env or {}).items():
         monkeypatch.setenv(name, value)
@@ -218,20 +220,23 @@ def test_correction_cache_proposals_never_leave_the_history_pending(tiny_pack, m
     _assert_bounded(run)
 
 
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
 @pytest.mark.parametrize("replay", [False, True], ids=["direct", "qsa-replay"])
 @pytest.mark.parametrize("greedy", [False, True], ids=["sampled", "greedy"])
 def test_rejected_correction_cache_proposals_leave_nothing_stacked(
-    tiny_pack, monkeypatch, greedy, replay
+    tiny_pack, monkeypatch, greedy, replay, capture
 ):
-    # The tiny random model rejects the served successors; the capture commit
-    # defers each correction to the next round, so those rounds append
-    # nothing to the history their draft staged a row in.
+    # The tiny random model rejects the served successors. The capture commit
+    # leaves each correction to the next round, so those rounds append
+    # nothing to the history their draft staged a row in; without it the
+    # commit appends the correction.
     run = _generate(
         tiny_pack,
         monkeypatch,
         max_tokens=24,
         prompt=_SUCCESSORS,
         greedy=greedy,
+        capture_commit=capture,
         env={"MTPLX_QSA_MTP_PRECOMPUTE": "1"} if replay else None,
         speculative_depth=1,
         prompt_correction_cache=True,
@@ -245,9 +250,10 @@ def test_rejected_correction_cache_proposals_leave_nothing_stacked(
         and draft.get("accepted") is False
     ]
     assert len(rejected_hits) > 3
-    # Rounds after a commit that appended nothing: the history must hold
-    # nothing at all when the next draft starts.
-    assert sum(1 for _now, left in run.rounds if left == 0) > 3, run.rounds
+    if capture:
+        # Rounds after a commit that appended nothing: the history must hold
+        # nothing at all when the next draft starts.
+        assert sum(1 for _now, left in run.rounds if left == 0) > 3, run.rounds
     _assert_bounded(run)
 
 
