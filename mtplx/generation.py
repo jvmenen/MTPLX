@@ -8506,6 +8506,42 @@ def _prompt_logit_slices(
             yield trunk_start + offset, logits[0]
 
 
+def _prompt_scoring_logit_rows(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    logits_rows: int,
+    trunk_rows: int,
+):
+    """Yield ``(start, logits[rows, vocab])`` per slice for prompt scoring.
+
+    The Gemma 4 assistant pair has no ``forward_ar``; its backend yields the
+    slices from one target forward (see
+    ``gemma4_prompt_scoring_logit_chunks``). Every other runtime runs
+    ``_prompt_logit_slices`` on one prefill cache.
+    """
+
+    if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        from .backends.gemma4_assistant import gemma4_prompt_scoring_logit_chunks
+
+        for start, _end, logits in gemma4_prompt_scoring_logit_chunks(
+            rt, prompt_ids, chunk_size=logits_rows
+        ):
+            yield start, logits[0]
+            # Drop this slice before the next head call: one slice resident.
+            del logits
+        return
+    cache = _make_target_prefill_cache(rt)
+    prompt_array = mx.array([prompt_ids])
+    yield from _prompt_logit_slices(
+        rt,
+        prompt_array,
+        cache,
+        logits_rows=logits_rows,
+        trunk_rows=trunk_rows,
+    )
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8534,18 +8570,15 @@ def score_prompt_logprobs(
         raise ValueError("prompt_ids must not be empty")
     top_k = max(1, int(top_k))
     chunk_size = max(16, int(chunk_size))
-    cache = _make_target_prefill_cache(rt)
     n = len(prompt_ids)
-    prompt_array = mx.array([prompt_ids])
     token_logprobs: list[float | None] = []
     top_entries: list[list[tuple[int, float]]] = []
     if trunk_chunk_size is None:
         trunk_chunk_size = _prompt_score_trunk_chunk_size()
     started = time.perf_counter()
-    for start, rows_logits in _prompt_logit_slices(
+    for start, rows_logits in _prompt_scoring_logit_rows(
         rt,
-        prompt_array,
-        cache,
+        prompt_ids,
         logits_rows=chunk_size,
         trunk_rows=max(1, int(trunk_chunk_size)),
     ):
