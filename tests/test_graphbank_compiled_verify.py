@@ -2516,6 +2516,77 @@ def test_compiled_verify_quant_bits_gate(monkeypatch):
     assert parity_bank.permanent_eager is False
 
 
+def _gdn_runtime(*, embed, norm=None, head_k_dim=128, quantized_embed=False):
+    """The attributes admission reads: embedding, layer norms, GDN key head size."""
+    from types import SimpleNamespace
+
+    if quantized_embed:
+        embed_tokens = SimpleNamespace(
+            weight=mx.zeros((2,), dtype=mx.uint32), scales=mx.zeros((2,), dtype=embed)
+        )
+    else:
+        embed_tokens = SimpleNamespace(weight=mx.zeros((2,), dtype=embed))
+    layer = SimpleNamespace(
+        linear_attn=SimpleNamespace(head_k_dim=head_k_dim),
+        input_layernorm=SimpleNamespace(weight=mx.zeros((2,), dtype=norm or embed)),
+    )
+    inner = SimpleNamespace(embed_tokens=embed_tokens, layers=[layer])
+    return SimpleNamespace(model=SimpleNamespace(model=inner))
+
+
+def test_float32_gdn_key_scale_demotes_at_admission(monkeypatch, capsys):
+    """A float32 stream through GDN layers of key head size 128 verifies eagerly.
+
+    The fused kernels of the compiled verifier hold 128**-0.5 as 0.08838835
+    (7 significant digits), so its GDN states, hidden states and logits
+    differ from the eager verifier's from the first round; a half-precision
+    stream holds the scale exactly, and so does head size 64 in float32.
+    """
+    import mtplx.graphbank as graphbank_module
+    from mtplx.graphbank import CompiledVerifyBank, _float32_gdn_key_scale_head_dim
+
+    monkeypatch.setattr(graphbank_module, "_PERMANENT_EAGER_LOGGED", set())
+    monkeypatch.setattr(
+        graphbank_module,
+        "compiled_verify_status",
+        dict(graphbank_module.compiled_verify_status),
+    )
+    # A speed override; it does not reach a correctness gate.
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_FORCE", "1")
+
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32)) == 128
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32, head_k_dim=32)) == 32
+    # One float32 norm weight promotes a half-precision stream.
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.bfloat16, norm=mx.float32)) == 128
+    for embed in (mx.bfloat16, mx.float16):
+        assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=embed)) is None
+        assert (
+            _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=embed, quantized_embed=True))
+            is None
+        )
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32, head_k_dim=64)) is None
+
+    bank = CompiledVerifyBank(_gdn_runtime(embed=mx.float32))
+    assert bank.permanent_eager is True
+    assert bank.permanent_eager_reason == "float32_gdn_key_scale:head_k_dim=128"
+    assert bank.to_dict()["permanent_eager_reason"] == "float32_gdn_key_scale:head_k_dim=128"
+    CompiledVerifyBank(_gdn_runtime(embed=mx.float32))  # the next request: no second line
+    lines = [line for line in capsys.readouterr().out.splitlines() if "permanent-eager" in line]
+    assert len(lines) == 1
+    assert "float32_gdn_key_scale:head_k_dim=128" in lines[0]
+    assert "128**-0.5" in lines[0] and "7 significant digits" in lines[0]
+
+    for embed in (mx.bfloat16, mx.float16):
+        assert CompiledVerifyBank(_gdn_runtime(embed=embed)).permanent_eager is False
+        assert (
+            CompiledVerifyBank(_gdn_runtime(embed=embed, quantized_embed=True)).permanent_eager
+            is False
+        )
+    # The parity diagnostics measure the mismatch instead.
+    assert CompiledVerifyBank(_gdn_runtime(embed=mx.float32), parity=True).permanent_eager is False
+    assert CompiledVerifyBank(_gdn_runtime(embed=mx.float32), parity2=True).permanent_eager is False
+
+
 # -- A2.1 commit-first donation (speed-war Lane A2, 2026-07-06) ----------------
 
 

@@ -1344,12 +1344,15 @@ compiled_verify_status: dict[str, Any] = {
 _PERMANENT_EAGER_LOGGED: set[str] = set()
 
 
-def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
+def _record_permanent_eager(
+    reason: str, *, once: bool = False, why: str | None = None
+) -> None:
     """Record (and log once per distinct reason) a permanent-eager flip.
 
     ``once=True`` marks deterministic construction-time flips (per-model
     quant gate): the first bank records and logs; subsequent per-request
     banks only re-assert ``permanent_eager`` without inflating the count.
+    ``why`` is appended to the log line for a reason code that needs one.
     """
     already_logged = reason in _PERMANENT_EAGER_LOGGED
     compiled_verify_status["permanent_eager"] = True
@@ -1366,6 +1369,7 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
             print(
                 "[mtplx] compiled-verify permanent-eager: "
                 + reason
+                + (f"; {why}" if why else "")
                 + " (verify runs the eager path from here)",
                 flush=True,
             )
@@ -1889,6 +1893,88 @@ def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     return bits is None or bits in (4, 8)
 
 
+def _fused_kernel_keeps_float32(value: float) -> bool:
+    """Whether float32(value) survives as a constant of a fused MLX kernel.
+
+    MLX 0.32.2 writes a fused kernel's scalar constants into its Metal source
+    with std::numeric_limits<float>::digits10 + 1 = 7 significant digits
+    (mlx/backend/common/compiled.h); a float32 needs 9 to read back exactly.
+    """
+
+    import numpy as np
+
+    exact = np.float32(value)
+    return bool(np.float32(float(f"{float(exact):.7g}")) == exact)
+
+
+def _runtime_trunk_activation_dtype(runtime: Any) -> Any:
+    """The residual stream's dtype, from the loaded embedding and layer norms.
+
+    The embedding (its scales when quantized) sets the stream's dtype and
+    every RMSNorm promotes it to its weight's dtype (MLX rms_norm returns
+    ``result_type(x, weight)``), so one float32 norm weight makes the rest of
+    the trunk float32. None when the model has no recognizable embedding.
+    """
+
+    try:
+        model = getattr(runtime, "model", None)
+        text_model = getattr(model, "language_model", model)
+        inner = getattr(text_model, "model", text_model)
+        embed = getattr(inner, "embed_tokens", None)
+        source = getattr(embed, "scales", None)
+        if source is None:
+            source = getattr(embed, "weight", None)
+        if source is None:
+            return None
+        dtypes = [source.dtype]
+        for layer in getattr(inner, "layers", []) or []:
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                weight = getattr(getattr(layer, name, None), "weight", None)
+                if weight is not None:
+                    dtypes.append(weight.dtype)
+        return mx.float32 if mx.float32 in dtypes else dtypes[0]
+    except Exception:
+        return None
+
+
+def _float32_gdn_key_scale_head_dim(runtime: Any) -> int | None:
+    """A GDN key head size whose float32 scales a fused kernel would change.
+
+    The GatedDeltaNet verify forward scales its queries by head_k_dim ** -1
+    and its keys by head_k_dim ** -0.5, as Python floats (mlx_lm qwen3_5 and
+    qwen3_next, mtplx/gdn_capture.py; Flash-Next scales its queries by
+    head_k_dim ** -0.5). With a bfloat16 or float16 stream they become
+    half-precision constants, which 7 digits hold exactly; with a float32
+    stream they are float32 constants, and at head size 128 the compiled
+    verifier's fused kernel reads 128 ** -0.5 = 0.0883883461 back as
+    0.0883883536, so its GDN states, hidden states and logits differ from the
+    eager verifier's from the first round. Returns the first such head size
+    of a float32 trunk, else None.
+    """
+
+    try:
+        if _runtime_trunk_activation_dtype(runtime) != mx.float32:
+            return None
+        model = getattr(runtime, "model", None)
+        text_model = getattr(model, "language_model", model)
+        inner = getattr(text_model, "model", text_model)
+        for layer in getattr(inner, "layers", []) or []:
+            head_k_dim = getattr(
+                getattr(layer, "linear_attn", None), "head_k_dim", None
+            )
+            if head_k_dim is None:
+                continue
+            head_k_dim = int(head_k_dim)
+            if not (
+                _fused_kernel_keeps_float32(head_k_dim ** -0.5)
+                and _fused_kernel_keeps_float32(1.0 / head_k_dim)
+            ):
+                return head_k_dim
+        return None
+    except Exception:
+        return None
+
+
 def compare_verify_outputs(
     reference: dict[str, Any],
     candidate: dict[str, Any],
@@ -2064,6 +2150,28 @@ class CompiledVerifyBank:
                 f"quant_bits_gate:bits={_runtime_trunk_quant_bits(runtime)}"
             )
             _record_permanent_eager(self.permanent_eager_reason, once=True)
+        if not parity and not parity2 and not self.permanent_eager:
+            # Committed state must equal the eager verifier's. A float32
+            # stream through GDN layers whose key scale a fused kernel
+            # rewrites cannot (see _float32_gdn_key_scale_head_dim); no
+            # shipping pack streams float32. The parity diagnostics bypass
+            # this gate, as they do the bits gate, to measure the mismatch.
+            head_k_dim = _float32_gdn_key_scale_head_dim(runtime)
+            if head_k_dim is not None:
+                self.permanent_eager = True
+                self.permanent_eager_reason = (
+                    f"float32_gdn_key_scale:head_k_dim={head_k_dim}"
+                )
+                _record_permanent_eager(
+                    self.permanent_eager_reason,
+                    once=True,
+                    why=(
+                        "float32 activations, and MLX writes the GDN key scale "
+                        f"{head_k_dim}**-0.5 into fused kernels with 7 "
+                        "significant digits, so the compiled verifier would not "
+                        "match the eager one"
+                    ),
+                )
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
         capture_layout = getattr(runtime, "_mtplx_capture_layout", None)
         self._capture_layout_override = (
