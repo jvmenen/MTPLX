@@ -22,6 +22,7 @@ import asyncio
 import inspect
 import traceback
 import builtins
+import contextvars
 import errno
 import gc
 import hashlib
@@ -14682,26 +14683,108 @@ def _encode_rendered_chat_text_segmented(
 ) -> list[int]:
     if not boundaries:
         return _encode_rendered_chat_text(tokenizer, rendered)
-    encode_segment = _chat_segment_encoder(tokenizer, template_observability)
-    token_ids: list[int] = []
-    start = 0
-    for boundary in sorted(set(int(boundary) for boundary in boundaries)):
-        if boundary <= start or boundary >= len(rendered):
-            continue
-        token_ids.extend(encode_segment(rendered[start:boundary]))
-        start = boundary
-        if token_counts_at is not None and boundary in token_counts_at:
-            # Cumulative token count at this char boundary — token-exact
-            # because the segment split IS the encode split.
-            token_counts_at[boundary] = len(token_ids)
-    if start < len(rendered):
-        token_ids.extend(encode_segment(rendered[start:]))
+    with _chat_encode_snapshot(tokenizer) as snapshot:
+        encode_segment = _chat_segment_encoder(
+            tokenizer, template_observability, snapshot
+        )
+        token_ids: list[int] = []
+        start = 0
+        for boundary in sorted(set(int(boundary) for boundary in boundaries)):
+            if boundary <= start or boundary >= len(rendered):
+                continue
+            token_ids.extend(encode_segment(rendered[start:boundary]))
+            start = boundary
+            if token_counts_at is not None and boundary in token_counts_at:
+                # Cumulative token count at this char boundary — token-exact
+                # because the segment split IS the encode split.
+                token_counts_at[boundary] = len(token_ids)
+        if start < len(rendered):
+            token_ids.extend(encode_segment(rendered[start:]))
     return token_ids
+
+
+class _ChatEncodeSnapshot:
+    """One request's view of a tokenizer's encoding configuration.
+
+    The encoding fingerprint (_chat_tokenizer_encoding_fingerprint) is
+    taken once, the first time a cache key or the turn-cut proof needs it,
+    and once more at the end, before anything the request encoded is
+    stored. Segment ids wait in ``pending`` until then and are stored only
+    when the two fingerprints agree, so ids are never filed under a
+    configuration other than the one that produced them. That is two
+    fingerprints per request whatever the number of segments. The
+    fingerprint reads every added token, so taking it after each miss made
+    a cold 128-segment encode with 16,384 added tokens take 1.1 s (3 ms
+    before the fingerprint existed); taken twice it takes 10 ms.
+    """
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+        self.pending: dict[str, list[int]] = {}
+        self._fingerprint: str | None = None
+        self._confirmed = False
+        self._unchanged = True
+
+    @property
+    def fingerprint(self) -> str:
+        if self._fingerprint is None:
+            self._fingerprint = _chat_tokenizer_encoding_fingerprint(self.tokenizer)
+        return self._fingerprint
+
+    def remember(self, key: str, ids: list[int]) -> None:
+        self.pending[key] = ids
+        self._confirmed = False
+
+    def recall(self, key: str) -> list[int] | None:
+        ids = self.pending.get(key)
+        return None if ids is None else list(ids)
+
+    def confirm(self, *, force: bool = False) -> bool:
+        """Take the fingerprint again and store the pending segment ids when
+        it has not changed; True when it has not. Without ``force`` it only
+        runs when something is pending."""
+        if self._fingerprint is None or not (self.pending or force):
+            return True
+        if not self._confirmed:
+            self._unchanged = (
+                _chat_tokenizer_encoding_fingerprint(self.tokenizer)
+                == self._fingerprint
+            )
+            self._confirmed = True
+        if self._unchanged:
+            for key, ids in self.pending.items():
+                GLOBAL_CHAT_SEGMENT_MEMO.put(key, ids)
+        self.pending.clear()
+        return self._unchanged
+
+
+_CHAT_ENCODE_SNAPSHOT: "contextvars.ContextVar[_ChatEncodeSnapshot | None]" = (
+    contextvars.ContextVar("mtplx_chat_encode_snapshot", default=None)
+)
+
+
+@contextmanager
+def _chat_encode_snapshot(tokenizer: Any):
+    """The snapshot of the encode in progress with ``tokenizer``: the one a
+    caller already opened (_encode_messages opens one per request), or a new
+    one that is confirmed when this block ends without an error."""
+    current = _CHAT_ENCODE_SNAPSHOT.get()
+    if current is not None and current.tokenizer is tokenizer:
+        yield current
+        return
+    snapshot = _ChatEncodeSnapshot(tokenizer)
+    token = _CHAT_ENCODE_SNAPSHOT.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _CHAT_ENCODE_SNAPSHOT.reset(token)
+    snapshot.confirm()
 
 
 def _chat_segment_encoder(
     tokenizer: Any,
     template_observability: dict[str, Any] | None,
+    snapshot: _ChatEncodeSnapshot,
 ) -> Callable[[str], list[int]]:
     """Encoder for one segment of a segmented chat encode.
 
@@ -14711,43 +14794,37 @@ def _chat_segment_encoder(
     transcripts resend every earlier segment each turn, so only the new ones
     are tokenized. Counts land in template_observability["chat_segment_memo"].
 
-    The key is the tokenizer key, which carries the encoding fingerprint
-    (added tokens with their flags, the special-token split policy). It is
-    taken here and again after every miss's encode, and a miss's ids are
-    stored only when the two agree, so ids are never filed under a tokenizer
-    configuration other than the one that produced them.
+    The key is the tokenizer key, which carries the snapshot's encoding
+    fingerprint (added tokens with their flags, the special-token split
+    policy). A miss's ids go to the snapshot, which stores them when the
+    request's encode ends and the fingerprint still matches; a segment that
+    repeats within the request reuses them before that.
     """
     tokenizer_key = (
-        _chat_encode_tokenizer_key(tokenizer)
+        _chat_encode_tokenizer_key(
+            tokenizer, encoding_fingerprint=snapshot.fingerprint
+        )
         if GLOBAL_CHAT_SEGMENT_MEMO.enabled()
         else None
     )
     if tokenizer_key is None:
         return lambda text: _encode_rendered_chat_text(tokenizer, text)
-    current = {"tokenizer_key": tokenizer_key}
     counts = {"hits": 0, "misses": 0, "reused_tokens": 0}
     if template_observability is not None:
         template_observability["chat_segment_memo"] = counts
 
     def encode_segment(text: str) -> list[int]:
-        key = ChatSegmentEncodeMemo.make_key(
-            tokenizer_key=current["tokenizer_key"], text=text
-        )
+        key = ChatSegmentEncodeMemo.make_key(tokenizer_key=tokenizer_key, text=text)
         ids = GLOBAL_CHAT_SEGMENT_MEMO.get(key)
+        if ids is None:
+            ids = snapshot.recall(key)
         if ids is not None:
             counts["hits"] += 1
             counts["reused_tokens"] += len(ids)
             return ids
         counts["misses"] += 1
         ids = _encode_rendered_chat_text(tokenizer, text)
-        refreshed = _chat_encode_tokenizer_key(tokenizer)
-        if refreshed == current["tokenizer_key"]:
-            GLOBAL_CHAT_SEGMENT_MEMO.put(key, ids)
-        elif refreshed is not None:
-            # The tokenizer changed since the key was taken: these ids may
-            # come from either configuration, so they are not stored, and
-            # the rest of this encode looks up under the new key.
-            current["tokenizer_key"] = refreshed
+        snapshot.remember(key, ids)
         return ids
 
     return encode_segment
@@ -14773,14 +14850,17 @@ def _encode_rendered_chat_turns(
     _chat_turn_segments_proven); without the proof the render is encoded in
     one call.
     """
-    if not _chat_turn_segments_enabled(tokenizer):
+    if not _chat_turn_segments_allowed():
         return _encode_rendered_chat_text(tokenizer, rendered)
-    return _encode_rendered_chat_text_segmented(
-        tokenizer,
-        rendered,
-        _chat_turn_boundaries(rendered),
-        template_observability=template_observability,
-    )
+    with _chat_encode_snapshot(tokenizer) as snapshot:
+        if not _chat_turn_segments_proven(tokenizer, snapshot.fingerprint)[0]:
+            return _encode_rendered_chat_text(tokenizer, rendered)
+        return _encode_rendered_chat_text_segmented(
+            tokenizer,
+            rendered,
+            _chat_turn_boundaries(rendered),
+            template_observability=template_observability,
+        )
 
 
 def _chat_turn_boundaries(rendered: str) -> list[int]:
@@ -14792,13 +14872,18 @@ def _chat_turn_boundaries(rendered: str) -> list[int]:
     return boundaries
 
 
-def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
+def _chat_turn_segments_allowed() -> bool:
     """Env MTPLX_CHAT_TURN_SEGMENTS=off disables; only useful with the memo."""
     if not _env_bool_setting("MTPLX_CHAT_TURN_SEGMENTS", default=True):
         return False
-    if not GLOBAL_CHAT_SEGMENT_MEMO.enabled():
+    return GLOBAL_CHAT_SEGMENT_MEMO.enabled()
+
+
+def _chat_turn_segments_enabled(tokenizer: Any) -> bool:
+    if not _chat_turn_segments_allowed():
         return False
-    return _chat_turn_segments_proven(tokenizer)[0]
+    with _chat_encode_snapshot(tokenizer) as snapshot:
+        return _chat_turn_segments_proven(tokenizer, snapshot.fingerprint)[0]
 
 
 _CHAT_TURN_SEGMENT_PROOFS: "weakref.WeakKeyDictionary[Any, tuple[str, bool, str]]" = (
@@ -14833,7 +14918,9 @@ _CHAT_TURN_SEGMENT_PROBES = (
 )
 
 
-def _chat_turn_segments_proven(tokenizer: Any) -> tuple[bool, str]:
+def _chat_turn_segments_proven(
+    tokenizer: Any, fingerprint: str | None = None
+) -> tuple[bool, str]:
     """Whether cutting before every ``<|im_start|>`` is proven to give the
     single-call ids on this tokenizer, and why.
 
@@ -14845,10 +14932,12 @@ def _chat_turn_segments_proven(tokenizer: Any) -> tuple[bool, str]:
     single-call ids on every probe render when cut.
 
     Proven on first use per tokenizer object and encoding configuration
-    (the fingerprint the encode caches use), so a tokenizer changed in place
-    is proven again. Each decision is logged once.
+    (the fingerprint the encode caches use; callers pass the one their
+    request's snapshot took), so a tokenizer changed in place is proven
+    again. Each decision is logged once.
     """
-    fingerprint = _chat_tokenizer_encoding_fingerprint(tokenizer)
+    if fingerprint is None:
+        fingerprint = _chat_tokenizer_encoding_fingerprint(tokenizer)
     with _CHAT_TURN_SEGMENT_PROOFS_LOCK:
         try:
             cached = _CHAT_TURN_SEGMENT_PROOFS.get(tokenizer)
@@ -15138,7 +15227,9 @@ _CHAT_ENCODE_TOKENIZER_IDS: "weakref.WeakKeyDictionary[Any, str]" = (
 _CHAT_ENCODE_TOKENIZER_IDS_LOCK = threading.Lock()
 
 
-def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
+def _chat_encode_tokenizer_key(
+    tokenizer: Any, *, encoding_fingerprint: str | None = None
+) -> str | None:
     """Identity component of the encode-cache key.
 
     Three parts, all required for correctness:
@@ -15151,6 +15242,7 @@ def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
       other flags changes how text splits while the vocab size and the
       added-token count stay the same, so the key of both encode caches
       (whole request and per segment) must follow the flags themselves.
+      Callers inside a request pass the fingerprint its snapshot took.
     Returns None (→ caller skips caching) for non-weakref-able tokenizers.
     """
     try:
@@ -15165,7 +15257,11 @@ def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
     tmpl_sha = hashlib.sha256(
         str(template).encode("utf-8", errors="surrogatepass")
     ).hexdigest()[:16]
-    encoding = _chat_tokenizer_encoding_fingerprint(tokenizer)
+    encoding = (
+        encoding_fingerprint
+        if encoding_fingerprint is not None
+        else _chat_tokenizer_encoding_fingerprint(tokenizer)
+    )
     return f"{type(tokenizer).__name__}:{uid}:{tmpl_sha}:{encoding}"
 
 
@@ -15180,6 +15276,18 @@ def _chat_tokenizer_layers(tokenizer: Any) -> list[Any]:
             break
         layers.append(inner)
     return layers
+
+
+def _chat_rust_tokenizer(tokenizer: Any) -> Any | None:
+    """The Rust ``tokenizers.Tokenizer`` behind the tokenizer, if any."""
+    try:
+        from tokenizers import Tokenizer as RustTokenizer
+    except ImportError:
+        return None
+    for layer in _chat_tokenizer_layers(tokenizer):
+        if isinstance(layer, RustTokenizer):
+            return layer
+    return None
 
 
 def _chat_tokenizer_splits_special_tokens(tokenizer: Any) -> bool:
@@ -15202,10 +15310,11 @@ def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
     only when it next encodes, so right after a change the two disagree,
     and an OR of them would keep the old key.
 
-    Recomputed on every call because nothing signals a change. It costs
-    14-19 us on the Gemma 4, Qwen 3.6/3.8, MiMo and Bonsai tokenizers (24-33
-    added tokens) and 61 us on LFM2.5 (124). mlx-lm's TokenizerWrapper
-    forwards the attributes to the HF tokenizer.
+    Nothing signals a change, so each request takes it twice (see
+    _ChatEncodeSnapshot). The cost grows with the added tokens: 10-13 us on
+    the Gemma 4, Qwen 3.6/3.8, MiMo and Bonsai tokenizers (24-33 added
+    tokens), 36 us on LFM2.5 (124), about 4.7 ms with 16,384. mlx-lm's
+    TokenizerWrapper forwards the attributes to the HF tokenizer.
     """
     digest = hashlib.sha256()
     try:
@@ -15219,6 +15328,17 @@ def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
             f":encode_special_tokens={getattr(layer, 'encode_special_tokens', None)!r}"
             .encode("utf-8", errors="surrogatepass")
         )
+    rust = _chat_rust_tokenizer(tokenizer)
+    if rust is not None:
+        # transformers reads its added_tokens_decoder from this table, and an
+        # AddedToken's repr carries its content and all five flags: one repr
+        # of the table costs half of the per-token walk below.
+        digest.update(
+            repr(rust.get_added_tokens_decoder()).encode(
+                "utf-8", errors="surrogatepass"
+            )
+        )
+        return digest.hexdigest()[:16]
     try:
         added = list(tokenizer.added_tokens_decoder.items())
     except (AttributeError, TypeError):
@@ -15259,9 +15379,84 @@ def _encode_messages(
     prompt, so a hit is byte-identical by construction. Agent clients resend
     the full transcript every turn — without this, the whole Jinja render +
     BPE tokenize re-runs per request and lands in TTFT.
+
+    The request runs inside one encoding snapshot (_ChatEncodeSnapshot):
+    the tokenizer fingerprint in both cache keys is taken once, and taken
+    again before the whole-request entry and the new segment ids are
+    stored, which happens only if it did not change.
     """
-    if not GLOBAL_CHAT_ENCODE_CACHE.enabled():
-        return _encode_messages_uncached(
+    with _chat_encode_snapshot(tokenizer) as snapshot:
+        if not GLOBAL_CHAT_ENCODE_CACHE.enabled():
+            return _encode_messages_uncached(
+                tokenizer,
+                messages,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+                scoped_reasoning_history=scoped_reasoning_history,
+                preserve_reasoning_history=preserve_reasoning_history,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+                tool_choice=tool_choice,
+                tool_prompt_mode=tool_prompt_mode,
+                template_observability=template_observability,
+                allow_committed_reasoning=allow_committed_reasoning,
+            )
+        try:
+            tokenizer_key = _chat_encode_tokenizer_key(
+                tokenizer, encoding_fingerprint=snapshot.fingerprint
+            )
+            if tokenizer_key is None:
+                key = None
+            else:
+                payload = {
+                    "messages": [
+                        (
+                            m.model_dump(exclude_none=True)
+                            if hasattr(m, "model_dump")
+                            else m
+                        )
+                        for m in messages
+                    ],
+                    "enable_thinking": bool(enable_thinking),
+                    "reasoning_effort": reasoning_effort,
+                    "strip": bool(strip_assistant_reasoning_history),
+                    "scoped": bool(scoped_reasoning_history),
+                    "preserve_echo": bool(preserve_reasoning_history),
+                    "gen_prompt": bool(add_generation_prompt),
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "tool_prompt_mode": tool_prompt_mode,
+                    "committed_reasoning": bool(allow_committed_reasoning),
+                    # The rendered prompt embeds the current date (tool contract's
+                    # burst-pinned _current_date_line; hypothetically also
+                    # strftime_now-style templates reading the raw wall clock).
+                    # Key on BOTH days so the key flips whenever either source
+                    # can change the render: raw wall clock covers
+                    # template-embedded dates at midnight, the pinned day covers
+                    # the contract line at pin refresh. A flip only re-renders
+                    # once — the pinned contract bytes stay identical across
+                    # midnight, so session/bank prefixes are unaffected.
+                    "render_day": (
+                        f"{time.strftime('%Y-%m-%d')}:{_pinned_render_day()}"
+                    ),
+                }
+                key = ChatEncodeCache.make_key(
+                    tokenizer_key=tokenizer_key,
+                    payload=payload,
+                )
+        except Exception:
+            key = None
+        if key is not None:
+            cached = GLOBAL_CHAT_ENCODE_CACHE.get(key)
+            if cached is not None:
+                ids, stored_observability = cached
+                if template_observability is not None:
+                    template_observability.update(stored_observability)
+                    template_observability["chat_encode_cache"] = "hit"
+                return ids
+        fresh_observability: dict[str, Any] = {}
+        ids = _encode_messages_uncached(
             tokenizer,
             messages,
             enable_thinking=enable_thinking,
@@ -15273,78 +15468,15 @@ def _encode_messages(
             tools=tools,
             tool_choice=tool_choice,
             tool_prompt_mode=tool_prompt_mode,
-            template_observability=template_observability,
+            template_observability=fresh_observability,
             allow_committed_reasoning=allow_committed_reasoning,
         )
-    try:
-        tokenizer_key = _chat_encode_tokenizer_key(tokenizer)
-        if tokenizer_key is None:
-            key = None
-        else:
-            payload = {
-                "messages": [
-                    m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
-                    for m in messages
-                ],
-                "enable_thinking": bool(enable_thinking),
-                "reasoning_effort": reasoning_effort,
-                "strip": bool(strip_assistant_reasoning_history),
-                "scoped": bool(scoped_reasoning_history),
-                "preserve_echo": bool(preserve_reasoning_history),
-                "gen_prompt": bool(add_generation_prompt),
-                "tools": tools,
-                "tool_choice": tool_choice,
-                "tool_prompt_mode": tool_prompt_mode,
-                "committed_reasoning": bool(allow_committed_reasoning),
-                # The rendered prompt embeds the current date (tool contract's
-                # burst-pinned _current_date_line; hypothetically also
-                # strftime_now-style templates reading the raw wall clock).
-                # Key on BOTH days so the key flips whenever either source
-                # can change the render: raw wall clock covers
-                # template-embedded dates at midnight, the pinned day covers
-                # the contract line at pin refresh. A flip only re-renders
-                # once — the pinned contract bytes stay identical across
-                # midnight, so session/bank prefixes are unaffected.
-                "render_day": (
-                    f"{time.strftime('%Y-%m-%d')}:{_pinned_render_day()}"
-                ),
-            }
-            key = ChatEncodeCache.make_key(
-                tokenizer_key=tokenizer_key,
-                payload=payload,
-            )
-    except Exception:
-        key = None
-    if key is not None:
-        cached = GLOBAL_CHAT_ENCODE_CACHE.get(key)
-        if cached is not None:
-            ids, stored_observability = cached
-            if template_observability is not None:
-                template_observability.update(stored_observability)
-                template_observability["chat_encode_cache"] = "hit"
-            return ids
-    fresh_observability: dict[str, Any] = {}
-    ids = _encode_messages_uncached(
-        tokenizer,
-        messages,
-        enable_thinking=enable_thinking,
-        reasoning_effort=reasoning_effort,
-        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-        scoped_reasoning_history=scoped_reasoning_history,
-        preserve_reasoning_history=preserve_reasoning_history,
-        add_generation_prompt=add_generation_prompt,
-        tools=tools,
-        tool_choice=tool_choice,
-        tool_prompt_mode=tool_prompt_mode,
-        template_observability=fresh_observability,
-        allow_committed_reasoning=allow_committed_reasoning,
-    )
-    if key is not None:
-        GLOBAL_CHAT_ENCODE_CACHE.put(key, ids, fresh_observability)
-    if template_observability is not None:
-        template_observability.update(fresh_observability)
-        template_observability["chat_encode_cache"] = "miss"
-    return ids
+        if key is not None and snapshot.confirm(force=True):
+            GLOBAL_CHAT_ENCODE_CACHE.put(key, ids, fresh_observability)
+        if template_observability is not None:
+            template_observability.update(fresh_observability)
+            template_observability["chat_encode_cache"] = "miss"
+        return ids
 
 
 def _encode_messages_uncached(

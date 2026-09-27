@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import threading
+import weakref
 from pathlib import Path
 
 import pytest
 
 import mtplx.server.openai as oa
-from mtplx.chat_encode_cache import ChatSegmentEncodeMemo
+from mtplx.chat_encode_cache import ChatEncodeCache, ChatSegmentEncodeMemo
 
 
 class GreedyTokenizer:
@@ -309,7 +310,7 @@ def test_split_policy_change_is_not_served_stale(memo, monkeypatch):
     Rust flag still says split; the key must see the transformers flag
     change on its own."""
     tok = _special_marker_tokenizer(split_special_tokens=True)
-    text, cut = "<|im_start|>hi<|im_start|>hi", [14]
+    text, cut = "<|im_start|>hi<|im_start|>abc", [14]
     split_ids = _segmented(tok, text, cut)
     assert 8 not in split_ids  # the marker went in as text
 
@@ -317,7 +318,7 @@ def test_split_policy_change_is_not_served_stale(memo, monkeypatch):
     assert tok._tokenizer.encode_special_tokens is True  # not synced yet
     obs: dict = {}
     ids = _segmented(tok, text, cut, obs)
-    assert ids == [8, 2, 8, 2]
+    assert ids == [8, 2, 8, 1]
     assert obs["chat_segment_memo"]["hits"] == 0
 
 
@@ -352,6 +353,117 @@ def test_ids_are_filed_under_the_configuration_that_produced_them(
     ids = _segmented(tok, TEXT, BOUNDARIES, obs)
     assert ids == _without_memo(monkeypatch, tok, TEXT, BOUNDARIES)
     assert obs["chat_segment_memo"]["hits"] == 0
+
+
+def _many_added_tokens_tokenizer(count: int):
+    """A real fast tokenizer with ``count`` added tokens: the fingerprint
+    walks all of them, so its cost grows with the count."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"[UNK]": 0}
+    for word in ["user", "turn", "<", "|", "im_start", ">", "\n"]:
+        vocab[word] = len(vocab)
+    for index in range(256):
+        vocab[f"w{index}"] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w+|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_special_tokens(
+        [tokenizers.AddedToken("<|im_start|>", normalized=False, special=True)]
+    )
+    backend.add_tokens(
+        [
+            tokenizers.AddedToken(f"<extra_{index}>", normalized=False)
+            for index in range(count)
+        ]
+    )
+    tok = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    )
+    tok.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    return tok
+
+
+@pytest.fixture
+def fingerprint_calls(monkeypatch):
+    calls = {"count": 0}
+    real = oa._chat_tokenizer_encoding_fingerprint
+
+    def counting(tokenizer):
+        calls["count"] += 1
+        return real(tokenizer)
+
+    monkeypatch.setattr(oa, "_chat_tokenizer_encoding_fingerprint", counting)
+    return calls
+
+
+def test_fingerprint_is_taken_twice_per_encode_whatever_the_misses(
+    memo, monkeypatch, fingerprint_calls
+):
+    """4,096 added tokens and 128 turns that all miss: the fingerprint is
+    taken when the encode starts and once more before its ids are stored,
+    not once per miss (that cost 1.1 s for 128 misses at 16,384 added
+    tokens)."""
+    tok = _many_added_tokens_tokenizer(4096)
+    turns = [f"<|im_start|>user w{index % 256} turn\n" for index in range(128)]
+    rendered = "".join(turns)
+    boundaries = oa._chat_turn_boundaries(rendered)
+    assert len(boundaries) == 127
+
+    obs: dict = {}
+    cold = _segmented(tok, rendered, boundaries, obs)
+    assert obs["chat_segment_memo"]["misses"] == 128
+    assert fingerprint_calls["count"] == 2
+
+    fingerprint_calls["count"] = 0
+    obs = {}
+    warm = _segmented(tok, rendered, boundaries, obs)
+    assert obs["chat_segment_memo"]["hits"] == 128
+    assert fingerprint_calls["count"] == 1  # nothing new to store
+
+    assert cold == warm == oa._encode_rendered_chat_text(tok, rendered)
+
+
+def test_whole_request_encode_takes_two_fingerprints(
+    memo, monkeypatch, fingerprint_calls
+):
+    """Through the request front: the whole-request key, the turn-cut proof
+    and the segment keys share one fingerprint, and one more confirms it
+    before anything is stored. A repeat is a whole-request hit: one."""
+    monkeypatch.setattr(oa, "GLOBAL_CHAT_ENCODE_CACHE", ChatEncodeCache(max_entries=8))
+    monkeypatch.setattr(oa, "_CHAT_TURN_SEGMENT_PROOFS", weakref.WeakKeyDictionary())
+    tok = _many_added_tokens_tokenizer(4096)
+    request = oa.ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "user", "content": f"<|im_start|>user w{index} turn\n"}
+            for index in range(64)
+        ],
+    )
+
+    def encode(obs):
+        return oa._encode_messages(
+            tok,
+            request.messages,
+            enable_thinking=False,
+            scoped_reasoning_history=True,
+            template_observability=obs,
+        )
+
+    obs: dict = {}
+    first = encode(obs)
+    assert obs["chat_encode_cache"] == "miss"
+    assert obs["chat_segment_memo"]["misses"] >= 64
+    assert fingerprint_calls["count"] == 2
+
+    fingerprint_calls["count"] = 0
+    obs = {}
+    assert encode(obs) == first
+    assert obs["chat_encode_cache"] == "hit"
+    assert fingerprint_calls["count"] == 1
 
 
 def test_off_switch_bypasses_the_memo(memo, monkeypatch):

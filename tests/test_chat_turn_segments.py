@@ -81,17 +81,28 @@ def test_boundaries_sit_before_every_turn_but_the_first():
     assert oa._chat_turn_boundaries("no turns here") == []
 
 
+def _proof_encodes(tok) -> int:
+    """Encode calls the one-time proof makes: each probe once whole, then
+    once per piece between its cuts."""
+    return sum(
+        2 + len(oa._chat_turn_boundaries(probe))
+        for probe in oa._chat_turn_segment_probes(tok)
+    )
+
+
 def test_turns_are_encoded_separately_and_memoized(memo):
     tok = TurnTokenizer(FakeAddedToken("<|im_start|>"))
-    assert oa._chat_turn_segments_enabled(tok)  # the one-time proof
-    tok.encode_calls = 0
     obs: dict = {}
     ids = oa._encode_rendered_chat_turns(tok, RENDER, obs)
     assert ids == [ord(char) for char in RENDER]
-    assert tok.encode_calls == 3
+    # Cold: the proof runs first, then each of the three turns is encoded.
+    assert tok.encode_calls == _proof_encodes(tok) + 3
     assert obs["chat_segment_memo"]["misses"] == 3
 
+    # Warm: the proof is kept, the three turns are reused, one is new.
+    tok.encode_calls = 0
     oa._encode_rendered_chat_turns(tok, RENDER + "<|im_start|>user\nmore", obs)
+    assert tok.encode_calls == 1
     assert obs["chat_segment_memo"] == {
         "hits": 3,
         "misses": 1,
