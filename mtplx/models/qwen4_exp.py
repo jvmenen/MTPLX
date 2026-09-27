@@ -3015,11 +3015,35 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
+        # float32(sqrt(head_dim)), read through ``_score_divisor``.
+        object.__setattr__(
+            self,
+            "_sqrt_head_dim_buffer",
+            mx.array([math.sqrt(self.head_dim)] * 2, dtype=mx.float32),
+        )
         self._mrope_axes = (
             mx.array(_build_mrope_axes(args.mrope_section, args.mrope_interleaved), dtype=mx.int32)
             if args.mrope_section and sum(args.mrope_section) == int(args.rotary_dim) // 2
             else None
         )
+
+    def _score_divisor(self) -> mx.array:
+        """The block-score divisor float32(sqrt(head_dim)), never a constant.
+
+        The fixed-bank verify lane records ``_select_eager`` into the compiled
+        verifier. Divided by the Python float, sqrt(head_dim) becomes a scalar
+        constant of any fused kernel the division joins, and MLX 0.32.2 writes
+        such constants into the kernel source with 7 significant digits
+        (mlx/backend/common/compiled.h): sqrt(128) = 11.3137083 reads back as
+        11.31371, which turns distinct scores such as 1.5000001 / sqrt(128)
+        and 1.5000002 / sqrt(128) into a tie that the top-k cutoff breaks by
+        block id. A one-element array with no primitive is inlined the same
+        way (mlx/compile.cpp takes it for a constant), so the divisor is the
+        output of a slice: always read from memory, the float32 that the eager
+        division and the Metal selectors (SQRT_HEAD_DIM) use.
+        """
+
+        return self._sqrt_head_dim_buffer[:1]
 
     def _uses_vision_positions(self) -> bool:
         return vision_qsa_enabled() and self._mrope_axes is not None and vision_rope_state() is not None
@@ -3220,7 +3244,7 @@ class QSAIndexer(nn.Module):
         for s0 in range(0, S, tile):
             s1 = min(s0 + tile, S)
             sc = mx.matmul(q[:, s0:s1].astype(mx.float32), pooled_t)
-            sc = mx.maximum(sc, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
+            sc = mx.maximum(sc, 0.0).sum(axis=2) / self._score_divisor()
             sc = sc[0]  # [s1-s0, nb]
             valid_t = blk[None, :] < nb_q[s0:s1, None]
             masked_t = mx.where(valid_t, sc, neg) - tie
@@ -3273,7 +3297,7 @@ class QSAIndexer(nn.Module):
         else:
             scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1,S,H,nb]
             scores = (
-                mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
+                mx.maximum(scores, 0.0).sum(axis=2) / self._score_divisor()
             )
             scores = scores[0]  # [S, nb]
             masked_scores = mx.where(valid, scores, neg)
