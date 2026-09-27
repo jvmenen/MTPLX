@@ -11,6 +11,8 @@ harness), so the result-dict plumbing is exercised end to end.
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -216,6 +218,64 @@ def test_chat_first_token_logprobs_openai_shape(monkeypatch):
     assert calls[0]["first_token_logprobs_top_k"] == 3
 
 
+def _byte_level_tokenizer():
+    """A real byte-level BPE tokenizer with no merges: one token per byte,
+    so "é" is two tokens that each decode to U+FFFD on their own."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    alphabet = sorted(tokenizers.pre_tokenizers.ByteLevel.alphabet())
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.BPE(
+            vocab={char: index for index, char in enumerate(alphabet)}, merges=[]
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.ByteLevel(
+        add_prefix_space=False
+    )
+    backend.decoder = tokenizers.decoders.ByteLevel()
+    return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def test_chat_logprobs_report_the_bytes_of_byte_level_tokens(monkeypatch):
+    """The two halves of "é" both decode to U+FFFD, so their UTF-8 is the
+    same three bytes. The response must carry each token's own byte, and
+    the two alternatives must stay apart."""
+    tokenizer = _byte_level_tokenizer()
+    lead, trail = tokenizer.encode("é", add_special_tokens=False)
+    [letter] = tokenizer.encode("a", add_special_tokens=False)
+    first = SimpleNamespace(
+        token_id=lead,
+        logprob=-0.5,
+        top=((lead, -0.5), (trail, -1.25), (letter, -2.0)),
+    )
+    calls: list[dict] = []
+    client, state = _envelope_client(
+        monkeypatch,
+        generator=_logprobs_generator(
+            calls, first=first, text=tokenizer.decode([lead])
+        ),
+    )
+    state.runtime.tokenizer = tokenizer
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=BYPASS,
+        json={
+            "messages": [{"role": "user", "content": "label?"}],
+            "max_tokens": 1,
+            "logprobs": True,
+            "top_logprobs": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    [entry] = response.json()["choices"][0]["logprobs"]["content"]
+    assert entry["token"] == "\ufffd"
+    assert entry["bytes"] == [0xC3]
+    assert [alt["bytes"] for alt in entry["top_logprobs"]] == [[0xC3], [0xA9], [0x61]]
+    assert bytes(entry["bytes"] + entry["top_logprobs"][1]["bytes"]).decode() == "é"
+
+
 def test_chat_without_logprobs_has_no_logprobs_field(monkeypatch):
     calls: list[dict] = []
     client, _state = _envelope_client(
@@ -313,3 +373,101 @@ def test_mtp_batch_rejects_logprobs_without_solo_fallback(monkeypatch):
             generation_mode="mtp",
             first_token_logprobs_top_k=5,
         )
+
+
+# --- token bytes -------------------------------------------------------------
+
+
+def _sentencepiece_tokenizer():
+    """A real SentencePiece-style tokenizer like Gemma's: "\u2581" for a
+    space, <0xNN> byte tokens for anything outside the vocabulary."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"<unk>": 0}
+    for byte in range(256):
+        vocab[f"<0x{byte:02X}>"] = len(vocab)
+    for piece in ("\u2581hello", "\u2581", "é"):
+        vocab[piece] = len(vocab)
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.BPE(
+            vocab=vocab, merges=[], unk_token="<unk>", byte_fallback=True
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Metaspace(
+        prepend_scheme="never"
+    )
+    backend.decoder = tokenizers.decoders.Sequence(
+        [
+            tokenizers.decoders.Replace("\u2581", " "),
+            tokenizers.decoders.ByteFallback(),
+            tokenizers.decoders.Fuse(),
+        ]
+    )
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>"
+    )
+
+
+@pytest.mark.parametrize("make", [_byte_level_tokenizer, _sentencepiece_tokenizer])
+def test_token_bytes_spell_the_text_back(make):
+    tokenizer = make()
+    text = "é hello 😀"
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    assert b"".join(bytes(token_bytes(token)) for token in ids) == text.encode()
+
+
+def test_sentencepiece_byte_tokens_and_spaces():
+    tokenizer = _sentencepiece_tokenizer()
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    assert openai._token_byte_scheme(tokenizer) == "sentencepiece"
+    [emoji_lead, *_rest] = tokenizer.encode("😀", add_special_tokens=False)
+    assert tokenizer.convert_ids_to_tokens(emoji_lead) == "<0xF0>"
+    assert token_bytes(emoji_lead) == [0xF0]
+    hello = tokenizer.convert_tokens_to_ids("\u2581hello")
+    assert token_bytes(hello) == list(b" hello")
+
+
+def test_added_tokens_are_their_content():
+    tokenizer = _byte_level_tokenizer()
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<|im_end|>"]})
+    [end] = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    assert openai._token_bytes_reader(tokenizer)(end) == list(b"<|im_end|>")
+
+
+def test_text_tokenizer_reports_decoded_text_or_null():
+    tokenizer = SimpleNamespace(
+        decode=lambda ids, **_kwargs: "".join(
+            "\ufffd" if token >= 0xD800 else chr(token) for token in ids
+        )
+    )
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    assert openai._token_byte_scheme(tokenizer) == "text"
+    assert token_bytes(ord("é")) == list("é".encode())
+    assert token_bytes(0xD800) is None
+
+
+MODELS = Path.home() / ".mtplx/models"
+
+
+@pytest.mark.parametrize(
+    "pack",
+    [
+        MODELS / "Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
+        MODELS / "Youssofal--Gemma4-MTPLX-Optimized-Speed" / "target",
+    ],
+    ids=["qwen3.6-byte-level", "gemma4-sentencepiece"],
+)
+def test_real_pack_token_bytes_spell_the_text_back(pack):
+    if not (pack / "tokenizer.json").exists():
+        pytest.skip("model pack not cached locally")
+    from mtplx.runtime import _load_tokenizer_resilient
+
+    tokenizer = _load_tokenizer_resilient(
+        pack, json.loads((pack / "config.json").read_text())
+    )
+    text = "Café naïve 日本語 😀👍🏽 \U0001f9ec\u0f00\U0001d11e zero\u200bwidth\r\n\tend"
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    token_bytes = openai._token_bytes_reader(tokenizer)
+    assert all(token_bytes(token) is not None for token in ids)
+    assert b"".join(bytes(token_bytes(token)) for token in ids) == text.encode()

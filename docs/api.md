@@ -44,7 +44,11 @@ Both completion routes can return the next-token distribution after the prompt
 through the normal generation path. The values are the raw model
 log-probabilities of the row that produced the token, before temperature,
 penalties, grammar masks and steering. The top-K list always contains the sampled
-token with its true value. Limits: `max_tokens` must be 1, `stream` and a
+token with its true value. On chat, each entry's `bytes` are the token's own
+bytes, read from the tokenizer's vocabulary: a byte-level token that holds part
+of a character reports that byte, not the replacement character its text
+decodes to, and `bytes` is `null` when the tokenizer gives no way to recover
+them. Limits: `max_tokens` must be 1, `stream` and a
 non-empty `stop` are refused, and `K` is capped by `MTPLX_PROMPT_LOGPROBS_MAX`
 (default 128). Requests the MTP batch lane cannot serve are refused with 400
 rather than answered without logprobs.

@@ -25767,14 +25767,21 @@ def _completion_first_token_logprobs(tokenizer: Any, first: Any) -> dict[str, An
 
 
 def _chat_first_token_logprobs(tokenizer: Any, first: Any) -> dict[str, Any]:
-    """OpenAI /v1/chat/completions ``choices[0].logprobs`` for one token."""
+    """OpenAI /v1/chat/completions ``choices[0].logprobs`` for one token.
+
+    ``bytes`` are the token's own bytes (_token_bytes_reader), not the
+    UTF-8 of its decoded text: a byte-level token that holds part of a
+    character decodes to U+FFFD, whose UTF-8 is the same for every such
+    token and not the token's bytes.
+    """
+
+    token_bytes = _token_bytes_reader(tokenizer)
 
     def entry(token_id: int, logprob: float) -> dict[str, Any]:
-        text = tokenizer.decode([int(token_id)])
         return {
-            "token": text,
+            "token": tokenizer.decode([int(token_id)]),
             "logprob": float(logprob),
-            "bytes": list(text.encode("utf-8")),
+            "bytes": token_bytes(int(token_id)),
         }
 
     sampled = entry(first.token_id, first.logprob)
@@ -25782,6 +25789,117 @@ def _chat_first_token_logprobs(tokenizer: Any, first: Any) -> dict[str, Any]:
         entry(token_id, logprob) for token_id, logprob in first.top
     ]
     return {"content": [sampled], "refusal": None}
+
+
+def _gpt2_byte_decoder() -> dict[str, int]:
+    """The inverse of GPT-2's bytes_to_unicode: the character byte-level BPE
+    vocabularies use for each byte, back to that byte."""
+    printable = [
+        *range(ord("!"), ord("~") + 1),
+        *range(ord("\u00a1"), ord("\u00ac") + 1),
+        *range(ord("\u00ae"), ord("\u00ff") + 1),
+    ]
+    decoder = {chr(byte): byte for byte in printable}
+    shifted = 0
+    for byte in range(256):
+        if byte not in decoder.values():
+            decoder[chr(256 + shifted)] = byte
+            shifted += 1
+    return decoder
+
+
+_GPT2_BYTE_DECODER = _gpt2_byte_decoder()
+_BYTE_FALLBACK_PIECE_RE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+_TOKEN_BYTE_SCHEMES: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
+
+
+def _token_byte_scheme(tokenizer: Any) -> str:
+    """How the tokenizer's vocabulary pieces spell bytes, read from its
+    decoder: "byte_level" (GPT-2 byte-to-unicode pieces: Qwen, LFM2.5,
+    MiMo, Bonsai), "sentencepiece" ("\u2581" for a space and <0xNN> byte
+    tokens: Gemma 4), or "text" (neither; the decoded text is the token).
+    Kept per tokenizer object."""
+    try:
+        cached = _TOKEN_BYTE_SCHEMES.get(tokenizer)
+    except TypeError:
+        cached = None
+    if cached is not None:
+        return cached
+    scheme = _detect_token_byte_scheme(tokenizer)
+    try:
+        _TOKEN_BYTE_SCHEMES[tokenizer] = scheme
+    except TypeError:
+        pass
+    return scheme
+
+
+def _detect_token_byte_scheme(tokenizer: Any) -> str:
+    for layer in _chat_tokenizer_layers(tokenizer):
+        # A fast tokenizer's decoder serializes to its tokenizer.json entry.
+        try:
+            description = json.loads(getattr(layer, "decoder").__getstate__())
+        except (AttributeError, TypeError, ValueError):
+            continue
+        kinds: set[str] = set()
+        pending = [description]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                if isinstance(item.get("type"), str):
+                    kinds.add(item["type"])
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+        if "ByteLevel" in kinds:
+            return "byte_level"
+        if kinds & {"ByteFallback", "Metaspace"}:
+            return "sentencepiece"
+    # A slow GPT-2 style tokenizer keeps the table itself.
+    if isinstance(getattr(tokenizer, "byte_decoder", None), dict):
+        return "byte_level"
+    return "text"
+
+
+def _token_bytes_reader(tokenizer: Any) -> Callable[[int], list[int] | None]:
+    """A function from token id to the bytes the token stands for, or None
+    when the tokenizer gives no way to recover them.
+
+    Added tokens are their content. Otherwise the vocabulary piece is read
+    with the tokenizer's own byte scheme (_token_byte_scheme). A tokenizer
+    with neither reports the UTF-8 of the decoded text, and None when that
+    text holds U+FFFD, since then the token is part of a character.
+    """
+    scheme = _token_byte_scheme(tokenizer)
+    to_piece = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if to_piece is None:
+        scheme = "text"
+    try:
+        added = {
+            int(token_id): str(getattr(token, "content", token))
+            for token_id, token in tokenizer.added_tokens_decoder.items()
+        }
+    except (AttributeError, TypeError, ValueError):
+        added = {}
+
+    def token_bytes(token_id: int) -> list[int] | None:
+        if token_id in added:
+            return list(added[token_id].encode("utf-8"))
+        if scheme == "text":
+            text = tokenizer.decode([token_id])
+            return None if "\ufffd" in text else list(text.encode("utf-8"))
+        piece = to_piece(token_id)
+        if not isinstance(piece, str):
+            return None
+        if scheme == "byte_level":
+            if not all(char in _GPT2_BYTE_DECODER for char in piece):
+                return None
+            return [_GPT2_BYTE_DECODER[char] for char in piece]
+        byte_piece = _BYTE_FALLBACK_PIECE_RE.fullmatch(piece)
+        if byte_piece is not None:
+            return [int(byte_piece.group(1), 16)]
+        return list(piece.replace("\u2581", " ").encode("utf-8"))
+
+    return token_bytes
 
 
 async def _prompt_scoring_response(
