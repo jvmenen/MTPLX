@@ -14634,6 +14634,12 @@ def _chat_segment_encoder(
     the segment's exact text: memoizing them is exact by construction. Agent
     transcripts resend every earlier segment each turn, so only the new ones
     are tokenized. Counts land in template_observability["chat_segment_memo"].
+
+    The key is the tokenizer key, which carries the encoding fingerprint
+    (added tokens with their flags, the special-token split policy). It is
+    taken here and again after every miss's encode, and a miss's ids are
+    stored only when the two agree, so ids are never filed under a tokenizer
+    configuration other than the one that produced them.
     """
     tokenizer_key = (
         _chat_encode_tokenizer_key(tokenizer)
@@ -14642,13 +14648,15 @@ def _chat_segment_encoder(
     )
     if tokenizer_key is None:
         return lambda text: _encode_rendered_chat_text(tokenizer, text)
-    tokenizer_key = f"{tokenizer_key}:{_chat_segment_vocab_size(tokenizer)}"
+    current = {"tokenizer_key": tokenizer_key}
     counts = {"hits": 0, "misses": 0, "reused_tokens": 0}
     if template_observability is not None:
         template_observability["chat_segment_memo"] = counts
 
     def encode_segment(text: str) -> list[int]:
-        key = ChatSegmentEncodeMemo.make_key(tokenizer_key=tokenizer_key, text=text)
+        key = ChatSegmentEncodeMemo.make_key(
+            tokenizer_key=current["tokenizer_key"], text=text
+        )
         ids = GLOBAL_CHAT_SEGMENT_MEMO.get(key)
         if ids is not None:
             counts["hits"] += 1
@@ -14656,26 +14664,17 @@ def _chat_segment_encoder(
             return ids
         counts["misses"] += 1
         ids = _encode_rendered_chat_text(tokenizer, text)
-        GLOBAL_CHAT_SEGMENT_MEMO.put(key, ids)
+        refreshed = _chat_encode_tokenizer_key(tokenizer)
+        if refreshed == current["tokenizer_key"]:
+            GLOBAL_CHAT_SEGMENT_MEMO.put(key, ids)
+        elif refreshed is not None:
+            # The tokenizer changed since the key was taken: these ids may
+            # come from either configuration, so they are not stored, and
+            # the rest of this encode looks up under the new key.
+            current["tokenizer_key"] = refreshed
         return ids
 
     return encode_segment
-
-
-def _chat_segment_vocab_size(tokenizer: Any) -> str | None:
-    """Vocabulary component of the segment-memo key.
-
-    The tokenizer identity key survives tokens added to a live tokenizer
-    (``add_tokens``), and a new token can change how a remembered segment
-    splits. The base vocab size plus the added-token count changes with it.
-    ``len(tokenizer)`` would too, but on a fast tokenizer with a ~250K vocab
-    it costs ~11 ms per call; these two attributes cost microseconds.
-    mlx-lm's TokenizerWrapper forwards both to the HF tokenizer.
-    """
-    try:
-        return f"{int(tokenizer.vocab_size)}+{len(tokenizer.added_tokens_decoder)}"
-    except (AttributeError, TypeError, ValueError):
-        return None
 
 
 _CHAT_TURN_OPEN = "<|im_start|>"
@@ -14921,12 +14920,16 @@ _CHAT_ENCODE_TOKENIZER_IDS_LOCK = threading.Lock()
 def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
     """Identity component of the encode-cache key.
 
-    Two parts, both required for correctness:
+    Three parts, all required for correctness:
     - a per-INSTANCE uuid (weakref registry): two tokenizers with identical
       templates but different vocabs must never share entries;
     - the current template hash, computed EVERY call: template swaps on a
       live tokenizer (chat_template_profile application) must change the key
-      immediately — no memoized value to go stale.
+      immediately — no memoized value to go stale;
+    - the encoding fingerprint, computed EVERY call: re-adding a token with
+      other flags changes how text splits while the vocab size and the
+      added-token count stay the same, so the key of both encode caches
+      (whole request and per segment) must follow the flags themselves.
     Returns None (→ caller skips caching) for non-weakref-able tokenizers.
     """
     try:
@@ -14941,7 +14944,69 @@ def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
     tmpl_sha = hashlib.sha256(
         str(template).encode("utf-8", errors="surrogatepass")
     ).hexdigest()[:16]
-    return f"{type(tokenizer).__name__}:{uid}:{tmpl_sha}"
+    encoding = _chat_tokenizer_encoding_fingerprint(tokenizer)
+    return f"{type(tokenizer).__name__}:{uid}:{tmpl_sha}:{encoding}"
+
+
+def _chat_tokenizer_layers(tokenizer: Any) -> list[Any]:
+    """The tokenizer and the ones it wraps: mlx-lm's TokenizerWrapper keeps
+    the HF tokenizer in ``_tokenizer``, a fast HF tokenizer keeps the Rust
+    tokenizer there. Each layer can carry its own encode policy."""
+    layers = [tokenizer]
+    for _ in range(3):
+        inner = getattr(layers[-1], "_tokenizer", None)
+        if inner is None or any(inner is layer for layer in layers):
+            break
+        layers.append(inner)
+    return layers
+
+
+def _chat_tokenizer_splits_special_tokens(tokenizer: Any) -> bool:
+    """True when encode treats special added tokens as plain text:
+    transformers' ``split_special_tokens`` or the Rust tokenizer's
+    ``encode_special_tokens``, on any layer."""
+    return any(
+        getattr(layer, "split_special_tokens", False) is True
+        or getattr(layer, "encode_special_tokens", False) is True
+        for layer in _chat_tokenizer_layers(tokenizer)
+    )
+
+
+def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
+    """Hash of the encoding state a live tokenizer can change in place: the
+    base vocab size, every added token with its content, id and matching
+    flags (single_word, lstrip, rstrip, normalized, special), and the
+    special-token split policy.
+
+    Recomputed on every call because nothing signals a change. It costs
+    14-19 us on the Gemma 4, Qwen 3.6/3.8, MiMo and Bonsai tokenizers (24-33
+    added tokens) and 61 us on LFM2.5 (124). mlx-lm's TokenizerWrapper
+    forwards the attributes to the HF tokenizer.
+    """
+    digest = hashlib.sha256()
+    try:
+        digest.update(f"vocab={int(tokenizer.vocab_size)}".encode())
+    except (AttributeError, TypeError, ValueError):
+        digest.update(b"vocab=?")
+    digest.update(
+        b"split=1" if _chat_tokenizer_splits_special_tokens(tokenizer) else b"split=0"
+    )
+    try:
+        added = list(tokenizer.added_tokens_decoder.items())
+    except (AttributeError, TypeError):
+        added = []
+    for token_id, token in added:
+        flags = [getattr(token, name, None) for name in _ADDED_TOKEN_MATCH_FLAGS]
+        content = getattr(token, "content", token)
+        digest.update(
+            f"\x1e{token_id}\x1f{flags!r}\x1f{content}".encode(
+                "utf-8", errors="surrogatepass"
+            )
+        )
+    return digest.hexdigest()[:16]
+
+
+_ADDED_TOKEN_MATCH_FLAGS = ("single_word", "lstrip", "rstrip", "normalized", "special")
 
 
 def _encode_messages(

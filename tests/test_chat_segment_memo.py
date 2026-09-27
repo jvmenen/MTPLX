@@ -222,12 +222,14 @@ def test_tokens_added_in_place_are_not_served_stale(memo, monkeypatch):
     assert obs["chat_segment_memo"]["hits"] == 0
 
 
-def test_vocab_key_reads_through_a_wrapper():
+def test_encoding_fingerprint_reads_through_a_wrapper():
     inner = GreedyTokenizer(VOCAB)
-    assert oa._chat_segment_vocab_size(WrappedTokenizer(inner)) == "1000+8"
+    wrapped = WrappedTokenizer(inner)
+    before = oa._chat_tokenizer_encoding_fingerprint(wrapped)
+    assert oa._chat_tokenizer_encoding_fingerprint(wrapped) == before
     inner.add_tokens(["abcab"])
-    assert oa._chat_segment_vocab_size(WrappedTokenizer(inner)) == "1000+9"
-    assert oa._chat_segment_vocab_size(object()) is None
+    assert oa._chat_tokenizer_encoding_fingerprint(wrapped) != before
+    assert isinstance(oa._chat_tokenizer_encoding_fingerprint(object()), str)
 
 
 def test_wrapped_tokenizer_sees_tokens_added_to_the_inner_one(memo, monkeypatch):
@@ -238,6 +240,78 @@ def test_wrapped_tokenizer_sees_tokens_added_to_the_inner_one(memo, monkeypatch)
     obs: dict = {}
     ids = _segmented(wrapped, TEXT, BOUNDARIES, obs)
     assert ids == _without_memo(monkeypatch, wrapped, TEXT, BOUNDARIES)
+    assert obs["chat_segment_memo"]["hits"] == 0
+
+
+def _single_word_ab_tokenizer():
+    """A real fast tokenizer whose added token ``ab`` is whole-word only."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(
+            vocab={"[UNK]": 0, "x": 1, "|": 2}, unk_token="[UNK]"
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_tokens(
+        [tokenizers.AddedToken("ab", single_word=True, normalized=False)]
+    )
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    )
+
+
+def test_added_token_flag_change_is_not_served_stale(memo, monkeypatch):
+    """Re-adding ``ab`` without single_word keeps the vocab size and the
+    added-token count, but "xab" now splits as x + ab. The memo must not
+    serve the ids it stored under the old flags."""
+    from tokenizers import AddedToken
+
+    tok = _single_word_ab_tokenizer()
+    text, cut = "xab|xab", [4]
+    assert _segmented(tok, text, cut) == [1, 0, 0, 2, 1, 0, 0]
+
+    tok.add_tokens([AddedToken("ab", single_word=False, normalized=False)])
+    assert (tok.vocab_size, len(tok.added_tokens_decoder)) == (3, 2)
+    obs: dict = {}
+    ids = _segmented(tok, text, cut, obs)
+    assert ids == [1, 3, 2, 1, 3]
+    assert ids == _without_memo(monkeypatch, tok, text, cut)
+    assert obs["chat_segment_memo"]["hits"] == 0
+
+
+class ChangingTokenizer(GreedyTokenizer):
+    """Gains a token during its first encode call, as a shared tokenizer
+    reconfigured by another thread would, and can drop it again."""
+
+    def __init__(self, vocab, piece: str):
+        super().__init__(vocab)
+        self.piece = piece
+
+    def encode(self, text, add_special_tokens=False):
+        ids = super().encode(text, add_special_tokens=add_special_tokens)
+        if self.encode_calls == 1:
+            self.add_tokens([self.piece])
+        return ids
+
+    def remove_piece(self):
+        self.vocab = [piece for piece in self.vocab if piece != self.piece]
+
+
+def test_ids_are_filed_under_the_configuration_that_produced_them(
+    memo, monkeypatch
+):
+    """The key is taken again after every miss. Segments encoded after the
+    change are filed under the new configuration, so once the tokenizer is
+    back to the old one none of them is served for it."""
+    tok = ChangingTokenizer(VOCAB, piece="abcab")
+    _segmented(tok, TEXT, BOUNDARIES)
+    tok.remove_piece()
+    obs: dict = {}
+    ids = _segmented(tok, TEXT, BOUNDARIES, obs)
+    assert ids == _without_memo(monkeypatch, tok, TEXT, BOUNDARIES)
     assert obs["chat_segment_memo"]["hits"] == 0
 
 

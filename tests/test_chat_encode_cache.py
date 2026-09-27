@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import mtplx.server.openai as server
 from mtplx.chat_encode_cache import ChatEncodeCache
 from mtplx.server.openai import ChatMessage, _encode_messages
@@ -142,3 +144,38 @@ def test_render_day_is_part_of_the_key(monkeypatch):
     monkeypatch.setattr(server.time, "strftime", next_day)
     _encode_messages(tok, _messages(), enable_thinking=True)
     assert cache.stats()["misses"] == 2  # midnight rollover re-rendered
+
+
+def test_added_token_flag_change_invalidates(monkeypatch):
+    """Re-adding a token with other flags keeps the vocab size and the
+    added-token count but changes how text splits: "xab" is x + ab once
+    ``ab`` stops being whole-word only. A hit must not serve the old ids."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    cache = _fresh_cache(monkeypatch)
+    monkeypatch.setenv("MTPLX_CHAT_SEGMENT_MEMO", "off")
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(
+            vocab={"[UNK]": 0, "x": 1, "|": 2}, unk_token="[UNK]"
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split(
+        pattern=tokenizers.Regex(r"\w|[^\w\s]|\s"), behavior="isolated"
+    )
+    backend.add_tokens(
+        [tokenizers.AddedToken("ab", single_word=True, normalized=False)]
+    )
+    tok = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    )
+    tok.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    messages = [ChatMessage(role="user", content="xab|xab")]
+
+    before = _encode_messages(tok, messages, enable_thinking=False)
+    tok.add_tokens(
+        [tokenizers.AddedToken("ab", single_word=False, normalized=False)]
+    )
+    after = _encode_messages(tok, messages, enable_thinking=False)
+    assert before == [1, 0, 0, 2, 1, 0, 0]
+    assert after == [1, 3, 2, 1, 3]
+    assert cache.stats()["hits"] == 0
