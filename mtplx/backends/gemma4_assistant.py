@@ -15,6 +15,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -904,7 +905,7 @@ def gemma4_prefill_spans(rows: int, width: int | None) -> list[tuple[int, int]]:
     if head == 1:
         head += width
     edges = [0, *range(head or width, rows + 1, width)]
-    return list(zip(edges, edges[1:]))
+    return list(pairwise(edges))
 
 
 class Gemma4TargetAdapter:
@@ -976,8 +977,8 @@ class Gemma4TargetAdapter:
         or the layer whose KV it shares. A forward over such a cache returns
         its kept window plus the new rows, not every row."""
 
-        layers = list(getattr(self.text_model, "layers"))
-        previous = list(getattr(self.text_model, "previous_kvs"))
+        layers = list(self.text_model.layers)
+        previous = list(self.text_model.previous_kvs)
         caches = list(cache or ())
         producers: dict[str, Any] = {}
         for idx, layer in enumerate(layers):

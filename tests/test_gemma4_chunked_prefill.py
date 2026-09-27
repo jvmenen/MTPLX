@@ -34,6 +34,7 @@ within the first 13 tokens, and the chunked path does no earlier.
 from __future__ import annotations
 
 import time
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +44,7 @@ mx = pytest.importorskip("mlx.core")
 gemma4_text = pytest.importorskip("mlx_lm.models.gemma4_text")
 
 import mtplx.backends.gemma4_assistant as gemma4
-import mtplx.generation as generation
+from mtplx import generation
 from mtplx.sampling import SamplerConfig
 from mtplx.session_bank import SessionBank
 
@@ -60,28 +61,28 @@ OUTPUT_ATOL = 5e-3
 
 
 def _text_config(window: int, *, layers=LAYERS, shared: int = 2, hidden: int = 64) -> dict:
-    return dict(
-        model_type="gemma4_text",
-        hidden_size=hidden,
-        num_hidden_layers=len(layers),
-        intermediate_size=2 * hidden,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=256,
-        global_head_dim=512,
-        num_global_key_value_heads=1,
-        attention_k_eq_v=True,
-        sliding_window=window,
-        num_kv_shared_layers=shared,
-        use_double_wide_mlp=False,
-        hidden_size_per_layer_input=0,
-        enable_moe_block=False,
-        vocab_size=VOCAB,
-        max_position_embeddings=65_536,
-        final_logit_softcapping=30.0,
-        layer_types=list(layers),
-        tie_word_embeddings=True,
-    )
+    return {
+        "model_type": "gemma4_text",
+        "hidden_size": hidden,
+        "num_hidden_layers": len(layers),
+        "intermediate_size": 2 * hidden,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "num_global_key_value_heads": 1,
+        "attention_k_eq_v": True,
+        "sliding_window": window,
+        "num_kv_shared_layers": shared,
+        "use_double_wide_mlp": False,
+        "hidden_size_per_layer_input": 0,
+        "enable_moe_block": False,
+        "vocab_size": VOCAB,
+        "max_position_embeddings": 65_536,
+        "final_logit_softcapping": 30.0,
+        "layer_types": list(layers),
+        "tie_word_embeddings": True,
+    }
 
 
 class _Tokenizer:
@@ -207,7 +208,7 @@ def test_the_chunks_end_full_at_the_last_row_and_never_run_one_row(rows, width, 
     got = gemma4.gemma4_prefill_spans(rows, width)
     assert [end - start for start, end in got] == spans
     assert got[0][0] == 0 and got[-1][1] == rows
-    assert all(a[1] == b[0] for a, b in zip(got, got[1:]))
+    assert all(a[1] == b[0] for a, b in pairwise(got))
     assert all(end - start >= 2 for start, end in got) or rows == 1
 
 
@@ -329,7 +330,7 @@ def test_only_prompts_longer_than_one_chunk_are_split(tiny_pair, monkeypatch, cp
     runtime = tiny_pair(16)
     prompt = _prompt(66)
     cache, single, forwards = _prefill(runtime, prompt[:64], 64, monkeypatch)
-    whole_cache, whole, _ = _prefill(runtime, prompt[:64], "whole", monkeypatch)
+    _whole_cache, whole, _ = _prefill(runtime, prompt[:64], "whole", monkeypatch)
     assert forwards == [64]
     assert np.array_equal(_np(single.logits), _np(whole.logits))
     assert np.array_equal(_np(single.hidden), _np(whole.hidden))
