@@ -7,6 +7,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from .attention_context import current_attention_phase
 from .attention_math import attention_gate
 from .rope_origin import (
     cache_owns_rotary_origin,
@@ -203,17 +204,28 @@ def _install_split_attention_hook(attn: Any) -> bool:
         mask: mx.array | None = None,
         cache: Any | None = None,
     ) -> mx.array:
-        if not getattr(
-            self, "_mtplx_split_full_attention_enabled", False
-        ) and not cache_owns_rotary_origin(cache):
+        route_off = not getattr(self, "_mtplx_split_full_attention_enabled", False)
+        if route_off and not cache_owns_rotary_origin(cache):
             # No MTPLX attention route asked for, and the cache has no rotary
             # origin of its own: the stock forward, untouched. A cache that
             # owns one (an image request on a compiled route) rotates at it
             # below; the body under it is the stock forward's, row for row.
             # The canary first: a tensor-offset cache that SHOULD have owned
             # one is counted here, before the stock forward ropes it plainly.
-            note_unowned_rotary_origin(cache)
-            return original_call(self, x, mask=mask, cache=cache)
+            if current_attention_phase() != "decode_verify" or not (
+                _attention_has_gated_q_proj(self)
+            ):
+                note_unowned_rotary_origin(cache)
+                return original_call(self, x, mask=mask, cache=cache)
+            # A gated verify forward takes the body as well (its rope reads
+            # the offset through rope_offset_of, which runs the same canary).
+            # With no route asked for, every lane below stays off (blockwise
+            # included, which has a switch of its own) and the body is the
+            # stock forward row for row, except that its gate goes through
+            # attention_gate: mlx-lm's ``output * mx.sigmoid(gate)`` runs a
+            # standalone sigmoid eagerly and a fused one inside the compiled
+            # verifier's trace, which differ in the last bit of some bfloat16
+            # and float32 values (mtplx/attention_math.py).
         if not _attention_has_gated_q_proj(self):
             return original_call(self, x, mask=mask, cache=cache)
 
@@ -252,6 +264,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
         )
         blockwise_enabled = bool(
             cache is not None
+            and not (route_off and not cache_owns_rotary_origin(cache))
             and getattr(self, "_mtplx_blockwise_full_attention_enabled", False)
             and cached_prefix_len is not None
             and cached_prefix_len >= blockwise_threshold
