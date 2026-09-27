@@ -20348,86 +20348,118 @@ def _run_prefill_admission(
         settle(cheap)
         return None
 
-    reused_tokens = 0
-    reused_mode = "none"
-    source_entry = None
     identity = dict(restore_identity or {})
     plan_fn = getattr(session_bank, "restore_plan", None)
-    if session_bank is not None and callable(plan_fn):
-        # The bank answers with the restore's own lanes and gates (exact
-        # prefix; near prefix with recurrent boundaries, identity, epochs,
-        # lease usability), the same selection reclamation protects.
-        try:
-            plan = plan_fn(probe_ids, near_prefix=vision_splice is None, **identity)
-        except Exception:
-            plan = None
-        if plan and int(plan.get("reuse_tokens") or 0) > 0:
-            reused_tokens = int(plan["reuse_tokens"])
-            reused_mode = str(plan.get("mode") or "exact")
-            source_entry = plan.get("source")
-    elif session_bank is not None:
-        try:
-            entry = session_bank.longest_prefix(probe_ids)
-        except Exception:
-            entry = None
-        if entry is not None:
-            reused_tokens = len(entry.token_ids)
-            reused_mode = "exact"
-            source_entry = entry
-        # The restore path also serves prompts no entry is an exact prefix
-        # of: a block-prefix restore rewinds to the last safe boundary under
-        # the common prefix (the turn after a forced tool round, whose banked
-        # entry ends in the transient sentinel; a retokenized tail). Ask the
-        # bank the question the restore asks, or the estimate reads 0 and
-        # the session's own restorable entry is cleared as "superseded" (2.11
-        # release gate, tool_result_forced: 41,901 tokens re-prefilled cold,
-        # 54 s, with a 41,391-token block restore available).
-        shared_fn = getattr(session_bank, "longest_shared_prefix_tokens", None)
-        if callable(shared_fn):
+
+    def plan_restore() -> dict[str, Any]:
+        """What the restore will read, asked of the bank now. Every release
+        step spares the entries named here, and the admission asks again
+        after any step that evicted something: a bill that kept its first
+        answer priced a warm extension after its source was gone (the
+        review of 9c96dd9c)."""
+
+        reused_tokens = 0
+        reused_mode = "none"
+        source_entry = None
+        keys: set[tuple[int, ...]] = set()
+        if session_bank is not None and callable(plan_fn):
+            # The bank answers with the restore's own lanes and gates (exact
+            # prefix; near prefix with recurrent boundaries, identity,
+            # epochs, lease usability), the same selection reclamation
+            # protects.
             try:
-                block_tokens = _block_restorable_prefix_tokens(shared_fn(probe_ids))
+                plan = plan_fn(probe_ids, near_prefix=vision_splice is None, **identity)
             except Exception:
-                block_tokens = 0
-            if block_tokens > reused_tokens:
-                reused_tokens = block_tokens
-                reused_mode = "block_prefix"
-                source_entry = None
-    if session_bank is not None:
-        # The engine's live sessions serve a committed prefix too (a pending
-        # postcommit is about to bank one; #447: a warm 212K session read as
-        # a full miss, was cleared as "superseded", and every retry was a
-        # cold 211,807-token miss until a restart).
-        if vision_splice is None and _prefill_admission_live_prefix_enabled():
-            live_tokens = _live_session_prefix_tokens(state, prompt_ids, session_bank)
-            if live_tokens > reused_tokens:
-                reused_tokens = live_tokens
-                reused_mode = "live_session"
-                source_entry = None
-    copies = (
-        _admission_restore_copies_prefix(
-            source_entry,
-            # The near-prefix lane tries a lease first whenever the entry
-            # still owns its live cache.
-            restore_mode if reused_mode == "exact" else "reference",
+                plan = None
+            if plan:
+                keys = {tuple(key) for key in (plan.get("keys") or ())}
+            if plan and int(plan.get("reuse_tokens") or 0) > 0:
+                reused_tokens = int(plan["reuse_tokens"])
+                reused_mode = str(plan.get("mode") or "exact")
+                source_entry = plan.get("source")
+        elif session_bank is not None:
+            try:
+                entry = session_bank.longest_prefix(probe_ids)
+            except Exception:
+                entry = None
+            if entry is not None:
+                reused_tokens = len(entry.token_ids)
+                reused_mode = "exact"
+                source_entry = entry
+                keys = {tuple(entry.token_ids)}
+            # The restore path also serves prompts no entry is an exact
+            # prefix of: a block-prefix restore rewinds to the last safe
+            # boundary under the common prefix (the turn after a forced tool
+            # round, whose banked entry ends in the transient sentinel; a
+            # retokenized tail). Ask the bank the question the restore asks,
+            # or the estimate reads 0 and the session's own restorable entry
+            # is cleared as "superseded" (2.11 release gate,
+            # tool_result_forced: 41,901 tokens re-prefilled cold, 54 s, with
+            # a 41,391-token block restore available).
+            shared_fn = getattr(session_bank, "longest_shared_prefix_tokens", None)
+            if callable(shared_fn):
+                try:
+                    block_tokens = _block_restorable_prefix_tokens(shared_fn(probe_ids))
+                except Exception:
+                    block_tokens = 0
+                if block_tokens > reused_tokens:
+                    reused_tokens = block_tokens
+                    reused_mode = "block_prefix"
+                    source_entry = None
+        if session_bank is not None:
+            # The engine's live sessions serve a committed prefix too (a
+            # pending postcommit is about to bank one; #447: a warm 212K
+            # session read as a full miss, was cleared as "superseded", and
+            # every retry was a cold 211,807-token miss until a restart).
+            if vision_splice is None and _prefill_admission_live_prefix_enabled():
+                live_tokens = _live_session_prefix_tokens(state, prompt_ids, session_bank)
+                if live_tokens > reused_tokens:
+                    reused_tokens = live_tokens
+                    reused_mode = "live_session"
+                    source_entry = None
+        copies = (
+            _admission_restore_copies_prefix(
+                source_entry,
+                # The near-prefix lane tries a lease first whenever the entry
+                # still owns its live cache.
+                restore_mode if reused_mode == "exact" else "reference",
+            )
+            if reused_mode in {"exact", "near_prefix"}
+            else True
         )
-        if reused_mode in {"exact", "near_prefix"}
-        else True
-    )
-    source_layout = (
-        prefill_cache_layout(runtime, reused_tokens)
-        if reused_tokens > 0 and not copies
-        else None
-    )
-    lease = (
-        _lease_cache_shape(source_entry)
-        if reused_tokens > 0 and not copies and source_entry is not None
-        else None
-    )
+        return {
+            "reused_tokens": int(reused_tokens),
+            "reused_mode": reused_mode,
+            "source_entry": source_entry,
+            "keys": keys,
+            "copies": bool(copies),
+            "source_layout": (
+                prefill_cache_layout(runtime, reused_tokens)
+                if reused_tokens > 0 and not copies
+                else None
+            ),
+            "lease": (
+                _lease_cache_shape(source_entry)
+                if reused_tokens > 0 and not copies and source_entry is not None
+                else None
+            ),
+        }
+
+    restore = plan_restore()
+    reused_tokens = restore["reused_tokens"]
+    reused_mode = restore["reused_mode"]
+    copies = restore["copies"]
     miss_tokens = max(0, prompt_tokens - reused_tokens)
 
     def price() -> dict[Any, dict[str, Any]]:
         return {
-            w: growth(reused_tokens, copies, source_layout, w, lease=lease)
+            w: growth(
+                restore["reused_tokens"],
+                restore["copies"],
+                restore["source_layout"],
+                w,
+                lease=restore["lease"],
+            )
             for w in widths
         }
 
@@ -20493,6 +20525,33 @@ def _run_prefill_admission(
         # chunk width before anyone's state is taken.
         return shed_deficit(snapshot, current)
 
+    def replan(step: str, evicted: Any) -> None:
+        # A step that evicted anything may have changed what the restore
+        # reads: ask again and price the request on the answer.
+        nonlocal restore, models, current
+        if not evicted:
+            return
+        before = restore
+        restore = plan_restore()
+        models = price()
+        current = models[narrow]
+        if (
+            restore["reused_tokens"] != before["reused_tokens"]
+            or restore["copies"] != before["copies"]
+        ):
+            receipt.setdefault("restore_replanned", []).append(
+                {
+                    "after": step,
+                    "reusable_prefix_tokens": int(restore["reused_tokens"]),
+                    "reusable_prefix_mode": restore["reused_mode"],
+                    "restore_copies_prefix": bool(restore["copies"]),
+                }
+            )
+
+    # Sessions generating, finalizing or being released: no step takes
+    # their state.
+    in_flight_ids = _in_flight_session_ids(state)
+
     if chosen is not _ADMISSION_NO_FIT:
         # A narrower chunk fits without taking anything from anyone: its
         # smaller forward is the cheapest way to make room (2026-09-27
@@ -20546,6 +20605,10 @@ def _run_prefill_admission(
                     clear_pool()
                     now = measure()
                     steps.append("superseded_session")
+                    replan(
+                        "superseded_session",
+                        receipt["superseded_session_entries_evicted"],
+                    )
                 elif session_id and reused_tokens > 0:
                     # A restorable prefix exists: pin this session so the LRU
                     # pass below cannot evict the entry the restore depends on.
@@ -20559,15 +20622,22 @@ def _run_prefill_admission(
                             max(0, bank_bytes_now - remaining),
                             reason="prefill_admission",
                             protect_active=True,
+                            protect_keys=restore["keys"],
+                            protect_session_ids=in_flight_ids,
                         )
                     )
                     clear_pool()
                     now = measure()
                     steps.append("lru_idle_entries")
+                    replan("lru_idle_entries", receipt["lru_entries_evicted"])
                 # 5. #447: a deep session's sibling snapshots (forked
                 # generations no put-time supersede collapses) are
                 # active-protected above; walk the chain prefixes, never an
-                # entry this prompt restores from.
+                # entry this prompt restores from, never a busy session's.
+                # No ownership hold: the walk drops bank entries only, never
+                # a session record or its live cache, and this admission
+                # runs inside the engine's generation lock, so no other
+                # request restores while it walks.
                 if _prefill_admission_chain_shed_enabled():
                     remaining = deficit(now)
                     bank_bytes_now = int(session_bank.total_nbytes)
@@ -20577,19 +20647,21 @@ def _run_prefill_admission(
                             max(0, bank_bytes_now - remaining),
                             protect_tokens=probe_ids,
                             reason="prefill_admission_chain",
+                            protect_keys=restore["keys"],
+                            protect_session_ids=in_flight_ids,
                         )
                         receipt["chain_entries_evicted"] = int(chain_evicted)
                         receipt["terminal_entries_evicted"] = int(terminal_evicted)
                         clear_pool()
                         now = measure()
                         steps.append("chain_walk")
+                        replan("chain_walk", int(chain_evicted) + int(terminal_evicted))
             except Exception as exc:
                 receipt["bank_error"] = repr(exc)
 
     # 6. Whole idle conversations (the 2026-09-26 report: pi's compaction is
     # a new session and the conversation it summarizes is idle, holding a
     # generation-final and a postcommit entry with a live cache each).
-    in_flight_ids = _in_flight_session_ids(state)
     keep_ids = set(in_flight_ids)
     if session_id:
         keep_ids.add(str(session_id))
@@ -20616,6 +20688,7 @@ def _run_prefill_admission(
                 )
                 clear_pool()
                 now = measure()
+                replan("idle_sessions", rounds[-1].get("entries"))
                 if deficit(now) <= 0 or not rounds[-1].get("entries"):
                     break
             steps.append("idle_sessions")
@@ -20649,6 +20722,10 @@ def _run_prefill_admission(
             clear_pool()
             now = measure()
             steps.append("own_session_siblings")
+            replan(
+                "own_session_siblings",
+                (receipt["own_session_release"] or {}).get("entries"),
+            )
         except Exception as exc:
             receipt["own_session_release_error"] = repr(exc)
 

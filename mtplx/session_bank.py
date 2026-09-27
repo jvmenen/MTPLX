@@ -3216,6 +3216,8 @@ class SessionBank:
         *,
         reason: str = "memory_pressure",
         protect_active: bool = False,
+        protect_keys: Any = None,
+        protect_session_ids: Any = None,
     ) -> int:
         """Evict least-recently-used entries until the bank fits the target.
 
@@ -3232,21 +3234,37 @@ class SessionBank:
         (2026-08-28 receipt: a 93k OpenCode session's bank was walked to 0
         bytes mid-request, TTFT 54-57 s after). Real macOS pressure keeps
         take-anything semantics — active sessions merely sort last there.
+
+        ``protect_keys`` (entries a prompt is about to restore from, whatever
+        session owns them) and ``protect_session_ids`` (sessions generating
+        or being released) are never taken: the admission's LRU step used to
+        pin only the incoming session, and evicted another idle session's
+        entry that was this prompt's restore source (the review of
+        9c96dd9c).
         """
 
         evicted = 0
         target = max(0, int(target_bytes))
         active = self._active_session_ids()
+        keep_keys = {tuple(key) for key in (protect_keys or ())}
+        keep_sessions = {str(sid) for sid in (protect_session_ids or ()) if sid}
         while self._entries and self.total_nbytes > target:
             candidates = self._entries.values()
+            if keep_keys or keep_sessions:
+                candidates = [
+                    entry
+                    for key, entry in self._entries.items()
+                    if key not in keep_keys
+                    and not (entry.session_id and entry.session_id in keep_sessions)
+                ]
             if protect_active and active:
                 candidates = [
                     entry
                     for entry in candidates
                     if entry.session_id not in active
                 ]
-                if not candidates:
-                    break
+            if not candidates:
+                break
             victim = min(
                 candidates,
                 # Real memory pressure may take anything, but active sessions
@@ -3749,6 +3767,8 @@ class SessionBank:
         *,
         protect_tokens: list[int] | tuple[int, ...] | None = None,
         reason: str = "prefill_admission_chain",
+        protect_keys: Any = None,
+        protect_session_ids: Any = None,
     ) -> tuple[int, int]:
         """Escalating eviction for the admission shed (#447).
 
@@ -3771,11 +3791,16 @@ class SessionBank:
         token with the prompt is not a restore source), and
         every eviction is RAM-only: the SSD cold tier still restores a walked
         entry, so the worst case is a disk read on some session's next turn,
-        not this request's abort.
+        not this request's abort. ``protect_keys`` adds the caller's own
+        restore plan (validated with the request's identity) and
+        ``protect_session_ids`` spares every session that is generating or
+        being released: the walk took their snapshots too.
         Returns ``(non_terminal_evicted, terminal_evicted)``.
         """
         target = max(0, int(target_bytes))
-        protected_keys = self.restore_source_keys(protect_tokens)
+        protected_keys = set(self.restore_source_keys(protect_tokens))
+        protected_keys |= {tuple(key) for key in (protect_keys or ())}
+        busy_sessions = {str(sid) for sid in (protect_session_ids or ()) if sid}
 
         def _walk(candidates_fn, order_key) -> int:
             evicted = 0
@@ -3797,6 +3822,8 @@ class SessionBank:
             # walking one frees nothing and costs the running session its
             # state. Measured: the first decode after such an eviction ran
             # at 15 tok/s against 63 stock.
+            if entry.session_id and entry.session_id in busy_sessions:
+                return False
             return entry.cache_ref is None and not entry.live_ref_only
 
         def _evictable_under_deficit(entry) -> bool:
@@ -3808,6 +3835,8 @@ class SessionBank:
             # shed could not reach ("bank 0, nothing sheddable", then a 507
             # that only a restart cleared). Releasing one costs that session
             # a disk restore or a prefill on its next turn.
+            if entry.session_id and entry.session_id in busy_sessions:
+                return False
             return _evictable(entry) or entry.live_ref_only
 
         def _non_terminal_candidates():
