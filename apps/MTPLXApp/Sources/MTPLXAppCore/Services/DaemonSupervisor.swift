@@ -180,6 +180,10 @@ public final class DaemonSupervisor: @unchecked Sendable {
     /// Where the held daemon's health was verified: the owned launch's
     /// health URL or the adopted daemon's. Read only while a daemon is held.
     private var heldBaseURL: URL?
+    /// The API key the held daemon was launched or adopted with (#528). A
+    /// daemon reads its key once at startup, so a key changed in settings
+    /// since then is not the key it accepts.
+    private var heldAPIKey: String?
     private let logStore: BoundedLogStore
     /// Where a failed start's output is written (#504). `nil` writes nothing:
     /// the default, so a test that fails a launch never touches the real home.
@@ -428,11 +432,19 @@ public final class DaemonSupervisor: @unchecked Sendable {
     /// (#503) or settings reloaded from disk change where the next launch
     /// listens, not where the running one does.
     public func activeBaseURL() -> URL? {
+        activeConnection()?.baseURL
+    }
+
+    /// Where the held daemon listens and the API key it was launched or
+    /// adopted with, or `nil` when the supervisor holds none (#528). Both
+    /// belong to the daemon, not to the settings: the settings describe the
+    /// next launch, and the running daemon read its key once at startup.
+    public func activeConnection() -> (baseURL: URL, apiKey: String?)? {
         lock.withLock {
-            guard process != nil || adoptedProcessID != nil || launchInProgress else {
-                return nil
-            }
-            return heldBaseURL
+            guard process != nil || adoptedProcessID != nil || launchInProgress,
+                  let heldBaseURL
+            else { return nil }
+            return (heldBaseURL, heldAPIKey)
         }
     }
 
@@ -448,6 +460,35 @@ public final class DaemonSupervisor: @unchecked Sendable {
             guard process != nil || launchInProgress else { return nil }
             return ownedLaunchID
         }
+    }
+
+    /// Whether `pid` is still the daemon this supervisor holds (#528): the
+    /// owned root while its Process runs, or a live process whose
+    /// environment carries the held launch id. A pid alone proves nothing
+    /// once its process has exited: the kernel hands the number out again.
+    public func pidRunsHeldDaemon(_ pid: pid_t) -> Bool {
+        let held = lock.withLock { () -> (process: Process?, launchID: String?) in
+            (process, adoptedProcessID != nil ? adoptedLaunchID : ownedLaunchID)
+        }
+        if let process = held.process, process.processIdentifier == pid {
+            return process.isRunning
+        }
+        guard pid > 1, let launchID = held.launchID, Self.pidIsAlive(pid) else { return false }
+        return Self.appLaunchID(ofProcess: pid) == launchID
+    }
+
+    /// Whether the daemon this supervisor holds still runs (#528). An
+    /// adopted daemon gives no exit callback, so this is the only way to
+    /// learn that it is gone while something else answers on its port.
+    public func heldDaemonIsRunning() -> Bool {
+        let held = lock.withLock { (process: process, adoptedPID: adoptedProcessID) }
+        if let process = held.process {
+            return process.isRunning
+        }
+        if let adoptedPID = held.adoptedPID {
+            return pidRunsHeldDaemon(adoptedPID)
+        }
+        return false
     }
 
     /// The daemon root pid this supervisor owns or adopted, for liveness
@@ -556,6 +597,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 guard adoptCurrentLaunch(
                     existing,
                     healthBaseURL: healthBaseURL,
+                    apiKey: apiKey,
                     generation: launchGeneration,
                     lifecycleEpoch: launchLifecycleEpoch,
                     automaticAttempt: automaticAttempt
@@ -619,6 +661,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             adoptedLaunchID = nil
             ownedLaunchID = launchIdentifier(from: command)
             heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             launchInProgress = true
             // A Process has been reserved but does not have a usable PID until
             // run() returns. Keep the public phase at .starting through that
@@ -1100,6 +1143,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private func adoptCurrentLaunch(
         _ health: HealthPayload,
         healthBaseURL: URL,
+        apiKey: String?,
         generation: Int,
         lifecycleEpoch: Int,
         automaticAttempt: Int?
@@ -1115,6 +1159,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             adoptedProcessID = pid
             adoptedLaunchID = health.startup?.launchId
             heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             lastOwnedLaunch = nil
             automaticRestartEligible = false
             restartStatus = .idle
@@ -1193,6 +1238,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         guard adoptCurrentLaunch(
             existing,
             healthBaseURL: healthBaseURL,
+            apiKey: apiKey,
             generation: adoptionGeneration,
             lifecycleEpoch: adoptionLifecycleEpoch,
             automaticAttempt: nil
@@ -1230,6 +1276,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             waitsForLaunch: Bool,
             process: Process?,
             adoptedPID: pid_t?,
+            adoptedLaunchID: String?,
             lifecycleEpoch: Int,
             launchID: String?
         )? in
@@ -1261,6 +1308,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             // root PID after the launch barrier opens.
             let currentProcess = expectedProcess ?? process
             let currentAdoptedPID = adoptedProcessID
+            let currentAdoptedLaunchID = adoptedLaunchID
             let currentLaunchID = ownedLaunchID
             let currentLifecycleEpoch = lifecycleEpoch
             state = .stopping
@@ -1268,6 +1316,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 launchInProgress,
                 currentProcess,
                 currentAdoptedPID,
+                currentAdoptedLaunchID,
                 currentLifecycleEpoch,
                 currentLaunchID
             )
@@ -1280,15 +1329,41 @@ public final class DaemonSupervisor: @unchecked Sendable {
         if stopContext.waitsForLaunch {
             await waitForLaunchCompletion()
         }
+        // Signal only processes confirmed as this lifecycle's daemon (#528).
+        // A pid is a number the kernel hands out again once its process has
+        // exited and been reaped: an adopted daemon that exited while the
+        // Mac slept, or a pid from an older /health answer, can name an
+        // unrelated process by the time Stop runs. The owned root is
+        // confirmed by its Process object while it runs. Any other pid is
+        // confirmed only when the process holding it carries this
+        // lifecycle's launch id in its environment, read from the kernel as
+        // for #503. A pid that cannot be confirmed is never signalled.
         var rootPIDs: [pid_t] = []
-        if let currentPID = stopContext.process?.processIdentifier {
-            rootPIDs.append(currentPID)
+        if let owned = stopContext.process,
+           owned.processIdentifier > 1,
+           owned.isRunning {
+            rootPIDs.append(owned.processIdentifier)
         }
-        if let adopted = stopContext.adoptedPID {
-            rootPIDs.append(adopted)
+        let confirmingLaunchID = stopContext.adoptedPID != nil
+            ? stopContext.adoptedLaunchID
+            : stopContext.launchID
+        var unconfirmedPIDs: [pid_t] = []
+        let otherPIDs = ([stopContext.adoptedPID].compactMap { $0 } + additionalProcessIDs)
+            .filter { $0 > 1 }
+        for pid in otherPIDs where !rootPIDs.contains(pid) && !unconfirmedPIDs.contains(pid) {
+            if let confirmingLaunchID, Self.appLaunchID(ofProcess: pid) == confirmingLaunchID {
+                rootPIDs.append(pid)
+            } else if Self.pidIsAlive(pid) {
+                unconfirmedPIDs.append(pid)
+            }
         }
-        rootPIDs.append(contentsOf: additionalProcessIDs)
-        rootPIDs = rootPIDs.filter { $0 > 1 }
+        if !unconfirmedPIDs.isEmpty {
+            let list = unconfirmedPIDs.map(String.init).joined(separator: ",")
+            await logStore.append(
+                "stop: not signalling pid \(list): the process there does not carry this daemon's launch id (the daemon exited and the pid now belongs to another process)",
+                stream: .system
+            )
+        }
         // A daemon can exit after Stop has claimed the lifecycle but before
         // pgrep expands its descendants. Those descendants then reparent and
         // are no longer discoverable by PPID, so include the exact inherited

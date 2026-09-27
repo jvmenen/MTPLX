@@ -88,10 +88,13 @@ final class DaemonHoldTests: XCTestCase {
 
     func testAdoptedDaemonIsHeldUnderTheLaunchIDItReported() async throws {
         // A real process stands in for the adopted daemon, so Stop signals
-        // something this test owns.
+        // something this test owns. It carries the launch id in its
+        // environment, as a daemon the app launched does; Stop signals only
+        // a process that does.
         let adopted = Process()
         adopted.executableURL = URL(fileURLWithPath: "/bin/sleep")
         adopted.arguments = ["30"]
+        adopted.environment = ["MTPLX_APP_LAUNCH_ID": "prior-session"]
         try adopted.run()
         addTeardownBlock { if adopted.isRunning { adopted.terminate() } }
         let health = try healthPayload(
@@ -117,6 +120,10 @@ final class DaemonHoldTests: XCTestCase {
 
         await supervisor.stop(graceSeconds: 1)
         XCTAssertEqual(supervisor.currentHold(), .none)
+        for _ in 0..<100 where adopted.isRunning {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(adopted.isRunning, "Stop signalled the adopted daemon it could confirm")
     }
 
     /// The supervisor contract itself is unchanged: `start` on a held slot

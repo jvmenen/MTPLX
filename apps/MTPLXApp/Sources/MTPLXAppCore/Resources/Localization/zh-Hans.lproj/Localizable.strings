@@ -190,6 +190,7 @@
 "Another MTPLX server holds port %@ (pid %@); this app is not connected to it." = "另一个 MTPLX 服务器占用了端口 %@（pid %@）；此应用未连接到它。";
 "Another MTPLX server holds port %@; this app is not connected to it." = "另一个 MTPLX 服务器占用了端口 %@；此应用未连接到它。";
 "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted." = "另一个进程正使这台 Mac 陷入内存压力。峰值期间解码速度可能下降；引擎自身的内存占用保持稳定，未逐出任何内容。";
+"Another server holds port %@; this app is not connected to it." = "另一个服务器占用了端口 %@；此应用未连接到它。";
 "ANSWER" = "答案";
 "API key" = "API 密钥";
 "API key (optional)" = "API 密钥（可选）";

@@ -101,10 +101,18 @@ struct ReconnectFakeDaemon {
     /// A daemon the app did not launch in this session: an app-owned one
     /// from an earlier session (with a launch id) or `mtplx serve` typed in
     /// a terminal (without one).
-    func launchOutsideTheApp(launchID: String?) throws -> Process {
+    /// With `apiKey`, the daemon requires that key on every request (a
+    /// server whose key the app does not have answers 401).
+    func launchOutsideTheApp(launchID: String?, apiKey: String? = nil) throws -> Process {
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["serve", "--port", String(port), "--model", modelDirectory.path]
+        var arguments = ["serve", "--port", String(port), "--model", modelDirectory.path]
+        if let apiKey {
+            let keyFile = root.appendingPathComponent("outside-key-\(UUID().uuidString)")
+            try Data(apiKey.utf8).write(to: keyFile)
+            arguments += ["--api-key-file", keyFile.path]
+        }
+        process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "MTPLX_APP_LAUNCH_ID")
         if let launchID {
@@ -115,8 +123,38 @@ struct ReconnectFakeDaemon {
         return process
     }
 
-    func waitUntilHealthy(timeout: TimeInterval = 10) async throws -> HealthPayload {
-        let client = MTPLXAPIClient(baseURL: baseURL)
+    /// Waits until something answers HTTP on the port, whatever it says.
+    func waitUntilAnswering(timeout: TimeInterval = 10) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        let url = baseURL.appendingPathComponent("health")
+        while Date() < deadline {
+            if let (_, response) = try? await URLSession.shared.data(from: url),
+               response is HTTPURLResponse {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw DaemonSupervisorError.healthTimeout
+    }
+
+    /// /health reports this pid instead of the daemon's own, or its own
+    /// again with `nil`.
+    func setReportedPID(_ pid: pid_t?) throws {
+        let url = root.appendingPathComponent("report-pid")
+        if let pid {
+            try Data(String(pid).utf8).write(to: url)
+        } else if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// /health answers 200 with a body that is not a health payload.
+    func setHealthUndecodable(_ undecodable: Bool) throws {
+        try setFlag("health-undecodable", undecodable)
+    }
+
+    func waitUntilHealthy(timeout: TimeInterval = 10, apiKey: String? = nil) async throws -> HealthPayload {
+        let client = MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let health = try? await client.health(), health.ok {
@@ -165,7 +203,8 @@ struct ReconnectFakeDaemon {
         configuration: MTPLXAppConfiguration,
         supervisor: DaemonSupervisor = DaemonSupervisor(),
         fans: FanCallRecorder,
-        openCodeConfigURL: URL? = nil
+        openCodeConfigURL: URL? = nil,
+        beforeStaticStateAnswersAreRead: (@Sendable () async -> Void)? = nil
     ) -> MTPLXBackendStore {
         // HOME inside the fixture: a failed launch writes the runtime
         // import-recheck marker under the builder's Application Support.
@@ -192,7 +231,8 @@ struct ReconnectFakeDaemon {
             fanModeSetter: { _, mode, _, _ in
                 await fans.set(mode)
                 return FanModeResponse(verified: true, currentMode: mode)
-            }
+            },
+            beforeStaticStateAnswersAreRead: beforeStaticStateAnswersAreRead
         )
     }
 
@@ -275,6 +315,12 @@ struct ReconnectFakeDaemon {
         LAUNCH_ID = arg("--app-launch-id") or os.environ.get("MTPLX_APP_LAUNCH_ID") or None
         PID = os.getpid()
         PARENT = os.getppid()
+        # Like `mtplx serve`: the key is read once at startup from the file
+        # the app hands over, and every request must carry it.
+        API_KEY = None
+        if arg("--api-key-file"):
+            with open(arg("--api-key-file"), encoding="utf-8") as key_file:
+                API_KEY = key_file.read().strip() or None
 
         def control(name):
             return os.path.join(CONTROL, name)
@@ -398,12 +444,32 @@ struct ReconnectFakeDaemon {
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
+            def _authorized(self):
+                return API_KEY is None or self.headers.get("Authorization") == "Bearer " + API_KEY
+
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                if not self._authorized():
+                    return self._empty(401)
                 if path == "/health":
                     if flag("health-down"):
                         return self._empty(503)
-                    return self._json(HEALTH)
+                    if flag("health-undecodable"):
+                        body = b"<html>not an MTPLX health payload</html>"
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    payload = dict(HEALTH)
+                    if os.path.exists(control("report-pid")):
+                        # The pid this daemon claims on /health: a stand-in
+                        # for a pid the kernel has since given to another
+                        # process.
+                        with open(control("report-pid"), encoding="utf-8") as handle:
+                            payload["startup"] = dict(HEALTH["startup"], pid=int(handle.read().strip()))
+                    return self._json(payload)
                 if path == "/v1/mtplx/metrics/stream":
                     if flag("stream-down"):
                         return self._empty(503)
@@ -449,6 +515,8 @@ struct ReconnectFakeDaemon {
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 if length:
                     self.rfile.read(length)
+                if not self._authorized():
+                    return self._empty(401)
                 if path == "/v1/mtplx/settings":
                     return self._json(SETTINGS)
                 return self._empty(404)
@@ -475,6 +543,57 @@ actor FanCallRecorder {
 
     func set(_ mode: String) {
         modes.append(mode)
+    }
+}
+
+/// A TCP listener that takes connections into its backlog and never
+/// answers. To the port preflight it is another app on the port, which it
+/// re-probes for the whole settle window.
+final class SilentListener {
+    private let descriptor: Int32
+
+    init(port: Int) throws {
+        descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var reuse: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port)).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, Darwin.listen(descriptor, 16) == 0 else {
+            let failure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EADDRINUSE)
+            Darwin.close(descriptor)
+            throw failure
+        }
+    }
+
+    func close() {
+        Darwin.close(descriptor)
+    }
+}
+
+/// Runs an action set by the test at most once, the first time `run` is
+/// called after it was set; before that, `run` does nothing.
+actor OneShotAction {
+    private var action: (@MainActor @Sendable () async -> Void)?
+
+    func set(_ action: @escaping @MainActor @Sendable () async -> Void) {
+        self.action = action
+    }
+
+    func run() async {
+        guard let action else { return }
+        self.action = nil
+        await action()
     }
 }
 
@@ -1250,6 +1369,265 @@ final class DaemonReconnectTests: XCTestCase {
         await store.startDaemon()
         XCTAssertNil(store.configurationChangeFailure)
         XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(daemon.spawns().count, 1)
+    }
+
+    // MARK: Codex final review, finding 1: a stale answer from the replaced daemon
+
+    /// Refresh's answers come from daemon A, and a restart replaces A with
+    /// B before they are read. A's answer carries A's launch id, which is
+    /// not B's: read against B it looked like another server on the port,
+    /// and the app reaped its own replacement daemon. It is now dropped.
+    @MainActor
+    func testAStaleRefreshAnswerFromTheReplacedDaemonIsDropped() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let restartInTheWindow = OneShotAction()
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .default),
+            fans: FanCallRecorder(),
+            beforeStaticStateAnswersAreRead: { await restartInTheWindow.run() }
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let first = try XCTUnwrap(store.health?.startup)
+        await restartInTheWindow.set { @MainActor in
+            try? await store.applyConfiguration(store.configuration, restartIfRunning: true)
+        }
+
+        await store.refresh()
+
+        let spawns = daemon.spawns()
+        XCTAssertEqual(spawns.count, 2, "A and its replacement B")
+        let replacement = try XCTUnwrap(spawns.last)
+        XCTAssertNotEqual(replacement.launchID, first.launchId)
+        XCTAssertEqual(store.daemonState, .running, "the app's replacement daemon was not reaped")
+        XCTAssertEqual(kill(pid_t(replacement.pid), 0), 0, "B is still running")
+        XCTAssertEqual(store.health?.startup?.launchId, replacement.launchID)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+    }
+
+    // MARK: Codex final review, finding 2: Stop while a start still prepares
+
+    /// Stop lands while a start is still in the port preflight, before it
+    /// has launched anything. The start used to carry on after Stop
+    /// returned and launch on the next free port.
+    @MainActor
+    func testStopDuringThePortPreflightMeansNothingLaunches() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let listener = try SilentListener(port: daemon.port)
+        defer { listener.close() }
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        store.portSettleTimeoutSeconds = 3
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        let start = Task { @MainActor in await store.startDaemon() }
+        // The preflight re-probes the silent port for about four seconds.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        await store.stopDaemon()
+        await start.value
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(daemon.spawns().count, 0, "nothing launches after Stop")
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertEqual(store.startupPhase, .idle)
+        XCTAssertNil(store.portFallbackNotice, "no port move for a launch that did not happen")
+        XCTAssertEqual(store.configuration.port, daemon.port)
+        let logged = await logsMention(store, "start abandoned")
+        XCTAssertTrue(logged, "the Logs window records why nothing launched")
+    }
+
+    // MARK: Codex final review, finding 3: a pid that now belongs to another process
+
+    /// The app adopted a daemon whose /health named pid X. The daemon then
+    /// exited and the kernel gave X to an unrelated process. Here /health
+    /// reports the pid of an unrelated `sleep` from the start, which is the
+    /// same situation. Stop used to signal X. It now signals only a process
+    /// that carries the daemon's launch id.
+    @MainActor
+    func testStopNeverSignalsAProcessThatNowHoldsTheAdoptedDaemonsPID() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        let unrelated = Process()
+        unrelated.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        unrelated.arguments = ["60"]
+        try unrelated.run()
+        addTeardownBlock { if unrelated.isRunning { unrelated.terminate() } }
+        try daemon.setReportedPID(unrelated.processIdentifier)
+        _ = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let store = daemon.makeStore(configuration: MTPLXAppConfiguration(), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running, "adopted")
+        XCTAssertEqual(store.health?.startup?.pid, Int(unrelated.processIdentifier))
+
+        await store.stopDaemon()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertTrue(unrelated.isRunning, "Stop never signals a process it cannot confirm as the app's daemon")
+        let logged = await logsMention(store, "not signalling pid \(unrelated.processIdentifier)")
+        XCTAssertTrue(logged, "the Logs window records the pid it left alone")
+    }
+
+    // MARK: Codex final review, finding 4: a server that does not identify itself
+
+    /// An adopted daemon exits and a server that does not identify itself
+    /// takes its port: /health answers 401 (a key the app does not have) or
+    /// an undecodable 200. Both prove a live server and used to reset the
+    /// watchdog every round, so the badge read Running for good. With the
+    /// app's daemon gone, the app now lets it go and names the other server.
+    @MainActor
+    private func assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+        undecodableHealth: Bool,
+        strangerKey: String?
+    ) async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let prior = try daemon.launchOutsideTheApp(launchID: "prior-session-\(UUID().uuidString)")
+        addTeardownBlock { if prior.isRunning { prior.terminate() } }
+        _ = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let supervisor = DaemonSupervisor()
+        let store = daemon.makeStore(
+            configuration: MTPLXAppConfiguration(),
+            supervisor: supervisor,
+            fans: FanCallRecorder()
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        store.loadPersistedSettings()
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+
+        prior.terminate()
+        prior.waitUntilExit()
+        try daemon.setHealthUndecodable(undecodableHealth)
+        let stranger = try daemon.launchOutsideTheApp(launchID: nil, apiKey: strangerKey)
+        addTeardownBlock { if stranger.isRunning { stranger.terminate() } }
+        try await daemon.waitUntilAnswering()
+
+        let expected = "Another server holds port \(daemon.port); this app is not connected to it."
+        try await pollUntil("the other server is named", timeout: 15) {
+            store.daemonState == .degraded(expected)
+        }
+        XCTAssertEqual(store.daemonState, .degraded(expected))
+        XCTAssertTrue(badge(store).label.hasPrefix("Degraded — Another server"), badge(store).label)
+        XCTAssertFalse(supervisor.isRunning(), "the app let go of the daemon it lost")
+
+        await store.stopDaemon()
+        XCTAssertTrue(stranger.isRunning, "Stop never signals the other server")
+    }
+
+    @MainActor
+    func testAServerAnswering401AfterTheAdoptedDaemonExitsIsNamed() async throws {
+        try await assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+            undecodableHealth: false,
+            strangerKey: "a-key-the-app-does-not-have"
+        )
+    }
+
+    @MainActor
+    func testAServerAnsweringUndecodableHealthAfterTheAdoptedDaemonExitsIsNamed() async throws {
+        try await assertAnUnidentifiedServerIsNamedAfterTheAdoptedDaemonExits(
+            undecodableHealth: true,
+            strangerKey: nil
+        )
+    }
+
+    // MARK: Codex final review, finding 5: the benchmark needs the app's own daemon
+
+    /// `mtplx serve` from a terminal holds the configured port and the app
+    /// holds nothing. The benchmark used to take that server as ready, run
+    /// against it and post settings to it. It now says the port is held by
+    /// a server started outside the app, and starts nothing beside it.
+    @MainActor
+    func testTheBenchmarkRefusesAServerStartedOutsideTheApp() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await daemon.waitUntilHealthy()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        do {
+            let ready = try await store.ensureDaemonReadyForBenchmark()
+            XCTFail("the benchmark took a server the app does not run (pid \(ready.startup?.pid ?? -1))")
+        } catch BenchmarkDaemonReadinessError.startupFailed(let reason) {
+            XCTAssertTrue(reason.contains("started outside the app"), reason)
+        }
+
+        XCTAssertNotEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        XCTAssertEqual(daemon.spawns().count, 1, "no second model was started beside it")
+        XCTAssertTrue(terminalServer.isRunning)
+    }
+
+    /// The app's own daemon still passes, without a second launch.
+    @MainActor
+    func testTheBenchmarkUsesTheAppsOwnDaemon() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        let launched = try XCTUnwrap(store.health?.startup)
+
+        let ready = try await store.ensureDaemonReadyForBenchmark()
+
+        XCTAssertEqual(ready.startup?.launchId, launched.launchId)
+        XCTAssertEqual(daemon.spawns().count, 1)
+        XCTAssertEqual(store.daemonState, .running)
+    }
+
+    // MARK: Codex final review, finding 6: the key of the daemon that keeps serving
+
+    /// A change of the API key fails before its restart (the OpenCode
+    /// config write fails), so the running daemon keeps the key it started
+    /// with; the scripted daemon, like `mtplx serve`, read it once and
+    /// requires it on every request. `configuration` holds the new key for
+    /// the next launch. Requests to the running daemon used the new key and
+    /// got 401 under a Running badge; they now carry the daemon's own key.
+    @MainActor
+    func testAFailedKeyChangeKeepsUsingTheKeyTheServingDaemonHas() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let blockedConfig = daemon.root.appendingPathComponent("opencode-blocked", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockedConfig, withIntermediateDirectories: true)
+        var configuration = daemon.configuration(fanMode: .default)
+        configuration.apiKey = "key-the-daemon-started-with"
+        let store = daemon.makeStore(
+            configuration: configuration,
+            fans: FanCallRecorder(),
+            openCodeConfigURL: blockedConfig
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        XCTAssertEqual(store.daemonState, .running)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        let launched = try XCTUnwrap(store.health?.startup)
+
+        var next = store.configuration
+        next.apiKey = "a-new-key"
+        next.lastLaunchTarget = LaunchTarget.openCode.rawValue
+        do {
+            try await store.applyConfiguration(next, restartIfRunning: true)
+            XCTFail("the OpenCode config write was expected to fail")
+        } catch {
+            // Settings shows "Apply failed" with this error.
+        }
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertNotNil(store.configurationChangeFailure)
+        XCTAssertEqual(store.configuration.apiKey, "a-new-key", "the saved change is kept for the next launch")
+        XCTAssertEqual(store.activeAPIKey, "key-the-daemon-started-with")
+        let answer = try await store.apiClient.health()
+        XCTAssertEqual(answer.startup?.launchId, launched.launchId, "requests still reach the serving daemon")
+        await store.refresh()
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(store.health?.startup?.launchId, launched.launchId)
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
         XCTAssertEqual(daemon.spawns().count, 1)
     }
 
