@@ -1705,10 +1705,10 @@ class VllmMetalPagedKVCache:
             self._quant_bank = bank
             self.kv_quant_bank_rebuilds += 1
         if int(bank["tokens"]) > offset:
-            # The offset moved backwards without trim() (meta_state rewind):
-            # the bank prefix below the new offset still mirrors unchanged
-            # page rows; anything above re-extends when the offset
-            # re-advances over rewrites.
+            # Backstop for an offset that moved backwards outside trim() and
+            # the meta_state setter (both truncate at the rewind itself). It
+            # only helps while no write has landed since the rewind: rows
+            # rewritten below the old count are invisible from here.
             bank["tokens"] = offset
         valid = int(bank["tokens"])
         bank_k = bank["k"]
@@ -1782,10 +1782,10 @@ class VllmMetalPagedKVCache:
             self._dequant_memo = memo
             self.kv_quant_dequant_memo_rebuilds += 1
         if int(memo["tokens"]) > offset:
-            # The offset moved backwards without trim() (meta_state rewind):
-            # the mirror prefix below the new offset is still the dequant of
-            # unchanged rows; anything above re-dequantizes when the offset
-            # re-advances over rewrites.
+            # Backstop for an offset that moved backwards outside trim() and
+            # the meta_state setter (both truncate at the rewind itself). It
+            # only helps while no write has landed since the rewind: rows
+            # rewritten below the old count are invisible from here.
             memo["tokens"] = offset
         valid = int(memo["tokens"])
         mirror_k = memo["mirror_k"]
@@ -2117,6 +2117,22 @@ class VllmMetalPagedKVCache:
                 f"{offset} > {self.capacity}"
             )
         self.offset = offset
+        # A rewind here is a trim without trim(): the next write lands on rows
+        # the dequant mirror / quant bank still count as valid, and their
+        # read-time check cannot see it once the offset re-advances.
+        self._truncate_derived_views(offset)
+
+    def _truncate_derived_views(self, offset: int) -> None:
+        """Clamp the dequant mirror and the quant bank to rows [0, offset).
+
+        Both views extend tail-only from their ``tokens`` count, so every
+        backward move of the offset must shorten that count before the
+        retracted rows are rewritten: past it they would serve the old rows.
+        The prefix below ``offset`` stays exact (flat rows are append-stable).
+        """
+        for derived in (self._dequant_memo, self._quant_bank):
+            if derived is not None:
+                derived["tokens"] = min(int(derived["tokens"]), int(offset))
 
     def is_trimmable(self) -> bool:
         return True
@@ -2124,18 +2140,9 @@ class VllmMetalPagedKVCache:
     def trim(self, n: int) -> int:
         n = min(int(self.offset), int(n))
         self.offset -= n
-        if self._dequant_memo is not None:
-            # Retracted rows are rewritten via _write_tail before reuse; the
-            # mirror prefix below the new offset is still exact.
-            self._dequant_memo["tokens"] = min(
-                int(self._dequant_memo["tokens"]), int(self.offset)
-            )
-        if self._quant_bank is not None:
-            # Same append-stable argument as the memo: the bank prefix below
-            # the new offset still mirrors unchanged page rows exactly.
-            self._quant_bank["tokens"] = min(
-                int(self._quant_bank["tokens"]), int(self.offset)
-            )
+        # Retracted rows are rewritten via _write_tail before reuse; the
+        # mirror and bank prefixes below the new offset are still exact.
+        self._truncate_derived_views(self.offset)
         # The kv_quant numerics route deliberately survives trim():
         # speculative-verify rejections retract rows mid-request, and
         # re-latching here would switch math when a rejection lands the
