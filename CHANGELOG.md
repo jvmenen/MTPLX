@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_MTP_HISTORY_CACHE_ONLY=1` (opt-in): prefill draft-head history appends evaluate the cache only.** A prefill loop appends every chunk to the MTP draft head's history and then evaluated the head's output hidden, which nothing reads. With the switch on, the append evaluates the head cache's key and value buffers instead: MLX then runs exactly the kernels behind the cache write and never dispatches the attention, `o_proj`, experts and final norm that only feed the hidden (the idea of 9760a15c for Flash-Next's own head, here without model code for mlx-lm's Qwen3.5/3.6 head). Prefill phase and plain mlx-lm `KVCache` entries only; decode appends, other cache kinds and every other caller are unchanged. Counter `mtp_history_cache_only_appends`. Default off.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

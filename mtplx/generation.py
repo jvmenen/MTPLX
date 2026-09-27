@@ -92,6 +92,10 @@ from .graphbank import (
     stamp_rope_delta,
 )
 from .native_mlp import set_native_mlp_context
+from .mtp_history_cache_only import (
+    mtp_history_cache_arrays,
+    mtp_history_cache_only_enabled,
+)
 from .loop_guard import LoopGuard, loop_guard_config_from_env
 from .thinking_guard import ThinkingGuard, ThinkingGuardConfig
 from .profiles import resolve_long_context_mtp_depth
@@ -8108,7 +8112,16 @@ def _append_mtp_history(
         )
     if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started
-    _eval(hidden)
+    cache_arrays = (
+        mtp_history_cache_arrays(mtp_cache)
+        if phase == "prefill" and mtp_history_cache_only_enabled()
+        else None
+    )
+    if cache_arrays is not None:
+        _runtime_count(rt, "mtp_history_cache_only_appends")
+        _eval(*cache_arrays)
+    else:
+        _eval(hidden)
     return time.perf_counter() - started
 
 
