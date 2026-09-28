@@ -268,3 +268,123 @@ env PYTHONPATH=$HOME/Dev/MTPLX-integratie MTPLX_BATCH_INVARIANT_PREFILL=1 \
 ### Meetmateriaal eindtest 2
 
 Lokaal: `~/Dev/laya-nl/eindbench/eindtest2.log`, `eindtest2-analyse.txt`, `resultaten/e2-{oud,nieuw}-{1,2,t0}.json` (met `.ruw.json`), serverlogs `logs/eindtest2-*`. De splitsing naar 512 tokens en de telling van goed/fout bij afwijkende oordelen zijn met een los script uit de rijen berekend. Poort 8000 is na afloop vrij gelaten.
+
+## Eindtest 3: definitieve set op zes taken (28 september, nacht)
+
+### Samenvatting
+
+De definitieve set (perf/definitief a0c03d3d met invariante prefill, K1, K2, K3 en kopanker) is op het productiemodel duidelijk beter dan 2.11.3 en doet op de dichte modellen geen schade:
+
+- **Qwen3.6 (productie):** een agentgesprek van twaalf beurten duurt 63 in plaats van 167 s (−62%; de schone nieuw-run 50,1 s, −70%). Het eerste token van een lange beurt komt na 7,9 in plaats van 18,0 s. Classificatie via de scoreroute 335 in plaats van 520 ms (−36%) met gelijke nauwkeurigheid (0,717). Na classificatie 3,6 GiB minder geheugen, MLX-piek 1,1 GiB lager. Decode bij een korte prompt +4,9%; chat-decode −6%, net als in eindtest 2 andere tekst en geen tragere berekening.
+- **Qwen3.5-9B:** dezelfde agentwinst (111 naar 40 s, herhaalpogingen 8 naar 0), classificatie −16% met precies dezelfde oordelen, geheugenpiek 1,9 GiB lager.
+- **Qwen3.8-27B:** een paar procent sneller (agent −3%, korte beurten −15%, classificatie −6%), 3,1 GiB minder na classificatie, MLX-piek 1 GiB hoger.
+- **Gemma 4:** chat veel sneller (korte vervolgbeurt 0,5 in plaats van 24,7 s), agent gelijk, scoreroute werkt nu (op 2.11.3 een serverfout). Kost 5 GiB meer werkgeheugen na de agent, omdat nieuw gesprekken vasthoudt.
+- **Bonsai-2-27B:** niet te vergelijken; 2.11.3 kan het model niet laden. Nieuw draait stabiel.
+
+### Opzet
+
+- **Oud:** 2.11.3 uit de Homebrew-venv, zoals eindtest 2. **Nieuw:** `~/Dev/MTPLX-definitief` op a0c03d3d (`perf/definitief`), env uit `~/Dev/laya-nl/eindtest3/nieuw.env`: `MTPLX_BATCH_INVARIANT_PREFILL=1`, `MTPLX_MTP_HISTORY_CACHE_ONLY=1` (K1), `MTPLX_PREFILL_CHUNK_SIZE_DENSE=4096` en `_REPAGE=4096` (K2), `MTPLX_A3B_MOE_PREFILL_COMBINE=1` (K3), `MTPLX_SESSION_HEAD_ANCHOR=1` (kopanker). Bewust uit: voorrang, K4, T3, T7, W4.
+- **Taken** (platform-scripttaken, `eindtest3.zsh <taak>`, 02:08 tot 04:13): qwen36 (Balance, volledige werklast ~60K, agent op serverstandaard), qwen36-t0 (idem, agent op temperatuur 0), qwen38 (Qwen3.8-27B Speed, klein), gemma (Gemma 4 Speed, eigen werklast), q9b (Qwen3.5-9B Speed, middel), bonsai (Ternary-Bonsai-2-27B Speed, klein). Per taak oud, nieuw, oud, nieuw op een verse server met eigen SSD-cachemap; dezelfde argumenten en model-env voor oud en nieuw.
+- **Analyse:** `analyse3.py`, mediaan over twee runs per versie. Qwen3.6 per deel apart (`--deel std` en `--deel t0`).
+
+### Geldigheid
+
+- Alle 22 runs zijn gestart en afgerond (bench exit 0, lader 100 W). 2.11.3 startte bij Qwen3.6, Qwen3.8, Gemma en Qwen3.5-9B normaal; de nieuwe server gaf nergens een traceback.
+- **Bonsai:** 2.11.3 stopte beide keren tijdens het laden (`Model type prism_hadamard_qwen35 not supported`). Alleen nieuw is gemeten.
+- **Lane:** op Qwen3.6 geïnstalleerd in alle vier nieuw-runs (391 lineaire lagen, 41 SwitchGLU's, 30 GDN-lagen, 41 MoE-combineblokken). Op de dichte modellen geweigerd zoals verwacht: Qwen3.8 en 9B `dense_model`, Gemma `not_reached`, Bonsai `unsupported_linear:HadamardQuantizedLinear`.
+- **Gemma, classificatie:** op 2.11.3 geeft de scoreroute HTTP 500 (`Gemma4AssistantRuntime` heeft geen `forward_ar`); op nieuw werkt die (nauwkeurigheid 0,800). Eerste-token-logprobs werkt op geen van beide ("logprobs are not supported on the gemma4_assistant backend"). 2.11.3 geeft voor Gemma geen tokentelling terug, dus decode tok/s is daar alleen uit het serverlog te halen: 21,6 tegen 21,9 tok/s (decode) en 28,4 tegen 27,9 tok/s (chat), dus gelijk.
+- **Vreemd verkeer van Bink.** Het platform stuurde tijdens drie Qwen3.6-runs eigen verzoeken naar poort 8000 (titels en de nachtelijke conversatiereview, `max_tokens` 7.000 of 32.000):
+
+  | Run | Verzoeken | Rekentijd | Fase | Gevolg |
+  |---|---|---|---|---|
+  | qwen36 nieuw-2 | 2 titels (1.057 tokens) | 37,5 s | agent | agentgesprek 75,9 tegen 50,1 s in nieuw-1; mediaan onderschat de winst |
+  | qwen36-t0 oud-t0-1 | 3 titels | 66,4 s | agent | oud-agent te traag (192 s) |
+  | qwen36-t0 oud-t0-2 | 4, conversatiereview en sessienaam (4.742 tot 23.245 tokens) | 62,4 s | agent | oud-agent te traag (182 s); de controle op `requests_completed` zag dit niet, de marge voor herhaalpogingen dekte het |
+  | qwen36-t0 nieuw-t0-2 | 4, conversatiereview (ruim 60K tokens) | 87,0 s | decode | snelheden gelijk aan nieuw-t0-1, maar de sessies bleven in de bank: geheugencijfers van deel 2 onbruikbaar |
+
+  Qwen3.8, Gemma, 9B en Bonsai hadden geen vreemd verkeer. Voor Qwen3.6 gelden daarom de cijfers van deel 1, met de agentwinst als ondergrens; deel 2 levert de bitgelijkheid.
+- **Analysebestand:** deel 2 schreef zijn analyse, zoals gepland, over die van deel 1 heen in één bestand over alle acht runs. Daarin waren alleen de agentrijen per temperatuur gesplitst. `analyse3.py` kreeg `--deel std|t0` en een sectie "vreemd verkeer" uit de serverlogs; `eindtest3.zsh` schrijft voortaan `analyse-<taak>.txt`. Nu: `analyse-qwen36.txt` (deel 1), `analyse-qwen36-t0.txt` (deel 2), `analyse-qwen36-samen.txt` (alles), het origineel als `analyse-qwen36-samen-origineel.txt`.
+
+### Resultaten per model
+
+Mediaan over twee runs per versie. Verschil relatief bij tijden en snelheden, absoluut in GiB bij geheugen.
+
+**Qwen3.6-35B-A3B Balance, deel 1** (agent op serverstandaard, productie):
+
+| Meting | oud | nieuw | verschil |
+|---|---|---|---|
+| Agent: TTFT lange beurten | 18,0 s | 7,94 s | −56% |
+| Agent: TTFT korte beurten | 1,16 s | 0,60 s | −48% |
+| Agent: hele gesprek | 167,2 s | 63,0 s (schone run 50,1) | −62% (−70%) |
+| Agent: herhaalpogingen | 10 | 0 | −10 |
+| Scoreroute p50 / totaal | 520 ms / 123,2 s | 335 ms / 78,3 s | −36% / −36% |
+| Eerste-token-logprobs p50 | n.v.t. | 314 ms | −40% tegen oud scoreroute |
+| Decode korte prompt | 77,2 tok/s | 80,9 tok/s | +4,9% |
+| Chat: decode / TTFT lang | 81,8 tok/s / 8,19 s | 76,8 tok/s / 7,12 s | −6,0% / −13% |
+| MLX-piek / footprint-piek | 40,72 / 45,05 GiB | 39,64 / 44,20 GiB | −1,08 / −0,85 |
+| Footprint na classificatie / na agent | 31,61 / 40,70 GiB | 27,99 / 40,96 GiB | −3,61 / +0,26 |
+
+**Qwen3.6-35B-A3B Balance, deel 2** (agent op temperatuur 0): agent TTFT lang 18,7 naar 7,63 s (−59%), hele gesprek 187,2 naar 48,0 s (−74%; tegen het schone oud van deel 1 −71%), scoreroute 524 naar 340 ms (−35%), eerste-token-logprobs 319 ms, decode 77,0 naar 80,8 tok/s. Geheugen niet bruikbaar (zie geldigheid).
+
+**Qwen3.8-27B Speed** (dicht, lane geweigerd):
+
+| Meting | oud | nieuw | verschil |
+|---|---|---|---|
+| Agent: TTFT lang / kort | 11,03 / 0,499 s | 10,51 / 0,423 s | −4,7% / −15% |
+| Agent: hele gesprek (herhaalpogingen) | 62,4 s (1) | 60,8 s (1) | −2,7% |
+| Scoreroute p50 | 1.350 ms | 1.270 ms | −5,9% |
+| Eerste-token-logprobs p50 | n.v.t. | 1.240 ms | −8,1% tegen oud scoreroute |
+| Decode korte prompt / chat | 31,4 / 38,2 tok/s | 30,9 / 38,5 tok/s | −1,4% / +0,9% |
+| Chat: TTFT lang | 10,89 s | 10,90 s | +0,1% |
+| MLX-piek / footprint-piek | 34,97 / 40,16 GiB | 36,00 / 40,91 GiB | +1,03 / +0,76 |
+| Footprint na classificatie / na agent | 24,11 / 37,24 GiB | 21,00 / 36,73 GiB | −3,10 / −0,51 |
+
+**Gemma 4 Speed** (dicht, lane geweigerd):
+
+| Meting | oud | nieuw | verschil |
+|---|---|---|---|
+| Agent: TTFT lang / kort | 13,61 / 0,616 s | 13,65 / 0,617 s | +0,3% / +0,2% |
+| Agent: hele gesprek | 98,5 s | 98,7 s | +0,2% |
+| Scoreroute p50 / nauwkeurigheid | serverfout | 1.375 ms / 0,800 | |
+| Eerste-token-logprobs | niet ondersteund | niet ondersteund | |
+| Decode korte prompt: TTFT / tok/s | 0,392 s / (serverlog 21,6) | 0,149 s / 22,0 | −62% / gelijk |
+| Chat: TTFT lang / kort | 24,37 / 24,7 s | 14,52 / 0,50 s | −40% / −98% |
+| Chat: hele blok | 189,0 s | 64,2 s | −66% |
+| MLX-piek / footprint-piek | 35,54 / 36,77 GiB | 37,79 / 40,09 GiB | +2,25 / +3,32 |
+| Footprint na classificatie / na agent | 20,95 / 26,40 GiB | 21,34 / 31,40 GiB | +0,39 / +5,00 |
+
+**Qwen3.5-9B Speed** (dicht, lane geweigerd):
+
+| Meting | oud | nieuw | verschil |
+|---|---|---|---|
+| Agent: TTFT lang / kort | 16,99 / 1,447 s | 7,42 / 0,500 s | −56% / −65% |
+| Agent: hele gesprek (herhaalpogingen) | 111,4 s (8) | 40,3 s (0) | −64% |
+| Scoreroute p50 | 517 ms | 435 ms | −16% |
+| Eerste-token-logprobs p50 | n.v.t. | 387 ms | −25% tegen oud scoreroute |
+| Decode korte prompt / chat | 63,3 / 68,2 tok/s | 61,8 / 68,8 tok/s | −2,4% / +0,9% |
+| Chat: TTFT lang | 7,69 s | 7,64 s | −0,7% |
+| MLX-piek / footprint-piek | 21,31 / 25,58 GiB | 19,44 / 23,77 GiB | −1,88 / −1,81 |
+| Footprint na classificatie / na agent | 12,80 / 21,76 GiB | 9,36 / 21,13 GiB | −3,44 / −0,62 |
+
+**Ternary-Bonsai-2-27B Speed**, alleen nieuw: agent TTFT lang 9,95 s, kort 0,42 s, gesprek 67,3 s (2 herhaalpogingen); scoreroute 1.207 ms (0,700), eerste-token-logprobs 1.145 ms (0,713); decode 42,5 tok/s, chat 44,0 tok/s; MLX-piek 23,96 GiB.
+
+### Kwaliteit
+
+| Model | Scoreroute oud / nieuw | Zelfde oordeel oud-nieuw | Eerste-token (nieuw) | Gretige streams oud-oud / nieuw-nieuw / oud-nieuw |
+|---|---|---|---|---|
+| Qwen3.6 deel 1 | 0,717 / 0,717 | 228/240 | 0,725 | 15/15 / 15/15 / 3/15 |
+| Qwen3.6 deel 2 | 0,717 / 0,717 | 228/240 | 0,725 | 27/27 / 27/27 / 3/27 |
+| Qwen3.8 | 0,763 / 0,763 | 80/80 | 0,750 | 19/19 / 19/19 / 14/19 |
+| Gemma 4 | serverfout / 0,800 | | niet ondersteund | 15/15 / 15/15 / 11/15 |
+| Qwen3.5-9B | 0,688 / 0,688 | 240/240 | 0,688 | 23/23 / 23/23 / 9/23 |
+| Bonsai | niet te laden / 0,700 | | 0,713 | nieuw-nieuw 19/19 |
+
+Beide versies zijn met zichzelf bitgelijk op alle modellen, ook in het agentgesprek bij temperatuur 0. Oud tegen nieuw wijkt op Qwen3.6 af zoals in eindtest 2 (upstream-rekenwijze, invariante prefill en de herhaalpogingsfix). Op de dichte modellen, waar de lane uit staat, is de classificatie bitgelijk met 2.11.3 en wijken de gretige teksten minder af.
+
+### Conclusie
+
+De set is klaar voor Bink: op het productiemodel is een agentgesprek twee tot drie keer zo snel, classificatie een derde sneller met gelijke oordelen, en het geheugen lager. De dichte modellen gaan er gelijk op of vooruit; alleen Gemma houdt meer geheugen vast, en dat is het gevolg van gesprekshergebruik dat de chat juist veel sneller maakt. Bink stuurde tijdens de meting eigen verzoeken naar de testserver; dat raakt alleen Qwen3.6 en maakt de winst eerder kleiner dan groter (vondst 70).
+
+### Meetmateriaal eindtest 3
+
+Lokaal in `~/Dev/laya-nl/eindtest3/`: `eindtest3-<taak>.log`, `analyse-<taak>.txt` (plus `analyse-qwen36-samen.txt`), `resultaten/<model>/e3-*.json` met `.ruw.json` en `.health.json`, `logs/<model>/` (server-, bench- en startlogs). Taken: `taken/done/eva-script-mtplx-eindtest-3-*.md` in het platform. Heranalyse op 28 sep 04:27, zonder nieuwe metingen.
