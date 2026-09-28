@@ -11711,6 +11711,18 @@ def _agent_steering_enabled() -> bool:
     return _agent_rewrites_mode() == "on"
 
 
+def _steering_retries_allowed() -> bool:
+    """Stream retries that append a steering user turn, unless rewrites are off.
+
+    The tool-fed empty retry and the stalled-promise retry re-generate from
+    the transcript plus an injected instruction. MTPLX_AGENT_REWRITES=off is
+    the #282 hard passthrough guarantee, so it disables them; the default
+    posture keeps them.
+    """
+
+    return _agent_rewrites_mode() != "off"
+
+
 def _env_int_optional(name: str) -> int | None:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -34269,6 +34281,7 @@ def create_app(state: ServerState) -> FastAPI:
                         or read_only_inspection_request
                         or not tool_result_history_present
                         or request.seed is not None
+                        or not _steering_retries_allowed()
                     ):
                         return generated
                     first_text = _strip_mtplx_internal_continuation_markers(
@@ -34645,6 +34658,7 @@ def create_app(state: ServerState) -> FastAPI:
                         not tools_active
                         or not tool_result_history_present
                         or request.seed is not None
+                        or not _steering_retries_allowed()
                     ):
                         return generated
                     raw_text = _strip_mtplx_internal_continuation_markers(
