@@ -85,17 +85,21 @@ _THRASH_MIN_GROWTH_BYTES = 256 * MIB
 # Compressor growth alone is not the signature while the kernel still has a
 # large clean file cache to drop (supply at or above the shed floor) and its
 # free pages are not starved. macOS 27 compresses other apps' idle pages
-# early and runs with fewer free pages: on 2026-09-29 (E1, 128 GB, Flash-Next,
-# macOS 27.0.1) a healthy 65K prefill was aborted twice as "death_signature"
-# at 2.4 and 1.45 GB free with 25.0 and 23.2 GB of file-backed pages, the
-# compressor growing 0.8 GB in 2.8 s and swap flat. Every recorded death
-# shape stays caught: the freezes and the 09-23 panic had free pages at 0.0
-# to 0.5 GiB (under this line) or little file cache (supply under the shed
-# floor, where compressor growth counts as before), and swap growth counts at
-# the abort floor whatever the file cache. 512 MiB is eight times the
-# kernel's own free-page target on a 16 KiB-page Mac (vm_page_free_target
-# 4,000 pages), where reclaim is not yet under way.
-_THRASH_STARVED_FREE_BYTES = 512 * MIB
+# early and runs with few free pages: on 2026-09-29 (128 GB, Flash-Next,
+# macOS 27.0.1) healthy cold prefills were aborted as "death_signature" at
+# 2.4 and 1.45 GB free with 23 to 25 GB of file-backed pages (E1, 65K), and
+# at 0.16 and 0.58 GB free with 17.6 to 18.2 GB of file-backed pages and swap
+# flat (the E2d agent replay, 32K and 61K), the compressor growing 0.5 GB in
+# 1.3 to 2.9 s. The replay's lowest healthy free reading was 109 MiB. The
+# kernel defends its own free-page target (vm_page_free_target, 4,000 pages
+# = 62.5 MiB on a 16 KiB-page Mac): above it the pageout daemon keeps up.
+# Every recorded death was under it: the 2026-09-23 panic at 878 free pages
+# (13.7 MiB), the 09-03 freeze at 0.0 GB free; the field-report freezes had
+# little file cache (supply under the shed floor, where compressor growth
+# counts as before), swap growth counts at the abort floor whatever the file
+# cache, and runaway compression is stopped by its own line below.
+_KERNEL_FREE_TARGET_FALLBACK_PAGES = 4000
+_KERNEL_PAGE_SIZE_FALLBACK_BYTES = 16 * 1024
 # Runaway compression during one prefill, whatever the supply reads: macOS 27
 # can compress other apps' memory by tens of GB while clean file pages keep
 # the supply looking healthy. 2026-09-29, 128 GB, 2.12.0, a 131,072-token
@@ -193,6 +197,27 @@ def _sysctl_int(name: bytes, width: int) -> int | None:
     if rc != 0:
         return None
     return int(value.value)
+
+
+@functools.cache
+def starved_free_bytes() -> int:
+    """The kernel's free-page target in bytes (vm_page_free_target pages of
+    hw.pagesize): free pages under it mean the pageout daemon is not keeping
+    up, which is when compressor growth is the death signature even with a
+    large file cache. Read once; 4,000 pages of 16 KiB when unreadable."""
+
+    pages = None
+    page_size = None
+    try:
+        pages = _sysctl_int(b"vm.vm_page_free_target", 4)
+        page_size = _sysctl_int(b"hw.pagesize", 8)
+    except Exception:
+        pass
+    if not pages or pages <= 0:
+        pages = _KERNEL_FREE_TARGET_FALLBACK_PAGES
+    if not page_size or page_size <= 0:
+        page_size = _KERNEL_PAGE_SIZE_FALLBACK_BYTES
+    return int(pages) * int(page_size)
 
 
 class _VMStatistics64(ctypes.Structure):
@@ -450,10 +475,11 @@ def thrashing_base(
     if free >= abort:
         return None
     # Compression counts when the kernel has little else to reclaim or its
-    # free pages are starved; with a large clean file cache it is the
-    # kernel's own choice (see _THRASH_STARVED_FREE_BYTES). Swap always does.
+    # free pages are under its own target; with a large clean file cache and
+    # free pages above the target it is the kernel's own choice (see
+    # starved_free_bytes). Swap always does.
     compression_counts = (
-        int(reading.available_bytes) < shed or free < _THRASH_STARVED_FREE_BYTES
+        int(reading.available_bytes) < shed or free < starved_free_bytes()
     )
     earlier = [previous] if isinstance(previous, SystemMemory) else list(previous)
     for base in earlier:
@@ -594,6 +620,7 @@ __all__ = [
     "read_system_memory",
     "thrashing_base",
     "reading_floors",
+    "starved_free_bytes",
     "system_memory_floors",
     "system_memory_guard_enabled",
     "system_pressure_level",

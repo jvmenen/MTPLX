@@ -97,6 +97,139 @@ def test_macos27_early_compression_with_a_big_file_cache_is_not_death(pair):
     assert sm.system_pressure_level(after, previous=before) == 1
 
 
+# E2d, 2026-09-29 05:0x, the agent replay on Flash-Next at the product
+# defaults: both arms were refused mid-prefill as "death_signature" with
+# 17.6 to 18.2 GB of file-backed pages and swap flat (the 507 bodies in
+# receipts/ttft/replay-diag-{A-50de43bb,B-ttft-32c84b08}). B had the 512 MiB
+# starved line: free 0.16 GB was under it.
+E2D_B_32K = (
+    _reading(
+        free=158_171_136,
+        file_backed=18_891_063_296,
+        wired=96_960_315_392,
+        compressor=5_821_431_808,
+        swap=98_369_536,
+        level=24,
+        at_s=0.0,
+    ),
+    _reading(
+        free=162_988_032,
+        file_backed=18_221_350_912,
+        wired=97_474_232_320,
+        compressor=6_334_103_552,
+        swap=98_369_536,
+        level=23,
+        at_s=1.313,
+    ),
+)
+E2D_A_61K = (
+    _reading(
+        free=309_362_688,
+        file_backed=19_672_399_872,
+        wired=95_837_110_272,
+        compressor=6_564_511_744,
+        swap=105_840_640,
+        level=24,
+        at_s=0.0,
+    ),
+    _reading(
+        free=579_796_992,
+        file_backed=17_627_742_208,
+        wired=96_829_997_056,
+        compressor=7_125_827_584,
+        swap=105_840_640,
+        level=23,
+        at_s=2.024,
+    ),
+)
+
+# The replay's own vm_stat rows (vm.jsonl, one a second) around each arm's
+# lowest free reading: (t, free, speculative, purgeable, file-backed, wired
+# pages; compressor and swap bytes). The lowest is 7,004 free pages
+# (109 MiB), 1.75 times the kernel's 4,000-page target.
+_E2D_ROWS = {
+    "B": [
+        (6341.617, 133289, 2834, 1266, 1186209, 5809804, 5820809216, 98366914),
+        (6342.638, 180124, 3202, 1601, 1193448, 3854064, 5820874752, 98366914),
+        (6343.662, 24652, 3528, 1665, 1206579, 5900105, 5820874752, 98366914),
+        (6344.673, 229405, 2654, 69, 1171270, 5788627, 5821431808, 98366914),
+        (6345.689, 7295, 2751, 56, 1169331, 5940731, 5821431808, 98366914),
+        (6346.702, 7163, 2487, 127, 1156319, 5953635, 5821431808, 98366914),
+        (6347.722, 7004, 2279, 117, 1119274, 5967192, 6190350336, 98366914),
+        (6348.355, 408561, 2264, 66, 1116426, 5654157, 5871878144, 98366914),
+    ],
+    "A": [
+        (6042.618, 235072, 326, 1051, 1329846, 5710556, 6404964352, 105843261),
+        (6043.634, 8170, 211, 1026, 1298127, 5977558, 6404964352, 105843261),
+        (6044.654, 333698, 255, 1040, 1284211, 5679303, 6404964352, 105843261),
+        (6045.673, 103685, 450, 1054, 1284503, 5855497, 6404849664, 105843261),
+        (6046.690, 94360, 449, 1140, 1284531, 5862754, 6404849664, 105843261),
+        (6047.708, 7735, 284, 1140, 1224271, 6001354, 6404849664, 105843261),
+        (6048.721, 7415, 364, 1328, 1213949, 5956212, 6404833280, 105843261),
+        (6049.738, 27173, 358, 1361, 1111808, 6092399, 6404833280, 105843261),
+        (6050.748, 23089, 467, 1365, 1111996, 5977378, 6404833280, 105843261),
+    ],
+}
+
+
+def _vm_row_reading(row) -> sm.SystemMemory:
+    t, free, speculative, purgeable, file_backed, wired, compressor, swap = row
+    page = 16384
+    return _reading(
+        free=(free + purgeable) * page,
+        file_backed=max(0, file_backed - speculative) * page,
+        wired=wired * page,
+        compressor=compressor,
+        swap=swap,
+        at_s=t,
+    )
+
+
+def test_the_kernel_free_target_is_the_starved_line():
+    # vm_page_free_target pages of hw.pagesize: 4,000 x 16 KiB on this Mac.
+    assert 16 * MIB <= sm.starved_free_bytes() <= 256 * MIB
+
+
+@pytest.mark.parametrize(
+    "pair", [E2D_B_32K, E2D_A_61K], ids=["e2d-B-32k-0.16GB-free", "e2d-A-61k-0.58GB-free"]
+)
+def test_e2d_replay_readings_are_not_death(pair):
+    before, after = pair
+    shed, abort = sm.reading_floors(after)
+    assert after.free_bytes < abort and after.available_bytes >= shed
+    growth = after.compressor_bytes - before.compressor_bytes
+    assert growth / (after.monotonic_s - before.monotonic_s) >= 256 * MIB
+    assert after.free_bytes > sm.starved_free_bytes()
+
+    assert not sm.memory_thrashing(after, before)
+    assert sm.system_pressure_level(after, previous=before) == 1
+
+
+@pytest.mark.parametrize("arm", ["B", "A"])
+def test_e2d_vm_rows_never_trip_through_the_window(arm):
+    window = sm.ReadingWindow()
+    for row in _E2D_ROWS[arm]:
+        reading = _vm_row_reading(row)
+        assert not sm.memory_thrashing(reading, window.readings()), row
+        window.add(reading)
+
+
+def test_the_same_rows_trip_once_free_pages_fall_under_the_kernel_target():
+    # The B rows with the last one's free pages at the 09-23 panic's 878:
+    # the compressor step that was benign above the target is death under it.
+    rows = list(_E2D_ROWS["B"][:-1])
+    last = list(rows[-1])
+    last[1] = 878
+    rows[-1] = tuple(last)
+    window = sm.ReadingWindow()
+    tripped = False
+    for row in rows:
+        reading = _vm_row_reading(row)
+        tripped = tripped or sm.memory_thrashing(reading, window.readings())
+        window.add(reading)
+    assert tripped
+
+
 def test_macos27_reading_with_swap_growth_still_trips():
     before, after = E1_FIRST
     swapping = _reading(
