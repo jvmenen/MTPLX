@@ -27,6 +27,9 @@ class _StubTarget:
         self.weight = weight
         self.head_rows: list[int] = []
 
+    def cache_offset(self, cache):
+        return len(cache[0]["tokens"])
+
     def logits_from_hidden(self, hidden):
         self.head_rows.append(int(hidden.shape[1]))
         # Elementwise product + sum instead of a GPU matmul: plain float32,
@@ -50,16 +53,18 @@ class _StubGemmaRuntime:
         self.forward_calls: list[dict] = []
 
     def make_cache(self):
-        return []
+        return [{"tokens": []}]
 
     def forward_target(self, input_ids, *, cache=None, phase="unknown", compute_logits=True):
         ids = np.asarray(input_ids).reshape(-1).tolist()
         self.forward_calls.append(
             {"tokens": ids, "phase": phase, "compute_logits": compute_logits}
         )
-        emb = self.embed[mx.array(ids)]
-        steps = mx.arange(1, len(ids) + 1, dtype=mx.float32)[:, None]
-        hidden = mx.tanh(mx.cumsum(emb, axis=0) / steps)[None]
+        cache[0]["tokens"].extend(ids)
+        prefix = cache[0]["tokens"]
+        emb = self.embed[mx.array(prefix)]
+        steps = mx.arange(1, len(prefix) + 1, dtype=mx.float32)[:, None]
+        hidden = mx.tanh(mx.cumsum(emb, axis=0) / steps)[None, -len(ids):]
         return SimpleNamespace(
             logits=self.target.logits_from_hidden(hidden) if compute_logits else None,
             hidden=hidden,
@@ -130,6 +135,27 @@ def test_gemma4_scoring_independent_of_chunk_size():
 
     assert small["positions"] == whole["positions"]
     assert small["token_logprobs"] == whole["token_logprobs"]
+
+
+@pytest.mark.parametrize("rows", [48, 49])
+def test_gemma4_scoring_respects_prefill_width(monkeypatch, rows):
+    """A bounded head must not hide whole-prompt attention allocations."""
+    monkeypatch.setenv("MTPLX_GEMMA4_PREFILL_CHUNK_TOKENS", "16")
+    rt = _StubGemmaRuntime()
+    prompt = _prompt(rows)
+    scored = score_prompt_logprobs(rt, prompt, top_k=4, chunk_size=32)
+
+    widths = [len(call["tokens"]) for call in rt.forward_calls]
+    assert max(widths) <= 16
+    assert min(widths) >= 2  # Never enter the sliding cache's decode path.
+    assert sum(widths) == rows
+    assert max(rt.target.head_rows) <= 16
+    ref = _reference_logprobs(rt, prompt)
+    np.testing.assert_allclose(
+        scored["token_logprobs"],
+        [ref[i, prompt[i + 1]] for i in range(rows - 1)],
+        atol=1e-4,
+    )
 
 
 def test_gemma4_scored_label_matches_first_token_from_generation_prefill():

@@ -3042,29 +3042,37 @@ def gemma4_prompt_scoring_logit_chunks(
 ):
     """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
 
-    Same forward as the generation prefill (``_gemma4_prefill_prompt``): the
-    whole prompt in one target pass without logits on a fresh cache. The
-    logits head then runs per chunk of hidden rows, so at most
-    ``chunk_size x vocab`` logits are resident at once.
+    Use generation's prefill spans on one fresh cache. Attention scratch
+    follows the prefill width, and the head runs on at most ``chunk_size``
+    hidden rows at a time. Scoring never needs the assistant's shared KV.
     """
 
     _ensure_thread_streams()
     mx = _require_mlx_core()
-    output = runtime.forward_target(
-        mx.array([prompt_ids], dtype=mx.int32),
-        cache=runtime.make_cache(),
-        phase="prefill",
-        compute_logits=False,
+    cache = runtime.make_cache()
+    spans = gemma4_prefill_spans(
+        len(prompt_ids), gemma4_prefill_chunk_tokens(len(prompt_ids))
     )
-    hidden = output.hidden
-    del output
-    mx.eval(hidden)
-    n = len(prompt_ids)
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        logits = runtime.target.logits_from_hidden(hidden[:, start:end, :])
-        yield start, end, logits
-        del logits
+    with _gemma4_committed_updates(cache):
+        for span_start, span_end in spans:
+            output = runtime.forward_target(
+                mx.array([prompt_ids[span_start:span_end]], dtype=mx.int32),
+                cache=cache,
+                phase="prefill",
+                compute_logits=False,
+            )
+            hidden = output.hidden
+            del output
+            mx.eval(hidden, *_gemma4_cache_arrays(cache))
+            for start in range(span_start, span_end, chunk_size):
+                end = min(span_end, start + chunk_size)
+                logits = runtime.target.logits_from_hidden(
+                    hidden[:, start - span_start : end - span_start, :]
+                )
+                yield start, end, logits
+                del logits
+            del hidden
+            mx.clear_cache()
 
 
 def _clone_gemma4_prompt_cache(

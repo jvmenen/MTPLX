@@ -8449,8 +8449,8 @@ def _prompt_scoring_logit_chunks(
 ):
     """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
 
-    The Gemma 4 assistant pair has no ``forward_ar``; its backend yields the
-    same chunks from one target forward (see
+    The Gemma 4 assistant pair has no ``forward_ar``; its backend yields
+    logits from its own chunked target prefill (see
     ``gemma4_prompt_scoring_logit_chunks``).
     """
 
