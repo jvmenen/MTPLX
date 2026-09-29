@@ -15732,6 +15732,11 @@ def _encode_messages_uncached(
             template_observability["native_agent_tail_contract_active"] = bool(
                 native_tail_added
             )
+    # Tool choice constrains the request even when the template owns schemas.
+    # The contract path may have appended this already; the helper deduplicates.
+    if tools and _append_forced_tool_choice_sentinel(normalized, tool_choice=tool_choice):
+        if template_observability is not None:
+            template_observability["forced_tool_choice_sentinel_injected"] = True
     if gemma4_encoding:
         if template_observability is not None:
             template_observability["backend_chat_encoding"] = "gemma4"
