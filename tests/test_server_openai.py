@@ -7210,6 +7210,122 @@ def test_gemma4_encoder_renders_assistant_tool_call_before_tool_result():
     assert "package.json\nsrc" in rendered
 
 
+
+def _gemma4_tool_round(tokenizer):
+    tool_call = {
+        "id": "call_bash",
+        "type": "function",
+        "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})},
+    }
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(role="assistant", content="", tool_calls=[tool_call]),
+            openai.ChatMessage(role="tool", tool_call_id="call_bash", content="package.json"),
+        ],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=[{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+    )
+    return tokenizer.text
+
+
+def test_gemma4_tool_history_stays_native_when_the_tokenizer_reports_no_tool_calling():
+    """Gemma 4 packs ship no chat template, so mlx-lm's TokenizerWrapper
+    reports has_tool_calling=False. The history must still reach the Gemma 4
+    encoder structured: the model's own calls as the <tool_call> XML the tool
+    contract asks for, results as tool_response turns - not the generic
+    "[Calling tool: ...]" / "[Tool Result (...)]" user-turn fallback."""
+
+    class GemmaWrapperTokenizer:
+        bos_token = "<bos>"
+        has_tool_calling = False
+        model_specific_special_tokens = {
+            "think_token": "<|think|>",
+            "soc_token": "<|channel>",
+            "eoc_token": "<channel|>",
+        }
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    rendered = _gemma4_tool_round(GemmaWrapperTokenizer())
+    assert "[Calling tool:" not in rendered
+    assert "[Tool Result" not in rendered
+    assert "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>" in rendered
+    assert "<|turn>tool_response\npackage.json<turn|>" in rendered
+
+
+
+def _gemma4_capture_encode(messages, *, enable_thinking):
+    from mtplx.chat_encoding import encode_gemma4_messages
+
+    class Capture:
+        bos_token = "<bos>"
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    tok = Capture()
+    encode_gemma4_messages(tok, messages, enable_thinking=enable_thinking, add_generation_prompt=True)
+    return tok.text
+
+
+_GEMMA4_CALL = {"id": "c1", "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})}}
+
+
+def test_gemma4_thinking_off_history_keeps_the_empty_thought_scaffold():
+    """Thinking off, the generation prompt ends in an empty thought block and
+    the model writes its turn after it; the history must render the same
+    bytes, or every such turn diverges from the next prompt."""
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=False)
+    generated = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><turn|>\n"
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=False)
+    assert nxt.startswith(first + generated)
+
+
+def test_gemma4_thought_is_followed_directly_by_the_tool_call():
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=True)
+    generated = ("<|channel>thought\nrun ls<channel|><tool_call>\n<function=bash>\n<parameter=command>\n"
+                 "ls\n</parameter>\n</function>\n</tool_call><turn|>\n")
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "reasoning_content": "run ls", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=True)
+    assert nxt.startswith(first + generated)
+
+def test_non_gemma_tokenizer_without_tool_calling_keeps_the_text_fallback():
+    from mtplx.server.omlx_bridge.adapter import normalize_messages_for_template
+
+    class PlainTokenizer:
+        has_tool_calling = False
+
+    normalized = normalize_messages_for_template(
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "c1", "type": "function",
+                             "function": {"name": "bash", "arguments": "{}"}}],
+            ),
+            openai.ChatMessage(role="tool", tool_call_id="c1", content="ok"),
+        ],
+        tokenizer=PlainTokenizer(),
+    )
+    assert normalized[1]["content"].startswith("[Calling tool: bash(")
+    assert normalized[2] == {"role": "user", "content": "[Tool Result (c1)]: ok",
+                             **{k: v for k, v in normalized[2].items() if k not in ("role", "content")}}
+
 def test_agent_transcript_canonicalization_preserves_tool_history_text():
     tool_call = {
         "id": "call_write",
