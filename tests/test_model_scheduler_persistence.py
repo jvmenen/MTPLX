@@ -17,6 +17,8 @@ from __future__ import annotations
 import time
 from threading import Event
 
+import pytest
+
 from mtplx.model_scheduler import ModelWorkScheduler
 
 
@@ -478,7 +480,12 @@ def test_bank_cold_jobs_carry_session_coalesce_key():
     )
     assert len(dispatched) == 1
     assert getattr(dispatched[0], "coalesce_key", None) == "ssd_cold:session-42"
-    assert getattr(dispatched[0], "pinned_bytes", None) == 64
+    # While the bank holds the entry the job pins nothing extra; once the
+    # bank lets the entry go, the queued job is what keeps its bytes.
+    pinned = dispatched[0].pinned_bytes
+    assert pinned() == 0
+    bank.clear(session_id="session-42")
+    assert pinned() == 64
 
 
 def test_capability_marker_and_legacy_fallback_shape():
@@ -675,6 +682,8 @@ def test_coalescing_releases_pinned_bytes():
 
 
 def test_persistence_budget_reads_env(monkeypatch):
+    import mtplx.memory_plan as memory_plan
+
     def budget() -> int:
         scheduler = _scheduler()
         try:
@@ -687,4 +696,105 @@ def test_persistence_budget_reads_env(monkeypatch):
     monkeypatch.setenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "off")
     assert budget() == 0
     monkeypatch.delenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES")
+    monkeypatch.setattr(memory_plan, "detect_total_ram_bytes", lambda: 128 * 1024**3)
     assert budget() == 4 * 1024**3
+
+
+@pytest.mark.parametrize(
+    "ram_gib, budget_gib",
+    [(8, 0.5), (16, 0.5), (36, 1.125), (64, 2), (128, 4), (512, 16)],
+)
+def test_default_budget_follows_the_machine(ram_gib, budget_gib):
+    from mtplx.model_scheduler import _default_persistence_max_pending_bytes
+
+    assert _default_persistence_max_pending_bytes(ram_gib * 1024**3) == int(
+        budget_gib * 1024**3
+    )
+
+
+def test_live_pinned_bytes_are_read_at_the_check():
+    """A job's bytes count from the moment the bank lets its entry go."""
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    _held, release = _hold_owner(scheduler)
+    held_by_bank = {"a": True}
+    try:
+        old = scheduler.submit_idle_persistence(
+            lambda: None,
+            coalesce_key="ssd_cold:a",
+            pinned_bytes=lambda: 0 if held_by_bank["a"] else 80,
+        )
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:b", pinned_bytes=40
+        )
+        assert not old.cancelled()
+        assert scheduler.stats()["persistence_pending_bytes"] == 40
+        held_by_bank["a"] = False
+        assert scheduler.stats()["persistence_pending_bytes"] == 120
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:c", pinned_bytes=10
+        )
+        assert old.cancelled()
+        assert scheduler.stats()["persistence_pending_bytes"] == 50
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_resident_session_persist_survives_another_sessions_commit():
+    """The 09-27 probe, now a test: a large main session the RAM bank still
+    holds, then a small second session commits while the owner is busy. The
+    main session's SSD encode must stay queued (cancelling it frees nothing
+    and only loses the disk copy); both reach the SSD tier once idle."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from mtplx.cache_state import CacheSnapshot
+    from mtplx.session_bank import SessionBank
+
+    persisted: list[str] = []
+    scheduler = _scheduler(persistence_max_pending_bytes=64 * 1024**2)
+    bank = SessionBank(
+        max_entries=8,
+        max_bytes=8 * 1024**3,
+        per_session_max_bytes=8 * 1024**3,
+        cold_tier=SimpleNamespace(
+            put_entry=lambda entry, capabilities=None: persisted.append(
+                entry.session_id
+            )
+            or True
+        ),
+    )
+    bank.cold_enqueue_dispatch = lambda job: scheduler.submit_idle_persistence(
+        job,
+        coalesce_key=getattr(job, "coalesce_key", None),
+        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
+    )
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    held, release = _hold_owner(scheduler)
+    try:
+        for session_id, tokens, nbytes in (
+            ("main", list(range(1, 400)), 5 * 1024**3),
+            ("subagent", [7, 8, 9], 16 * 1024**2),
+        ):
+            bank.put_snapshot(
+                runtime=runtime,
+                token_ids=tokens,
+                cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+                logits=None,
+                hidden=None,
+                session_id=session_id,
+                snapshot_epoch=len(tokens),
+                nbytes_override=nbytes,
+            )
+        stats = scheduler.stats()
+        assert stats["persistence_budget_dropped"] == 0
+        assert stats["persistence_pending_bytes"] == 0
+        release.set()
+        held.result(timeout=2)
+        deadline = time.monotonic() + 5.0
+        while len(persisted) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sorted(persisted) == ["main", "subagent"]
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)

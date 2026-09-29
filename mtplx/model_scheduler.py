@@ -20,13 +20,52 @@ import time
 from typing import Any, Callable
 
 
+_PERSISTENCE_PENDING_MIN_BYTES = 512 * 1024**2
+
+
+def _default_persistence_max_pending_bytes(total_ram_bytes: int | None = None) -> int:
+    """1/32 of physical memory (4 GiB on a 128 GB Mac), at least 512 MiB.
+
+    The budget counts only memory the session bank has already let go of
+    and a queued job still holds, so it is sized like the memory guard's
+    floors (2.5% of RAM to abort, 5% to shed): a backlog alone stays below
+    the shed band on every Mac. The author's 4 GiB on 128 GB is the same
+    value there, measured flat under his 4-client load.
+    """
+    if total_ram_bytes is None:
+        from .memory_plan import detect_total_ram_bytes
+
+        total_ram_bytes = detect_total_ram_bytes()
+    if not total_ram_bytes or int(total_ram_bytes) <= 0:
+        return 4 * 1024**3
+    return max(_PERSISTENCE_PENDING_MIN_BYTES, int(total_ram_bytes) // 32)
+
+
 def _persistence_max_pending_bytes_from_env() -> int:
     raw = os.environ.get("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "").strip()
     if raw.lower() in ("0", "off", "false", "no"):
         return 0
+    if not raw:
+        return _default_persistence_max_pending_bytes()
     from .cache_bank.cold_tier import parse_size_bytes
 
-    return parse_size_bytes(raw or None, 4 * 1024**3)
+    return parse_size_bytes(raw, _default_persistence_max_pending_bytes())
+
+
+def _pinned_bytes(item: "_WorkItem") -> int:
+    """What a queued persistence job holds that nothing else does.
+
+    ``pinned_bytes`` is a byte count, or a callable the session bank gives
+    its jobs: the entry's size once the bank no longer holds the entry, 0
+    while it does (cancelling that job would free nothing and only lose the
+    SSD copy). Read at the moment of the check, never cached.
+    """
+    value = item.pinned_bytes
+    try:
+        raw = value() if callable(value) else value
+        return max(0, int(raw or 0))
+    except Exception:
+        return 0
 
 
 _QOS_CLASSES = {
@@ -108,7 +147,7 @@ class _WorkItem:
     # item starts (``active_item_receipt``), so a request can say which
     # work its time-to-first-token waited behind.
     submitted_behind: dict[str, Any] | None = None
-    pinned_bytes: int = 0
+    pinned_bytes: int | Callable[[], int] = 0
 
 
 class _KeepaliveTurn:
@@ -195,7 +234,6 @@ class ModelWorkScheduler:
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
         self._persistence_cancelled = 0
-        self._persistence_pending_bytes = 0
         self._persistence_budget_dropped = 0
         # Idle-pump budget (issue #290): the persistence band is normally
         # reachable only while the idle deque is COMPLETELY empty, so any
@@ -483,7 +521,7 @@ class ModelWorkScheduler:
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
                 "persistence_cancelled": self._persistence_cancelled,
-                "persistence_pending_bytes": self._persistence_pending_bytes,
+                "persistence_pending_bytes": self._persistence_pinned_bytes_locked(),
                 "persistence_max_pending_bytes": self.persistence_max_pending_bytes,
                 "persistence_budget_dropped": self._persistence_budget_dropped,
                 "persistence_pump_budget": self._persistence_pump_budget,
@@ -595,7 +633,7 @@ class ModelWorkScheduler:
         *args: Any,
         batch_key: str | None = None,
         coalesce_key: str | None = None,
-        pinned_bytes: int = 0,
+        pinned_bytes: int | Callable[[], int] = 0,
         **kwargs: Any,
     ) -> Future:
         """Durability work: strictly below idle_postcommit, quiet-grace
@@ -645,7 +683,6 @@ class ModelWorkScheduler:
             for stale in list(self._persistence):
                 if stale.coalesce_key == coalesce_key:
                     self._persistence.remove(stale)
-                    self._persistence_pending_bytes -= stale.pinned_bytes
                     stale.future.cancel()
                     cancelled += 1
             self._persistence_cancelled += cancelled
@@ -671,29 +708,31 @@ class ModelWorkScheduler:
                     while queue:
                         item = queue.popleft()
                         item.future.cancel()
-                self._persistence_pending_bytes = 0
             self._condition.notify_all()
         if wait and not park and self._thread.is_alive():
             self._thread.join()
 
+    def _persistence_pinned_bytes_locked(self) -> int:
+        return sum(_pinned_bytes(item) for item in self._persistence)
+
     def _enforce_persistence_budget_locked(self, *, keep: _WorkItem) -> None:
+        """Cancel the oldest queued jobs that hold memory nothing else holds
+        until the rest fit the budget. The newest job and jobs that pin
+        nothing (their entry is still in the bank) are never dropped."""
+
         budget = self.persistence_max_pending_bytes
         if budget <= 0:
             return
-        while self._persistence_pending_bytes > budget:
-            victim = next(
-                (
-                    item
-                    for item in self._persistence
-                    if item is not keep and item.pinned_bytes > 0
-                ),
-                None,
-            )
-            if victim is None:
+        pinned = [(item, _pinned_bytes(item)) for item in self._persistence]
+        total = sum(nbytes for _item, nbytes in pinned)
+        for item, nbytes in pinned:
+            if total <= budget:
                 return
-            self._persistence.remove(victim)
-            self._persistence_pending_bytes -= victim.pinned_bytes
-            victim.future.cancel()
+            if item is keep or nbytes <= 0:
+                continue
+            self._persistence.remove(item)
+            total -= nbytes
+            item.future.cancel()
             self._persistence_budget_dropped += 1
 
     def _submit(
@@ -723,7 +762,6 @@ class ModelWorkScheduler:
                 for stale in list(self._persistence):
                     if stale.coalesce_key == coalesce_key:
                         self._persistence.remove(stale)
-                        self._persistence_pending_bytes -= stale.pinned_bytes
                         stale.future.cancel()
                         self._persistence_coalesced += 1
             self._sequence += 1
@@ -738,7 +776,11 @@ class ModelWorkScheduler:
                 earliest_start_s=earliest_start_s,
                 coalesce_key=coalesce_key,
                 submitted_behind=self._submitted_behind_locked(),
-                pinned_bytes=max(0, int(pinned_bytes or 0)),
+                pinned_bytes=(
+                    pinned_bytes
+                    if callable(pinned_bytes)
+                    else max(0, int(pinned_bytes or 0))
+                ),
             )
             if kind == "foreground":
                 # A request is arriving: its tail postcommit is imminent.
@@ -748,7 +790,6 @@ class ModelWorkScheduler:
                 self._foreground.append(item)
             elif kind == "idle_persistence":
                 self._persistence.append(item)
-                self._persistence_pending_bytes += item.pinned_bytes
                 self._enforce_persistence_budget_locked(keep=item)
             else:
                 self._idle.append(item)
@@ -899,9 +940,7 @@ class ModelWorkScheduler:
                             # Pump-bridged pop: consume one armed slot.
                             self._persistence_pump_budget -= 1
                             self._persistence_pumped += 1
-                        item = self._persistence.popleft()
-                        self._persistence_pending_bytes -= item.pinned_bytes
-                        return item
+                        return self._persistence.popleft()
                     if wait_until is None:
                         wait_until = ready_at
                     else:

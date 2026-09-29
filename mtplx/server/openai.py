@@ -3873,7 +3873,9 @@ class ServerState:
                         job,
                         batch_key="ssd.cold_enqueue",
                         coalesce_key=getattr(job, "coalesce_key", None),
-                        pinned_bytes=int(getattr(job, "pinned_bytes", 0) or 0),
+                        # A count, or the bank's callable: what the job holds
+                        # once the bank itself no longer holds the entry.
+                        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
                     )
                 )
                 # The memory guard's idle-session release cancels a released

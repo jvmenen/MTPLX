@@ -3689,7 +3689,19 @@ class SessionBank:
             return body()
 
         job.coalesce_key = key
-        job.pinned_bytes = int(entry.nbytes) if pins else 0
+        if pins:
+            # Counted against the dispatcher's pending budget only once the
+            # bank has let the entry go: while the bank holds it, the job
+            # pins nothing extra and cancelling it only loses the SSD copy
+            # (a resident main session's persist must survive another
+            # session's commit).
+            token_ids = entry.token_ids
+            nbytes = int(entry.nbytes)
+            job.pinned_bytes = lambda: (
+                0 if self._entries.get(token_ids) is entry_ref() else nbytes
+            )
+        else:
+            job.pinned_bytes = 0
         dispatch = self.cold_enqueue_dispatch
         if dispatch is None:
             raise RuntimeError("no idle-lane dispatcher")
