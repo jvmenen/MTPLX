@@ -22,7 +22,7 @@ from test_server_openai import (
 from mtplx.server import openai
 from mtplx.server.openai import create_app
 
-ORPHAN_TAIL = "parameter=limit>\n180\n</parameter>\n</function>\n</tool_call>"
+ORPHAN_TAIL = "</think>\n\nparameter=limit>\n180\n</parameter>\n</function>\n</tool_call>"
 STALLED_PROMISE = "</think>\n\nLet me check the build output now."
 ANSWER = "Implemented the HUD cleanup and verified npm build."
 
@@ -60,6 +60,8 @@ def _tool_fed_request() -> dict:
 
 
 def _pass_kind(observability: dict) -> str:
+    if observability.get("reasoning_completion_repair_attempted"):
+        return "reasoning_completion_repair"
     if observability.get("tool_fed_empty_retry_attempted"):
         return "tool_fed_empty_retry"
     if observability.get("stalled_agent_retry_attempted"):
@@ -150,5 +152,17 @@ def test_agent_rewrites_off_disables_steering_retries(monkeypatch, first_text):
 
     assert kinds == ["first"]
     assert len(prompts) == 1
+    assert "tool_fed_empty_retry_attempted" not in stats
+    assert "stalled_agent_retry_attempted" not in stats
+
+
+def test_agent_rewrites_off_keeps_protocol_reasoning_completion(monkeypatch):
+    """Off disables injected user instructions, not the existing close repair."""
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    thinking = "The user wants the task finished. I can now summarize the result."
+    prompts, kinds, stats = _run_stream(monkeypatch, [thinking, ANSWER])
+    assert kinds == ["first", "reasoning_completion_repair"]
+    continued = prompts[0] + [ord(char) for char in thinking]
+    assert prompts[1][: len(continued)] == continued
     assert "tool_fed_empty_retry_attempted" not in stats
     assert "stalled_agent_retry_attempted" not in stats
