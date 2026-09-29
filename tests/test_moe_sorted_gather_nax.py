@@ -177,9 +177,20 @@ def test_swiglu_no_row_bound(tokens):
     assert np.array_equal(_bits(ours), _bits(nn.silu(gate) * up))
 
 
+def test_short_chunks_follow_the_installed_mlx():
+    """MLX before 0.32.3 tiles rows across experts and ours wins from 4,096
+    rows; MLX 0.32.3 tiles per expert and keeps short chunks."""
+
+    assert nax_gather.min_rows("0.32.2") == 4096
+    assert nax_gather.min_rows("0.32.3.dev20260920") == 4096
+    assert nax_gather.min_rows("0.32.3") == 16384
+    assert nax_gather.min_rows("0.32.4") == 16384
+    assert nax_gather.min_rows() == nax_gather.min_rows(mx.__version__)
+
+
 def test_small_widths_and_other_layouts_keep_the_stock_kernel():
     wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
-    rows = nax_gather.MIN_ROWS
+    rows = nax_gather.min_rows()
     tok = mx.zeros((rows, 1, 256), dtype=mx.bfloat16)
     idx = mx.zeros((rows,), dtype=mx.uint32)
     kw = dict(group_size=32, bits=4, mode="affine")
@@ -195,7 +206,7 @@ def test_small_widths_and_other_layouts_keep_the_stock_kernel():
 
 def test_rehearsal_switch_and_kill_switch_keep_the_stock_kernel(monkeypatch):
     wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
-    rows = nax_gather.MIN_ROWS
+    rows = nax_gather.min_rows()
     tok = mx.zeros((rows, 1, 256), dtype=mx.bfloat16)
     idx = mx.zeros((rows,), dtype=mx.uint32)
     kw = dict(group_size=32, bits=4, mode="affine")
@@ -214,7 +225,9 @@ def test_a_failed_canary_falls_back_to_the_stock_op(monkeypatch):
         return real_launch(*args, **kwargs) + 1
 
     monkeypatch.setattr(nax_gather, "_launch", wrong)
-    tok, row_map, idx = _routed(500, 64, 10, 256, mx.bfloat16, seed=13)
+    # Enough rows for the entry point to take the kernel under any MLX.
+    tok, row_map, idx = _routed(2000, 64, 10, 256, mx.bfloat16, seed=13)
+    assert int(idx.shape[0]) >= nax_gather.min_rows()
     wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
     assert nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4) is None
     assert nax_gather.stats()["canary_failures"] == 1
@@ -232,7 +245,8 @@ def test_a_failed_swiglu_canary_falls_back_to_the_stock_chain(monkeypatch):
         return real_launch(*args, **kwargs) + 1
 
     monkeypatch.setattr(nax_gather, "_launch", wrong)
-    tok, row_map, idx = _routed(500, 64, 10, 256, mx.bfloat16, seed=23)
+    tok, row_map, idx = _routed(2000, 64, 10, 256, mx.bfloat16, seed=23)
+    assert int(idx.shape[0]) >= nax_gather.min_rows()
     wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
     y = msg.swiglu_rows(tok, row_map, wq, s, b, idx, group_size=32, bits=4)
     assert np.array_equal(_bits(y), _bits(_stock_swiglu(tok, row_map, wq, s, b, idx, 32, 4)))

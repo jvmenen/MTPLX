@@ -47,8 +47,9 @@ runs the stock op (for ``swiglu=True``: the stock gather, split and
 
 Only on tensor-unit GPUs (``nax_detect.nax_available()``: the M1 to M4
 rehearsal switch keeps the stock path), for affine weights, bf16 or fp16
-activations, 4 or 8 bits, K and N multiples of 64, and at least ``MIN_ROWS``
-routed rows (decode and verify widths keep MLX's kernel).
+activations, 4 or 8 bits, K and N multiples of 64, and at least
+:func:`min_rows` routed rows (decode and verify widths, and the short chunks
+where MLX's own kernel is as fast, keep MLX's kernel).
 ``MTPLX_MOE_SORTED_GATHER_KERNEL=0`` keeps the stock path.
 """
 
@@ -64,14 +65,21 @@ import mlx.core as mx
 
 from mtplx import nax_detect
 
-__all__ = ["applies", "gather_rows_qmm", "stats"]
+__all__ = ["applies", "gather_rows_qmm", "min_rows", "stats"]
 
 BM = 64
 BN = 64
 BK = 64
 THREADS = 128
-#: Routed rows below this keep MLX's kernel (decode and verify widths).
+#: Routed rows below :func:`min_rows` keep MLX's kernel.  MLX before 0.32.3
+#: tiles sorted rows 64 at a time across expert boundaries, and ours is faster
+#: from about 410 tokens at top-10 (1.07x to 1.33x at 410 to 1,024 tokens on an
+#: M5 Max).  MLX 0.32.3 tiles each expert's run on its own too and is faster
+#: than ours on short chunks (ours 0.82x to 0.98x at 410 to 1,024 tokens), so
+#: with it ours starts at 16,384 rows, where it wins on both (1.12x to 1.25x
+#: from 2,048 tokens).
 MIN_ROWS = 4096
+MIN_ROWS_SEGMENTED_MLX = 16384
 _BITS = (4, 8)
 _GROUPS = (32, 64, 128)
 _DTYPES = (mx.bfloat16, mx.float16)
@@ -370,6 +378,16 @@ def _kernel():
     )
 
 
+@lru_cache(maxsize=None)
+def min_rows(version: str | None = None) -> int:
+    """The fewest routed rows the kernel takes under this (or the given) MLX."""
+
+    from mtplx.moe_sorted_gather import mlx_release_affected
+
+    tiles_across_experts = mlx_release_affected(mx.__version__ if version is None else version)
+    return MIN_ROWS if tiles_across_experts else MIN_ROWS_SEGMENTED_MLX
+
+
 def _enabled() -> bool:
     raw = (os.environ.get(_ENV) or "").strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -402,7 +420,7 @@ def applies(
     if rhs_indices is None or rhs_indices.ndim != 1 or row_map is None or row_map.ndim != 1:
         return False
     rows = int(rhs_indices.shape[0])
-    if rows < MIN_ROWS or int(row_map.shape[0]) != rows or row_map.dtype != mx.uint32:
+    if rows < min_rows() or int(row_map.shape[0]) != rows or row_map.dtype != mx.uint32:
         return False
     if w.ndim != 3 or w.dtype != mx.uint32:
         return False
