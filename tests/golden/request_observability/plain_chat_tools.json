@@ -134,6 +134,10 @@
  },
  "make_mtp_cache_calls": 0,
  "mean_accept_probability_by_depth": [],
+ "mlx_cache_cleanup": {
+  "cleared": true,
+  "reason": "after_request"
+ },
  "mode": "mtpk",
  "mtp_depth": 3,
  "mtp_forward_calls": 0,

@@ -23628,6 +23628,16 @@ def _auto_clear_mlx_cache_after_completed_request(
     session_id: str | None,
     request_observability: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    # Every completed request returns the allocator's freed buffers to macOS
+    # (default "auto"). The pool holds what decode freed, up to the MLX cache
+    # limit (8 GiB on a 128 GB Mac): 0.5 GiB at the median and 3.5 GiB at
+    # p90 of 4,104 logged requests, max 8.0 GiB, resident through the
+    # client's whole think-and-tool time for nothing. Prefill clears the pool
+    # after every chunk already, and decode-sized buffers cannot serve the
+    # next prefill's shapes, so the next request re-allocates only its first
+    # decode rounds' small buffers. clear_cache never touches a live array:
+    # outputs are bit-identical. MTPLX_CLEAR_CACHE_AFTER_REQUEST=off keeps
+    # the pool; "aime" restricts the clear to that client.
     raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
         return None
@@ -23638,9 +23648,7 @@ def _auto_clear_mlx_cache_after_completed_request(
     if raw in {"1", "true", "yes", "always"}:
         reason = "after_request_forced"
     elif raw == "auto":
-        if client != "aime" or session_id is not None:
-            return None
-        reason = "aime_stateless_question"
+        reason = "after_request"
     elif raw == "aime":
         if client != "aime":
             return None
