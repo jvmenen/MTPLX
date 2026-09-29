@@ -1623,19 +1623,10 @@ def _explicit_memory_limit_bytes() -> int | None:
     return int(value) if value > 0 else None
 
 
-# The allocator pool's default bound: a sixty-fourth of the Mac (2 GiB on
-# 128 GB), a forty-eighth of an explicit engine limit or memory budget, never
-# under 512 MiB nor over 8 GiB. See _default_mlx_cache_limit_bytes.
-_MLX_CACHE_LIMIT_RAM_DIVISOR = 64
-_MLX_CACHE_LIMIT_ENGINE_DIVISOR = 48
-_MLX_CACHE_LIMIT_MIN_BYTES = 512 * 1024**2
-_MLX_CACHE_LIMIT_MAX_BYTES = 8 * 1024**3
-
-
 def _default_mlx_cache_limit_bytes(
     memory_budget: int | None = None, explicit_limit: int | None = None
 ) -> int | None:
-    """Default bound for the MLX allocator's freed-buffer pool.
+    """RAM-tiered default for the MLX allocator's freed-buffer cache.
 
     MLX's own cache limit tracks the memory limit (~0.75x RAM high-water),
     so freed transients accumulate for the process lifetime (#150 — mmmugh
@@ -1643,50 +1634,38 @@ def _default_mlx_cache_limit_bytes(
     12 GiB; the growth was the allocator cache, which no profile bounded).
     A cache LIMIT only bounds what stays retained after buffers are freed —
     prefill spikes still allocate whatever they need — so the bound trades a
-    little reuse at the tail for a flat resident footprint.
+    little reuse at the tail for a flat resident footprint. Tiers keep
+    several GiB of hot-loop reuse on every box.
 
-    The bound is a sixty-fourth of the Mac: 2 GiB on 128 GB, 1 GiB on 64 GB,
-    at least 512 MiB and at most 8 GiB. It was a twelfth of the default
-    limit (8 GiB on 128 GB), and inside every Flash-Next prefill chunk the
-    pool sat at that cap (7.5 to 8.6 GB in the 2026-09-29 guard receipts),
-    about 60% of the working set beside the KV. The E3a cell (2026-09-29,
-    128 GB M5 Max, Flash-Next Optimized Speed, one tree, A B B A, a fresh
-    server per boot, 8 GiB against 2 GiB): the footprint peak fell 2.6 to
-    4.5 GB (16K: 98.3 and 96.5 GB against 93.8 and 93.9; 64K: 98.7 against
-    95.1 and 95.2), 4K and 16K time to first token and prefill rate stayed
-    within noise (16K 1,496 and 1,621 tok/s against 1,496 and 1,509; 4K
-    1,702 and 1,854 against 1,800 and 1,608), and a 64K cold prompt that the
-    8 GiB arm could not serve was served in both boots. A decode step's
-    buffers are a few MB, reused many times over under any of these bounds.
-    Smaller Macs run smaller models and windows, so the pool keeps the same
-    share of the machine.
-
-    An explicit MTPLX_MEMORY_LIMIT_BYTES (``explicit_limit``) or memory
-    budget bounds it at a forty-eighth of itself (the same share of the
-    75% default limit), so an operator who lowers the limit lowers the pool
-    with it (the review of 9c96dd9c).
+    An explicit MTPLX_MEMORY_LIMIT_BYTES (``explicit_limit``) bounds it too,
+    at a twelfth of the limit: the tiers are a twelfth of each machine's
+    default limit, and a lowered limit left the cache at its RAM tier (8 GiB
+    of pooled buffers under a 48 GiB limit on a 128 GB Mac; the review of
+    9c96dd9c).
     """
-
-    def clamp(value: int) -> int:
-        return max(
-            _MLX_CACHE_LIMIT_MIN_BYTES, min(_MLX_CACHE_LIMIT_MAX_BYTES, int(value))
-        )
 
     def bounded(value: int) -> int:
         if explicit_limit is None or int(explicit_limit) <= 0:
-            return clamp(value)
-        return clamp(
-            min(int(value), int(explicit_limit) // _MLX_CACHE_LIMIT_ENGINE_DIVISOR)
+            return int(value)
+        return min(
+            int(value),
+            max(1 * 1024**3, int(explicit_limit) // _ALLOWANCE_LIMIT_DIVISOR),
         )
 
     if memory_budget is not None:
-        return bounded(int(memory_budget) // _MLX_CACHE_LIMIT_ENGINE_DIVISOR)
+        return bounded(max(1 * 1024**3, min(8 * 1024**3, memory_budget // 8)))
     total = _total_ram_bytes()
     if total is None:
         if explicit_limit:
-            return bounded(_MLX_CACHE_LIMIT_MAX_BYTES)
+            return bounded(8 * 1024**3)
         return None  # unknown machine: leave MLX defaults untouched
-    return bounded(int(total) // _MLX_CACHE_LIMIT_RAM_DIVISOR)
+    if total <= 36 * 1024**3:
+        return bounded(2 * 1024**3)
+    if total <= 72 * 1024**3:
+        return bounded(4 * 1024**3)
+    if total <= 100 * 1024**3:
+        return bounded(6 * 1024**3)
+    return bounded(8 * 1024**3)
 
 
 def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
@@ -3301,6 +3280,7 @@ class ServerState:
         self.foreground_lock = Lock()
         self.foreground_active = 0
         self.model_scheduler = ModelWorkScheduler(name="mtplx-model")
+        _wire_owner_idle_pool_return(self, self.model_scheduler)
         # Compatibility shim for older tests/helpers that expect an executor
         # with submit()/shutdown(). New serving code uses model_scheduler
         # explicitly for foreground-vs-idle admission.
@@ -23852,6 +23832,10 @@ def _clear_mlx_cache_after_request(
                 "trigger": reason,
                 "error": repr(exc),
             }
+        # What the return costs the request's tail (the review of 4c9da1ba:
+        # the response's elapsed_s is taken before it): the wait for the
+        # GPU's queued work and the release itself.
+        started = time.perf_counter()
         synchronize = getattr(mx, "synchronize", None)
         if callable(synchronize):
             synchronize()
@@ -23863,7 +23847,11 @@ def _clear_mlx_cache_after_request(
                 "trigger": reason,
             }
         clear_cache()
-        return {"cleared": True, "reason": reason}
+        return {
+            "cleared": True,
+            "reason": reason,
+            "elapsed_s": round(time.perf_counter() - started, 6),
+        }
     except Exception as exc:
         return {
             "cleared": False,
@@ -23874,6 +23862,34 @@ def _clear_mlx_cache_after_request(
     finally:
         if acquired:
             lock.release()
+
+
+def _return_mlx_pool_when_owner_idle(state: Any) -> dict[str, Any]:
+    """The model owner has had no work for its idle grace (a second): hand
+    the MLX buffer pool back to macOS.
+
+    The pool keeps its full bound while work runs: a prefill reuses its
+    per-layer buffers inside every chunk, and a 2 GiB bound (3863e9d8, since
+    reverted) cost 6 to 10% of the 16K and 64K prefill rate when the prompt
+    followed earlier requests in the same boot (2026-09-29, 128 GB, Flash-Next,
+    A B B A: 16K 1,533/1,550 against 1,700/1,617 tok/s, 64K 1,403/1,384
+    against 1,549/1,545). Between bursts of work nothing reuses it, so it is
+    returned here: after a request, and after the postcommits and SSD
+    encodes that follow it. MTPLX_CLEAR_CACHE_AFTER_REQUEST=off keeps it."""
+
+    pool = _mlx_allocator_public_stats().get("cache_memory_bytes")
+    if pool == 0:
+        return {"cleared": False, "reason": "pool_empty", "pool_bytes": 0}
+    receipt = _clear_mlx_cache_after_request(state, reason="owner_idle")
+    receipt["pool_bytes"] = pool
+    return receipt
+
+
+def _wire_owner_idle_pool_return(state: Any, scheduler: Any) -> None:
+    """Point the owner thread's idle turn at ``_return_mlx_pool_when_owner_idle``."""
+
+    if hasattr(scheduler, "on_owner_idle"):
+        scheduler.on_owner_idle = lambda: _return_mlx_pool_when_owner_idle(state)
 
 
 def _auto_clear_mlx_cache_after_completed_request(

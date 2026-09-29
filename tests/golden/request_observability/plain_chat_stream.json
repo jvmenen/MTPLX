@@ -134,6 +134,7 @@
  "mean_accept_probability_by_depth": [],
  "mlx_cache_cleanup": {
   "cleared": true,
+  "elapsed_s": "<float>",
   "reason": "after_request"
  },
  "mode": "mtpk",

@@ -41,26 +41,10 @@ def _caps(limit_gib: float, source: str) -> SimpleNamespace:
 
 
 class TestTheCacheLimit:
-    def test_the_default_is_a_sixty_fourth_of_the_mac(self):
-        # 2026-09-29 E3a: 2 GiB on 128 GB cut the footprint 2.6 to 4.5 GB with
-        # 4K and 16K within noise (was 8 GiB, a twelfth of the default limit).
-        assert srv._default_mlx_cache_limit_bytes(None) == 2 * GIB
+    def test_the_default_keeps_its_ram_tier(self):
+        assert srv._default_mlx_cache_limit_bytes(None) == 8 * GIB
 
-    @pytest.mark.parametrize(
-        "ram_gib, cache_gib",
-        [(8, 0.5), (16, 0.5), (36, 0.5625), (64, 1), (96, 1.5), (128, 2), (512, 8), (1024, 8)],
-    )
-    def test_it_keeps_that_share_on_every_mac(self, monkeypatch, ram_gib, cache_gib):
-        monkeypatch.setattr(srv, "_total_ram_bytes", lambda: int(ram_gib * GIB))
-        assert srv._default_mlx_cache_limit_bytes(None) == int(cache_gib * GIB)
-
-    def test_a_memory_budget_bounds_it_at_the_same_share(self):
-        assert srv._default_mlx_cache_limit_bytes(96 * GIB) == 2 * GIB
-        assert srv._default_mlx_cache_limit_bytes(12 * GIB) == GIB // 2
-
-    @pytest.mark.parametrize(
-        "limit_gib, cache_gib", [(112, 2), (96, 2), (90, 1.875), (48, 1), (12, 0.5)]
-    )
+    @pytest.mark.parametrize("limit_gib, cache_gib", [(96, 8), (90, 7.5), (48, 4), (12, 1)])
     def test_an_explicit_limit_bounds_it(self, limit_gib, cache_gib):
         assert srv._default_mlx_cache_limit_bytes(
             None, explicit_limit=int(limit_gib * GIB)
@@ -75,8 +59,8 @@ class TestTheCacheLimit:
         status = srv._configure_mlx_cache_limit(
             SimpleNamespace(mlx_cache_limit=None, memory_budget=None)
         )
-        assert applied == [1 * GIB]
-        assert status["limit_bytes"] == 1 * GIB
+        assert applied == [4 * GIB]
+        assert status["limit_bytes"] == 4 * GIB
         assert status["source"] == "ram_tier_default_bounded_by_memory_limit"
 
     def test_an_explicit_cache_limit_still_wins(self, monkeypatch):

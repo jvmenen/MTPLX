@@ -127,7 +127,13 @@ separate, existing knob: `--mlx-cache-limit` (env `MTPLX_MLX_CACHE_LIMIT`,
 otherwise to a RAM tier - 8 GiB at 100 GB and above. `/health` reports it as
 `mlx_cache_limit` with the applied `limit_bytes`. That pool is reclaimable, so
 it is not lost memory, but it is 8 GiB the page cache does not get; lowering it
-is the first lever if `auto` keeps sizing the budget too small.
+is the first lever if `auto` keeps sizing the budget too small. The engine
+returns the pool to macOS after every completed request and about a second
+after its model thread goes idle, so between requests it holds nothing
+(`MTPLX_CLEAR_CACHE_AFTER_REQUEST=off` keeps it; the scheduler stats count the
+idle returns under `owner_idle`). While work runs the pool keeps its
+full limit: a prefill reuses its buffers inside every chunk, and a 2 GiB limit
+cost 6 to 10% of the 16K and 64K prefill rate on a 128 GB Mac.
 
 ### What `/health` reports
 

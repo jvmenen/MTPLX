@@ -157,6 +157,15 @@ class _KeepaliveTurn:
 _KEEPALIVE = _KeepaliveTurn()
 
 
+class _OwnerIdleTurn:
+    """Sentinel `_take_next` returns once the owner thread has had no work
+    for ``owner_idle_grace_s`` after running some: the moment the server
+    hands the MLX buffer pool back to macOS (``on_owner_idle``)."""
+
+
+_OWNER_IDLE = _OwnerIdleTurn()
+
+
 def _batch_key_class(batch_key: str) -> str:
     """Stable telemetry class for a batch key: the prefix before the first ':'.
 
@@ -253,6 +262,21 @@ class ModelWorkScheduler:
         self._persistence_pump_budget = 0
         self._persistence_pumped = 0
         self._last_quiet_anchor_s = time.monotonic()
+        # Owner idle hook: called on the owner thread, outside the lock,
+        # once the owner has had no work for owner_idle_grace_s after
+        # running some (a request, a postcommit, an SSD encode). The server
+        # returns the MLX buffer pool to macOS there, so the pool the work
+        # needed at full size (prefill reuses it within each chunk) is not
+        # held while nothing runs. The grace outlasts the 100-200 ms of
+        # handler Python between one request's restore and its generation,
+        # which arrive as separate items. Keepalive beats are not work.
+        self.on_owner_idle: Callable[[], Any] | None = None
+        self.owner_idle_grace_s = 1.0
+        self._owner_worked = False
+        self._owner_last_done_s = 0.0
+        self._owner_idle_turns = 0
+        self._owner_idle_errors = 0
+        self._owner_idle_last: dict[str, Any] | None = None
         # Idle keepalive (GPU residency): see arm_idle_keepalive.
         self._keepalive_fn: Callable[[], Any] | None = None
         self._keepalive_interval_s = 0.0
@@ -480,6 +504,30 @@ class ModelWorkScheduler:
             return None
         return self._last_owner_activity_s + self._keepalive_interval_s
 
+    def _run_owner_idle(self) -> None:
+        """Call ``on_owner_idle`` on the owner thread; a hook that raises is
+        counted and reported in ``stats()``, never raised into the loop."""
+
+        hook = self.on_owner_idle
+        if hook is None:
+            return
+        started = time.monotonic()
+        error: str | None = None
+        result: Any = None
+        try:
+            result = hook()
+        except Exception as exc:  # noqa: BLE001 - reported below
+            error = f"{type(exc).__name__}: {exc}"
+        with self._condition:
+            self._owner_idle_turns += 1
+            if error is not None:
+                self._owner_idle_errors += 1
+            self._owner_idle_last = {
+                "elapsed_s": round(time.monotonic() - started, 6),
+                "error": error,
+                "result": dict(result) if isinstance(result, dict) else None,
+            }
+
     def _run_keepalive(self) -> None:
         fn = self._keepalive_fn
         if fn is None:
@@ -515,6 +563,14 @@ class ModelWorkScheduler:
                 else None
             )
             return {
+                "owner_idle": {
+                    "turns": self._owner_idle_turns,
+                    "errors": self._owner_idle_errors,
+                    "grace_s": self.owner_idle_grace_s,
+                    "last": dict(self._owner_idle_last)
+                    if self._owner_idle_last is not None
+                    else None,
+                },
                 "idle_keepalive": self._keepalive_state_locked(time.monotonic()),
                 "foreground_pending": len(self._foreground),
                 "idle_pending": len(self._idle),
@@ -818,6 +874,9 @@ class ModelWorkScheduler:
             if item is _KEEPALIVE:
                 self._run_keepalive()
                 continue
+            if item is _OWNER_IDLE:
+                self._run_owner_idle()
+                continue
             if not item.future.set_running_or_notify_cancel():
                 with self._condition:
                     self._cancelled_before_start += 1
@@ -869,6 +928,8 @@ class ModelWorkScheduler:
                     # rung or a postcommit snapshot is not a user talking
                     # to the model.
                     self._last_owner_activity_s = time.monotonic()
+                    self._owner_worked = True
+                    self._owner_last_done_s = self._last_owner_activity_s
                     if item.kind == "foreground":
                         self._keepalive_attentive_anchor_s = self._last_owner_activity_s
                     if item.kind != "idle_persistence":
@@ -954,6 +1015,12 @@ class ModelWorkScheduler:
                     wait_until = (
                         keepalive_at if wait_until is None else min(wait_until, keepalive_at)
                     )
+                if self._owner_worked and self.on_owner_idle is not None:
+                    idle_at = self._owner_last_done_s + self.owner_idle_grace_s
+                    if now >= idle_at:
+                        self._owner_worked = False
+                        return _OWNER_IDLE
+                    wait_until = idle_at if wait_until is None else min(wait_until, idle_at)
                 if wait_until is not None:
                     self._condition.wait(timeout=max(0.0, wait_until - now))
                     continue
