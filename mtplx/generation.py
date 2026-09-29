@@ -15665,7 +15665,7 @@ def generate_mtpk(
                 # Reserve the bonus before either final cache is advanced;
                 # bucket slack alone does not widen one-row attention.
                 compiled_verify_bank.reserve_fixed_m4_window(
-                    cache, committed_count=len(tokens) - 1, window_tokens=1,
+                    cache, committed_count=len(tokens) - 1, window_tokens=1, final_capture=True,
                 )
             if (
                 _mtp_history_uses_committed_cache(mtp_history_policy)
