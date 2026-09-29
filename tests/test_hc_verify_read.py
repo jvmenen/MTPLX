@@ -154,13 +154,23 @@ def _bf16_index(value: float) -> int:
 
 
 def test_the_tables_are_the_stock_lowerings_at_every_input():
+    # Each row equals, at every finite input, the lowering its sites take in
+    # the running MLX: row 0 the fused one (silu, inject gate), row 1 the
+    # standalone primitive (mix gate).
     for dtype in (mx.bfloat16, mx.float16):
         assert hc_verify_read._table_check(dtype) is None
     table = _bits(hc_verify_read.sigmoid_table(mx.bfloat16))
     at = _bf16_index(DIVERGENT)
-    # Row 0 (fused: silu, inject) and row 1 (standalone: mix gate) really are
-    # two lowerings; a single table would be wrong at one of the sites.
-    assert table[at] != table[65536 + at]
+    value = mx.array([DIVERGENT], dtype=mx.bfloat16)
+    standalone = int(_bits(mx.sigmoid(value))[0])
+    assert int(table[65536 + at]) == standalone
+    # MLX 0.32.2 parts the two lowerings at this input, so one table would be
+    # wrong at one of the sites there. MLX 0.32.3 gives both the same value;
+    # the rows follow whichever build is running.
+    from importlib.metadata import version
+
+    if version("mlx") == "0.32.2":
+        assert table[at] != table[65536 + at]
 
 
 def test_the_mix_gate_takes_the_standalone_sigmoid_where_the_lowerings_part():
@@ -229,17 +239,39 @@ def _graph_primitives(outputs, tmp_path) -> list[str]:
     return names
 
 
-def _installed_model(module_seed=7):
+def _served_here() -> bool:
+    """The read's device route on the GPU running the tests."""
+
+    from mtplx.nax_detect import gpu_architecture
+
+    return bool(hc_verify_read.device_route(gpu_architecture())[0])
+
+
+needs_the_read = pytest.mark.skipif(
+    not _served_here(),
+    reason="this GPU's route keeps the stock chain (M1, M2, an Ultra): nothing to engage",
+)
+
+
+def _model(module_seed=7):
     reader = _residual(seed=module_seed)
     mixer = _residual(combine=False, seed=module_seed + 1)
-    model = SimpleNamespace(
+    return SimpleNamespace(
         layers=[SimpleNamespace(attn_hyper_connection=reader)],
         hyper_connection_mixer=mixer,
     )
-    report = hc_verify_read.install(model, rows=(4,), architecture="applegpu_g17s")
+
+
+def _installed_model(module_seed=7):
+    """The read installed the way the route installs it: on this GPU's own
+    architecture (never a forced one)."""
+
+    model = _model(module_seed)
+    report = hc_verify_read.install(model, rows=(4,))
     return model, report
 
 
+@needs_the_read
 def test_inside_a_compiled_body_one_read_is_three_kernels(tmp_path):
     model, report = _installed_model()
     assert report["installed"], report
@@ -299,6 +331,7 @@ def test_a_pending_write_on_the_stock_path_is_written_before_the_read():
         np.testing.assert_array_equal(_bits(a), _bits(b))
 
 
+@needs_the_read
 def test_the_probe_turns_the_read_off_on_any_difference(monkeypatch, capsys):
     real = hc_verify_read.read_rows
 
@@ -320,6 +353,121 @@ def test_the_probe_turns_the_read_off_on_any_difference(monkeypatch, capsys):
     assert hc_verify_read.engagement()["traces"] == 0
 
 
+def _zero_columns(x, hc, width, columns=8):
+    """``x`` with the first ``columns`` values of every stream set to -0."""
+
+    rows = x.shape[1]
+    grouped = x.reshape(1, rows, hc, width)
+    zeros = mx.zeros((1, rows, hc, columns), dtype=x.dtype) * -1.0
+    return mx.concatenate([zeros, grouped[..., columns:]], axis=-1).reshape(x.shape)
+
+
+@needs_the_read
+def test_a_sign_only_difference_turns_the_read_off_and_the_stock_chain_serves(monkeypatch, capsys):
+    # A read right in every bit but the sign of a zero (a stream sum started
+    # from its first product instead of +0 gives -0 where the stock mean is
+    # +0) must fail the probe; the compiled read then equals the stock chain.
+    real = hc_verify_read.read_rows
+
+    def zero_sign_slip(*args, **kwargs):
+        mixed, written, inject = real(*args, **kwargs)
+        bits = mx.view(mixed, mx.uint16)
+        slipped = mx.where((bits & 0x7FFF) == 0, bits | 0x8000, bits)
+        return mx.view(slipped, mixed.dtype), written, inject
+
+    monkeypatch.setattr(hc_verify_read, "read_rows", zero_sign_slip)
+    model, report = _installed_model()
+    assert not report["installed"]
+    assert "mixed differs" in report["disabled_reason"]
+    assert "hyper-connection verify read off" in capsys.readouterr().out
+    reader = model.layers[0].attn_hyper_connection
+    x, _block, _gates = _stream(FAMILY, 4, seed=18)
+    x = _zero_columns(x, FAMILY.hc_count, FAMILY.hidden_size)
+    mx.eval(x)
+    with compiled_step_body():
+        got = mx.compile(lambda s: reader(s))(x)
+    want = _stock(reader, x, None)
+    mx.eval(*got, *want)
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(_bits(a), _bits(b))
+    assert (_bits(got[0])[..., :8] == 0).all()  # +0, not -0
+    assert hc_verify_read.engagement()["traces"] == 0
+
+
+@needs_the_read
+def test_with_the_production_v3_flag_one_row_keeps_the_v3_read(monkeypatch, tmp_path):
+    # The server arms MTPLX_FUSED_HC_V3=1 for this family, so single-row
+    # decode reads take the 8-bit v3 read. The verify-width read serves 2 to
+    # 8 rows only and leaves that path as it was, output bits included.
+    from mtplx.kernels import hyper_connection_v3
+
+    monkeypatch.setenv("MTPLX_FUSED_HC_V3", "1")
+    model, report = _installed_model()
+    assert report["installed"], report
+    reader = model.layers[0].attn_hyper_connection
+    # The device probe dispatches the v3 kernels once itself; take it first.
+    served_v3 = hyper_connection_v3.device_supports_hyper_v3()
+    calls = []
+    real = hyper_connection_v3.fused_hyper_read_v3
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hyper_connection_v3, "fused_hyper_read_v3", counted)
+    x1, block1, gates1 = _stream(FAMILY, 1, seed=19)
+    with compiled_step_body():
+        one = reader(x1, pending=(block1, gates1))
+    mx.eval(*one)
+    assert len(calls) == (1 if served_v3 else 0)
+    assert hc_verify_read.engagement()["traces"] == 0
+
+    hc_verify_read.reset_state()  # the same read with the verify read off
+    with compiled_step_body():
+        again = reader(x1, pending=(block1, gates1))
+    mx.eval(*again)
+    for a, b in zip(one, again):
+        np.testing.assert_array_equal(_bits(a), _bits(b))
+
+    model, report = _installed_model()
+    reader = model.layers[0].attn_hyper_connection
+    before = len(calls)
+    x4, block4, gates4 = _stream(FAMILY, 4, seed=20)
+    with compiled_step_body():
+        four = reader(x4, pending=(block4, gates4))
+    names = [name for name in _graph_primitives(list(four), tmp_path) if name != "Reshape"]
+    assert names.count("CustomKernel") == 3, names
+    assert len(calls) == before
+    assert hc_verify_read.engagement()["traces"] == 1
+
+
+def test_a_pending_write_of_another_dtype_keeps_the_stock_promotion():
+    # A float32 block output promotes the stock write to a float32 stream:
+    # bf16 1 + float32 2^-10 * 1 = float32 1.0009765625. The kernels would
+    # write the stream in bfloat16 (1), so such a write keeps the stock path.
+    model, report = _installed_model()
+    reader = model.layers[0].attn_hyper_connection
+    x, block, gates = _stream(FAMILY, 4, seed=21)
+    x = mx.ones_like(x)
+    block = mx.full(block.shape, 2.0**-10, dtype=mx.float32)
+    gates = mx.ones_like(gates)
+    mx.eval(x, block, gates)
+    before = hc_verify_read.engagement()["traces"]
+    with compiled_step_body():
+        mixed, written, inject = mx.compile(lambda s, b, g: reader(s, pending=(b, g)))(x, block, gates)
+    mx.eval(mixed, written, inject)
+    assert hc_verify_read.engagement()["traces"] == before
+    assert written.dtype == mx.float32
+    assert float(written[0, 0, 0].item()) == 1.0009765625
+    want = _stock(reader, x, (block, gates))
+    mx.eval(*want)
+    for a, b in zip((mixed, written, inject), want):
+        assert a.dtype == b.dtype
+        np.testing.assert_array_equal(np.array(a.astype(mx.float32)).view(np.uint32),
+                                      np.array(b.astype(mx.float32)).view(np.uint32))
+
+
+@needs_the_read
 def test_a_kernel_that_fails_to_build_leaves_the_stock_chain(monkeypatch):
     def refuse(*_args, **_kwargs):
         raise RuntimeError("pipeline refused")
@@ -337,6 +485,7 @@ def test_the_switch_keeps_the_stock_chain(monkeypatch):
     assert report["probe_cases"] == 0
 
 
+@needs_the_read
 def test_a_biased_or_replaced_projection_keeps_the_stock_chain():
     # The kernels read the projection weights only; a bias (the parity test
     # plants one to put an exact value on the inject gate) must send the read
@@ -358,6 +507,7 @@ def test_a_biased_or_replaced_projection_keeps_the_stock_chain():
     assert hc_verify_read.engagement()["traces"] == 0
 
 
+@needs_the_read
 def test_quantized_mixers_keep_the_stock_chain():
     import mlx.nn as nn
 

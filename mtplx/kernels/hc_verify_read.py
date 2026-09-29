@@ -25,12 +25,14 @@ kernel repeats MLX 0.32.2's own arithmetic in the same order:
   in order, a ``simd_sum`` per 32 virtual lanes, one ``simd_sum`` over the 32
   partial slots, IEEE division by the width, precise ``rsqrt``, a cast to the
   element type before the weight multiply;
-* each projection row is reduced the way MLX's wide gemv reduces it (the
-  route MLX takes for 2 to 15 rows on GPU generation 15 and newer): lanes
-  own interleaved blocks of four values, eight blocks per unrolled step, each
-  step's partial added to the lane's total, the tail blocks after, then a
-  halving shuffle tree over the lanes; 32 lanes per row when all rows fit one
-  pass or the projection has at most 64 outputs, else 16;
+* each projection row is summed in the order MLX's wide gemv gives it (the
+  route MLX takes for 2 to 15 rows on GPU generation 15 and newer), which
+  the probe observes on this GPU: lanes own interleaved blocks of four
+  values, the blocks of the grouped region summed eight at a time from zero
+  before joining the lane's total, the remaining blocks one at a time, then
+  the lanes combined pairwise at halving distances; 32 lanes per row when all
+  rows fit one pass or the projection has at most 64 outputs, else 16. The
+  kernels' code is this module's own (``hc_row_dot``);
 * the stock read evaluates its sigmoids two ways, and the kernels read each
   from a table of the stock values at every 16-bit input, made at install:
   the silu and the inject gate fuse into a JIT kernel (fast ``exp``), while
@@ -115,52 +117,65 @@ inline U hc_sigmoid(U x, const device U* table) {
     return table[as_type<ushort>(x)];
 }
 
-// One projection row for the NR vectors of a pass, reduced over K in the
-// wide-gemv order: lane k owns the blocks of four values at k, k + KL,
-// k + 2 KL, ...; each unrolled step of 8 blocks sums into a step partial that
-// is then added to the lane total; the tail blocks follow one by one; a
-// halving shuffle tree leaves the row's value on the slice's first lane.
+// One projection row for the NR vectors of a pass, over K values shared by
+// KL lanes. The row is read in blocks of four values and lane k takes blocks
+// k, k + KL, k + 2 KL, ... in that order. Inside the grouped region (the
+// longest prefix that is a whole number of groups of eight blocks per lane)
+// each group's eight block products are summed from zero and the group sum
+// then joins the lane's running total; each block after it joins the total on
+// its own. The lanes' totals then combine over a butterfly, partners at
+// distance KL / 2, KL / 4, ..., 1, which gives the first lane of every slice
+// the association the library's reduction gives it on this route. That order
+// is the specification; install's probe compares the result with the
+// library's own output bit for bit before anything uses it.
 // Vectors past ``valid`` re-read the last valid one (their results are never
 // stored), as the library does for a short last pass.
 template <typename U, int KL, int K, int NR>
-inline void hc_wide_dot(
+inline void hc_row_dot(
     const device U* w_row,
     const device U* x,
     int valid,
     uint k_lane,
     thread float* acc) {
-    constexpr int UNROLL = 8;
-    constexpr int K4 = K / 4;
-    constexpr int MAIN = K4 - K4 % (KL * UNROLL);
-    const device vec<U, 4>* w4 = (const device vec<U, 4>*)w_row;
-    const device vec<U, 4>* x4 = (const device vec<U, 4>*)x;
-    int xo[NR];
+    constexpr int BLOCKS = K / 4;
+    constexpr int GROUP = 8;
+    constexpr int GROUPED = BLOCKS - BLOCKS % (KL * GROUP);
+    const device vec<U, 4>* w_blocks = (const device vec<U, 4>*)w_row;
+    const device vec<U, 4>* x_blocks = (const device vec<U, 4>*)x;
+    int vector_base[NR];
     for (int r = 0; r < NR; ++r) {
         acc[r] = 0.0f;
-        xo[r] = min(r, valid - 1) * K4;
+        vector_base[r] = min(r, valid - 1) * BLOCKS;
     }
-    for (int base = 0; base < MAIN; base += KL * UNROLL) {
-        float4 wv[UNROLL];
-        for (int i = 0; i < UNROLL; ++i) {
-            wv[i] = float4(w4[base + i * KL + (int)k_lane]);
+    int block = (int)k_lane;
+    for (; block < GROUPED; block += GROUP * KL) {
+        // The group's weight blocks are read before any product is formed.
+        float4 w_group[GROUP];
+        for (int g = 0; g < GROUP; ++g) {
+            w_group[g] = float4(w_blocks[block + g * KL]);
         }
+        float group_sum[NR];
         for (int r = 0; r < NR; ++r) {
-            float step = 0.0f;
-            for (int i = 0; i < UNROLL; ++i) {
-                step += dot(wv[i], float4(x4[xo[r] + base + i * KL + (int)k_lane]));
+            group_sum[r] = 0.0f;
+        }
+        for (int g = 0; g < GROUP; ++g) {
+            for (int r = 0; r < NR; ++r) {
+                group_sum[r] += dot(w_group[g], float4(x_blocks[vector_base[r] + block + g * KL]));
             }
-            acc[r] += step;
+        }
+        for (int r = 0; r < NR; ++r) {
+            acc[r] += group_sum[r];
         }
     }
-    for (int idx = MAIN + (int)k_lane; idx < K4; idx += KL) {
-        const float4 wv = float4(w4[idx]);
+    for (; block < BLOCKS; block += KL) {
+        const float4 w = float4(w_blocks[block]);
         for (int r = 0; r < NR; ++r) {
-            acc[r] += dot(wv, float4(x4[xo[r] + idx]));
+            acc[r] += dot(w, float4(x_blocks[vector_base[r] + block]));
         }
     }
     for (int r = 0; r < NR; ++r) {
-        for (ushort off = KL / 2; off >= 1; off >>= 1) {
-            acc[r] += simd_shuffle_down(acc[r], off);
+        for (ushort distance = KL / 2; distance > 0; distance >>= 1) {
+            acc[r] += simd_shuffle_xor(acc[r], distance);
         }
     }
 }
@@ -250,7 +265,7 @@ _DOWN_SOURCE = r"""
         const uint n = (group * SIMDGROUPS + sg) * (32u / (uint)KL_DOWN) + lane / (uint)KL_DOWN;
         const uint k_lane = lane % (uint)KL_DOWN;
         const uint n_read = min(n, (uint)(LOWRANK - 1));
-        hc_wide_dot<T, KL_DOWN, HCD, NV>(
+        hc_row_dot<T, KL_DOWN, HCD, NV>(
             w_down + (size_t)n_read * HCD, xs, valid, k_lane, acc);
         if (k_lane == 0 && n < (uint)LOWRANK) {
             for (int r = 0; r < valid; ++r) {
@@ -263,7 +278,7 @@ _DOWN_SOURCE = r"""
         // The inject projection has hc_count outputs, so the library keeps
         // all 32 lanes on each row: one simdgroup per inject row.
         if (sg < (uint)HC) {
-            hc_wide_dot<T, 32, HCD, NV>(
+            hc_row_dot<T, 32, HCD, NV>(
                 w_inject + (size_t)sg * HCD, xs, valid, lane, acc);
             if (lane == 0) {
                 for (int r = 0; r < valid; ++r) {
@@ -290,7 +305,7 @@ _UP_SOURCE = r"""
     T total[NV];
     for (int s = 0; s < HC; ++s) {
         const uint n = (uint)s * D + c;
-        hc_wide_dot<T, KL_UP, LOWRANK, NV>(
+        hc_row_dot<T, KL_UP, LOWRANK, NV>(
             w_up + (size_t)n * LOWRANK, mix + (size_t)v0 * LOWRANK, valid, k_lane, acc);
         for (int r = 0; r < NV; ++r) {
             const int rv = min(v0 + r, ROWS - 1);
@@ -691,10 +706,12 @@ def _probe_case(module: Any, rows: int, pending: bool, seed: int) -> Optional[st
     dtype = module.hc_norm.weight.dtype
     hcd = hc * width
     keys = mx.random.split(mx.random.key(seed), 3)
-    x = (mx.random.normal((1, rows, hcd - 8), key=keys[0]) * 3.0).astype(dtype)
-    # Signed zeros reach the stream sum as -0 products; the stock reduce turns
-    # them into +0 and so must the kernels.
-    x = mx.concatenate([mx.zeros((1, rows, 8), dtype=dtype) * -1.0, x], axis=-1)
+    x = (mx.random.normal((1, rows, hc, width - 8), key=keys[0]) * 3.0).astype(dtype)
+    # The first 8 columns of every stream are -0: each of those columns then
+    # reaches the stream sum as -0 products only, which the stock reduce turns
+    # into a +0 mean (it starts every sum from +0), and so must the kernels.
+    x = mx.concatenate([mx.zeros((1, rows, hc, 8), dtype=dtype) * -1.0, x], axis=-1)
+    x = x.reshape(1, rows, hcd)
     block = (mx.random.normal((1, rows, width), key=keys[1]) * 2.0).astype(dtype)
     gates = mx.random.uniform(0.0, 2.0, (1, rows, hc), key=keys[2]).astype(dtype)
     combine = "block_inject_weight" in module

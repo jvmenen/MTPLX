@@ -248,19 +248,102 @@ def test_a_yarn_amplitude_matches_eager_every_round(monkeypatch):
     _assert_every_round_exact(result)
 
 
+def _hc_read_served_here() -> bool:
+    """The hyper-connection read's device route on this GPU (M1, M2 and an
+    Ultra keep the stock chain; single-die generation 15 and newer take it)."""
+
+    from mtplx.kernels import hc_verify_read
+    from mtplx.nax_detect import gpu_architecture
+
+    return bool(hc_verify_read.device_route(gpu_architecture())[0])
+
+
 def test_the_hyper_connection_read_engages_in_the_compiled_verifier(monkeypatch):
     # The route install proves the verify-width read on this GPU; the
     # compiled verifier then traces it into every round, and every round
-    # still equals the eager verifier bit for bit.
+    # still equals the eager verifier. Where the device route keeps the
+    # stock chain, the install says so and nothing engages.
     from mtplx.kernels import hc_verify_read
 
     rt = _runtime()
     report = rt._mtplx_hc_verify_read
-    assert report["installed"], report
-    assert report["rows"] == (4,)
     traced_before = hc_verify_read.engagement()["traces"]
     result = _generate(rt, "parity2", monkeypatch)
     assert result.stats.fixed_m4_admission["reason"] == "admitted"
     _assert_every_round_exact(result)
+    if not _hc_read_served_here():
+        assert not report["installed"], report
+        assert hc_verify_read.engagement()["traces"] == traced_before
+        return
+    assert report["installed"], report
+    assert report["rows"] == (4,)
     assert hc_verify_read.engagement()["traces"] > traced_before
     assert 4 in hc_verify_read.engagement()["engaged_rows"]
+
+
+def _raw_bytes(a: mx.array) -> np.ndarray:
+    """The array's storage as unsigned integers: equality here is bit equality
+    (a signed zero or a NaN payload counts as a difference)."""
+
+    if a.dtype in (mx.bfloat16, mx.float16):
+        return np.array(mx.view(a, mx.uint16))
+    host = np.array(a)
+    return host.reshape(-1).view(np.uint8) if host.dtype.kind in "fc" else host
+
+
+def _record_compiled_rounds(monkeypatch) -> list[dict]:
+    """Every compiled round's outputs as the verifier returned them: logits,
+    hidden state, captures and each cache leaf, stored as raw bytes."""
+
+    rounds: list[dict] = []
+    real = graphbank.CompiledVerifyBank._fixed_m4_parity2_compare
+
+    def spy(self, dispatch, clone, input_ids, **kw):
+        if kw["dispatch_kind"] == "compiled":
+            leaves = {"logits": kw["candidate_logits"], "hidden": kw["candidate_hidden"]}
+            for name, value in kw["candidate_captures"].items():
+                leaves[f"capture:{name}"] = value
+            for index, value in enumerate(kw["candidate_state"]):
+                leaves[f"state:{index}"] = value
+            arrays = {k: v for k, v in leaves.items() if isinstance(v, mx.array)}
+            mx.eval(list(arrays.values()))
+            rounds.append({k: (v.dtype, tuple(v.shape), _raw_bytes(v)) for k, v in arrays.items()})
+        return real(self, dispatch, clone, input_ids, **kw)
+
+    monkeypatch.setattr(graphbank.CompiledVerifyBank, "_fixed_m4_parity2_compare", spy)
+    return rounds
+
+
+def test_the_compiled_verifier_with_the_kernels_equals_its_parent_bit_for_bit(monkeypatch):
+    # The parent is the same compiled verifier with the verify-width
+    # hyper-connection read switched off at install: the stock chain
+    # traced into the compiled body. Every compiled round's
+    # logits, hidden state, captures and cache leaves must match it in their
+    # raw bits, and so must the tokens.
+    from mtplx.kernels import hc_verify_read
+
+    rounds = _record_compiled_rounds(monkeypatch)
+    monkeypatch.setenv(hc_verify_read.ENV, "0")
+    parent_rt = _runtime()
+    assert not parent_rt._mtplx_hc_verify_read["installed"]
+    hc_before = hc_verify_read.engagement()["traces"]
+    parent = _generate(parent_rt, "parity2", monkeypatch)
+    assert hc_verify_read.engagement()["traces"] == hc_before
+    parent_rounds = list(rounds)
+    rounds.clear()
+
+    monkeypatch.delenv(hc_verify_read.ENV)
+    rt = _runtime()
+    candidate = _generate(rt, "parity2", monkeypatch)
+    if _hc_read_served_here():
+        assert hc_verify_read.engagement()["traces"] > hc_before
+
+    assert candidate.tokens == parent.tokens
+    assert len(rounds) == len(parent_rounds) > 0
+    for index, (want, got) in enumerate(zip(parent_rounds, rounds)):
+        assert got.keys() == want.keys(), index
+        for name, (dtype, shape, bits) in want.items():
+            got_dtype, got_shape, got_bits = got[name]
+            assert (got_dtype, got_shape) == (dtype, shape), (index, name)
+            differing = int(np.count_nonzero(got_bits != bits))
+            assert differing == 0, (index, name, differing)

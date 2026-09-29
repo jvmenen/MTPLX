@@ -1182,7 +1182,7 @@ class GatedResidual(nn.Module):
             self._v3_pack = prepare_v3_pack(self)
         return True
 
-    def _verify_rows_read_applies(self, hyper_input: mx.array) -> bool:
+    def _verify_rows_read_applies(self, hyper_input: mx.array, pending=None) -> bool:
         # The verify-width read (mtplx.kernels.hc_verify_read) reproduces the
         # compiled stock chain bit for bit, so it engages only inside a
         # compiled step body (whose fused lowering that is), at the widths
@@ -1194,6 +1194,18 @@ class GatedResidual(nn.Module):
             rows *= s
         if not hc_verify_read.MIN_ROWS <= rows <= hc_verify_read.MAX_ROWS:
             return False
+        if pending is not None:
+            # The kernels write the stream in its own dtype. A block output
+            # or inject of another dtype promotes the stock write (a float32
+            # block output makes a float32 stream), so it keeps that write.
+            block_out, inject = pending
+            lead = tuple(hyper_input.shape[:-1])
+            if block_out.dtype != hyper_input.dtype or inject.dtype != hyper_input.dtype:
+                return False
+            if tuple(block_out.shape) != lead + (self.hidden_size,):
+                return False
+            if tuple(inject.shape) != lead + (self.hc_count,):
+                return False
         return hc_verify_read.serves(self, hyper_input.dtype, rows)
 
     def _verify_rows_read(self, hyper_input: mx.array, pending):
@@ -1238,7 +1250,7 @@ class GatedResidual(nn.Module):
         comes back as the second output is the written one.
         """
 
-        if self._verify_rows_read_applies(hyper_input):
+        if self._verify_rows_read_applies(hyper_input, pending):
             return self._verify_rows_read(hyper_input, pending)
         if pending is not None:
             hyper_input = _hyper_residual_write(hyper_input, *pending)
