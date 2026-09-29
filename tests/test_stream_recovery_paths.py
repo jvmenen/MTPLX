@@ -234,7 +234,7 @@ def test_recovery_chain_keeps_last_pass_values_and_updates_metrics():
     }
     second = {
         "completion_tokens": 4,
-        "stats": {"prompt_eval_time_s": 0.5, "new_prefill_tokens": 7, "ttft_s": 4.0},
+        "stats": {"request_id": "r", "prompt_eval_time_s": 0.5, "new_prefill_tokens": 7, "ttft_s": 4.0},
     }
 
     result = _run_stream_recovery_chain(
@@ -250,6 +250,16 @@ def test_recovery_chain_keeps_last_pass_values_and_updates_metrics():
     assert result["stats"]["stream_attempts_new_prefill_tokens"] == 7
     assert result["stats"]["stream_attempts_completion_tokens"] == 7
     assert state.last_metrics[-1]["stream_attempts"] == 2
+    assert state.last_metrics[-1]["tool_fed_empty_retry_x"] == 1
+
+
+def test_recovery_totals_do_not_overwrite_another_requests_metrics():
+    state = SimpleNamespace(last_metrics=[{"request_id": "r"}, {"request_id": "other"}])
+    first = {"completion_tokens": 3, "stats": {"request_id": "r"}}
+    second = {"completion_tokens": 4, "stats": {"request_id": "r"}}
+    _run_stream_recovery_chain(state, first, [lambda _: second])
+    assert state.last_metrics[0]["stream_attempts_completion_tokens"] == 7
+    assert state.last_metrics[1] == {"request_id": "other"}
 
 
 def test_recovery_chain_releases_discarded_generation_state():

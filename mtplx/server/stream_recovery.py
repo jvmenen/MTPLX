@@ -83,6 +83,17 @@ def _run_stream_recovery_chain(
                 stats.setdefault(key, value)
     totals = _stream_attempt_totals(attempts)
     stats.update(totals)
-    if state.last_metrics:
-        state.last_metrics[-1].update(totals)
+    request_id = stats.get("request_id")
+    metric = next(
+        (row for row in reversed(state.last_metrics)
+         if request_id is not None and row.get("request_id") == request_id),
+        None,
+    )
+    if metric is not None:
+        metric.update(
+            (key, value)
+            for key, value in stats.items()
+            if key.startswith(_STREAM_RECOVERY_STAT_PREFIXES)
+        )
+        metric.update(totals)
     return generated
