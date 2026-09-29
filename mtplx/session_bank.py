@@ -2828,7 +2828,7 @@ class SessionBank:
         epoch = int(entry.snapshot_epoch)
         try:
             self._dispatch_persistence(
-                entry, lambda: self.run_live_ref_spill(token_ids, epoch)
+                entry, lambda: self.run_live_ref_spill(token_ids, epoch), pins=False
             )
         except BaseException as exc:
             self.eviction_log.append(
@@ -2909,6 +2909,7 @@ class SessionBank:
                     self._dispatch_persistence(
                         entry,
                         lambda: self.run_live_ref_spill(token_ids, snapshot_epoch),
+                        pins=False,
                     )
                 except Exception:
                     pass
@@ -3666,12 +3667,16 @@ class SessionBank:
         body: Callable[[], Any],
         *,
         key: str | None = None,
+        pins: bool = True,
     ) -> None:
         """File one idle-lane job for ``entry`` (raises what the dispatcher
         raises): its SSD encode, keyed by ``cold_persistence_key``, or its
         snapshot settle (``key``). The dispatcher keeps only the newest per
         key, and the pending map records which entry that newest job is
-        for: every queued job holds its entry's arrays until it runs."""
+        for: every queued job holds its entry's arrays until it runs.
+        ``pins`` is False for a job whose body holds no arrays (a live-ref
+        spill carries token ids and an epoch); the others carry the entry's
+        size as ``pinned_bytes`` for the dispatcher's pending-bytes budget."""
 
         key = cold_persistence_key(entry) if key is None else str(key)
         # A weak reference: the map must not pin what the job itself does
@@ -3684,6 +3689,7 @@ class SessionBank:
             return body()
 
         job.coalesce_key = key
+        job.pinned_bytes = int(entry.nbytes) if pins else 0
         dispatch = self.cold_enqueue_dispatch
         if dispatch is None:
             raise RuntimeError("no idle-lane dispatcher")
