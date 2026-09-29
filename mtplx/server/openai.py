@@ -41222,10 +41222,20 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        # The same span clock as chat (request_spans): arrival, the prologue,
+        # the engine's marks, and the first text written to the stream.
+        _handler_start_s = time.perf_counter()
+        response_id = f"cmpl-{uuid.uuid4().hex}"
+        ttft_clock = request_spans.open_clock(
+            response_id,
+            arrival=request_spans.arrival_s(raw_request),
+            handler_start=_handler_start_s,
+        )
         headers = dict(raw_request.headers)
         raw_metadata = _request_extra(request, "metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
+        ttft_clock.mark("encode")
         if not prompt_ids:
             # An empty body used to fall through into generation machinery and
             # surface as a 500 with a Python exception string — external
@@ -41247,6 +41257,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _completions_sweep,
                 except_session_id=None,
             )
+        ttft_clock.mark("postcommit_sweep")
         policy = resolve_request_policy(
             state,
             request,
@@ -41255,6 +41266,7 @@ def create_app(state: ServerState) -> FastAPI:
             endpoint="completions",
             prompt_tokens=len(prompt_ids),
         )
+        ttft_clock.mark("policy")
         request_generation_mode = policy.request_generation_mode
         request_depth = policy.request_depth
         effective_request_depth = policy.effective_request_depth
@@ -41277,7 +41289,6 @@ def create_app(state: ServerState) -> FastAPI:
             )
         stop_sequences = _normalize_stop_sequences(request.stop)
         model = state.model_id
-        response_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
         # OpenAI semantics: logprobs=0 is a real request ("sampled token
@@ -41319,6 +41330,7 @@ def create_app(state: ServerState) -> FastAPI:
                 top_k_field="logprobs",
             )
 
+        ttft_clock.mark("prologue")
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
             # generation worker and are decoded as they arrive, mirroring the
@@ -41463,6 +41475,9 @@ def create_app(state: ServerState) -> FastAPI:
                             )
                         if not text:
                             return []
+                    # Yielded as soon as it is returned: the client's first
+                    # token (the first mark of the name wins).
+                    ttft_clock.mark("first_delta_sent")
                     return [text_chunk(text)]
 
                 try:
@@ -41651,6 +41666,8 @@ def create_app(state: ServerState) -> FastAPI:
                         for chunk in emit_text(f"\n\n{footer}", monitor=False):
                             yield chunk
                 stats["finish_reason"] = finish_reason
+                # The first text can go out after the engine published.
+                request_spans.refresh(ttft_clock, stats)
                 final_payload = {
                     "id": response_id,
                     "object": "text_completion",

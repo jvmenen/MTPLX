@@ -488,3 +488,76 @@ def test_the_first_visible_delta_is_what_a_client_counts(delta, visible):
         + ', "finish_reason": null}]}\n\n'
     )
     assert openai._sse_chunk_carries_visible_delta(chunk) is visible
+
+
+def test_a_response_shorter_than_the_stream_interval_ends_at_its_first_delta(
+    monkeypatch,
+):
+    # The review of 4c9da1ba: a delta written by the final drain (every
+    # token held under stream_interval) must end the spans too, not leave
+    # them at the engine's first token.
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args.stream_interval = 64
+    _fake_engine(monkeypatch, ["Hi"])
+
+    with TestClient(create_app(state)) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "enable_thinking": False,
+                "stream": True,
+                "max_tokens": 16,
+            },
+        ) as response:
+            assert response.status_code == 200
+            body = response.read().decode()
+
+    spans = _stream_stats(body)["ttft_spans"]
+    assert spans["endpoint"] == "first_delta_sent"
+    assert "first_delta_sent_s" in spans["exclusive_s"]
+    assert spans["sum_s"] == pytest.approx(spans["ttft_s"], abs=1e-4)
+
+
+def test_a_streamed_completion_carries_spans_that_end_at_its_first_text(monkeypatch):
+    # /v1/completions opened no clock before (the review of 4c9da1ba).
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    _fake_engine(monkeypatch, ["Hello there"])
+
+    with TestClient(create_app(state)) as client:
+        with client.stream(
+            "POST",
+            "/v1/completions",
+            json={"prompt": "Say hello", "stream": True, "max_tokens": 16},
+        ) as response:
+            assert response.status_code == 200
+            body = response.read().decode()
+        nonstream = client.post(
+            "/v1/completions",
+            json={"prompt": "Say hello", "stream": False, "max_tokens": 16},
+        )
+
+    spans = _stream_stats(body)["ttft_spans"]
+    assert spans["endpoint"] == "first_delta_sent"
+    for name in (
+        "encode",
+        "policy",
+        "prologue",
+        "dispatch",
+        "scheduler_queue",
+        "engine_first_token",
+        "first_delta_sent",
+    ):
+        assert f"{name}_s" in spans["exclusive_s"], (name, spans)
+    assert spans["sum_s"] == pytest.approx(spans["ttft_s"], abs=1e-4)
+    # A response that is not streamed has no first delta: its spans end at
+    # the engine's first token.
+    assert nonstream.status_code == 200, nonstream.text
+    plain = nonstream.json()["mtplx_stats"]["ttft_spans"]
+    assert plain["endpoint"] == "engine_first_token"
+    assert plain["sum_s"] == pytest.approx(plain["ttft_s"], abs=1e-4)
