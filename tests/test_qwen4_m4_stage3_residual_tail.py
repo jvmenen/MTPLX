@@ -289,7 +289,7 @@ def test_cpu_combined_tail_oracle_detects_omitted_bf16_narrowing() -> None:
     assert not np.array_equal(exact, reassociated)
 
 
-def test_routed_residual_binding_uses_exactly_two_dispatches(monkeypatch) -> None:
+def test_the_two_dispatch_parent_keeps_its_two_dispatches(monkeypatch) -> None:
     from mtplx.kernels import qwen4_m4_routed_down as kernel_module
 
     definitions = []
@@ -313,7 +313,7 @@ def test_routed_residual_binding_uses_exactly_two_dispatches(monkeypatch) -> Non
     monkeypatch.setattr(kernel_module, "_ROUTED_KERNEL", None)
     monkeypatch.setattr(kernel_module, "_RESIDUAL_TAIL_KERNEL", None, raising=False)
     monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
-    combined = kernel_module.bind_residual_tail()
+    combined = kernel_module.bind_residual_tail_two_dispatch()
     routed_inputs = tuple(object() for _ in range(6))
     shared_down = object()
     shared_factor = object()
@@ -354,6 +354,111 @@ def test_routed_residual_binding_uses_exactly_two_dispatches(monkeypatch) -> Non
     ]
     assert output.shape == hyper.shape
     assert output.dtype == mx.bfloat16
+
+
+def test_routed_residual_binding_is_one_dispatch(monkeypatch) -> None:
+    from mtplx.kernels import qwen4_m4_routed_down as kernel_module
+
+    definitions = []
+    launches = []
+
+    def fake_metal_kernel(**kwargs):
+        definitions.append(kwargs)
+
+        def run(**launch):
+            launches.append(launch)
+            return (_ArraySpec(launch["output_shapes"][0], launch["output_dtypes"][0]),)
+
+        return run
+
+    monkeypatch.setattr(kernel_module, "_PARALLEL_RESIDUAL_KERNEL", None)
+    monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
+    combined = kernel_module.bind_residual_tail()
+    routed_inputs = tuple(object() for _ in range(6))
+    shared_down, shared_factor = object(), object()
+    hyper = _ArraySpec((1, 4, 4 * 2560), mx.bfloat16)
+    inject = _ArraySpec((1, 4, 4), mx.bfloat16)
+
+    output = combined(*routed_inputs, shared_down, shared_factor, hyper, inject)
+
+    assert len(definitions) == 1 and len(launches) == 1
+    assert definitions[0]["input_names"] == [
+        "routed_h",
+        "weights",
+        "scales",
+        "biases",
+        "expert_ids",
+        "route_scores",
+        "shared_down",
+        "shared_factor",
+        "hyper",
+        "inject",
+    ]
+    assert definitions[0]["ensure_row_contiguous"] is True
+    assert launches[0]["inputs"] == [*routed_inputs, shared_down, shared_factor, hyper, inject]
+    assert (launches[0]["grid"], launches[0]["threadgroup"]) == kernel_module.parallel_launch_geometry()
+    assert launches[0]["threadgroup"][0] <= 256  # issue #400
+    assert launches[0]["output_shapes"] == [(4, 4 * 2560)]
+    assert output.shape == hyper.shape and output.dtype == mx.bfloat16
+
+
+def test_the_one_dispatch_source_keeps_every_bf16_boundary_in_order() -> None:
+    from mtplx.kernels.qwen4_m4_routed_down import parallel_residual_source
+
+    fused = parallel_residual_source()
+    steps = [
+        "bfloat down_value = bfloat(dots[slot][out]);",
+        "float(down_value) * float(route_scores[row * TOP_K + slot])",
+        "const uint slot = SLOT_ORDER[order_index];",
+        "bfloat gated_shared = bfloat(",
+        "float(shared_factor[row]) * float(shared_down[index])",
+        "bfloat block_out = bfloat(",
+        "float(routed_value) + float(gated_shared)",
+        "bfloat product = bfloat(\n            float(block_out) * float(inject_value));",
+        "float(hyper[hidden_index]) + float(product)",
+    ]
+    for step in steps:
+        assert step.replace("\\n", "\n") in fused or step in fused, step
+    assert fused.index("bfloat gated_shared") < fused.index("bfloat block_out") < fused.index("output[hidden_index]")
+    # Each slot's dot is the routed kernel's own loop body: one call site each.
+    assert fused.count("result[out] += qdot_q4(") == 1
+    assert fused.count("result[out] += qdot_q4_safe(") == 1
+    assert "simd_sum(result[out])" in fused
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="the kernels run on the GPU")
+def test_the_one_dispatch_tail_equals_the_two_dispatch_parent_bit_for_bit() -> None:
+    from mtplx.kernels import qwen4_m4_routed_down as kernel_module
+
+    experts, hidden, inter, rows, top_k = 16, 2560, 640, 4, 10
+    keys = mx.random.split(mx.random.key(29), 8)
+    weights = mx.random.randint(-(2**31), 2**31 - 1, (experts, hidden, inter // 8), dtype=mx.int32, key=keys[0]).view(mx.uint32)
+    scales = (0.01 + 0.002 * mx.random.normal((experts, hidden, inter // 32), key=keys[1])).astype(mx.bfloat16)
+    biases = (-0.08 + 0.002 * mx.random.normal((experts, hidden, inter // 32), key=keys[2])).astype(mx.bfloat16)
+    routed_h = (0.3 * mx.random.normal((rows, top_k, inter), key=keys[3])).astype(mx.bfloat16)
+    shared_down = (0.2 * mx.random.normal((rows, hidden), key=keys[4])).astype(mx.bfloat16)
+    shared_factor = mx.random.uniform(0, 1, (rows,), key=keys[5]).astype(mx.bfloat16)
+    hyper = mx.random.normal((1, rows, 4 * hidden), key=keys[6]).astype(mx.bfloat16)
+    inject = mx.random.uniform(-2, 2, (1, rows, 4), key=keys[7]).astype(mx.bfloat16)
+    rng = np.random.default_rng(3)
+    parent = kernel_module.bind_residual_tail_two_dispatch()
+    fused = kernel_module.bind_residual_tail()
+    for case in range(6):
+        if case == 0:
+            # Every row routes to the same ten experts, and equal scores tie.
+            ids = np.tile(np.arange(top_k), (rows, 1))
+            scores = np.full((rows, top_k), 0.1, dtype=np.float32)
+        else:
+            ids = np.stack([rng.choice(experts, top_k, replace=False) for _ in range(rows)])
+            scores = rng.random((rows, top_k)).astype(np.float32)
+            scores /= scores.sum(axis=1, keepdims=True)
+        expert_ids = mx.array(ids.astype(np.uint32))
+        route_scores = mx.array(scores).astype(mx.bfloat16)
+        args = (routed_h, weights, scales, biases, expert_ids, route_scores, shared_down, shared_factor, hyper, inject)
+        want, got = parent(*args), fused(*args)
+        mx.eval(want, got)
+        assert want.shape == got.shape == hyper.shape
+        assert np.array_equal(np.array(want.view(mx.uint16)), np.array(got.view(mx.uint16))), case
 
 
 def test_routed_residual_route_is_physical_m4_only(monkeypatch) -> None:
