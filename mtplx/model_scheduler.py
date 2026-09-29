@@ -92,6 +92,12 @@ class _WorkItem:
     queued_at_s: float = field(default_factory=time.monotonic)
     earliest_start_s: float = field(default_factory=time.monotonic)
     coalesce_key: str | None = None
+    # What stood in front of this item when it was submitted: the running
+    # item (kind, batch key, how long it had been running) and the queue
+    # depths. The owner thread publishes it with the queue wait when the
+    # item starts (``active_item_receipt``), so a request can say which
+    # work its time-to-first-token waited behind.
+    submitted_behind: dict[str, Any] | None = None
 
 
 class _KeepaliveTurn:
@@ -221,6 +227,7 @@ class ModelWorkScheduler:
         self._active_batch_key: str | None = None
         self._active_started_at_s: float | None = None
         self._active_queue_wait_s: float | None = None
+        self._active_receipt: dict[str, Any] | None = None
         self.owner_qos: str | None = None
         self._thread = Thread(
             target=self._run,
@@ -239,6 +246,40 @@ class ModelWorkScheduler:
     def foreground_pending(self) -> int:
         with self._condition:
             return len(self._foreground)
+
+    def active_item_receipt(self) -> dict[str, Any] | None:
+        """The running item's queue wait and what it was submitted behind.
+
+        Only meaningful on the owner thread (the item asking is the one
+        running); any other thread gets None.
+        """
+
+        if not self.is_owner_thread():
+            return None
+        with self._condition:
+            return dict(self._active_receipt) if self._active_receipt else None
+
+    def _submitted_behind_locked(self) -> dict[str, Any] | None:
+        if self._active_kind is None and not (
+            self._foreground or self._idle or self._persistence
+        ):
+            return None
+        behind: dict[str, Any] = {
+            "ahead_foreground": len(self._foreground),
+            "ahead_idle": len(self._idle),
+        }
+        if self._active_kind is not None:
+            behind["running_kind"] = self._active_kind
+            behind["running_batch_key"] = (
+                _batch_key_class(self._active_batch_key)
+                if self._active_batch_key
+                else None
+            )
+            if self._active_started_at_s is not None:
+                behind["running_for_s"] = max(
+                    0.0, time.monotonic() - self._active_started_at_s
+                )
+        return behind
 
     def persistence_pending(self) -> int:
         """Queued (not running) durability items. Cheap: for the server's
@@ -645,6 +686,7 @@ class ModelWorkScheduler:
                 batch_key=batch_key,
                 earliest_start_s=earliest_start_s,
                 coalesce_key=coalesce_key,
+                submitted_behind=self._submitted_behind_locked(),
             )
             if kind == "foreground":
                 # A request is arriving: its tail postcommit is imminent.
@@ -691,12 +733,16 @@ class ModelWorkScheduler:
                 continue
             now = time.monotonic()
             queue_wait_s = max(0.0, now - item.queued_at_s)
+            receipt = {"queue_wait_s": queue_wait_s, **(item.submitted_behind or {})}
+            # Readable by whoever holds the future once the item finished.
+            item.future.queue_receipt = receipt
             with self._condition:
                 self._active_kind = item.kind
                 self._active_sequence = item.sequence
                 self._active_batch_key = item.batch_key
                 self._active_started_at_s = now
                 self._active_queue_wait_s = queue_wait_s
+                self._active_receipt = receipt
                 self._active_self_reported = False
                 self._queue_wait_samples_s.append(queue_wait_s)
                 self._started += 1
@@ -744,6 +790,7 @@ class ModelWorkScheduler:
                     self._active_batch_key = None
                     self._active_started_at_s = None
                     self._active_queue_wait_s = None
+                    self._active_receipt = None
                     self._condition.notify_all()
                 # Release the finished item before looping: _take_next can
                 # park this frame indefinitely, and a bound local would pin

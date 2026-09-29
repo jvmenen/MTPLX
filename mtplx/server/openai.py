@@ -209,6 +209,7 @@ from mtplx.server.mtp_batch import (
     MTPBatchGenerationService,
     MTPBatchJob,
 )
+from mtplx.server import request_spans
 from mtplx.server import responses as responses_api
 from mtplx.server.omlx_bridge import (
     ToolCallStreamFilter as OMLXToolCallStreamFilter,
@@ -24095,6 +24096,13 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "live_frontier_unknown_tool_result_count",
     "dynamic_paged_kv",
     "session_prompt_prefix_commit",
+    # Where the time to first token went (mtplx/server/request_spans.py) and
+    # the attempt receipt: a response a retry or repair path regenerated
+    # says so, with the wall time of what it threw away.
+    "ttft_spans",
+    "attempts",
+    "discarded_attempt_wall_s",
+    "retry_path",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
     "stored",
@@ -28666,6 +28674,14 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    _ttft_clock = request_spans.clock_from_observability(request_observability_for_lane)
+    if _ttft_clock is not None:
+        if _ttft_clock.has_mark("dispatch"):
+            # A second generation for the same request: a repair or retry
+            # path threw the previous attempt away (its batch key names it).
+            _ttft_clock.discard_attempt(batch_key)
+        else:
+            _ttft_clock.mark("dispatch")
     if request_capture.capture_dir() and not bool(
         request_observability_for_lane.get("warmup")
     ):
@@ -29171,9 +29187,22 @@ def _run_generation(
     started = float((request_observability or {}).get("request_received_monotonic_s") or time.perf_counter())
     token_times: list[float] = []
     lock_wait_time_s = 0.0
+    ttft_clock = request_spans.clock_from_observability(request_observability)
+    if ttft_clock is not None:
+        ttft_clock.mark("scheduler_queue")
+        _owner = getattr(state, "model_scheduler", None)
+        _receipt = (
+            _owner.active_item_receipt()
+            if _owner is not None and hasattr(_owner, "active_item_receipt")
+            else None
+        )
+        if _receipt:
+            ttft_clock.detail("scheduler", _json_safe(_receipt))
 
     def record_tokens(new_tokens: list[int]) -> None:
         now = time.perf_counter()
+        if ttft_clock is not None and not token_times:
+            ttft_clock.mark("engine_first_token", now)
         token_times.extend([now for _token in new_tokens])
         if token_callback is not None:
             token_callback(new_tokens)
@@ -29218,6 +29247,8 @@ def _run_generation(
     for attempt in range(max_attempts):
         # Usage and TTFT describe the returned attempt, not discarded ones.
         token_times.clear()
+        if attempt and ttft_clock is not None:
+            ttft_clock.discard_attempt("blank_retry")
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
         smart_fan_lease: str | None = None
@@ -29250,6 +29281,8 @@ def _run_generation(
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
+        if ttft_clock is not None:
+            ttft_clock.mark("lock_wait")
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
@@ -29434,6 +29467,8 @@ def _run_generation(
                 _flight(state).emit_route(rec)
 
             set_route_tape_sink(_emit_route_tape)
+            if ttft_clock is not None:
+                ttft_clock.mark("admission")
             with (
                 _temporary_env(request_env),
                 prefill_chunk_size_override(prefill_chunk_tokens),
@@ -29808,6 +29843,7 @@ def _run_generation(
             # response (F8 — absent, not null-with-value).
             for key in [k for k in envelope if k.startswith("draft_sampler")]:
                 del envelope[key]
+        request_spans.publish(ttft_clock, envelope, stats=stats)
         cleanup = _auto_clear_mlx_cache_after_completed_request(
             state,
             session_id=session_id,
@@ -34117,6 +34153,10 @@ def create_app(state: ServerState) -> FastAPI:
     # preflights (which never carry credentials) are answered before the
     # key gate would 401 them.
     app.add_middleware(_OriginPolicyMiddleware, state=state)
+    # Outside every gate: the request's time-to-first-token clock starts when
+    # the request reaches the server, before the gates, the body read and the
+    # JSON parse (request_spans).
+    app.add_middleware(request_spans.RequestArrivalClock)
 
     browser_auth_tickets = _BrowserAuthTickets()
 
@@ -34372,6 +34412,9 @@ def create_app(state: ServerState) -> FastAPI:
             "dashboard_active_requests": dashboard_active,
             "active_requests": active_requests,
             "scheduler": scheduler_state,
+            # Where recent requests' time to first token went (p50/p90 per
+            # span, retried requests, discarded attempt wall).
+            "ttft_spans": request_spans.health_summary(),
             "session_bank": (
                 state.sessions.bank.to_dict()
                 if hasattr(getattr(state, "sessions", None), "bank")
@@ -35684,7 +35727,13 @@ def create_app(state: ServerState) -> FastAPI:
     async def chat_completions(
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
-        request_received_monotonic_s = time.perf_counter()
+        _handler_start_s = time.perf_counter()
+        request_received_monotonic_s = _handler_start_s
+        # The server-side TTFT starts at HTTP arrival (body read and parse
+        # included), the moment the client's clock is closest to.
+        _arrival_s = request_spans.arrival_s(raw_request)
+        if _arrival_s is not None and _arrival_s <= _handler_start_s:
+            request_received_monotonic_s = _arrival_s
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
@@ -35733,6 +35782,9 @@ def create_app(state: ServerState) -> FastAPI:
             headers=headers,
             metadata=metadata,
         )
+        ttft_clock = request_spans.open_clock(
+            response_id, arrival=_arrival_s, handler_start=_handler_start_s
+        )
         created = int(time.time())
         if _is_opencode_title_request(request):
             return _opencode_title_response(
@@ -35760,6 +35812,7 @@ def create_app(state: ServerState) -> FastAPI:
                 metadata=metadata,
                 endpoint="chat",
             )
+            ttft_clock.mark("policy")
         except BackgroundBusyBypass:
             return JSONResponse(
                 status_code=503,
@@ -35896,6 +35949,7 @@ def create_app(state: ServerState) -> FastAPI:
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
         )
+        ttft_clock.mark("encode")
         resolved_session_id: str | None = None
         resolved_session_source: str | None = None
         resolved_session_diagnostic: dict[str, Any] = {}
@@ -35955,6 +36009,7 @@ def create_app(state: ServerState) -> FastAPI:
             except Exception:
                 resolved_session_id = None
                 resolved_session_source = None
+            ttft_clock.mark("session_resolve")
             # Canon-after-wait (2026-08-21): the committed-reasoning gate
             # below peeks the session's committed stream, but the pending
             # postcommit sweep + wait used to run ~690 lines later — every
@@ -35988,6 +36043,7 @@ def create_app(state: ServerState) -> FastAPI:
                         _early_sweep,
                         except_session_id=resolved_session_id,
                     )
+                ttft_clock.mark("postcommit_sweep")
                 _early_peek = getattr(
                     getattr(state, "sessions", None), "peek", None
                 )
@@ -36001,6 +36057,7 @@ def create_app(state: ServerState) -> FastAPI:
                     early_postcommit_wait = await asyncio.to_thread(
                         _pending_session.resolve_pending_postcommit_for_request
                     )
+                ttft_clock.mark("postcommit_wait")
             # Defect B (2.8 headline): if this conversation's session holds a
             # committed stream the raw encode diverges from inside a think
             # block, substitute the committed think bytes and re-encode so
@@ -36049,6 +36106,7 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             if _canonicalized is not None:
                 messages_for_generation, prompt_ids = _canonicalized
+            ttft_clock.mark("canonicalize")
         if vision_images:
             # Off the event loop (#487): the tower forwards for every image
             # of the prompt ran inside this coroutine, so a history whose
@@ -36814,6 +36872,7 @@ def create_app(state: ServerState) -> FastAPI:
                     _cross_session_sweep,
                     except_session_id=session_id,
                 )
+                ttft_clock.mark("postcommit_sweep")
                 if cross_yield is not None:
                     request_observability["postcommit_cross_session_yield"] = (
                         cross_yield
@@ -36837,6 +36896,7 @@ def create_app(state: ServerState) -> FastAPI:
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request
             )
+            ttft_clock.mark("postcommit_wait")
             request_observability["postcommit_wait"] = postcommit_wait_outcome
             if (
                 postcommit_wait_outcome is not None
@@ -36858,11 +36918,13 @@ def create_app(state: ServerState) -> FastAPI:
                 except BaseException:
                     pass
 
+        ttft_clock.mark("prologue")
         if request.stream:
 
             async def event_stream():
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
+                first_delta_marked = False
                 last_token_s: float | None = None
                 # Enqueue stamp of the token item currently being drained
                 # (generation-thread perf_counter). The census subtracts it
@@ -38955,6 +39017,10 @@ def create_app(state: ServerState) -> FastAPI:
                                         field, text
                                     ):
                                         yield mark_sse_sent(chunk)
+                                        if not first_delta_marked:
+                                            # The client's TTFT ends here.
+                                            first_delta_marked = True
+                                            ttft_clock.mark("first_delta_sent")
                             else:
                                 for _field, text in drain_stream_tokens(stream_tokens):
                                     for chunk in stream_read_only_force_answer_text(
@@ -40048,6 +40114,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
+                request_spans.refresh(ttft_clock, generated["stats"])
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
