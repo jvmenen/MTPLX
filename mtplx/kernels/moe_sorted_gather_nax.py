@@ -111,8 +111,11 @@ def stats() -> dict[str, int]:
     return dict(_STATS)
 
 
-def _include_root() -> Path | None:
-    root = Path(mx.__file__).resolve().parent / "include"
+def _include_root(package: Path | None = None) -> Path | None:
+    """MLX's installed kernel headers (under ``package``, default the installed
+    ``mlx`` package), or None when any of them is missing."""
+
+    root = (package if package is not None else Path(mx.__file__).resolve().parent) / "include"
     for rel in _KERNEL_HEADERS + (_PREAMBLE_HEADER,):
         if not (root / rel).is_file():
             return None
@@ -173,10 +176,10 @@ def _mlx_headers() -> str | None:
     path runs) when this MLX install ships no kernel headers or any of them
     cannot be read; the reason is printed once and counted."""
 
-    root = _include_root()
-    if root is None:
-        return None
     try:
+        root = _include_root()
+        if root is None:
+            return None
         seen: set[str] = set()
         _closure(root, _PREAMBLE_HEADER, seen)  # already in every custom kernel
         out: list[str] = []
@@ -184,7 +187,7 @@ def _mlx_headers() -> str | None:
             _inline(root, rel, seen, out)
         sigmoid = _functor(root, "mlx/backend/metal/kernels/unary_ops.h", "Sigmoid")
         multiply = _functor(root, "mlx/backend/metal/kernels/binary_ops.h", "Multiply")
-    except (OSError, UnicodeDecodeError) as exc:
+    except Exception as exc:  # unreadable, missing or unexpected headers: the stock path runs
         _headers_unavailable(f"{type(exc).__name__}: {exc}")
         return None
     if sigmoid is None or multiply is None:

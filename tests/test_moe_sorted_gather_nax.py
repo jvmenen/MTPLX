@@ -11,6 +11,7 @@ everywhere else these tests check that the stock path runs.
 
 from __future__ import annotations
 
+import os
 import shutil
 
 import mlx.core as mx
@@ -393,6 +394,31 @@ def test_each_passing_first_call_check_logs_one_engagement_line(capsys):
     engaged = [line for line in err if line.startswith("[moe-sorted-gather] tensor-unit kernel on for ")]
     assert len(engaged) == 2
     assert "'narrow')" in engaged[0] and "'wide')" in engaged[1]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permissions do not stop root")
+def test_an_untraversable_include_directory_keeps_the_stock_path(tmp_path, monkeypatch):
+    """Where MLX's include directory cannot be traversed, the header lookup
+    itself raises (``Path.is_file()`` propagates PermissionError); the lookup
+    sits inside the same fallback, so the prefill keeps the stock path."""
+
+    import functools
+
+    package = tmp_path / "mlx"
+    locked = package / "include"
+    (locked / "mlx").mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            nax_gather._include_root(package)
+        monkeypatch.setattr(nax_gather, "_include_root", functools.partial(nax_gather._include_root, package))
+        nax_gather._mlx_headers.cache_clear()
+        assert nax_gather._mlx_headers() is None
+        assert nax_gather.stats()["header_failures"] == 1
+        assert not nax_gather.available()
+    finally:
+        locked.chmod(0o755)
+        nax_gather._mlx_headers.cache_clear()
 
 
 def test_unreadable_headers_keep_the_stock_path(tmp_path, monkeypatch):
