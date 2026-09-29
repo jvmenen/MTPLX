@@ -20,7 +20,6 @@ from .models.qwen4_exp import (
     SparseMoeBlock,
     _FusedGateUpMLP,
     _FusedGateUpSwitchGLU,
-    _hyper_residual_write,
 )
 from .runtime_options import env_bool
 
@@ -419,9 +418,10 @@ def _m4_routed_down_residual_tail_layer_forward(
         block_out = layer.linear_attn(mixed, ssm_mask, cache)
     else:
         block_out = layer.self_attn(mixed, cache)
-    hidden = _hyper_residual_write(hyper, block_out, inject)
-
-    mixed, hyper, inject = layer.mlp_hyper_connection(hidden)
+    # The attention write rides into the MLP read (see DecoderLayer).
+    mixed, hyper, inject = layer.mlp_hyper_connection(
+        hyper, pending=(block_out, inject)
+    )
     return _m4_routed_down_residual_tail_forward(
         layer.mlp,
         mixed,
@@ -447,9 +447,10 @@ def _m4_paired_routed_glu_residual_tail_layer_forward(
         block_out = layer.linear_attn(mixed, ssm_mask, cache)
     else:
         block_out = layer.self_attn(mixed, cache)
-    hidden = _hyper_residual_write(hyper, block_out, inject)
-
-    mixed, hyper, inject = layer.mlp_hyper_connection(hidden)
+    # The attention write rides into the MLP read (see DecoderLayer).
+    mixed, hyper, inject = layer.mlp_hyper_connection(
+        hyper, pending=(block_out, inject)
+    )
     return _m4_paired_routed_glu_residual_tail_forward(
         layer.mlp,
         mixed,

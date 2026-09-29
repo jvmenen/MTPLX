@@ -246,3 +246,21 @@ def test_a_yarn_amplitude_matches_eager_every_round(monkeypatch):
     assert np.float32(float(f"{float(exact):.7g}")) != exact  # a 7-digit constant would move it
     result = _generate(rt, "parity2", monkeypatch)
     _assert_every_round_exact(result)
+
+
+def test_the_hyper_connection_read_engages_in_the_compiled_verifier(monkeypatch):
+    # The route install proves the verify-width read on this GPU; the
+    # compiled verifier then traces it into every round, and every round
+    # still equals the eager verifier bit for bit.
+    from mtplx.kernels import hc_verify_read
+
+    rt = _runtime()
+    report = rt._mtplx_hc_verify_read
+    assert report["installed"], report
+    assert report["rows"] == (4,)
+    traced_before = hc_verify_read.engagement()["traces"]
+    result = _generate(rt, "parity2", monkeypatch)
+    assert result.stats.fixed_m4_admission["reason"] == "admitted"
+    _assert_every_round_exact(result)
+    assert hc_verify_read.engagement()["traces"] > traced_before
+    assert 4 in hc_verify_read.engagement()["engaged_rows"]

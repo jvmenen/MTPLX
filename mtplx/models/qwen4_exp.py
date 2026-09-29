@@ -64,6 +64,8 @@ from mlx_lm.models.qwen3_next import (
 
 from mtplx import nax_detect
 from mtplx.attention_context import current_attention_phase
+from mtplx.compile_state import in_compiled_step_body
+from mtplx.kernels import hc_verify_read
 from mtplx.attention_math import attention_gate
 from mtplx.float32_operand import float32_operand
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
@@ -1180,7 +1182,66 @@ class GatedResidual(nn.Module):
             self._v3_pack = prepare_v3_pack(self)
         return True
 
-    def __call__(self, hyper_input: mx.array):
+    def _verify_rows_read_applies(self, hyper_input: mx.array) -> bool:
+        # The verify-width read (mtplx.kernels.hc_verify_read) reproduces the
+        # compiled stock chain bit for bit, so it engages only inside a
+        # compiled step body (whose fused lowering that is), at the widths
+        # its install probe proved on this GPU.
+        if not in_compiled_step_body():
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if not hc_verify_read.MIN_ROWS <= rows <= hc_verify_read.MAX_ROWS:
+            return False
+        return hc_verify_read.serves(self, hyper_input.dtype, rows)
+
+    def _verify_rows_read(self, hyper_input: mx.array, pending):
+        lead = hyper_input.shape[:-1]
+        rows = 1
+        for s in lead:
+            rows *= s
+        combine = "block_inject_weight" in self
+        block_out = inject_in = None
+        if pending is not None:
+            block_out = pending[0].reshape(rows, self.hidden_size)
+            inject_in = pending[1].reshape(rows, self.hc_count)
+        mixed, written, inject = hc_verify_read.read_rows(
+            hyper_input.reshape(rows, self.hc_count * self.hidden_size),
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight if combine else None,
+            block_out,
+            inject_in,
+            hc=self.hc_count,
+            eps=self.hc_norm.eps,
+            sigmoid=hc_verify_read.installed_sigmoid(),
+        )
+        hc_verify_read.note_engaged(rows)
+        mixed = mixed.reshape(*lead, self.hidden_size)
+        if not combine:
+            return mixed
+        return (
+            mixed,
+            written.reshape(hyper_input.shape),
+            inject.reshape(*lead, self.hc_count),
+        )
+
+    def __call__(self, hyper_input: mx.array, pending=None):
+        """Read the hyper-connection streams.
+
+        ``pending`` is the previous block's residual write, ``(block_out,
+        inject)``, handed over instead of written first: the verify-width read
+        folds it into its norm pass, and every other path writes it with
+        ``_hyper_residual_write`` before reading. Either way the stream that
+        comes back as the second output is the written one.
+        """
+
+        if self._verify_rows_read_applies(hyper_input):
+            return self._verify_rows_read(hyper_input, pending)
+        if pending is not None:
+            hyper_input = _hyper_residual_write(hyper_input, *pending)
         if self._v3_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
 
@@ -5964,9 +6025,11 @@ class DecoderLayer(nn.Module):
             block_out = self.linear_attn(mixed, ssm_mask, cache)
         else:
             block_out = self.self_attn(mixed, cache)
-        hidden = _hyper_residual_write(hyper, block_out, inject)
-
-        mixed, hyper, inject = self.mlp_hyper_connection(hidden)
+        # The attention write rides into the MLP read, which folds it into its
+        # norm pass at verify widths and writes it first everywhere else.
+        mixed, hyper, inject = self.mlp_hyper_connection(
+            hyper, pending=(block_out, inject)
+        )
         block_out = self.mlp(mixed)
         hidden = _hyper_residual_write(hyper, block_out, inject)
         return hidden

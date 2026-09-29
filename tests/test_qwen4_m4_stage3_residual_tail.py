@@ -439,8 +439,16 @@ def test_routed_residual_layer_preserves_decoder_call_order_and_arguments(
             calls.append(("self", mixed, observed_cache))
             return block_out
 
-        def mlp_hyper_connection(self, value):
-            calls.append(("mlp_hyper", value.copy()))
+        def mlp_hyper_connection(self, value, pending=None):
+            # The attention write is handed over, not applied: the read owns
+            # it (the verify-width read folds it into its norm pass). Apply
+            # it here as the stock read does, so the stream the read sees is
+            # checked below exactly as before.
+            block, gates = pending
+            written = value + (block[..., None, :] * gates[..., :, None]).reshape(
+                *value.shape
+            )
+            calls.append(("mlp_hyper", written, value, block, gates))
             return mlp_mixed, mlp_hyper, mlp_inject
 
     layer = Layer()
@@ -476,6 +484,9 @@ def test_routed_residual_layer_preserves_decoder_call_order_and_arguments(
         block_out[..., None, :] * attn_inject[..., :, None]
     ).reshape(*attn_hyper.shape)
     np.testing.assert_array_equal(calls[3][1], expected_hidden)
+    assert calls[3][2] is attn_hyper
+    assert calls[3][3] is block_out
+    assert calls[3][4] is attn_inject
     if is_linear:
         assert calls[2][1] is attn_mixed
         assert calls[2][2] is ssm_mask
