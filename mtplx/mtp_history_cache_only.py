@@ -1,4 +1,4 @@
-"""Draft-head history appends in a prefill loop evaluate the cache only (opt-in).
+"""Draft-head history appends in a prefill loop evaluate the cache only.
 
 A prefill loop appends every chunk to the MTP draft head's history so the
 first draft step after the prompt can attend to it. ``_append_mtp_history``
@@ -19,7 +19,10 @@ Prefill phase only, and only for plain mlx-lm ``KVCache`` entries (the head's
 own cache as ``make_mtp_cache`` builds it); any other cache kind, decode, and
 every caller outside a prefill loop keep evaluating the hidden.
 
-``MTPLX_MTP_HISTORY_CACHE_ONLY=1`` turns it on (default off).
+On by default: the cache is bit-identical to the full layer pass and the first
+draft step after the prompt is unchanged (tests/test_mtp_history_cache_only.py),
+so there is nothing to trade.  ``MTPLX_MTP_HISTORY_CACHE_ONLY=0`` evaluates the
+hidden again.
 """
 
 from __future__ import annotations
@@ -31,9 +34,9 @@ ENV = "MTPLX_MTP_HISTORY_CACHE_ONLY"
 
 
 def mtp_history_cache_only_enabled() -> bool:
-    """The switch (default off)."""
+    """On unless ``MTPLX_MTP_HISTORY_CACHE_ONLY`` is set to a false value."""
 
-    return os.environ.get(ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get(ENV, "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def mtp_history_cache_arrays(mtp_cache: Any) -> list | None:

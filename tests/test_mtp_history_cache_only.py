@@ -3,12 +3,12 @@
 On a tiny quantized Qwen3.5-MoE with a one-layer MoE draft head injected the
 product way, these tests pin:
 
-* with ``MTPLX_MTP_HISTORY_CACHE_ONLY=1`` a prefill-phase append evaluates
+* a prefill-phase append evaluates
   exactly the draft cache's key and value buffers, never the hidden;
 * the cache carries the same bits as with the full layer pass, chunk after
   chunk, and the first draft step after it gives the same logits and hidden;
-* off by default, and decode appends, other cache kinds and a missing cache
-  keep evaluating the hidden.
+* on by default (``=0`` turns it off), and decode appends, other cache kinds
+  and a missing cache keep evaluating the hidden.
 """
 
 from __future__ import annotations
@@ -90,9 +90,12 @@ def _draft_step(model, cache, hidden_row, token):
     return logits, draft_hidden
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default_and_off_with_a_false_value(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-    assert mtp_history_cache_only_enabled() is False
+    assert mtp_history_cache_only_enabled() is True
+    for value in ("0", "false", "off", "no"):
+        monkeypatch.setenv(ENV, value)
+        assert mtp_history_cache_only_enabled() is False
     monkeypatch.setenv(ENV, "1")
     assert mtp_history_cache_only_enabled() is True
 
