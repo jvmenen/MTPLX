@@ -378,6 +378,23 @@ def test_each_row_regime_gets_its_own_first_call_check():
     assert nax_gather.stats()["calls"] == 4
 
 
+@needs_tensor_units
+def test_each_passing_first_call_check_logs_one_engagement_line(capsys):
+    """The server log shows that the kernel serves: one line per
+    instantiation and row regime when its first call passes the check, and
+    none on later calls."""
+
+    wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
+    narrow = _routed(300, 64, 10, 256, mx.bfloat16, seed=63)
+    wide = _routed(500, 64, 10, 256, mx.bfloat16, seed=64)
+    for tok, row_map, idx in (narrow, wide, narrow, wide):
+        assert nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4) is not None
+    err = capsys.readouterr().err.splitlines()
+    engaged = [line for line in err if line.startswith("[moe-sorted-gather] tensor-unit kernel on for ")]
+    assert len(engaged) == 2
+    assert "'narrow')" in engaged[0] and "'wide')" in engaged[1]
+
+
 def test_unreadable_headers_keep_the_stock_path(tmp_path, monkeypatch):
     """An install with the four checked headers but without unary_ops.h: no
     exception reaches the prefill, the reason is counted once, the kernel

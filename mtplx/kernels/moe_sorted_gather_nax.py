@@ -612,6 +612,12 @@ def _canary(
         _fail(key, "output differs from the stock sorted gather, bit for bit, on its first call")
         return False, None
     _CANARY[key] = True
+    print(
+        f"[moe-sorted-gather] tensor-unit kernel on for {key}: its first call equals the stock "
+        "sorted gather bit for bit",
+        file=sys.stderr,
+        flush=True,
+    )
     return True, ours
 
 
