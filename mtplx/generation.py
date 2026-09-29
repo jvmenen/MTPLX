@@ -8454,12 +8454,57 @@ def first_token_logprobs(
     )
 
 
+def _prompt_scoring_logit_chunks(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    chunk_size: int,
+    abort_check: Callable[[], bool] | None = None,
+):
+    """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
+
+    The Gemma 4 assistant pair has no ``forward_ar``; its backend yields
+    logits from its own chunked target prefill (see
+    ``gemma4_prompt_scoring_logit_chunks``).
+    """
+
+    if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        from .backends.gemma4_assistant import gemma4_prompt_scoring_logit_chunks
+
+        yield from gemma4_prompt_scoring_logit_chunks(
+            rt, prompt_ids, chunk_size=chunk_size, abort_check=abort_check
+        )
+        return
+    cache = _make_target_prefill_cache(rt)
+    n = len(prompt_ids)
+    prompt_array = mx.array([prompt_ids])
+    width = current_prefill_chunk_override()
+    if width is not None:
+        chunk_size = min(chunk_size, max(1, width))
+    for start in range(0, n, chunk_size):
+        _check_postcommit_abort(abort_check)
+        end = min(n, start + chunk_size)
+        with attention_phase("prefill"):
+            logits, _hidden = _forward_ar_optional_hidden(
+                rt,
+                prompt_array[:, start:end],
+                cache=cache,
+                hidden_variant=None,
+                emit_logits=True,
+            )
+        yield start, end, logits
+        # Drop this chunk before the next forward: one chunk resident.
+        del logits
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
     top_k: int,
     chunk_size: int = 256,
+    abort_check: Callable[[], bool] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Teacher-forced prompt scoring: per-position next-token top-K logprobs.
 
@@ -8478,23 +8523,13 @@ def score_prompt_logprobs(
         raise ValueError("prompt_ids must not be empty")
     top_k = max(1, int(top_k))
     chunk_size = max(16, int(chunk_size))
-    cache = _make_target_prefill_cache(rt)
     n = len(prompt_ids)
-    prompt_array = mx.array([prompt_ids])
     token_logprobs: list[float | None] = []
     top_entries: list[list[tuple[int, float]]] = []
     started = time.perf_counter()
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        chunk = prompt_array[:, start:end]
-        with attention_phase("prefill"):
-            logits, _hidden = _forward_ar_optional_hidden(
-                rt,
-                chunk,
-                cache=cache,
-                hidden_variant=None,
-                emit_logits=True,
-            )
+    for start, end, logits in _prompt_scoring_logit_chunks(
+        rt, prompt_ids, chunk_size=chunk_size, abort_check=abort_check
+    ):
         rows_logits = logits[0]
         row_lse = _row_logsumexp_f32(rows_logits)
         k = min(top_k, int(rows_logits.shape[-1]))
@@ -8532,6 +8567,9 @@ def score_prompt_logprobs(
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
         del logits, rows_logits, row_lse, top_idx, top_vals
+        if prefill_callback is not None:
+            prefill_callback({"phase": "chunk", "tokens_done": end, "tokens_total": n})
+    _check_postcommit_abort(abort_check)
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,

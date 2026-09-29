@@ -96,6 +96,25 @@ def test_the_backstops_are_armed_without_an_admission_bill(monkeypatch):
     assert guard.tripped["reason"] == "engine_limit"
 
 
+def test_shared_guard_keeps_the_reservation_and_health_fallback(monkeypatch):
+    from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+    state = _state()
+    monkeypatch.setattr(srv, "_prefill_chunk_reserve_bytes", _boom)
+    guard = srv.make_prefill_system_guard(
+        state, prompt_tokens=4096, chunk_tokens=256, priced=None
+    )
+
+    assert guard.chunk_reserve_bytes == RUNTIME_TRANSIENTS_BYTES
+    assert guard.after_prefill_reserve_bytes == RUNTIME_TRANSIENTS_BYTES
+    assert guard.limit == 96 * GIB
+    health = srv._memory_guard_health(state)
+    assert health["guard_degraded"] is True
+    assert health["degraded"][0]["where"] == "prefill_chunk_reserve"
+    assert "broken bank plan" in health["last_error"]["error"]
+    assert state.dashboard.memory_guard_events[-1]["action"] == "prefill_chunk_reserve_error"
+
+
 def test_health_and_the_dashboard_stream_carry_it():
     import inspect
 

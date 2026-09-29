@@ -3034,6 +3034,52 @@ def _gemma4_prefill_chunks(
     return result
 
 
+def gemma4_prompt_scoring_logit_chunks(
+    runtime: Gemma4AssistantRuntime,
+    prompt_ids: list[int],
+    *,
+    chunk_size: int,
+    abort_check: Any | None = None,
+):
+    """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
+
+    Use generation's prefill spans on one fresh cache. Attention scratch
+    follows the prefill width, and the head runs on at most ``chunk_size``
+    hidden rows at a time. Scoring never needs the assistant's shared KV.
+    """
+
+    from mtplx.generation import _check_postcommit_abort
+
+    _ensure_thread_streams()
+    mx = _require_mlx_core()
+    cache = runtime.make_cache()
+    spans = gemma4_prefill_spans(
+        len(prompt_ids), gemma4_prefill_chunk_tokens(len(prompt_ids))
+    )
+    with _gemma4_committed_updates(cache):
+        for span_start, span_end in spans:
+            _check_postcommit_abort(abort_check)
+            output = runtime.forward_target(
+                mx.array([prompt_ids[span_start:span_end]], dtype=mx.int32),
+                cache=cache,
+                phase="prefill",
+                compute_logits=False,
+            )
+            hidden = output.hidden
+            del output
+            mx.eval(hidden, *_gemma4_cache_arrays(cache))
+            for start in range(span_start, span_end, chunk_size):
+                _check_postcommit_abort(abort_check)
+                end = min(span_end, start + chunk_size)
+                logits = runtime.target.logits_from_hidden(
+                    hidden[:, start - span_start : end - span_start, :]
+                )
+                yield start, end, logits
+                del logits
+            del hidden
+            mx.clear_cache()
+
+
 def _clone_gemma4_prompt_cache(
     runtime: Gemma4AssistantRuntime,
     cache: list[Any],

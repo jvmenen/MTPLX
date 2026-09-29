@@ -573,6 +573,18 @@ def test_score_prompt_logprobs_alignment_and_normalization():
         )
 
 
+def test_prompt_scoring_honors_a_narrower_admitted_prefill_width():
+    from mtplx.generation import prefill_chunk_size_override, score_prompt_logprobs
+
+    model = TinyModel()
+    runtime = _runtime(model, mtp_enabled=True)
+    with prefill_chunk_size_override(5):
+        scored = score_prompt_logprobs(runtime, [0, 1, 2, 3] * 5, top_k=4, chunk_size=16)
+
+    assert [call["tokens"] for call in model.calls] == [5, 5, 5, 5]
+    assert len(scored["positions"]) == 19
+
+
 def _tiny_raw_logprobs():
     """Log-softmax of TinyModel's fixed row [0, 1, 0, 0]."""
     import math

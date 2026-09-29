@@ -114,6 +114,13 @@ from mtplx.chat_encode_cache import (
     ChatSegmentEncodeMemo,
 )
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+from mtplx.server.stream_recovery import (
+    _ATTEMPT_PROMPT_IDS_KEY,
+    _metric_for_request,
+    _run_stream_recovery_chain,
+    _update_recovery_metrics,
+)
+from mtplx.server.prefill_safety import make_prefill_system_guard, score_prompt_with_memory_policy
 from mtplx.constrained import (
     ResponseFormatError,
     constraint_spec_from_response_format,
@@ -9102,6 +9109,12 @@ def _request_parallel_tool_calls(request: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _request_prefers_parallel_tool_calls(request: Any) -> bool:
+    """Whether the client explicitly enables sibling calls in one turn."""
+
+    return _request_parallel_tool_calls(request) is True
+
+
 def _single_tool_call_stream_policy(
     *,
     parallel_tool_calls: bool | None,
@@ -11896,6 +11909,18 @@ def _agent_rewrites_mode() -> str:
 def _agent_steering_enabled() -> bool:
     """Legacy behavior-steering rewrites: only under MTPLX_AGENT_REWRITES=on."""
     return _agent_rewrites_mode() == "on"
+
+
+def _steering_retries_allowed() -> bool:
+    """Stream retries that append a steering user turn, unless rewrites are off.
+
+    The tool-fed empty retry and the stalled-promise retry re-generate from
+    the transcript plus an injected instruction. MTPLX_AGENT_REWRITES=off is
+    the #282 hard passthrough guarantee, so it disables them; the default
+    posture keeps them.
+    """
+
+    return _agent_rewrites_mode() != "off"
 
 
 def _env_int_optional(name: str) -> int | None:
@@ -15775,6 +15800,11 @@ def _encode_messages_uncached(
             template_observability["native_agent_tail_contract_active"] = bool(
                 native_tail_added
             )
+    # Tool choice constrains the request even when the template owns schemas.
+    # The contract path may have appended this already; the helper deduplicates.
+    if tools and _append_forced_tool_choice_sentinel(normalized, tool_choice=tool_choice):
+        if template_observability is not None:
+            template_observability["forced_tool_choice_sentinel_injected"] = True
     if gemma4_encoding:
         if template_observability is not None:
             template_observability["backend_chat_encoding"] = "gemma4"
@@ -24361,6 +24391,11 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_fed_empty_retry_prompt_tokens",
     "tool_fed_empty_retry_completion_tokens",
     "tool_fed_empty_retry_finish_reason",
+    "stream_attempts",
+    "stream_attempts_first_ttft_s",
+    "stream_attempts_prompt_eval_time_s",
+    "stream_attempts_new_prefill_tokens",
+    "stream_attempts_completion_tokens",
     "stalled_agent_retry_attempted",
     "stalled_agent_retry_succeeded",
     "stalled_agent_retry_reason",
@@ -24576,9 +24611,9 @@ def _merge_final_bridge_stats_into_latest_metrics(
     state: ServerState,
     stats: dict[str, Any],
 ) -> None:
-    if not getattr(state, "last_metrics", None):
+    latest = _metric_for_request(state, stats.get("request_id"))
+    if latest is None:
         return
-    latest = state.last_metrics[-1]
     for key in (
         "openai_bridge_mode",
         "tool_parser_source",
@@ -25194,6 +25229,7 @@ def _tool_prompt_mode_for_request(
     metadata: Mapping[str, Any],
     tools_active: bool,
     backend: BackendDescriptor | None = None,
+    prefers_parallel_tool_calls: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     launch_mode = _tool_prompt_mode_from_args(args)
     requested_mode = _request_tool_prompt_mode_override(
@@ -25233,6 +25269,12 @@ def _tool_prompt_mode_for_request(
     elif tools_active and client_hint == "opencode":
         mode = _TOOL_PROMPT_MODE_COMPACT
         source = "client:opencode"
+    elif tools_active and client_hint is not None and prefers_parallel_tool_calls:
+        # PI and Hermes normally use the richer hybrid contract for agent
+        # choreography. The declarative sibling-call mode is more reliable
+        # with the tokenizer-native template.
+        mode = _TOOL_PROMPT_MODE_NATIVE
+        source = f"client:{client_hint}:parallel"
     elif tools_active and client_hint is not None:
         mode = _TOOL_PROMPT_MODE_HYBRID
         source = f"client:{client_hint}"
@@ -29088,10 +29130,11 @@ async def _prompt_scoring_response(
         state.begin_foreground()
         state.lock.acquire()
         try:
-            return score_prompt_logprobs(
-                state.runtime,
+            return score_prompt_with_memory_policy(
+                state,
                 list(prompt_ids),
                 top_k=int(top_k),
+                request_observability=request_observability,
             )
         finally:
             state.lock.release()
@@ -29912,51 +29955,9 @@ def _run_generation(
             request_env = dict(dynamic_kv_reservation["env"])
             if prompt_publish_skipped:
                 request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
-            prefill_after_forward: dict[str, Any] = {}
-            try:
-                prefill_chunk_reserve = _prefill_chunk_reserve_bytes(
-                    state,
-                    prompt_tokens=len(prompt_ids),
-                    chunk_tokens=prefill_chunk_tokens,
-                    priced=admission_pricing.get("growth"),
-                )
-                prefill_after_forward = _prefill_after_forward_plan(
-                    state,
-                    prompt_tokens=len(prompt_ids),
-                    chunk_tokens=prefill_chunk_tokens,
-                    priced=admission_pricing.get("growth"),
-                )
-            except Exception as _reserve_exc:  # noqa: BLE001
-                # Like the admission itself: a guard that cannot price the
-                # chunk must not cost the request, and must not pass
-                # silently. The check still runs, with the engine limit and
-                # the planner's flat runtime reserve (3 GiB) held for each
-                # chunk, the figure every plan budgets for a forward.
-                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
-
-                prefill_chunk_reserve = int(RUNTIME_TRANSIENTS_BYTES)
-                _note_guard_health(
-                    state, where="prefill_chunk_reserve", error=_reserve_exc
-                )
-                _reserve_error = {
-                    "action": "prefill_chunk_reserve_error",
-                    "error": repr(_reserve_exc),
-                    "guard_degraded": True,
-                }
-                _record_guard_event(state, _reserve_error)
-                try:
-                    print(
-                        "[mtplx] memory guard " + json.dumps(_reserve_error),
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-            else:
-                _note_guard_health(state, where="prefill_chunk_reserve", error=None)
-            prefill_system_guard = _PrefillSystemGuard(
-                state,
-                chunk_reserve_bytes=prefill_chunk_reserve,
-                **prefill_after_forward,
+            prefill_system_guard = make_prefill_system_guard(
+                state, prompt_tokens=len(prompt_ids), chunk_tokens=prefill_chunk_tokens,
+                priced=admission_pricing.get("growth"),
             )
 
             def _prefill_abort_check() -> bool:
@@ -32498,6 +32499,7 @@ def _reasoning_completion_repair_prompt_ids(
         *[int(token) for token in generated_without_stop],
         *_encode_rendered_chat_text(tokenizer, repair_suffix),
     ]
+
 
 
 def _display_text(
@@ -37754,22 +37756,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats.update(retry_observability)
                     retry_succeeded = bool(retry_text.strip())
                     retry_stats["inspection_empty_retry_succeeded"] = retry_succeeded
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "inspection_empty_retry_attempted": True,
-                                "inspection_empty_retry_succeeded": retry_succeeded,
-                                "inspection_empty_retry_reason": (
-                                    "empty_tool_fed_read_only_inspection"
-                                ),
-                                "inspection_empty_retry_first_completion_tokens": (
-                                    first_completion_tokens
-                                ),
-                                "inspection_empty_retry_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_degenerate_tool_fed_empty_completion(
@@ -37780,6 +37767,7 @@ def create_app(state: ServerState) -> FastAPI:
                         or read_only_inspection_request
                         or not tool_result_history_present
                         or request.seed is not None
+                        or not _steering_retries_allowed()
                     ):
                         return generated
                     first_text = _strip_mtplx_internal_continuation_markers(
@@ -37907,23 +37895,8 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["tool_fed_empty_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "tool_fed_empty_retry_attempted": True,
-                                "tool_fed_empty_retry_succeeded": retry_succeeded,
-                                "tool_fed_empty_retry_reason": retry_reason,
-                                "tool_fed_empty_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "tool_fed_empty_retry_first_decode_tok_s": first_stats.get(
-                                    "decode_tok_s"
-                                ),
-                                "tool_fed_empty_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    retry_generated[_ATTEMPT_PROMPT_IDS_KEY] = repair_prompt_ids
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_repair_tool_fed_reasoning_only_completion(
@@ -38017,9 +37990,15 @@ def create_app(state: ServerState) -> FastAPI:
                     ):
                         return generated
                     first_stats = dict(generated.get("stats") or {})
+                    # Continue the pass from the prompt that generated its
+                    # tokens: after a tool-fed retry that is the retry prompt,
+                    # not the request's own.
+                    attempt_prompt_ids = (
+                        generated.get(_ATTEMPT_PROMPT_IDS_KEY)
+                    ) or prompt_ids
                     repair_prompt_ids = _reasoning_completion_repair_prompt_ids(
                         state.runtime.tokenizer,
-                        prompt_ids,
+                        attempt_prompt_ids,
                         [int(token) for token in generated.get("tokens") or []],
                     )
                     retry_observability = dict(request_observability)
@@ -38117,27 +38096,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["reasoning_completion_repair_decode_tok_s"] = (
                         retry_stats.get("decode_tok_s")
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "reasoning_completion_repair_attempted": True,
-                                "reasoning_completion_repair_succeeded": (
-                                    retry_succeeded
-                                ),
-                                "reasoning_completion_repair_reason": (
-                                    "tool_fed_reasoning_only_completion"
-                                ),
-                                "reasoning_completion_repair_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "reasoning_completion_repair_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                                "reasoning_completion_repair_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_stalled_agent_tool_promise(
@@ -38147,6 +38106,7 @@ def create_app(state: ServerState) -> FastAPI:
                         not tools_active
                         or not tool_result_history_present
                         or request.seed is not None
+                        or not _steering_retries_allowed()
                     ):
                         return generated
                     raw_text = _strip_mtplx_internal_continuation_markers(
@@ -38295,25 +38255,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["stalled_agent_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "stalled_agent_retry_attempted": True,
-                                "stalled_agent_retry_succeeded": retry_succeeded,
-                                "stalled_agent_retry_reason": (
-                                    "tool_promise_without_tool_call"
-                                ),
-                                "stalled_agent_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "stalled_agent_retry_first_decode_tok_s": first_stats.get(
-                                    "decode_tok_s"
-                                ),
-                                "stalled_agent_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_read_only_force_answer(
@@ -38456,27 +38398,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["read_only_force_answer_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "read_only_force_answer_retry_attempted": True,
-                                "read_only_force_answer_retry_succeeded": (
-                                    retry_succeeded
-                                ),
-                                "read_only_force_answer_retry_reason": (
-                                    "toolish_draft_after_tools_closed"
-                                ),
-                                "read_only_force_answer_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "read_only_force_answer_retry_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                                "read_only_force_answer_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def finish_released_commit(
@@ -38664,6 +38586,13 @@ def create_app(state: ServerState) -> FastAPI:
                     except RuntimeError:
                         # The loop is closed (server shutdown).
                         pass
+                recovery_steps = [
+                    maybe_retry_degenerate_read_only_inspection,
+                    maybe_retry_degenerate_tool_fed_empty_completion,
+                    maybe_repair_tool_fed_reasoning_only_completion,
+                    maybe_retry_read_only_force_answer,
+                    maybe_retry_stalled_agent_tool_promise,
+                ]
 
                 def worker() -> None:
                     try:
@@ -38705,20 +38634,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     mtp_batch_finalize_ownership
                                 ),
                             )
-                            generated = maybe_retry_degenerate_read_only_inspection(
-                                generated
-                            )
-                            generated = (
-                                maybe_retry_degenerate_tool_fed_empty_completion(
-                                    generated
-                                )
-                            )
-                            generated = maybe_repair_tool_fed_reasoning_only_completion(
-                                generated
-                            )
-                            generated = maybe_retry_read_only_force_answer(generated)
-                            generated = maybe_retry_stalled_agent_tool_promise(
-                                generated
+                            generated = _run_stream_recovery_chain(
+                                state, generated, recovery_steps
                             )
                         else:
                             with state.sessions.generation_slot(
@@ -38764,24 +38681,8 @@ def create_app(state: ServerState) -> FastAPI:
                                         mtp_batch_finalize_ownership
                                     ),
                                 )
-                                generated = maybe_retry_degenerate_read_only_inspection(
-                                    generated
-                                )
-                                generated = (
-                                    maybe_retry_degenerate_tool_fed_empty_completion(
-                                        generated
-                                    )
-                                )
-                                generated = (
-                                    maybe_repair_tool_fed_reasoning_only_completion(
-                                        generated
-                                    )
-                                )
-                                generated = maybe_retry_read_only_force_answer(
-                                    generated
-                                )
-                                generated = maybe_retry_stalled_agent_tool_promise(
-                                    generated
+                                generated = _run_stream_recovery_chain(
+                                    state, generated, recovery_steps
                                 )
                                 queue.put(("done", generated))
                                 commit_event.wait()
@@ -40505,8 +40406,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 generated["stats"]["content_empty_reason"] = (
                                     "truncated_inside_reasoning"
                                 )
-                            if state.last_metrics:
-                                state.last_metrics[-1]["reasoning_reentries"] = (
+                            metric = _metric_for_request(state, response_id)
+                            if metric is not None:
+                                metric["reasoning_reentries"] = (
                                     splitter.reentry_count
                                 )
                             footer = (

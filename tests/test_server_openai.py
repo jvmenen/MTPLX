@@ -3042,7 +3042,7 @@ def test_completions_prompt_scoring_contract(monkeypatch):
     state = _prompt_scoring_state()
     prompt = "abcd"  # CaptureTokenizer: 1 char = 1 token (ords)
 
-    def fake_score(runtime, prompt_ids, *, top_k):
+    def fake_score(runtime, prompt_ids, *, top_k, abort_check=None, prefill_callback=None):
         n = len(prompt_ids)
         positions = [
             [(prompt_ids[i + 1], -0.1), (prompt_ids[0], -2.0)]
@@ -3878,11 +3878,10 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         }
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
+        request_id = kwargs["request_observability"]["request_id"]
         # The real generation writes the request's metrics row, keyed by
         # its request id.
-        _state.last_metrics.append(
-            {"request_id": kwargs["request_observability"]["request_id"]}
-        )
+        _state.last_metrics.append({"request_id": request_id})
         token_callback = kwargs.get("token_callback")
         tokens = [ord("O"), ord("K")]
         if token_callback is not None:
@@ -3891,6 +3890,7 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -3948,6 +3948,8 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         if metric.get("session_prompt_prefix_commit")
     ]
     assert metrics_with_frontier
+    first_request_id = _stream_payloads(response.text)[0]["id"]
+    assert any(metric.get("request_id") == first_request_id for metric in metrics_with_frontier)
     assert (
         metrics_with_frontier[-1]["session_prompt_prefix_commit"]["boundary_kind"]
         == "postcommit_prompt_prefix"
@@ -4062,10 +4064,13 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
         tokens = [ord("O"), ord("K")]
+        request_id = kwargs["request_observability"]["request_id"]
+        _state.last_metrics.append({"request_id": request_id})
         return {
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -7277,6 +7282,122 @@ def test_gemma4_encoder_renders_assistant_tool_call_before_tool_result():
     assert "package.json\nsrc" in rendered
 
 
+
+def _gemma4_tool_round(tokenizer):
+    tool_call = {
+        "id": "call_bash",
+        "type": "function",
+        "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})},
+    }
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(role="assistant", content="", tool_calls=[tool_call]),
+            openai.ChatMessage(role="tool", tool_call_id="call_bash", content="package.json"),
+        ],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=[{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+    )
+    return tokenizer.text
+
+
+def test_gemma4_tool_history_stays_native_when_the_tokenizer_reports_no_tool_calling():
+    """Gemma 4 packs ship no chat template, so mlx-lm's TokenizerWrapper
+    reports has_tool_calling=False. The history must still reach the Gemma 4
+    encoder structured: the model's own calls as the <tool_call> XML the tool
+    contract asks for, results as tool_response turns - not the generic
+    "[Calling tool: ...]" / "[Tool Result (...)]" user-turn fallback."""
+
+    class GemmaWrapperTokenizer:
+        bos_token = "<bos>"
+        has_tool_calling = False
+        model_specific_special_tokens = {
+            "think_token": "<|think|>",
+            "soc_token": "<|channel>",
+            "eoc_token": "<channel|>",
+        }
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    rendered = _gemma4_tool_round(GemmaWrapperTokenizer())
+    assert "[Calling tool:" not in rendered
+    assert "[Tool Result" not in rendered
+    assert "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>" in rendered
+    assert "<|turn>tool_response\npackage.json<turn|>" in rendered
+
+
+
+def _gemma4_capture_encode(messages, *, enable_thinking):
+    from mtplx.chat_encoding import encode_gemma4_messages
+
+    class Capture:
+        bos_token = "<bos>"
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    tok = Capture()
+    encode_gemma4_messages(tok, messages, enable_thinking=enable_thinking, add_generation_prompt=True)
+    return tok.text
+
+
+_GEMMA4_CALL = {"id": "c1", "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})}}
+
+
+def test_gemma4_thinking_off_history_keeps_the_empty_thought_scaffold():
+    """Thinking off, the generation prompt ends in an empty thought block and
+    the model writes its turn after it; the history must render the same
+    bytes, or every such turn diverges from the next prompt."""
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=False)
+    generated = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><turn|>\n"
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=False)
+    assert nxt.startswith(first + generated)
+
+
+def test_gemma4_thought_is_followed_directly_by_the_tool_call():
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=True)
+    generated = ("<|channel>thought\nrun ls<channel|><tool_call>\n<function=bash>\n<parameter=command>\n"
+                 "ls\n</parameter>\n</function>\n</tool_call><turn|>\n")
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "reasoning_content": "run ls", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=True)
+    assert nxt.startswith(first + generated)
+
+def test_non_gemma_tokenizer_without_tool_calling_keeps_the_text_fallback():
+    from mtplx.server.omlx_bridge.adapter import normalize_messages_for_template
+
+    class PlainTokenizer:
+        has_tool_calling = False
+
+    normalized = normalize_messages_for_template(
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "c1", "type": "function",
+                             "function": {"name": "bash", "arguments": "{}"}}],
+            ),
+            openai.ChatMessage(role="tool", tool_call_id="c1", content="ok"),
+        ],
+        tokenizer=PlainTokenizer(),
+    )
+    assert normalized[1]["content"].startswith("[Calling tool: bash(")
+    assert normalized[2] == {"role": "user", "content": "[Tool Result (c1)]: ok",
+                             **{k: v for k, v in normalized[2].items() if k not in ("role", "content")}}
+
 def test_agent_transcript_canonicalization_preserves_tool_history_text():
     tool_call = {
         "id": "call_write",
@@ -9296,6 +9417,7 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
             ],
             "tools": [_bash_tool_schema(), _named_tool_schema("read"), _tool_schema()],
             "tool_choice": "auto",
+            "parallel_tool_calls": True,
             "max_tokens": 32,
         },
     )
@@ -9428,6 +9550,143 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(legacy_rewrites,
         == "compact_tool_contract:schema_free:v1"
     )
     assert "tool_prompt_mode=hybrid" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+def test_agent_tool_clients_use_native_mode_for_declared_parallel_requests(
+    monkeypatch, client_hint
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        seen["session_policy_fingerprint"] = kwargs["session_policy_fingerprint"]
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json={
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {
+                    "role": "user",
+                    "content": "Read package.json and pyproject.toml.",
+                },
+            ],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    stats = seen["request_observability"]
+    assert "tools" in kwargs
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}:parallel"
+    assert stats["tool_prompt_mode_client_repaired"] is False
+    assert stats["tool_contract_active"] is False
+    assert "tool_prompt_mode=native" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+@pytest.mark.parametrize("parallel_tool_calls", [False, None])
+def test_parallel_opt_out_keeps_agent_client_hybrid_mode(
+    monkeypatch, client_hint, parallel_tool_calls
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    request = {
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {
+                "role": "user",
+                "content": "Read package.json and pyproject.toml in parallel.",
+            },
+        ],
+        "tools": [_named_tool_schema("read")],
+        "tool_choice": "auto",
+        "max_tokens": 32,
+    }
+    if parallel_tool_calls is not None:
+        request["parallel_tool_calls"] = parallel_tool_calls
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json=request,
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}"
+    assert stats["tool_contract_active"] is True
+
+
+def test_declared_parallel_request_keeps_explicit_tool_prompt_mode_override(
+    monkeypatch,
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-client": "hermes",
+            "x-mtplx-tool-prompt-mode": "hybrid",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Read both files."}],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == "request"
+    assert stats["tool_contract_active"] is True
 
 
 def test_launch_client_env_labels_headerless_hermes(monkeypatch):
@@ -10381,10 +10640,12 @@ def test_read_only_force_answer_visible_text_strips_rehearsal_before_final():
 
 def test_merge_final_metrics_keeps_read_only_buffer_observability():
     state = _fake_state()
+    state.last_metrics[-1]["request_id"] = "read-only-request"
 
     openai._merge_final_bridge_stats_into_latest_metrics(
         state,
         {
+            "request_id": "read-only-request",
             "read_only_force_answer_buffered_stream": True,
             "read_only_force_answer_visible_prefix_stripped_chars": 512,
             "read_only_force_answer_visible_tokens": 231,
