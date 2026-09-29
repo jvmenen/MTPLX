@@ -64,6 +64,8 @@ from mlx_lm.models.qwen3_next import (
 
 from mtplx import moe_sorted_gather, nax_detect
 from mtplx.attention_context import current_attention_phase
+from mtplx.compile_state import in_compiled_step_body
+from mtplx.kernels import hc_verify_read
 from mtplx.attention_math import attention_gate
 from mtplx.float32_operand import float32_operand
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
@@ -1180,7 +1182,78 @@ class GatedResidual(nn.Module):
             self._v3_pack = prepare_v3_pack(self)
         return True
 
-    def __call__(self, hyper_input: mx.array):
+    def _verify_rows_read_applies(self, hyper_input: mx.array, pending=None) -> bool:
+        # The verify-width read (mtplx.kernels.hc_verify_read) reproduces the
+        # compiled stock chain bit for bit, so it engages only inside a
+        # compiled step body (whose fused lowering that is), at the widths
+        # its install probe proved on this GPU.
+        if not in_compiled_step_body():
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if not hc_verify_read.MIN_ROWS <= rows <= hc_verify_read.MAX_ROWS:
+            return False
+        if pending is not None:
+            # The kernels write the stream in its own dtype. A block output
+            # or inject of another dtype promotes the stock write (a float32
+            # block output makes a float32 stream), so it keeps that write.
+            block_out, inject = pending
+            lead = tuple(hyper_input.shape[:-1])
+            if block_out.dtype != hyper_input.dtype or inject.dtype != hyper_input.dtype:
+                return False
+            if tuple(block_out.shape) != lead + (self.hidden_size,):
+                return False
+            if tuple(inject.shape) != lead + (self.hc_count,):
+                return False
+        return hc_verify_read.serves(self, hyper_input.dtype, rows)
+
+    def _verify_rows_read(self, hyper_input: mx.array, pending):
+        lead = hyper_input.shape[:-1]
+        rows = 1
+        for s in lead:
+            rows *= s
+        combine = "block_inject_weight" in self
+        block_out = inject_in = None
+        if pending is not None:
+            block_out = pending[0].reshape(rows, self.hidden_size)
+            inject_in = pending[1].reshape(rows, self.hc_count)
+        mixed, written, inject = hc_verify_read.read_rows(
+            hyper_input.reshape(rows, self.hc_count * self.hidden_size),
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight if combine else None,
+            block_out,
+            inject_in,
+            hc=self.hc_count,
+            eps=self.hc_norm.eps,
+            sigmoid=hc_verify_read.installed_sigmoid(),
+        )
+        hc_verify_read.note_engaged(rows)
+        mixed = mixed.reshape(*lead, self.hidden_size)
+        if not combine:
+            return mixed
+        return (
+            mixed,
+            written.reshape(hyper_input.shape),
+            inject.reshape(*lead, self.hc_count),
+        )
+
+    def __call__(self, hyper_input: mx.array, pending=None):
+        """Read the hyper-connection streams.
+
+        ``pending`` is the previous block's residual write, ``(block_out,
+        inject)``, handed over instead of written first: the verify-width read
+        folds it into its norm pass, and every other path writes it with
+        ``_hyper_residual_write`` before reading. Either way the stream that
+        comes back as the second output is the written one.
+        """
+
+        if self._verify_rows_read_applies(hyper_input, pending):
+            return self._verify_rows_read(hyper_input, pending)
+        if pending is not None:
+            hyper_input = _hyper_residual_write(hyper_input, *pending)
         if self._v3_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
 
@@ -3216,6 +3289,16 @@ class QSAIndexer(nn.Module):
             return None
         return cache.pooled[:, :nb_total, :]
 
+    def _pooled_row_applies(self, cache, pooled: mx.array) -> bool:
+        # The one-kernel pooled-key row reproduces the compiled update (its
+        # rotation and sum spellings were matched against that lowering at
+        # install), so it engages only inside a compiled step body.
+        if not in_compiled_step_body():
+            return False
+        from mtplx.kernels import qsa_pooled_row
+
+        return qsa_pooled_row.serves(self, pooled, cache.raw_keys)
+
     def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
         """Update only newly completed blocks in a fixed QSA bank.
 
@@ -3239,11 +3322,32 @@ class QSAIndexer(nn.Module):
         # (``_call_rows`` has already read ``cache.rope_offset`` strictly by
         # the time a forward gets here.)
         rope_delta = getattr(cache, "rope_delta", None)
+        fused_row = self._pooled_row_applies(cache, pooled)
         for rel in range(max_new):
             block = nb_old + rel
             safe_block = mx.minimum(
                 block, mx.array(pooled_capacity - 1, dtype=block.dtype)
             )
+            if fused_row:
+                # The row below (mean, norm, rotation, select) in one kernel,
+                # bit for bit with it (mtplx.kernels.qsa_pooled_row).
+                from mtplx.kernels import qsa_pooled_row
+
+                merged = qsa_pooled_row.pooled_row(
+                    cache.raw_keys,
+                    pooled,
+                    block,
+                    nb_total,
+                    rope_delta,
+                    self.k_layernorm.weight,
+                    self._inv_freq,
+                    ratio=self.ratio,
+                    eps=self.k_layernorm.eps,
+                    amplitude=self._rope_attention_scaling,
+                )
+                qsa_pooled_row.note_engaged()
+                pooled = mx.slice_update(pooled, merged, safe_block, axes=(1,))
+                continue
             start = safe_block * self.ratio
             fresh = mx.slice(
                 cache.raw_keys,
@@ -3354,6 +3458,62 @@ class QSAIndexer(nn.Module):
             parts.append(top_t)
         return mx.concatenate(parts, axis=0)
 
+    def _verify_select_fused(
+        self,
+        q: mx.array,
+        pos_start,
+        cache,
+        pooled_t: mx.array,
+        nb_total: int,
+        k_eff: int,
+        tile: int,
+    ):
+        """A fixed bank's selection in two kernels around the score GEMM and
+        ``argpartition`` (mtplx.kernels.qsa_verify_select), bit for bit with
+        the stock chain below; None keeps that chain.
+
+        The lane choice mirrors the stock one: rows-gather when the bank chose
+        it at promotion, for more than one row, and no score tile splits the
+        rows; the dense mask otherwise.
+        """
+
+        from mtplx.kernels import qsa_verify_select
+
+        if not in_compiled_step_body():
+            # The kernels spell the division and the tie-break the way the
+            # compiled graph's fused kernels evaluate them; an eager call has
+            # the library's standalone kernels as its parent.
+            return None
+        S = int(q.shape[1])
+        rows_gather = (
+            S > 1
+            and not (0 < tile < S)
+            and bool(getattr(cache, "fixed_rows_gather", False))
+        )
+        if not qsa_verify_select.serves(self, S, nb_total, dense=not rows_gather):
+            return None
+        if not rows_gather and int(cache.raw_keys.shape[1]) != nb_total * self.ratio:
+            return None
+        raw = mx.matmul(q.astype(mx.float32), pooled_t)  # [1, S, H, nb]
+        masked = qsa_verify_select.block_scores(
+            raw,
+            pos_start,
+            self._score_divisor(),
+            ratio=self.ratio,
+            topk=self.block_topk,
+        )
+        part = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)
+        if rows_gather:
+            qsa_verify_select.note_engaged(S, "rows-gather")
+            token_idx, token_ok = qsa_verify_select.token_lists(
+                part, pos_start, ratio=self.ratio, topk=self.block_topk
+            )
+            return ("gather_rows", token_idx, token_ok)
+        qsa_verify_select.note_engaged(S, "dense")
+        return qsa_verify_select.dense_mask(
+            part, pos_start, ratio=self.ratio, topk=self.block_topk
+        )
+
     def _select_eager(
         self,
         q: mx.array,
@@ -3384,6 +3544,12 @@ class QSAIndexer(nn.Module):
         k_eff = min(self.block_topk, nb_total)
 
         tile = _qsa_score_tile_rows()
+        if fixed_capacity:
+            fused = self._verify_select_fused(
+                q, pos_start, cache, pooled_t, nb_total, k_eff, tile
+            )
+            if fused is not None:
+                return fused
         if S > 1 and not fixed_capacity and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.
@@ -5982,9 +6148,11 @@ class DecoderLayer(nn.Module):
             block_out = self.linear_attn(mixed, ssm_mask, cache)
         else:
             block_out = self.self_attn(mixed, cache)
-        hidden = _hyper_residual_write(hyper, block_out, inject)
-
-        mixed, hyper, inject = self.mlp_hyper_connection(hidden)
+        # The attention write rides into the MLP read, which folds it into its
+        # norm pass at verify widths and writes it first everywhere else.
+        mixed, hyper, inject = self.mlp_hyper_connection(
+            hyper, pending=(block_out, inject)
+        )
         block_out = self.mlp(mixed)
         hidden = _hyper_residual_write(hyper, block_out, inject)
         return hidden

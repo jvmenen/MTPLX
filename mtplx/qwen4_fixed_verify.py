@@ -388,6 +388,25 @@ def install_qwen4_fixed_verify_route(runtime: Any) -> dict[str, Any]:
             rows=4,
         )
 
+    # The hyper-connection read at the verify width: three kernels proved bit
+    # for bit against the compiled stock chain on this GPU, here, before the
+    # first verify trace. A failed probe leaves the stock chain serving.
+    from mtplx.kernels import hc_verify_read
+
+    runtime._mtplx_hc_verify_read = hc_verify_read.install(inner, rows=(4,))
+
+    # The fixed bank's QSA selection around the score GEMM and argpartition:
+    # two kernels proved against the compiled stock selector the same way.
+    from mtplx.kernels import qsa_verify_select
+
+    runtime._mtplx_qsa_verify_select = qsa_verify_select.install(inner, rows=(4,))
+
+    # The fixed bank's pooled-key row (mean, norm, rotation, select) in one
+    # kernel before the stock bank write, proved against the compiled update.
+    from mtplx.kernels import qsa_pooled_row
+
+    runtime._mtplx_qsa_pooled_row = qsa_pooled_row.install(inner)
+
     return {"installed": True, "linear_layers": len(linear), "rows": 4}
 
 
