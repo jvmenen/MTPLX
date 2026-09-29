@@ -573,7 +573,7 @@ def test_score_prompt_logprobs_alignment_and_normalization():
         )
 
 
-def test_prompt_scoring_honors_a_narrower_admitted_prefill_width():
+def test_generic_prompt_scoring_keeps_its_parent_width_under_serving_override():
     from mtplx.generation import prefill_chunk_size_override, score_prompt_logprobs
 
     model = TinyModel()
@@ -581,7 +581,7 @@ def test_prompt_scoring_honors_a_narrower_admitted_prefill_width():
     with prefill_chunk_size_override(5):
         scored = score_prompt_logprobs(runtime, [0, 1, 2, 3] * 5, top_k=4, chunk_size=16)
 
-    assert [call["tokens"] for call in model.calls] == [5, 5, 5, 5]
+    assert [call["tokens"] for call in model.calls] == [16, 4]
     assert len(scored["positions"]) == 19
 
 

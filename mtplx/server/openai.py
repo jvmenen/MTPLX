@@ -21422,6 +21422,7 @@ def _prefill_admission_shed(
     commit_prompt_prefix: bool = False,
     restore_identity: dict[str, Any] | None = None,
     pricing: dict[str, Any] | None = None,
+    prompt_scoring: bool = False,
 ) -> dict[str, Any] | None:
     """Price a request before its prefill; give back idle memory, or refuse.
 
@@ -21498,6 +21499,7 @@ def _prefill_admission_shed(
             commit_prompt_prefix=commit_prompt_prefix,
             restore_identity=restore_identity,
             pricing=pricing,
+            prompt_scoring=prompt_scoring,
         )
         _note_guard_health(state, where="prefill_admission", error=None)
         return receipt
@@ -21562,6 +21564,7 @@ def _run_prefill_admission(
     commit_prompt_prefix: bool,
     restore_identity: dict[str, Any] | None = None,
     pricing: dict[str, Any] | None = None,
+    prompt_scoring: bool = False,
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
@@ -21634,6 +21637,13 @@ def _run_prefill_admission(
     runtime = getattr(state, "runtime", None)
     layout = prefill_cache_layout(runtime, prompt_tokens)
     widths = _admission_prefill_widths(runtime, prompt_tokens, prefill_chunk_tokens)
+    if prompt_scoring:
+        from mtplx.server.prefill_safety import (
+            prompt_scoring_forward_widths,
+            prompt_scoring_growth,
+        )
+
+        widths = prompt_scoring_forward_widths(runtime, prompt_tokens, prefill_chunk_tokens)
     output_tokens = int(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
@@ -21689,6 +21699,8 @@ def _run_prefill_admission(
         lease: Mapping[str, Any] | None = None,
         source: Any | None = None,
     ) -> dict[str, Any]:
+        if prompt_scoring:
+            return prompt_scoring_growth(state, prompt_tokens=prompt_tokens, width=width)
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
         rows = miss if width is None else min(miss, width)
         at_width = geometry_at(width)
@@ -28682,6 +28694,7 @@ async def _prompt_scoring_response(
         },
         "mtplx_stats": {
             "mode": "prompt_scoring",
+            "prefill_chunk_tokens": scored.get("prefill_chunk_tokens"),
             "prompt_tokens": len(prompt_ids),
             "scored_positions": len(scored["positions"]),
             "top_k": int(top_k),
