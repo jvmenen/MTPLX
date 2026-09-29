@@ -40869,6 +40869,8 @@ def create_app(state: ServerState) -> FastAPI:
                 },
             )
             stop_generated = attach_response_observability(stop_generated)
+            # The stop path builds its own result: publish its spans too.
+            request_spans.refresh(ttft_clock, stop_generated["stats"])
             _merge_final_bridge_stats_into_latest_metrics(
                 state, stop_generated["stats"]
             )
