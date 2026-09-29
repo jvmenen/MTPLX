@@ -1143,7 +1143,7 @@ class TensorOffsetQSACache:
     def nbytes(self) -> int:
         return int(self.kv.nbytes + self.raw_keys.nbytes + self.pooled.nbytes)
 
-    def demote(self):
+    def demote(self, *, compact: bool = True):
         """Hand the state back as a stock ``QSACache``.
 
         The rotary delta does not travel: keys and pooled keys are stored
@@ -1162,7 +1162,7 @@ class TensorOffsetQSACache:
         entry.raw_keys = self._fixed_bank(self.raw_keys, self.dense_capacity, 1)
         entry.pooled = self.selector_pooled(self.pooled, 1)
         entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
-        if self.capacity > self.dense_capacity:
+        if compact and self.capacity > self.dense_capacity:
             # Prefix views retain the entire bucket, while SessionBank
             # charges the logical state. Publish owned logical arrays and
             # finish their copies here so lazy snapshots retain no bucket.
@@ -2852,6 +2852,7 @@ class CompiledVerifyBank:
         *,
         committed_count: int | None = None,
         window_tokens: int = 4,
+        final_capture: bool = False,
     ) -> None:
         """Reserve every target write into an installed fixed-capacity bank.
 
@@ -2859,7 +2860,9 @@ class CompiledVerifyBank:
         runs eager. They must renew capacity before writing, too. Generation
         supplies its host ledger to avoid a device sync; standalone callers
         without that ledger use the live cache offset. Generic banks are
-        unchanged. Keep four rows reserved for a possible lazy bonus write.
+        unchanged. Verification keeps four rows for a possible lazy bonus,
+        even at width one. Only an explicit final capture has no following
+        write and reserves just its window, preserving an existing grant.
         """
 
         dispatch = self._fixed_m4_dispatch
@@ -2870,7 +2873,10 @@ class CompiledVerifyBank:
             if committed_count is not None
             else dispatch["qsa_entries"][0].size()
         )
-        required_end = logical_start + max(4, int(window_tokens))
+        window_tokens = int(window_tokens)
+        required_end = logical_start + (
+            window_tokens if final_capture else max(4, window_tokens)
+        )
         # Follow the parent's grants independently of the larger allocation.
         # A rejection trims the offset, not these already granted widths.
         capacity_needed = required_end > int(dispatch["dense_capacity"])
@@ -4417,20 +4423,32 @@ class CompiledVerifyBank:
         ) + (time.perf_counter() - started)
         return len(leaves)
 
-    def demote(self, cache: Any) -> int:
+    def demote(self, cache: Any, *, compact: bool = True) -> int:
         """Restore stock containers for every tensor-offset adapter in place.
 
         Mandatory before postcommit / final-state capture: downstream cache
-        consumers must never see promoted adapters.
+        consumers must never see promoted adapters. Skip publication copies
+        when the caller will discard the state.
         """
         try:
             from .cache_state import TensorOffsetVllmMetalPagedKVCache
         except Exception:  # pragma: no cover - import guard for minimal test envs
             TensorOffsetVllmMetalPagedKVCache = None
+        # Retire all owners before conversion. Otherwise the installed plan
+        # pins every old QSA bank while compact copies accumulate beside it.
+        # Replacing cache entries below now releases each layer in turn.
+        self._clear_shadow_leaf_refs()
+        self._held_state_refs.clear()
+        self._fixed_m4_dispatch = None
+        self._shadow = None
+        self._shadow_signature = None
+        self._spec = None
+        self._compiled.clear()
+        self._program_hosts.clear()
         count = 0
         for idx, entry in enumerate(cache or []):
             if isinstance(entry, TensorOffsetQSACache):
-                cache[idx] = entry.demote()
+                cache[idx] = entry.demote(compact=compact)
                 count += 1
             elif isinstance(entry, TensorOffsetKVCache):
                 cache[idx] = entry.demote()
@@ -4442,15 +4460,6 @@ class CompiledVerifyBank:
                 count += 1
         if count:
             self.stats["demotions"] += count
-            # Container identity changed; compiled closures bound the old
-            # shadow, which no longer mirrors the cache list.
-            self._clear_shadow_leaf_refs()
-            self._held_state_refs.clear()
-            self._shadow = None
-            self._shadow_signature = None
-            self._spec = None
-            self._compiled.clear()
-            self._program_hosts.clear()
         return count
 
     def to_dict(self) -> dict[str, Any]:
