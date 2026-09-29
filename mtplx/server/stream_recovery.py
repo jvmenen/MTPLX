@@ -51,6 +51,27 @@ def _stream_attempt_totals(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     return totals
 
 
+def _metric_for_request(state: Any, request_id: Any) -> dict[str, Any] | None:
+    """Return the last pass of this request, never an unrelated completion."""
+    if request_id is None:
+        return None
+    return next(
+        (row for row in reversed(getattr(state, "last_metrics", ()))
+         if row.get("request_id") == request_id),
+        None,
+    )
+
+
+def _update_recovery_metrics(state: Any, stats: dict[str, Any]) -> None:
+    """Attach recovery fields to their request, even after another completion."""
+    metric = _metric_for_request(state, stats.get("request_id"))
+    if metric is not None:
+        metric.update(
+            (key, value) for key, value in stats.items()
+            if key.startswith((*_STREAM_RECOVERY_STAT_PREFIXES, "stream_attempts"))
+        )
+
+
 def _run_stream_recovery_chain(
     state: Any,
     generated: dict[str, Any],
@@ -83,17 +104,5 @@ def _run_stream_recovery_chain(
                 stats.setdefault(key, value)
     totals = _stream_attempt_totals(attempts)
     stats.update(totals)
-    request_id = stats.get("request_id")
-    metric = next(
-        (row for row in reversed(state.last_metrics)
-         if request_id is not None and row.get("request_id") == request_id),
-        None,
-    )
-    if metric is not None:
-        metric.update(
-            (key, value)
-            for key, value in stats.items()
-            if key.startswith(_STREAM_RECOVERY_STAT_PREFIXES)
-        )
-        metric.update(totals)
+    _update_recovery_metrics(state, stats)
     return generated

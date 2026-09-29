@@ -114,7 +114,12 @@ from mtplx.chat_encode_cache import (
     ChatSegmentEncodeMemo,
 )
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
-from mtplx.server.stream_recovery import _ATTEMPT_PROMPT_IDS_KEY, _run_stream_recovery_chain
+from mtplx.server.stream_recovery import (
+    _ATTEMPT_PROMPT_IDS_KEY,
+    _metric_for_request,
+    _run_stream_recovery_chain,
+    _update_recovery_metrics,
+)
 from mtplx.server.prefill_safety import make_prefill_system_guard, score_prompt_with_memory_policy
 from mtplx.constrained import (
     ResponseFormatError,
@@ -24199,9 +24204,9 @@ def _merge_final_bridge_stats_into_latest_metrics(
     state: ServerState,
     stats: dict[str, Any],
 ) -> None:
-    if not getattr(state, "last_metrics", None):
+    latest = _metric_for_request(state, stats.get("request_id"))
+    if latest is None:
         return
-    latest = state.last_metrics[-1]
     for key in (
         "openai_bridge_mode",
         "tool_parser_source",
@@ -37118,22 +37123,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats.update(retry_observability)
                     retry_succeeded = bool(retry_text.strip())
                     retry_stats["inspection_empty_retry_succeeded"] = retry_succeeded
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "inspection_empty_retry_attempted": True,
-                                "inspection_empty_retry_succeeded": retry_succeeded,
-                                "inspection_empty_retry_reason": (
-                                    "empty_tool_fed_read_only_inspection"
-                                ),
-                                "inspection_empty_retry_first_completion_tokens": (
-                                    first_completion_tokens
-                                ),
-                                "inspection_empty_retry_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_degenerate_tool_fed_empty_completion(
@@ -37273,23 +37263,7 @@ def create_app(state: ServerState) -> FastAPI:
                         retry_generated.get("finish_reason") or "stop"
                     )
                     retry_generated[_ATTEMPT_PROMPT_IDS_KEY] = repair_prompt_ids
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "tool_fed_empty_retry_attempted": True,
-                                "tool_fed_empty_retry_succeeded": retry_succeeded,
-                                "tool_fed_empty_retry_reason": retry_reason,
-                                "tool_fed_empty_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "tool_fed_empty_retry_first_decode_tok_s": first_stats.get(
-                                    "decode_tok_s"
-                                ),
-                                "tool_fed_empty_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_repair_tool_fed_reasoning_only_completion(
@@ -37489,27 +37463,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["reasoning_completion_repair_decode_tok_s"] = (
                         retry_stats.get("decode_tok_s")
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "reasoning_completion_repair_attempted": True,
-                                "reasoning_completion_repair_succeeded": (
-                                    retry_succeeded
-                                ),
-                                "reasoning_completion_repair_reason": (
-                                    "tool_fed_reasoning_only_completion"
-                                ),
-                                "reasoning_completion_repair_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "reasoning_completion_repair_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                                "reasoning_completion_repair_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_stalled_agent_tool_promise(
@@ -37668,25 +37622,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["stalled_agent_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "stalled_agent_retry_attempted": True,
-                                "stalled_agent_retry_succeeded": retry_succeeded,
-                                "stalled_agent_retry_reason": (
-                                    "tool_promise_without_tool_call"
-                                ),
-                                "stalled_agent_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "stalled_agent_retry_first_decode_tok_s": first_stats.get(
-                                    "decode_tok_s"
-                                ),
-                                "stalled_agent_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 def maybe_retry_read_only_force_answer(
@@ -37829,27 +37765,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["read_only_force_answer_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
-                    if state.last_metrics:
-                        state.last_metrics[-1].update(
-                            {
-                                "read_only_force_answer_retry_attempted": True,
-                                "read_only_force_answer_retry_succeeded": (
-                                    retry_succeeded
-                                ),
-                                "read_only_force_answer_retry_reason": (
-                                    "toolish_draft_after_tools_closed"
-                                ),
-                                "read_only_force_answer_retry_first_completion_tokens": int(
-                                    generated.get("completion_tokens") or 0
-                                ),
-                                "read_only_force_answer_retry_first_decode_tok_s": (
-                                    first_stats.get("decode_tok_s")
-                                ),
-                                "read_only_force_answer_retry_prompt_tokens": len(
-                                    repair_prompt_ids
-                                ),
-                            }
-                        )
+                    _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
                 recovery_steps = [
@@ -39756,8 +39672,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 generated["stats"]["content_empty_reason"] = (
                                     "truncated_inside_reasoning"
                                 )
-                            if state.last_metrics:
-                                state.last_metrics[-1]["reasoning_reentries"] = (
+                            metric = _metric_for_request(state, response_id)
+                            if metric is not None:
+                                metric["reasoning_reentries"] = (
                                     splitter.reentry_count
                                 )
                             footer = (

@@ -3841,6 +3841,8 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         }
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
+        request_id = kwargs["request_observability"]["request_id"]
+        _state.last_metrics.append({"request_id": request_id})
         token_callback = kwargs.get("token_callback")
         tokens = [ord("O"), ord("K")]
         if token_callback is not None:
@@ -3849,6 +3851,7 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -3898,6 +3901,8 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         if metric.get("session_prompt_prefix_commit")
     ]
     assert metrics_with_frontier
+    first_request_id = _stream_payloads(response.text)[0]["id"]
+    assert any(metric.get("request_id") == first_request_id for metric in metrics_with_frontier)
     assert (
         metrics_with_frontier[-1]["session_prompt_prefix_commit"]["boundary_kind"]
         == "postcommit_prompt_prefix"
@@ -4003,10 +4008,13 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
         tokens = [ord("O"), ord("K")]
+        request_id = kwargs["request_observability"]["request_id"]
+        _state.last_metrics.append({"request_id": request_id})
         return {
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -10568,10 +10576,12 @@ def test_read_only_force_answer_visible_text_strips_rehearsal_before_final():
 
 def test_merge_final_metrics_keeps_read_only_buffer_observability():
     state = _fake_state()
+    state.last_metrics[-1]["request_id"] = "read-only-request"
 
     openai._merge_final_bridge_stats_into_latest_metrics(
         state,
         {
+            "request_id": "read-only-request",
             "read_only_force_answer_buffered_stream": True,
             "read_only_force_answer_visible_prefix_stripped_chars": 512,
             "read_only_force_answer_visible_tokens": 231,
