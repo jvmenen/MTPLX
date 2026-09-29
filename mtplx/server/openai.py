@@ -26596,6 +26596,28 @@ def _stream_terminal_frame_before_commit_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "false", "off", "no"}
 
 
+# The delta keys a client counts as its first token (the chat stream writes
+# each delta as json.dumps of a one-key dict after this prefix).
+_SSE_VISIBLE_DELTA_PREFIXES = (
+    '"delta": {"content": "',
+    '"delta": {"reasoning_content": "',
+    '"delta": {"reasoning": "',
+    '"delta": {"tool_calls": [',
+)
+
+
+def _sse_chunk_carries_visible_delta(chunk: str) -> bool:
+    """Whether an SSE chunk carries a non-empty content, reasoning or
+    tool-call delta (not the role chunk, a progress or heartbeat chunk, or
+    the terminal frame)."""
+
+    for prefix in _SSE_VISIBLE_DELTA_PREFIXES:
+        at = chunk.find(prefix)
+        if at >= 0:
+            return chunk[at + len(prefix) : at + len(prefix) + 1] not in {'"', "]"}
+    return False
+
+
 def _session_named_by_client(session_source: str | None) -> bool:
     """The client named this session (a header, request metadata, or the
     user / chat / conversation field), so its next turn resolves to the same
@@ -37273,8 +37295,17 @@ def create_app(state: ServerState) -> FastAPI:
                 sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
                 def mark_sse_sent(chunk: str) -> str:
-                    nonlocal last_sse_sent_s
+                    nonlocal last_sse_sent_s, first_delta_marked
                     last_sse_sent_s = time.perf_counter()
+                    if not first_delta_marked and _sse_chunk_carries_visible_delta(
+                        chunk
+                    ):
+                        # The client's TTFT ends at its first non-empty
+                        # content, reasoning or tool-call delta, whichever
+                        # path writes it (a tool call held until its markup
+                        # is whole goes out after the engine's first token).
+                        first_delta_marked = True
+                        ttft_clock.mark("first_delta_sent")
                     if _STREAM_CENSUS_DIR is not None:
                         _stream_census_record(
                             response_id,
@@ -39541,10 +39572,6 @@ def create_app(state: ServerState) -> FastAPI:
                                         field, text
                                     ):
                                         yield mark_sse_sent(chunk)
-                                        if not first_delta_marked:
-                                            # The client's TTFT ends here.
-                                            first_delta_marked = True
-                                            ttft_clock.mark("first_delta_sent")
                             else:
                                 for _field, text in drain_stream_tokens(stream_tokens):
                                     for chunk in stream_read_only_force_answer_text(

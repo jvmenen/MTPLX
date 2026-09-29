@@ -297,3 +297,176 @@ def test_nonstream_blank_retry_names_the_discarded_attempt(monkeypatch):
     assert stats["retry_path"] == "blank_retry"
     assert stats["discarded_attempt_wall_s"] > 0.0
     assert stats["ttft_spans"]["exclusive_s"]["discarded_attempt_s"] > 0.0
+
+
+def test_streamed_repair_retry_names_the_discarded_attempt(monkeypatch):
+    """Item 3: a stream repair path that throws away its first generation
+    (here the stalled-agent retry: a tool promise without a tool call after
+    tool results) says so in the response: two attempts, the retry path, and
+    the wall time of the first one."""
+
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    texts = [
+        "</think>\n\nLet me read the file now.",
+        "</think>\n\nPart 2 has 93 lines.",
+    ]
+    calls: list[str] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        text = texts[len(calls)]
+        calls.append(text)
+        time.sleep(0.05)
+        tokens = [ord(char) for char in text]
+        callback = kwargs.get("token_callback")
+        if callback is not None:
+            for token in tokens:
+                callback([token])
+        observability = kwargs.get("request_observability") or {}
+        stats = {
+            **observability,
+            "generation_mode": kwargs["generation_mode"],
+            "mtp_depth": kwargs["depth"],
+            "completion_tokens": len(tokens),
+        }
+        # What the real generation does when it ends.
+        request_spans.publish(
+            request_spans.clock_from_observability(observability), stats
+        )
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": stats,
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    with TestClient(create_app(state)) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={
+                "messages": [
+                    {"role": "user", "content": "Count the lines of part 2."},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path": "notes.txt"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "93 lines"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "description": "Read a file.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        },
+                    }
+                ],
+                "stream": True,
+                "max_tokens": 128,
+                "enable_thinking": True,
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    assert len(calls) == 2, calls
+    stats = _stream_stats(body)
+    assert stats["attempts"] == 2
+    assert stats["retry_path"] == "chat.stream.stalled_agent_retry"
+    assert stats["discarded_attempt_wall_s"] > 0.0
+
+
+def test_a_tool_call_answer_ends_its_ttft_at_the_tool_call_delta(monkeypatch):
+    """E2d: every warm agent turn (a tool call) reported its spans ending at
+    the engine's first token, 0.37 s before the client's first delta (the
+    tool call goes out once its markup is whole), so the span sum missed
+    that share of the client's TTFT. The first visible delta of any kind
+    now ends the clock."""
+
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args.stream_interval = 1
+    _fake_engine(
+        monkeypatch,
+        [
+            "<tool_call>\n<function=read>\n<parameter=path>\nnotes.txt\n"
+            "</parameter>\n</function>\n</tool_call>"
+        ],
+    )
+
+    with TestClient(create_app(state)) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Read notes.txt"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "description": "Read a file.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        },
+                    }
+                ],
+                "enable_thinking": False,
+                "stream": True,
+                "max_tokens": 64,
+            },
+        ) as response:
+            assert response.status_code == 200
+            body = response.read().decode()
+
+    assert '"tool_calls": [' in body
+    stats = _stream_stats(body)
+    spans = stats["ttft_spans"]
+    assert spans["endpoint"] == "first_delta_sent"
+    assert "first_delta_sent_s" in spans["exclusive_s"]
+    assert spans["sum_s"] == pytest.approx(spans["ttft_s"], abs=1e-4)
+
+
+@pytest.mark.parametrize(
+    "delta, visible",
+    [
+        ({"role": "assistant"}, False),
+        ({}, False),
+        ({"content": ""}, False),
+        ({"content": "O"}, True),
+        ({"reasoning_content": "t"}, True),
+        ({"tool_calls": [{"index": 0}]}, True),
+    ],
+)
+def test_the_first_visible_delta_is_what_a_client_counts(delta, visible):
+    chunk = (
+        'data: {"id": "r", "object": "chat.completion.chunk", "created": 1, '
+        '"model": "m", "choices": [{"index": 0, "delta": '
+        + json.dumps(delta)
+        + ', "finish_reason": null}]}\n\n'
+    )
+    assert openai._sse_chunk_carries_visible_delta(chunk) is visible
