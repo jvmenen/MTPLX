@@ -81,10 +81,9 @@ from .fast_sampling import (
 from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import (
     CompiledVerifyBank,
+    FixedM4CapacityPlan,
     SpecDecodeGraphBank,
     TensorOffsetQSACache,
-    _fixed_m4_capacity_bucket,
-    _fixed_m4_initial_growth_reserve,
     _float32_gdn_key_scale_head_dim,
     _float32_gdn_key_scale_why,
     cache_array_tree,
@@ -390,6 +389,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     session_bank: Any | None = None,
     prompt_ids: list[int] | None = None,
     receipt: dict | None = None,
+    capacity_plan: FixedM4CapacityPlan | None = None,
 ) -> bool:
     """Construction gate for the shape-specialized physical-M4 verifier.
 
@@ -457,6 +457,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     fits = _qwen4_fixed_m4_lane_fits(
         rt, prompt_tokens=int(prompt_tokens), session_bank=session_bank,
         prompt_ids=prompt_ids, receipt=receipt,
+        capacity_plan=capacity_plan or FixedM4CapacityPlan.for_request(max_tokens),
     )
     if receipt is not None:
         receipt.update(engaged=fits, reason="admitted" if fits else "memory_gate")
@@ -644,6 +645,7 @@ def _qwen4_fixed_m4_admission(
     speculative_depth: int,
     session_bank: Any | None,
     receipt: dict,
+    capacity_plan: FixedM4CapacityPlan | None = None,
 ) -> tuple[bool, int | None]:
     """Admit one request to the compiled fixed-M4 verify lane.
 
@@ -686,6 +688,7 @@ def _qwen4_fixed_m4_admission(
         # keyed by surrogates, so the model-input ids would protect nothing.
         prompt_ids=list(bank_key_ids),
         receipt=receipt,
+        capacity_plan=capacity_plan,
     )
     return admitted, (vision["rope_delta"] if admitted else None)
 
@@ -727,7 +730,9 @@ def _qwen4_fixed_m4_promotion_bytes_per_token(rt: Any) -> int:
     return n_qsa * (2 * kv_heads * head_dim * 2 + idx_dim * 2 + (idx_dim * 2) // ratio)
 
 
-def _qwen4_fixed_m4_bank_rows(rt: Any, prompt_tokens: int) -> int:
+def _qwen4_fixed_m4_bank_rows(
+    rt: Any, prompt_tokens: int, capacity_plan: FixedM4CapacityPlan | None = None,
+) -> int:
     """Rows per QSA layer the fixed-M4 promotion allocates for this prompt.
 
     The prompt plus the initial growth reserve, rounded the way
@@ -737,20 +742,11 @@ def _qwen4_fixed_m4_bank_rows(rt: Any, prompt_tokens: int) -> int:
     to the capacity bucket, at most 7,936 rows more than the step alone.
     """
 
-    from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
-
     prompt_tokens = max(0, int(prompt_tokens))
     args = _qwen4_text_args(rt)
     ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
-    return TensorOffsetQSACache._bank_capacity(
-        prompt_tokens + _fixed_m4_initial_growth_reserve(),
-        ratio,
-        TensorOffsetQSACache.step,
-        rows_gather=(
-            _qsa_gather_enabled() and prompt_tokens >= _qsa_gather_min_context()
-        ),
-        bucket=_fixed_m4_capacity_bucket(),
-    )
+    plan = capacity_plan or FixedM4CapacityPlan.for_request(None)
+    return plan.rows(prompt_tokens, ratio, TensorOffsetQSACache.step)
 
 
 def _mlx_live_memory_bytes() -> int:
@@ -1115,6 +1111,8 @@ def _announce_qwen4_fixed_m4_skip(reason: str) -> None:
 def _qwen4_fixed_m4_lane_fits(
     rt: Any, *, prompt_tokens: int, session_bank: Any | None = None,
     prompt_ids: list[int] | None = None, receipt: dict | None = None,
+    capacity_plan: FixedM4CapacityPlan | None = None,
+    promotion_rows: int | None = None,
 ) -> bool:
     """Per-request memory gate for the strict fixed-M4 lane.
 
@@ -1148,15 +1146,28 @@ def _qwen4_fixed_m4_lane_fits(
     limit = _metal_memory_limit_bytes(rt)
     if limit <= 0:
         return True
-    bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens)
+    plan = capacity_plan or FixedM4CapacityPlan.for_request(None)
+    bank_rows = (
+        _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
+        if promotion_rows is None else int(promotion_rows)
+    )
     need = bank_rows * per_token
     live = _mlx_live_memory_bytes()
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
+    if live + need > line and plan.bucket and promotion_rows is None:
+        # A bucket must never evict an idle session or disable a compiled
+        # lane whose original allocation fits. Allocation consumes this same
+        # plan, including the admission decision to use the smaller bank.
+        plan.bucket = 0
+        bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
+        need = bank_rows * per_token
     if receipt is not None:
         receipt.update(
             live_bytes_before=live,
             promotion_bytes=need,
             promotion_rows=bank_rows,
+            capacity_bucket=plan.bucket,
+            reserve_tokens=plan.reserve_tokens,
             threshold_bytes=line,
         )
     if live + need <= line:
@@ -10515,6 +10526,7 @@ def generate_mtpk(
     # is ever sliced by a tensor offset (_qwen4_vision_compiled_verify_admission
     # names the shapes and settings that stay eager).
     fixed_m4_admission: dict[str, object] = {}
+    fixed_m4_capacity_plan = FixedM4CapacityPlan.for_request(max_tokens)
     qwen4_fixed_m4_compiled_verify, fixed_m4_rope_delta = _qwen4_fixed_m4_admission(
         rt,
         vision_splice=vision_splice,
@@ -10527,7 +10539,14 @@ def generate_mtpk(
         speculative_depth=speculative_depth,
         session_bank=session_bank,
         receipt=fixed_m4_admission,
+        capacity_plan=fixed_m4_capacity_plan,
     )
+    if qwen4_fixed_m4_compiled_verify:
+        fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
+            rt, prompt_tokens=len(prompt_ids), session_bank=session_bank,
+            prompt_ids=list(bank_commit_ids), capacity_plan=fixed_m4_capacity_plan,
+            promotion_rows=rows,
+        )
     _generic_compiled_verify = (
         verify_strategy in {"capture_commit", "graphbank_capture_commit"}
         or generic_compiled_target_prefix
@@ -10550,6 +10569,7 @@ def generate_mtpk(
             rt,
             max_verify_len=4 if qwen4_fixed_m4_compiled_verify else None,
             request_max_tokens=max_tokens,
+            capacity_plan=fixed_m4_capacity_plan if qwen4_fixed_m4_compiled_verify else None,
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",

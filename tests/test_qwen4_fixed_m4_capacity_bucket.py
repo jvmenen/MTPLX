@@ -444,12 +444,14 @@ def test_admission_prices_the_bucketed_bank(monkeypatch):
     bucketed_need = 49_152 * PER_TOKEN
     step_need = 41_216 * PER_TOKEN
 
-    # Enough room for the bank on the 256-row step, not for the bucketed one: refused.
+    # Enough room for the parent's bank: preserve its compiled route without
+    # evicting a cached session merely to buy bucket slack.
     live = line - (step_need + bucketed_need) // 2
     fits, receipt = _admit(monkeypatch, prompt=prompt, live=live)
-    assert fits is False
-    assert receipt["promotion_rows"] == 49_152
-    assert receipt["promotion_bytes"] == bucketed_need
+    assert fits is True
+    assert receipt["promotion_rows"] == 41_216
+    assert receipt["promotion_bytes"] == step_need
+    assert receipt["capacity_bucket"] == 0
 
     # The same machine with the bucket off admits the request, priced on the step.
     monkeypatch.setenv("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", "0")
