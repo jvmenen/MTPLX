@@ -641,3 +641,19 @@ def test_successful_combined_install_assigns_all_48_exact_owners(monkeypatch) ->
         layer._mtplx_m4_routed_down_residual_tail is combined for layer in layers
     )
     assert all(block._mtplx_m4_stage3 is stage3 for block in blocks)
+
+
+def test_the_install_self_check_compares_bit_patterns() -> None:
+    # A kernel that returned -0 where the reference has +0 is not bit-exact:
+    # the next sum, sign test or sort sees the difference. mx.array_equal
+    # calls them equal; the stage-3 install gate must not.
+    from mtplx.qwen4_m4_stage3 import _same_bits
+
+    plus = mx.array([0.0, 1.5], dtype=mx.bfloat16)
+    minus = mx.array([-0.0, 1.5], dtype=mx.bfloat16)
+    assert bool(mx.array_equal(plus, minus).item())
+    assert not bool(_same_bits(plus, minus).item())
+    assert bool(_same_bits(plus, plus).item())
+    ids = mx.array([3, 7], dtype=mx.uint32)
+    assert bool(_same_bits(ids, ids).item())
+    assert not bool(_same_bits(plus, plus.astype(mx.float32)).item())
