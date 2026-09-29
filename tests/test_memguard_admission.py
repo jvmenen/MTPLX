@@ -1632,7 +1632,7 @@ class TestValidationTurn:
             == 1000 * FN_ROW + V_SCRATCH_NARROW
         )
 
-    def test_the_request_arms_its_check_with_that_bill(self):
+    def test_the_request_arms_its_check_with_that_bill(self, monkeypatch):
         import inspect
 
         src = inspect.getsource(srv._run_generation)
@@ -1641,16 +1641,33 @@ class TestValidationTurn:
         narrowed = src.index(
             'prefill_chunk_tokens = int(admission_shed["prefill_chunk_tokens"])'
         )
+        armed = src.index("prefill_system_guard = make_prefill_system_guard(")
         reserved = src.index('priced=admission_pricing.get("growth"),')
-        # What it reserves once the forwards are done comes off the same bill.
-        after = src.index("prefill_after_forward = _prefill_after_forward_plan(")
-        armed = src.index(
-            "prefill_system_guard = _PrefillSystemGuard(\n"
-            "                state,\n"
-            "                chunk_reserve_bytes=prefill_chunk_reserve,\n"
-            "                **prefill_after_forward,"
+        assert admitted < handed < narrowed < armed < reserved
+        # Both generation and scoring construct the guard through the same
+        # helper. Check the actual bill and post-forward plan handed to it.
+        bill = {"chunk_bytes": 123}
+        seen = []
+
+        def reserve(_state, **kwargs):
+            seen.append(("reserve", kwargs))
+            return bill["chunk_bytes"]
+
+        def after(_state, **kwargs):
+            seen.append(("after", kwargs))
+            return {"after_prefill_reserve_bytes": 23, "restore_bytes": 31}
+
+        monkeypatch.setattr(srv, "_prefill_chunk_reserve_bytes", reserve)
+        monkeypatch.setattr(srv, "_prefill_after_forward_plan", after)
+        guard = srv.make_prefill_system_guard(
+            _flash_next_state(_manager()), prompt_tokens=4096, chunk_tokens=256, priced=bill
         )
-        assert admitted < handed < narrowed < reserved < after < armed
+        assert [name for name, _kwargs in seen] == ["reserve", "after"]
+        assert all(kwargs["priced"] is bill for _name, kwargs in seen)
+        assert all(kwargs["chunk_tokens"] == 256 for _name, kwargs in seen)
+        assert guard.chunk_reserve_bytes == 123
+        assert guard.after_prefill_reserve_bytes == 23
+        assert guard.restore_bytes == 31
 
     def test_the_chosen_width_reaches_the_prefill(self):
         """The admission's width is the one the prefill runs: generation

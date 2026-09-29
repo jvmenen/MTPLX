@@ -3039,6 +3039,7 @@ def gemma4_prompt_scoring_logit_chunks(
     prompt_ids: list[int],
     *,
     chunk_size: int,
+    abort_check: Any | None = None,
 ):
     """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
 
@@ -3046,6 +3047,8 @@ def gemma4_prompt_scoring_logit_chunks(
     follows the prefill width, and the head runs on at most ``chunk_size``
     hidden rows at a time. Scoring never needs the assistant's shared KV.
     """
+
+    from mtplx.generation import _check_postcommit_abort
 
     _ensure_thread_streams()
     mx = _require_mlx_core()
@@ -3055,6 +3058,7 @@ def gemma4_prompt_scoring_logit_chunks(
     )
     with _gemma4_committed_updates(cache):
         for span_start, span_end in spans:
+            _check_postcommit_abort(abort_check)
             output = runtime.forward_target(
                 mx.array([prompt_ids[span_start:span_end]], dtype=mx.int32),
                 cache=cache,

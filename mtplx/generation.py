@@ -8446,6 +8446,7 @@ def _prompt_scoring_logit_chunks(
     prompt_ids: list[int],
     *,
     chunk_size: int,
+    abort_check: Callable[[], bool] | None = None,
 ):
     """Yield ``(start, end, logits)`` per prompt chunk for prompt scoring.
 
@@ -8458,13 +8459,17 @@ def _prompt_scoring_logit_chunks(
         from .backends.gemma4_assistant import gemma4_prompt_scoring_logit_chunks
 
         yield from gemma4_prompt_scoring_logit_chunks(
-            rt, prompt_ids, chunk_size=chunk_size
+            rt, prompt_ids, chunk_size=chunk_size, abort_check=abort_check
         )
         return
     cache = _make_target_prefill_cache(rt)
     n = len(prompt_ids)
     prompt_array = mx.array([prompt_ids])
+    width = current_prefill_chunk_override()
+    if width is not None:
+        chunk_size = min(chunk_size, max(1, width))
     for start in range(0, n, chunk_size):
+        _check_postcommit_abort(abort_check)
         end = min(n, start + chunk_size)
         with attention_phase("prefill"):
             logits, _hidden = _forward_ar_optional_hidden(
@@ -8485,6 +8490,8 @@ def score_prompt_logprobs(
     *,
     top_k: int,
     chunk_size: int = 256,
+    abort_check: Callable[[], bool] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Teacher-forced prompt scoring: per-position next-token top-K logprobs.
 
@@ -8508,7 +8515,7 @@ def score_prompt_logprobs(
     top_entries: list[list[tuple[int, float]]] = []
     started = time.perf_counter()
     for start, end, logits in _prompt_scoring_logit_chunks(
-        rt, prompt_ids, chunk_size=chunk_size
+        rt, prompt_ids, chunk_size=chunk_size, abort_check=abort_check
     ):
         rows_logits = logits[0]
         row_lse = _row_logsumexp_f32(rows_logits)
@@ -8547,6 +8554,9 @@ def score_prompt_logprobs(
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
         del logits, rows_logits, row_lse, top_idx, top_vals
+        if prefill_callback is not None:
+            prefill_callback({"phase": "chunk", "tokens_done": end, "tokens_total": n})
+    _check_postcommit_abort(abort_check)
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,

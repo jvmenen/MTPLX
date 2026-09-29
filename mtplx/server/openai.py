@@ -115,6 +115,7 @@ from mtplx.chat_encode_cache import (
 )
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
 from mtplx.server.stream_recovery import _ATTEMPT_PROMPT_IDS_KEY, _run_stream_recovery_chain
+from mtplx.server.prefill_safety import make_prefill_system_guard, score_prompt_with_memory_policy
 from mtplx.constrained import (
     ResponseFormatError,
     constraint_spec_from_response_format,
@@ -28578,10 +28579,11 @@ async def _prompt_scoring_response(
         state.begin_foreground()
         state.lock.acquire()
         try:
-            return score_prompt_logprobs(
-                state.runtime,
+            return score_prompt_with_memory_policy(
+                state,
                 list(prompt_ids),
                 top_k=int(top_k),
+                request_observability=request_observability,
             )
         finally:
             state.lock.release()
@@ -29377,51 +29379,9 @@ def _run_generation(
             request_env = dict(dynamic_kv_reservation["env"])
             if prompt_publish_skipped:
                 request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
-            prefill_after_forward: dict[str, Any] = {}
-            try:
-                prefill_chunk_reserve = _prefill_chunk_reserve_bytes(
-                    state,
-                    prompt_tokens=len(prompt_ids),
-                    chunk_tokens=prefill_chunk_tokens,
-                    priced=admission_pricing.get("growth"),
-                )
-                prefill_after_forward = _prefill_after_forward_plan(
-                    state,
-                    prompt_tokens=len(prompt_ids),
-                    chunk_tokens=prefill_chunk_tokens,
-                    priced=admission_pricing.get("growth"),
-                )
-            except Exception as _reserve_exc:  # noqa: BLE001
-                # Like the admission itself: a guard that cannot price the
-                # chunk must not cost the request, and must not pass
-                # silently. The check still runs, with the engine limit and
-                # the planner's flat runtime reserve (3 GiB) held for each
-                # chunk, the figure every plan budgets for a forward.
-                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
-
-                prefill_chunk_reserve = int(RUNTIME_TRANSIENTS_BYTES)
-                _note_guard_health(
-                    state, where="prefill_chunk_reserve", error=_reserve_exc
-                )
-                _reserve_error = {
-                    "action": "prefill_chunk_reserve_error",
-                    "error": repr(_reserve_exc),
-                    "guard_degraded": True,
-                }
-                _record_guard_event(state, _reserve_error)
-                try:
-                    print(
-                        "[mtplx] memory guard " + json.dumps(_reserve_error),
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-            else:
-                _note_guard_health(state, where="prefill_chunk_reserve", error=None)
-            prefill_system_guard = _PrefillSystemGuard(
-                state,
-                chunk_reserve_bytes=prefill_chunk_reserve,
-                **prefill_after_forward,
+            prefill_system_guard = make_prefill_system_guard(
+                state, prompt_tokens=len(prompt_ids), chunk_tokens=prefill_chunk_tokens,
+                priced=admission_pricing.get("growth"),
             )
 
             def _prefill_abort_check() -> bool:

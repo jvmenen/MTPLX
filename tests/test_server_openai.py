@@ -3010,7 +3010,7 @@ def test_completions_prompt_scoring_contract(monkeypatch):
     state = _prompt_scoring_state()
     prompt = "abcd"  # CaptureTokenizer: 1 char = 1 token (ords)
 
-    def fake_score(runtime, prompt_ids, *, top_k):
+    def fake_score(runtime, prompt_ids, *, top_k, abort_check=None, prefill_callback=None):
         n = len(prompt_ids)
         positions = [
             [(prompt_ids[i + 1], -0.1), (prompt_ids[0], -2.0)]

@@ -120,7 +120,7 @@ def _fake_score(positions_by_index=None):
     """Engine-shaped scoring result: n-1 positions, position i predicts
     prompt token i+1 (the read-only score_prompt_logprobs contract)."""
 
-    def score(_runtime, prompt_ids, *, top_k):
+    def score(_runtime, prompt_ids, *, top_k, abort_check=None, prefill_callback=None):
         n = len(prompt_ids)
         positions = []
         for i in range(n - 1):
@@ -192,7 +192,7 @@ def test_prompt_scoring_actual_token_always_in_its_top_map(monkeypatch):
     rigged = {0: [(120, -0.05), (121, -0.9)]}
     score = _fake_score(positions_by_index=rigged)
 
-    def score_with_true_logprob(runtime, prompt_ids, *, top_k):
+    def score_with_true_logprob(runtime, prompt_ids, *, top_k, abort_check=None, prefill_callback=None):
         result = score(runtime, prompt_ids, top_k=top_k)
         result["token_logprobs"] = [-7.5] + [-0.1] * (len(prompt_ids) - 2)
         return result
