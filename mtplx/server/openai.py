@@ -24221,6 +24221,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "attempts",
     "discarded_attempt_wall_s",
     "retry_path",
+    # What this request waited for the previous turn's commit, when that
+    # turn's terminal frame went out before it.
+    "response_tail_wait",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
     "stored",
@@ -26444,6 +26447,73 @@ def _postcommit_cross_session_yield_enabled() -> bool:
         str(os.environ.get("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "1")).strip().lower()
     )
     return raw not in {"0", "false", "off", "no"}
+
+
+def _stream_terminal_frame_before_commit_enabled() -> bool:
+    """Write a stream's terminal frame and [DONE] at its last token.
+
+    The generation-final commit (history re-render and encode, bank write,
+    then the prompt-prefix commit and the idle postcommit's scheduling) runs
+    after the frame on the stream worker, which keeps the session's
+    generation slot until it is done; the next request of the same session
+    waits for it before reading the session, so it reads exactly what it read
+    when the frame waited for the commit. Other sessions never wait. The
+    client's tool call starts while the commit runs instead of after it (the
+    commit took 18 ms at the median and 160 ms at p90 in the flight logs, and
+    up to 30 s when another client's prefill held the model thread, #425).
+    Only for a session the client named (see
+    `_session_named_by_client`). Default on;
+    MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT=0 restores the wait. Adapted
+    from PR #557 (@jvmenen), without its admission barrier across sessions.
+    """
+    raw = os.environ.get("MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT", "1")
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _session_named_by_client(session_source: str | None) -> bool:
+    """The client named this session (a header, request metadata, or the
+    user / chat / conversation field), so its next turn resolves to the same
+    session whether or not this turn's commit has landed.
+
+    A session found by prompt inference is found through its committed
+    stream: a next turn that arrived before the commit landed would match
+    the older frontier or none at all (a second turn would start a new
+    session and prefill cold), so those turns keep the frame after the
+    commit.
+    """
+    source = str(session_source or "")
+    return source.startswith(("header.", "metadata.")) or source in {
+        "user",
+        "chat_id",
+        "conversation_id",
+    }
+
+
+# What a stream's terminal frame says when it went out before the commit: the
+# real outcome lands in the request's metrics row and in the session's
+# ``last_response_tail``, and the next turn's ``response_tail_wait``.
+_RESPONSE_TAIL_SNAPSHOT_MARKER: dict[str, Any] = {
+    "stored": None,
+    "mode": "after_response",
+    "reason": "terminal_frame_before_commit",
+}
+
+
+def _merge_response_tail_into_metrics(
+    state: Any, response_id: str | None, fields: Mapping[str, Any]
+) -> None:
+    """Land a response tail's commit outcome in that request's own metrics
+    row (the RAM ring the dashboard reads), found by its request id. Runs on
+    the event loop, the thread that reads and updates those rows."""
+
+    rows = getattr(state, "last_metrics", None)
+    if not rows or not response_id:
+        return
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("request_id") == response_id:
+            for key, value in fields.items():
+                row[key] = _json_safe(value)
+            return
 
 
 def _idle_postcommit_foreground_grace_s() -> float:
@@ -36073,6 +36143,7 @@ def create_app(state: ServerState) -> FastAPI:
         resolved_session_diagnostic: dict[str, Any] = {}
         early_postcommit_handled = False
         early_postcommit_wait: dict[str, Any] | None = None
+        early_response_tail_wait: dict[str, Any] | None = None
         early_cross_session_yield: dict[str, Any] | None = None
         # Image requests (2026-09-18): prompt_ids are still the TEXT ids here
         # (one placeholder pad per image), so the session resolution and the
@@ -36172,6 +36243,15 @@ def create_app(state: ServerState) -> FastAPI:
                     except Exception:
                         _pending_session = None
                 if _pending_session is not None:
+                    # The previous streamed turn's commit may still be
+                    # running after its terminal frame: read the session
+                    # only once it landed (and scheduled its postcommit).
+                    if hasattr(_pending_session, "wait_for_response_tail"):
+                        early_response_tail_wait = await asyncio.to_thread(
+                            _pending_session.wait_for_response_tail,
+                            STREAM_COMMIT_WAIT_MAX_S,
+                        )
+                    ttft_clock.mark("response_tail_wait")
                     early_postcommit_wait = await asyncio.to_thread(
                         _pending_session.resolve_pending_postcommit_for_request
                     )
@@ -36968,6 +37048,8 @@ def create_app(state: ServerState) -> FastAPI:
                     except BaseException:
                         pass
             postcommit_wait_outcome = early_postcommit_wait
+            if early_response_tail_wait is not None:
+                request_observability["response_tail_wait"] = early_response_tail_wait
             if postcommit_wait_outcome is not None:
                 request_observability["postcommit_wait"] = postcommit_wait_outcome
         else:
@@ -37011,6 +37093,13 @@ def create_app(state: ServerState) -> FastAPI:
                         except BaseException:
                             pass
         if not early_postcommit_handled and session is not None:
+            if hasattr(session, "wait_for_response_tail"):
+                response_tail_wait = await asyncio.to_thread(
+                    session.wait_for_response_tail, STREAM_COMMIT_WAIT_MAX_S
+                )
+                ttft_clock.mark("response_tail_wait")
+                if response_tail_wait is not None:
+                    request_observability["response_tail_wait"] = response_tail_wait
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request
             )
@@ -37082,7 +37171,8 @@ def create_app(state: ServerState) -> FastAPI:
                 }
                 yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
 
-                queue = _LoopFedStreamQueue(asyncio.get_running_loop())
+                stream_loop = asyncio.get_running_loop()
+                queue = _LoopFedStreamQueue(stream_loop)
                 cancel_event = _AttributedCancelEvent()
                 # Register this request in the dashboard's in-flight registry
                 # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
@@ -38158,6 +38248,60 @@ def create_app(state: ServerState) -> FastAPI:
                         "session_postcommit_snapshot"
                     ] = postcommit_snapshot
 
+                def hand_off_commit(
+                    kind: str,
+                    generated: dict[str, Any],
+                    postcommit: dict[str, Any] | None,
+                ) -> None:
+                    """Give the commit's outcome to the stream, or, when the
+                    terminal frame already went out, finish it here on the
+                    worker and land the outcome in this request's row."""
+
+                    if not commit_state.get("early"):
+                        if kind == "committed":
+                            queue.put(("committed", generated))
+                        else:
+                            queue.put(
+                                (
+                                    "released",
+                                    {"generated": generated, "postcommit": postcommit},
+                                )
+                            )
+                        return
+                    if kind == "released":
+                        finish_released_commit(
+                            generated,
+                            postcommit or {},
+                            assistant_history_content=str(
+                                commit_state.get("assistant_history_content") or ""
+                            ),
+                            assistant_tool_calls=commit_state.get(
+                                "assistant_tool_calls"
+                            ),
+                        )
+                    tail_stats = generated.get("stats") or {}
+                    outcome = {
+                        key: tail_stats[key]
+                        for key in (
+                            "session_postcommit_snapshot",
+                            "session_prompt_prefix_commit",
+                        )
+                        if key in tail_stats
+                    }
+                    commit_state["tail_outcome"] = outcome
+                    try:
+                        # Queued before the tail ends, so a request that
+                        # waited for the tail runs after the row is updated.
+                        stream_loop.call_soon_threadsafe(
+                            _merge_response_tail_into_metrics,
+                            state,
+                            response_id,
+                            outcome,
+                        )
+                    except RuntimeError:
+                        # The loop is closed (server shutdown).
+                        pass
+
                 def worker() -> None:
                     try:
                         _raise_if_stream_cancelled(cancel_event)
@@ -38357,15 +38501,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         generated["stats"][
                                             "session_postcommit_snapshot"
                                         ] = postcommit
-                                        queue.put(
-                                            (
-                                                "released",
-                                                {
-                                                    "generated": generated,
-                                                    "postcommit": postcommit,
-                                                },
-                                            )
-                                        )
+                                        hand_off_commit("released", generated, postcommit)
                                         return
                                     else:
                                         postcommit = _submit_foreground_model_work(
@@ -38401,14 +38537,8 @@ def create_app(state: ServerState) -> FastAPI:
                                             generated["stats"][
                                                 "session_postcommit_snapshot"
                                             ] = postcommit
-                                            queue.put(
-                                                (
-                                                    "released",
-                                                    {
-                                                        "generated": generated,
-                                                        "postcommit": postcommit,
-                                                    },
-                                                )
+                                            hand_off_commit(
+                                                "released", generated, postcommit
                                             )
                                             return
                                     generated["stats"][
@@ -38426,7 +38556,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             nbytes=int(postcommit.get("nbytes") or 0),
                                         )
-                                    queue.put(("committed", generated))
+                                    hand_off_commit("committed", generated, postcommit)
                                 else:
                                     queue.put(("released", None))
                                 return
@@ -38445,9 +38575,22 @@ def create_app(state: ServerState) -> FastAPI:
                             _safe_stdout_print(
                                 f"[mtplx] async session postcommit failed: {exc!r}"
                             )
+                        if commit_state.get("early"):
+                            commit_state["tail_outcome"] = {
+                                "error": f"{type(exc).__name__}: {exc}"
+                            }
                         queue.put(("error", exc))
                     else:
                         queue.put(("done", generated))
+                    finally:
+                        # After the generation slot was released: the next
+                        # request of this session may now read and take it.
+                        tail = commit_state.get("tail")
+                        tail_session = commit_state.get("tail_session")
+                        if tail is not None and tail_session is not None:
+                            tail_session.end_response_tail(
+                                tail, commit_state.get("tail_outcome")
+                            )
 
                 generation_future: Future = Future()
 
@@ -39787,6 +39930,27 @@ def create_app(state: ServerState) -> FastAPI:
                                 commit_state["retokenize_inline"] = (
                                     state.args.session_postcommit_mode == "inline"
                                 )
+                                early_terminal_frame = bool(
+                                    not commit_state["retokenize_inline"]
+                                    and _stream_terminal_frame_before_commit_enabled()
+                                    and _session_named_by_client(session_source)
+                                    and hasattr(session, "begin_response_tail")
+                                )
+                                if early_terminal_frame:
+                                    # The frame goes out now. The worker keeps
+                                    # the result it built and commits it; this
+                                    # stream renders its own copy, so the two
+                                    # threads never write one stats dict.
+                                    generated = {
+                                        **generated,
+                                        "stats": dict(generated.get("stats") or {}),
+                                    }
+                                    generated["stats"][
+                                        "session_postcommit_snapshot"
+                                    ] = dict(_RESPONSE_TAIL_SNAPSHOT_MARKER)
+                                    commit_state["tail_session"] = session
+                                    commit_state["tail"] = session.begin_response_tail()
+                                    commit_state["early"] = True
                                 commit_state["commit"] = True
                                 commit_event.set()
                                 # Bounded commit wait (#F34): the session
@@ -39804,7 +39968,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     deadline_s=STREAM_STALL_DEADLINE_S
                                 )
                                 commit_wait_started_s = time.perf_counter()
-                                while True:
+                                commit_kind, commit_item = "after_response", None
+                                while not early_terminal_frame:
                                     try:
                                         commit_kind, commit_item = await queue.get(
                                             0.25
@@ -39906,6 +40071,11 @@ def create_app(state: ServerState) -> FastAPI:
                                     break
                                 if commit_kind == "committed":
                                     generated = commit_item
+                                elif commit_kind == "after_response":
+                                    # The worker commits after the frame and
+                                    # lands the outcome in this request's
+                                    # metrics row.
+                                    pass
                                 elif commit_kind == "error":
                                     yield mark_sse_sent(error_chunk(commit_item))
                                     yield mark_sse_sent("data: [DONE]\n\n")

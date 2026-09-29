@@ -2043,6 +2043,38 @@ def _fake_streaming_session_state():
     return state
 
 
+@pytest.fixture(params=["before_commit", "after_commit"])
+def terminal_frame(request, monkeypatch):
+    """Both orders of a named session's streamed turn: the terminal frame at
+    the last token with the commit after it (the default), and the frame
+    after the commit (MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT=0)."""
+    monkeypatch.setenv(
+        "MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT",
+        "1" if request.param == "before_commit" else "0",
+    )
+    return request.param
+
+
+def _stream_commit_outcome(state, session_id, response_text, terminal_frame):
+    """A finished streamed turn's session-commit outcome, read where it lands:
+    the terminal frame's stats when the frame waited for the commit, else the
+    session's response tail once the commit that ran after the frame landed
+    (the frame then says ``after_response``)."""
+    if terminal_frame == "after_commit":
+        final = [
+            payload
+            for payload in _stream_payloads(response_text)
+            if payload.get("choices") and payload["choices"][0].get("finish_reason")
+        ]
+        return final[-1]["mtplx_stats"]
+    assert '"mode": "after_response"' in response_text
+    session = state.sessions.peek(session_id)
+    assert session is not None
+    session.wait_for_response_tail(5.0)
+    assert session.last_response_tail is not None
+    return session.last_response_tail
+
+
 def _fake_final_state(tokens):
     return SimpleNamespace(
         final_trunk_cache=["cache"],
@@ -3691,7 +3723,7 @@ def test_opencode_short_context_depth_policy_reports_decision():
 
 
 def test_streaming_session_uses_generation_final_postcommit_without_retokenized_tail(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     captured: dict[str, object] = {"batch_keys": []}
@@ -3808,8 +3840,13 @@ def test_streaming_session_uses_generation_final_postcommit_without_retokenized_
     assert '"content": "OK"' in response_text or (
         '"content": "O"' in response_text and '"content": "K"' in response_text
     )
-    assert '"mode": "generation_final_exact"' in response_text
+    outcome = _stream_commit_outcome(
+        state, "stream-session", response_text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "generation_final_exact"
     assert captured["commit_final_state_to_bank"] is False
+    # With the frame first, the second turn still reads the session only
+    # after this turn's commit landed.
     assert captured["batch_keys"] == [
         "chat.stream",
         "postcommit.stream.final:stream-session",
@@ -3820,7 +3857,7 @@ def test_streaming_session_uses_generation_final_postcommit_without_retokenized_
 
 
 def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -3841,6 +3878,11 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         }
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
+        # The real generation writes the request's metrics row, keyed by
+        # its request id.
+        _state.last_metrics.append(
+            {"request_id": kwargs["request_observability"]["request_id"]}
+        )
         token_callback = kwargs.get("token_callback")
         tokens = [ord("O"), ord("K")]
         if token_callback is not None:
@@ -3888,10 +3930,18 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         )
 
     assert response.status_code == 200
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "retokenized_history_mismatch"' in response.text
-    assert '"session_prompt_prefix_commit"' in response.text
-    assert '"postcommit_prompt_prefix"' in response.text
+    outcome = _stream_commit_outcome(
+        state, "unsafe-session", response.text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "retokenized_history_mismatch"
+    )
+    assert (
+        outcome["session_prompt_prefix_commit"]["boundary_kind"]
+        == "postcommit_prompt_prefix"
+    )
     metrics_with_frontier = [
         metric
         for metric in state.last_metrics
@@ -3913,7 +3963,7 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
 
 
 def test_streaming_stop_boundary_mismatch_schedules_idle_retokenized_postcommit(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -3971,9 +4021,18 @@ def test_streaming_stop_boundary_mismatch_schedules_idle_retokenized_postcommit(
         )
 
     assert response.status_code == 200
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "stop_token_boundary_mismatch"' in response.text
-    assert '"postcommit_prompt_prefix"' in response.text
+    outcome = _stream_commit_outcome(
+        state, "stop-boundary-session", response.text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "stop_token_boundary_mismatch"
+    )
+    assert (
+        outcome["session_prompt_prefix_commit"]["boundary_kind"]
+        == "postcommit_prompt_prefix"
+    )
     assert scheduled
 
 
@@ -4052,7 +4111,9 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
 
 
-def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
+def test_streaming_ar_schedules_async_postcommit_in_default_mode(
+    monkeypatch, terminal_frame
+):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
     foreground_batch_keys: list[str | None] = []
@@ -4117,10 +4178,16 @@ def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
         )
 
     assert response.status_code == 200
+    outcome = _stream_commit_outcome(
+        state, "ar-session", response.text, terminal_frame
+    )
     assert scheduled
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "missing_generation_final_state"' in response.text
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "missing_generation_final_state"
+    )
     assert '"generation_mode": "ar"' in response.text
     assert foreground_batch_keys == ["chat.stream"]
 
@@ -10461,7 +10528,9 @@ def test_read_only_force_answer_stream_fallback_emits_without_marker(monkeypatch
     assert stats["read_only_force_answer_visible_prefix_stripped_chars"] > 0
 
 
-def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatch):
+def test_read_only_force_answer_stream_postcommit_uses_client_history(
+    monkeypatch, terminal_frame
+):
     monkeypatch.setenv("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "2")
     state = _fake_streaming_session_state()
     # The char-level tokenizer plus the injected force-answer contract
@@ -10560,9 +10629,8 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
     )
 
     assert response.status_code == 200
-    payloads = _stream_payloads(response.text)
-    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
-    stats = final[-1]["mtplx_stats"]
+    # Read once the commit landed (it may run after the terminal frame).
+    stats = _stream_commit_outcome(state, "speedqa0606", response.text, terminal_frame)
     generation_final_text = "\n".join(
         str(message.content or "") for message in captured["generation_final_messages"]
     )
