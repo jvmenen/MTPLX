@@ -19996,6 +19996,12 @@ class _PrefillSystemGuard:
         # prefills that runaway compression is measured across.
         self.baseline_reading: Any | None = None
         self.episode = _compressor_episode(state)
+        # What the Mac did during this prefill, for the request's receipt
+        # (``trajectory``): the data the compression lines are calibrated on.
+        self._last_reading: Any | None = None
+        self._free_min: int | None = None
+        self._rate_5s_max: float | None = None
+        self._episode_growth_max: int | None = None
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
         # What the engine gave back before deciding to stop this request
@@ -20147,6 +20153,7 @@ class _PrefillSystemGuard:
                 self.baseline_reading = reading
             self.window.add(reading)
             episode_base = self.episode.note(reading)
+            self._note_trajectory(reading, earlier, episode_base)
             _shed_floor, abort_floor = _system_reading_floors(reading)
             if reason is None:
                 base = _system_thrashing_base(reading, earlier)
@@ -20168,6 +20175,60 @@ class _PrefillSystemGuard:
             "reading": reading,
             "base": base,
             "abort_floor": abort_floor,
+        }
+
+    def _note_trajectory(self, reading: Any, earlier: Any, episode_base: Any) -> None:
+        self._last_reading = reading
+        if reading.free_bytes is not None:
+            free = int(reading.free_bytes)
+            self._free_min = free if self._free_min is None else min(self._free_min, free)
+        if reading.compressor_bytes is None:
+            return
+        compressor = int(reading.compressor_bytes)
+        if episode_base is not None and episode_base.compressor_bytes is not None:
+            grown = compressor - int(episode_base.compressor_bytes)
+            if self._episode_growth_max is None or grown > self._episode_growth_max:
+                self._episode_growth_max = grown
+        # Net growth over at least five seconds: the newest earlier reading
+        # that far back (a single step between two readings is not a trend).
+        now_s = float(reading.monotonic_s)
+        for base in reversed(list(earlier or ())):
+            if base is None or base.compressor_bytes is None:
+                continue
+            elapsed = now_s - float(base.monotonic_s)
+            if elapsed >= 5.0:
+                rate = (compressor - int(base.compressor_bytes)) / elapsed
+                if self._rate_5s_max is None or rate > self._rate_5s_max:
+                    self._rate_5s_max = rate
+                break
+
+    def trajectory(self) -> dict[str, Any] | None:
+        """The Mac during this prefill, from the check's own readings: the
+        compressor (physical occupancy) at the first and last check, the
+        largest net growth rate over five seconds or more, the largest growth
+        since the run of prefills began, the lowest free pages, swap growth.
+        None when the Mac was never read."""
+
+        first, last = self.baseline_reading, self._last_reading
+        if first is None or last is None:
+            return None
+
+        def delta(name: str) -> int | None:
+            a, b = getattr(first, name, None), getattr(last, name, None)
+            return None if a is None or b is None else int(b) - int(a)
+
+        return {
+            "checks": int(self.checks),
+            "interval_s": round(float(last.monotonic_s) - float(first.monotonic_s), 3),
+            "compressor_start_bytes": first.compressor_bytes,
+            "compressor_end_bytes": last.compressor_bytes,
+            "compressor_growth_bytes": delta("compressor_bytes"),
+            "compressor_growth_5s_max_bytes_per_s": (
+                None if self._rate_5s_max is None else int(self._rate_5s_max)
+            ),
+            "episode_growth_max_bytes": self._episode_growth_max,
+            "free_min_bytes": self._free_min,
+            "swap_growth_bytes": delta("swap_used_bytes"),
         }
 
     def _shed_reusable_memory(self, verdict: Mapping[str, Any]) -> dict[str, Any]:
@@ -30139,6 +30200,9 @@ def _run_generation(
             request_observability["prefill_shed_before_abort"] = dict(
                 prefill_system_guard.shed
             )
+        _prefill_trajectory = prefill_system_guard.trajectory()
+        if _prefill_trajectory is not None and request_observability is not None:
+            request_observability["prefill_system_memory"] = _prefill_trajectory
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:

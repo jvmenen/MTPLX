@@ -1006,3 +1006,23 @@ def test_a_refusal_ends_the_run_and_the_full_line_bounds_the_retries(monkeypatch
     reading, reason = outcomes[3]
     assert reason == "compressor_full"
     assert 32 * GIB <= reading.compressor_bytes < 33 * GIB
+
+
+def test_each_prefill_records_what_the_mac_did_for_calibration(monkeypatch):
+    # The lines above are calibrated on one Mac. Every prefill's receipt
+    # now carries the compressor's physical occupancy at its first and last
+    # check, its largest net growth over five seconds or more (not a single
+    # step between two readings), the lowest free pages and swap growth.
+    readings = _trajectory(rate_gb_s=0.3, seconds=12)
+    guard = _prefill_guard(monkeypatch, readings)
+    for _ in readings:
+        assert guard() is False
+    trajectory = guard.trajectory()
+    assert trajectory["checks"] == len(readings)
+    assert trajectory["interval_s"] == pytest.approx(12.0)
+    assert trajectory["compressor_start_bytes"] == int(5.5 * GB)
+    assert trajectory["compressor_growth_bytes"] == pytest.approx(0.3 * GB * 12, rel=1e-6)
+    assert trajectory["compressor_growth_5s_max_bytes_per_s"] == pytest.approx(0.3 * GB, rel=1e-3)
+    assert trajectory["episode_growth_max_bytes"] == trajectory["compressor_growth_bytes"]
+    assert trajectory["free_min_bytes"] == int(2.0 * GB)
+    assert trajectory["swap_growth_bytes"] == 0
