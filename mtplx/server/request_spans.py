@@ -191,7 +191,9 @@ class RequestClock:
                 if endpoint_s is not None
                 else None
             ),
-            "spans": spans,
+            # Exclusive: no two spans overlap and together they cover the
+            # clock from arrival to the endpoint.
+            "exclusive_s": spans,
             "sum_s": round(sum(spans.values()), 6),
             "attempts": attempts,
             "discarded_attempt_wall_s": round(discarded, 6),
@@ -361,13 +363,15 @@ def health_summary(window: Iterable[Mapping[str, Any]] | None = None) -> dict[st
     ttfts = [float(row["ttft_s"]) for row in rows if row.get("ttft_s") is not None]
     names: list[str] = []
     for row in rows:
-        for name in row.get("spans") or {}:
+        for name in row.get("exclusive_s") or {}:
             if name not in names:
                 names.append(name)
     spans: dict[str, dict[str, float]] = {}
     for name in names:
         # A request that never took a mark spent nothing in that span.
-        values = [float((row.get("spans") or {}).get(name, 0.0)) for row in rows]
+        values = [
+            float((row.get("exclusive_s") or {}).get(name, 0.0)) for row in rows
+        ]
         spans[name] = {
             "p50": round(_percentile(values, 50.0), 6),
             "p90": round(_percentile(values, 90.0), 6),

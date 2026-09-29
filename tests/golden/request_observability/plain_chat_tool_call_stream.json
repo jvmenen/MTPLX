@@ -396,9 +396,7 @@
   },
   "discarded_attempt_wall_s": "<float>",
   "endpoint": "first_delta_sent",
-  "origin": "http_arrival",
-  "retry_paths": [],
-  "spans": {
+  "exclusive_s": {
    "admission_s": "<float>",
    "dispatch_s": "<float>",
    "encode_s": "<float>",
@@ -410,6 +408,8 @@
    "prologue_s": "<float>",
    "scheduler_queue_s": "<float>"
   },
+  "origin": "http_arrival",
+  "retry_paths": [],
   "sum_s": "<float>",
   "ttft_s": "<float>"
  },

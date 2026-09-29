@@ -45,7 +45,7 @@ def test_spans_add_up_to_the_first_token_by_construction():
     assert summary["endpoint"] == "first_delta_sent"
     assert summary["ttft_s"] == pytest.approx(2.502)
     assert summary["sum_s"] == pytest.approx(summary["ttft_s"], abs=1e-5)
-    assert list(summary["spans"]) == [
+    assert list(summary["exclusive_s"]) == [
         "http_parse_s",
         "policy_s",
         "encode_s",
@@ -55,7 +55,7 @@ def test_spans_add_up_to_the_first_token_by_construction():
         "engine_first_token_s",
         "first_delta_sent_s",
     ]
-    assert summary["spans"]["scheduler_queue_s"] == pytest.approx(1.2)
+    assert summary["exclusive_s"]["scheduler_queue_s"] == pytest.approx(1.2)
     assert summary["attempts"] == 1
     assert summary["discarded_attempt_wall_s"] == 0.0
 
@@ -66,7 +66,7 @@ def test_first_mark_of_a_name_wins():
     clock.mark("postcommit_wait", 5.0)
     clock.mark("engine_first_token", 6.0)
 
-    assert clock.summary()["spans"]["postcommit_wait_s"] == pytest.approx(1.0)
+    assert clock.summary()["exclusive_s"]["postcommit_wait_s"] == pytest.approx(1.0)
 
 
 def test_discarded_attempt_before_any_delta_is_its_own_span():
@@ -85,8 +85,8 @@ def test_discarded_attempt_before_any_delta_is_its_own_span():
     assert summary["attempts"] == 2
     assert summary["retry_paths"] == ["chat.stream.tool_fed_empty_retry"]
     assert summary["discarded_attempt_wall_s"] == pytest.approx(3.8)
-    assert summary["spans"]["discarded_attempt_s"] == pytest.approx(3.8)
-    assert summary["spans"]["scheduler_queue_s"] == pytest.approx(0.1)
+    assert summary["exclusive_s"]["discarded_attempt_s"] == pytest.approx(3.8)
+    assert summary["exclusive_s"]["scheduler_queue_s"] == pytest.approx(0.1)
     assert summary["ttft_s"] == pytest.approx(4.61)
     assert summary["sum_s"] == pytest.approx(4.61, abs=1e-5)
 
@@ -103,7 +103,7 @@ def test_discard_after_the_client_saw_a_delta_keeps_the_ttft():
     assert summary["ttft_s"] == pytest.approx(0.51)
     assert summary["attempts"] == 2
     assert summary["discarded_attempt_wall_s"] == pytest.approx(2.9)
-    assert "discarded_attempt_s" not in summary["spans"]
+    assert "discarded_attempt_s" not in summary["exclusive_s"]
 
 
 def test_health_summary_reports_percentiles_per_span():
@@ -253,8 +253,10 @@ def test_streamed_response_carries_spans_that_add_up_to_its_ttft(monkeypatch):
         "engine_first_token",
         "first_delta_sent",
     ):
-        assert f"{name}_s" in spans["spans"], (name, spans)
+        assert f"{name}_s" in spans["exclusive_s"], (name, spans)
     assert spans["sum_s"] == pytest.approx(spans["ttft_s"], abs=1e-4)
+    # The replay harness sums exclusive_s against the client's TTFT.
+    assert sum(spans["exclusive_s"].values()) == pytest.approx(spans["ttft_s"], abs=1e-4)
     # The engine span is explained by the engine's own receipt.
     assert spans["details"]["engine"]["prompt_eval_time_s"] == pytest.approx(0.001)
     # The server TTFT now starts at arrival, and the stream's first delta
@@ -294,4 +296,4 @@ def test_nonstream_blank_retry_names_the_discarded_attempt(monkeypatch):
     assert stats["attempts"] == 2
     assert stats["retry_path"] == "blank_retry"
     assert stats["discarded_attempt_wall_s"] > 0.0
-    assert stats["ttft_spans"]["spans"]["discarded_attempt_s"] > 0.0
+    assert stats["ttft_spans"]["exclusive_s"]["discarded_attempt_s"] > 0.0
