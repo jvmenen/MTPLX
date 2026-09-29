@@ -1620,10 +1620,19 @@ def _explicit_memory_limit_bytes() -> int | None:
     return int(value) if value > 0 else None
 
 
+# The allocator pool's default bound: a sixty-fourth of the Mac (2 GiB on
+# 128 GB), a forty-eighth of an explicit engine limit or memory budget, never
+# under 512 MiB nor over 8 GiB. See _default_mlx_cache_limit_bytes.
+_MLX_CACHE_LIMIT_RAM_DIVISOR = 64
+_MLX_CACHE_LIMIT_ENGINE_DIVISOR = 48
+_MLX_CACHE_LIMIT_MIN_BYTES = 512 * 1024**2
+_MLX_CACHE_LIMIT_MAX_BYTES = 8 * 1024**3
+
+
 def _default_mlx_cache_limit_bytes(
     memory_budget: int | None = None, explicit_limit: int | None = None
 ) -> int | None:
-    """RAM-tiered default for the MLX allocator's freed-buffer cache.
+    """Default bound for the MLX allocator's freed-buffer pool.
 
     MLX's own cache limit tracks the memory limit (~0.75x RAM high-water),
     so freed transients accumulate for the process lifetime (#150 — mmmugh
@@ -1631,38 +1640,50 @@ def _default_mlx_cache_limit_bytes(
     12 GiB; the growth was the allocator cache, which no profile bounded).
     A cache LIMIT only bounds what stays retained after buffers are freed —
     prefill spikes still allocate whatever they need — so the bound trades a
-    little reuse at the tail for a flat resident footprint. Tiers keep
-    several GiB of hot-loop reuse on every box.
+    little reuse at the tail for a flat resident footprint.
 
-    An explicit MTPLX_MEMORY_LIMIT_BYTES (``explicit_limit``) bounds it too,
-    at a twelfth of the limit: the tiers are a twelfth of each machine's
-    default limit, and a lowered limit left the cache at its RAM tier (8 GiB
-    of pooled buffers under a 48 GiB limit on a 128 GB Mac; the review of
-    9c96dd9c).
+    The bound is a sixty-fourth of the Mac: 2 GiB on 128 GB, 1 GiB on 64 GB,
+    at least 512 MiB and at most 8 GiB. It was a twelfth of the default
+    limit (8 GiB on 128 GB), and inside every Flash-Next prefill chunk the
+    pool sat at that cap (7.5 to 8.6 GB in the 2026-09-29 guard receipts),
+    about 60% of the working set beside the KV. The E3a cell (2026-09-29,
+    128 GB M5 Max, Flash-Next Optimized Speed, one tree, A B B A, a fresh
+    server per boot, 8 GiB against 2 GiB): the footprint peak fell 2.6 to
+    4.5 GB (16K: 98.3 and 96.5 GB against 93.8 and 93.9; 64K: 98.7 against
+    95.1 and 95.2), 4K and 16K time to first token and prefill rate stayed
+    within noise (16K 1,496 and 1,621 tok/s against 1,496 and 1,509; 4K
+    1,702 and 1,854 against 1,800 and 1,608), and a 64K cold prompt that the
+    8 GiB arm could not serve was served in both boots. A decode step's
+    buffers are a few MB, reused many times over under any of these bounds.
+    Smaller Macs run smaller models and windows, so the pool keeps the same
+    share of the machine.
+
+    An explicit MTPLX_MEMORY_LIMIT_BYTES (``explicit_limit``) or memory
+    budget bounds it at a forty-eighth of itself (the same share of the
+    75% default limit), so an operator who lowers the limit lowers the pool
+    with it (the review of 9c96dd9c).
     """
+
+    def clamp(value: int) -> int:
+        return max(
+            _MLX_CACHE_LIMIT_MIN_BYTES, min(_MLX_CACHE_LIMIT_MAX_BYTES, int(value))
+        )
 
     def bounded(value: int) -> int:
         if explicit_limit is None or int(explicit_limit) <= 0:
-            return int(value)
-        return min(
-            int(value),
-            max(1 * 1024**3, int(explicit_limit) // _ALLOWANCE_LIMIT_DIVISOR),
+            return clamp(value)
+        return clamp(
+            min(int(value), int(explicit_limit) // _MLX_CACHE_LIMIT_ENGINE_DIVISOR)
         )
 
     if memory_budget is not None:
-        return bounded(max(1 * 1024**3, min(8 * 1024**3, memory_budget // 8)))
+        return bounded(int(memory_budget) // _MLX_CACHE_LIMIT_ENGINE_DIVISOR)
     total = _total_ram_bytes()
     if total is None:
         if explicit_limit:
-            return bounded(8 * 1024**3)
+            return bounded(_MLX_CACHE_LIMIT_MAX_BYTES)
         return None  # unknown machine: leave MLX defaults untouched
-    if total <= 36 * 1024**3:
-        return bounded(2 * 1024**3)
-    if total <= 72 * 1024**3:
-        return bounded(4 * 1024**3)
-    if total <= 100 * 1024**3:
-        return bounded(6 * 1024**3)
-    return bounded(8 * 1024**3)
+    return bounded(int(total) // _MLX_CACHE_LIMIT_RAM_DIVISOR)
 
 
 def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
