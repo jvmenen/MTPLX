@@ -91,13 +91,12 @@ def _runtime(*, dtype=mx.bfloat16, rope=None, **overrides):
 
     smoke = _smoke()
     mx.random.seed(0)
-    args = dataclasses.replace(
-        smoke._tiny_text_args(),
-        head_dim=32,
-        indexer_head_dim=32,
-        indexer_compress_ratio=4,
-        ple_layer_ids=[1],
-        rope_parameters={
+    fields = {
+        "head_dim": 32,
+        "indexer_head_dim": 32,
+        "indexer_compress_ratio": 4,
+        "ple_layer_ids": [1],
+        "rope_parameters": {
             "mrope_interleaved": True,
             "mrope_section": [2, 1, 1],
             "partial_rotary_factor": 0.25,
@@ -105,8 +104,9 @@ def _runtime(*, dtype=mx.bfloat16, rope=None, **overrides):
             "rope_type": "default",
             **(rope or {}),
         },
-        **overrides,
-    )
+    }
+    fields.update(overrides)
+    args = dataclasses.replace(smoke._tiny_text_args(), **fields)
     model = Model(ModelArgs(model_type="qwen4_exp", text_config=dataclasses.asdict(args)))
     model.language_model.mtp = Qwen4ExpMTP(model.language_model.args)
     if dtype != mx.float32:
@@ -333,35 +333,43 @@ def _record_compiled_rounds(monkeypatch) -> list[dict]:
     return rounds
 
 
-def test_the_compiled_verifier_with_the_kernels_equals_its_parent_bit_for_bit(monkeypatch):
+@pytest.mark.parametrize("index_head", [32, 128], ids=["index-head-32", "index-head-128"])
+def test_the_compiled_verifier_with_the_kernels_equals_its_parent_bit_for_bit(monkeypatch, index_head):
     # The parent is the same compiled verifier with the verify-width
-    # hyper-connection read and the QSA selection switched off at install:
-    # the stock chains traced into the compiled body. Every compiled round's
-    # logits, hidden state, captures and cache leaves must match it in their
-    # raw bits, and so must the tokens.
-    from mtplx.kernels import hc_verify_read, qsa_verify_select
+    # hyper-connection read, the QSA selection and the pooled-key row switched
+    # off at install: the stock chains traced into the compiled body. Every
+    # compiled round's logits, hidden state, captures and cache leaves must
+    # match it in their raw bits, and so must the tokens. A 128-wide index head
+    # (Flash-Next's) brings the pooled-key row in; the tiny pack's 32-wide one
+    # keeps it out.
+    from mtplx.kernels import hc_verify_read, qsa_pooled_row, qsa_verify_select
 
     rounds = _record_compiled_rounds(monkeypatch)
-    monkeypatch.setenv(hc_verify_read.ENV, "0")
-    monkeypatch.setenv(qsa_verify_select.ENV, "0")
-    parent_rt = _runtime()
+    for module in (hc_verify_read, qsa_verify_select, qsa_pooled_row):
+        monkeypatch.setenv(module.ENV, "0")
+    parent_rt = _runtime(indexer_head_dim=index_head)
     assert not parent_rt._mtplx_hc_verify_read["installed"]
     assert not parent_rt._mtplx_qsa_verify_select["installed"]
-    hc_before = hc_verify_read.engagement()["traces"]
-    qsa_before = qsa_verify_select.engagement()["traces"]
+    assert not parent_rt._mtplx_qsa_pooled_row["installed"]
+    before = {m: m.engagement()["traces"] for m in (hc_verify_read, qsa_verify_select, qsa_pooled_row)}
     parent = _generate(parent_rt, "parity2", monkeypatch)
-    assert hc_verify_read.engagement()["traces"] == hc_before
-    assert qsa_verify_select.engagement()["traces"] == qsa_before
+    for module, count in before.items():
+        assert module.engagement()["traces"] == count
     parent_rounds = list(rounds)
     rounds.clear()
 
-    monkeypatch.delenv(hc_verify_read.ENV)
-    monkeypatch.delenv(qsa_verify_select.ENV)
-    rt = _runtime()
+    for module in (hc_verify_read, qsa_verify_select, qsa_pooled_row):
+        monkeypatch.delenv(module.ENV)
+    rt = _runtime(indexer_head_dim=index_head)
     candidate = _generate(rt, "parity2", monkeypatch)
-    assert qsa_verify_select.engagement()["traces"] > qsa_before
+    assert qsa_verify_select.engagement()["traces"] > before[qsa_verify_select]
     if _hc_read_served_here():
-        assert hc_verify_read.engagement()["traces"] > hc_before
+        assert hc_verify_read.engagement()["traces"] > before[hc_verify_read]
+    if index_head == 128:
+        assert rt._mtplx_qsa_pooled_row["installed"], rt._mtplx_qsa_pooled_row
+        assert qsa_pooled_row.engagement()["traces"] > before[qsa_pooled_row]
+    else:
+        assert not rt._mtplx_qsa_pooled_row["installed"]
 
     assert candidate.tokens == parent.tokens
     assert len(rounds) == len(parent_rounds) > 0
