@@ -3069,6 +3069,7 @@ def gemma4_prompt_scoring_logit_chunks(
             del output
             mx.eval(hidden, *_gemma4_cache_arrays(cache))
             for start in range(span_start, span_end, chunk_size):
+                _check_postcommit_abort(abort_check)
                 end = min(span_end, start + chunk_size)
                 logits = runtime.target.logits_from_hidden(
                     hidden[:, start - span_start : end - span_start, :]

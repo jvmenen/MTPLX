@@ -132,3 +132,22 @@ def test_scoring_checks_live_memory_before_the_next_chunk(scoring, monkeypatch):
     assert len(runtime.forward_calls) == 1
     assert response.json()["error"]["detail"]["memory"]["reason"] == "engine_limit"
     assert scoring.shed == [True]
+
+
+def test_scoring_aborts_between_heads_of_one_target_forward(scoring, monkeypatch):
+    scoring.state.args.prefill_chunk_tokens = 2048
+    target = scoring.state.runtime.target
+    head = target.logits_from_hidden
+
+    def trigger(hidden):
+        logits = head(hidden)
+        scoring.state.pressure_abort_event.set()
+        return logits
+
+    monkeypatch.setattr(target, "logits_from_hidden", trigger)
+    response = _score(scoring, 4096)
+
+    assert response.status_code == 507
+    assert len(scoring.state.runtime.forward_calls) == 1
+    assert target.head_rows == [256]  # Stop before the other seven head chunks.
+    assert scoring.shed == [True]
