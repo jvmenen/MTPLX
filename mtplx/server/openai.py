@@ -38026,6 +38026,138 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return retry_generated
 
+                def finish_released_commit(
+                    generated: dict[str, Any],
+                    postcommit: dict[str, Any],
+                    *,
+                    assistant_history_content: str,
+                    assistant_tool_calls: list[dict[str, Any]] | None,
+                ) -> None:
+                    """The generation-final commit did not store this turn: commit
+                    the prompt prefix and schedule the idle retokenized postcommit.
+
+                    Runs on the event loop before the terminal frame, or on the
+                    stream worker after it when the frame went out first.
+                    """
+                    prompt_prefix_boundary_kind = (
+                        "tool_call_prompt_prefix"
+                        if assistant_tool_calls
+                        else "postcommit_prompt_prefix"
+                    )
+                    if read_only_force_answer_contract_active or vision_splice is not None:
+                        prompt_prefix_commit_info = {
+                            "committed": False,
+                            "reason": (
+                                "vision_session_frontier_skip"
+                                if vision_splice is not None
+                                else "transient_generation_contract"
+                            ),
+                            "prefix_len": int(
+                                getattr(session, "prefix_len", 0) or 0
+                            ),
+                            "boundary_kind": prompt_prefix_boundary_kind,
+                        }
+                        prompt_prefix_len = int(
+                            prompt_prefix_commit_info["prefix_len"]
+                        )
+                    else:
+                        # The trailing tool-result continuation
+                        # hint is transient: the client never
+                        # echoes it, so a committed stream that
+                        # includes it can never be extended by
+                        # any future prompt (strict prefix rule)
+                        # - the committed frontier froze exactly
+                        # there (2026-08-21: 15,389 while the
+                        # true stream passed 76k). Commit only
+                        # the stable prefix; the hint's KV stays
+                        # live for this turn regardless.
+                        _stable_prefix = template_observability.get(
+                            "stable_prefix_len"
+                        )
+                        _prefix_commit_ids = prompt_ids
+                        if (
+                            isinstance(_stable_prefix, int)
+                            and 0 < _stable_prefix < len(prompt_ids)
+                        ):
+                            _prefix_commit_ids = prompt_ids[
+                                :_stable_prefix
+                            ]
+                        prompt_prefix_commit = session.commit_prompt_prefix(
+                            prompt_ids=_prefix_commit_ids,
+                            finish_reason=str(
+                                generated.get("finish_reason") or "stop"
+                            ),
+                            boundary_kind=prompt_prefix_boundary_kind,
+                        )
+                        prompt_prefix_commit_info = {
+                            "committed": bool(
+                                prompt_prefix_commit.committed
+                            ),
+                            "reason": prompt_prefix_commit.reason,
+                            "prefix_len": int(
+                                prompt_prefix_commit.prefix_len
+                            ),
+                            "boundary_kind": prompt_prefix_boundary_kind,
+                        }
+                        prompt_prefix_len = int(
+                            prompt_prefix_commit.prefix_len
+                        )
+                    generated["stats"][
+                        "session_prompt_prefix_commit"
+                    ] = prompt_prefix_commit_info
+                    unsafe_reason = str(
+                        postcommit.get("reason") or "unsafe_history"
+                    )
+                    postcommit_snapshot = (
+                        _skipped_idle_postcommit_snapshot(
+                            state=state,
+                            unsafe_reason=unsafe_reason,
+                            assistant_tool_calls=assistant_tool_calls,
+                            prompt_prefix_len=(prompt_prefix_len),
+                        )
+                    )
+                    if postcommit_snapshot is not None:
+                        postcommit_snapshot = (
+                            _attach_skipped_postcommit_cleanup(
+                                state,
+                                postcommit_snapshot,
+                            )
+                        )
+                    else:
+                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
+                            state,
+                            session_id=session_id,
+                            messages=raw_messages_for_postcommit,
+                            assistant_content=(
+                                assistant_history_content
+                            ),
+                            assistant_tool_calls=assistant_tool_calls,
+                            thinking_enabled=thinking_enabled,
+                            reasoning_effort=reasoning_effort,
+                            policy_fingerprint=postcommit_policy_fingerprint,
+                            unsafe_reason=unsafe_reason,
+                            tool_specs=postcommit_tool_specs,
+                            session=session,
+                            expected_session_revision=getattr(
+                                session, "revision", None
+                            ),
+                            keep_live_ref=session_keep_live_ref,
+                            tool_prompt_mode=postcommit_tool_prompt_mode,
+                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                            committed_stream_ids=[
+                                int(token) for token in prompt_ids
+                            ]
+                            + [
+                                int(token)
+                                for token in (
+                                    generated.get("tokens") or []
+                                )
+                            ],
+                        )
+                    generated["stats"][
+                        "session_postcommit_snapshot"
+                    ] = postcommit_snapshot
+
                 def worker() -> None:
                     try:
                         _raise_if_stream_cancelled(cancel_event)
@@ -39789,124 +39921,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     )
                                     generated = release.get("generated") or generated
                                     postcommit = release.get("postcommit") or {}
-                                    prompt_prefix_boundary_kind = (
-                                        "tool_call_prompt_prefix"
-                                        if assistant_tool_calls
-                                        else "postcommit_prompt_prefix"
+                                    finish_released_commit(
+                                        generated,
+                                        postcommit,
+                                        assistant_history_content=(
+                                            assistant_history_content
+                                        ),
+                                        assistant_tool_calls=assistant_tool_calls,
                                     )
-                                    if read_only_force_answer_contract_active or vision_splice is not None:
-                                        prompt_prefix_commit_info = {
-                                            "committed": False,
-                                            "reason": (
-                                                "vision_session_frontier_skip"
-                                                if vision_splice is not None
-                                                else "transient_generation_contract"
-                                            ),
-                                            "prefix_len": int(
-                                                getattr(session, "prefix_len", 0) or 0
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit_info["prefix_len"]
-                                        )
-                                    else:
-                                        # The trailing tool-result continuation
-                                        # hint is transient: the client never
-                                        # echoes it, so a committed stream that
-                                        # includes it can never be extended by
-                                        # any future prompt (strict prefix rule)
-                                        # - the committed frontier froze exactly
-                                        # there (2026-08-21: 15,389 while the
-                                        # true stream passed 76k). Commit only
-                                        # the stable prefix; the hint's KV stays
-                                        # live for this turn regardless.
-                                        _stable_prefix = template_observability.get(
-                                            "stable_prefix_len"
-                                        )
-                                        _prefix_commit_ids = prompt_ids
-                                        if (
-                                            isinstance(_stable_prefix, int)
-                                            and 0 < _stable_prefix < len(prompt_ids)
-                                        ):
-                                            _prefix_commit_ids = prompt_ids[
-                                                :_stable_prefix
-                                            ]
-                                        prompt_prefix_commit = session.commit_prompt_prefix(
-                                            prompt_ids=_prefix_commit_ids,
-                                            finish_reason=str(
-                                                generated.get("finish_reason") or "stop"
-                                            ),
-                                            boundary_kind=prompt_prefix_boundary_kind,
-                                        )
-                                        prompt_prefix_commit_info = {
-                                            "committed": bool(
-                                                prompt_prefix_commit.committed
-                                            ),
-                                            "reason": prompt_prefix_commit.reason,
-                                            "prefix_len": int(
-                                                prompt_prefix_commit.prefix_len
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit.prefix_len
-                                        )
-                                    generated["stats"][
-                                        "session_prompt_prefix_commit"
-                                    ] = prompt_prefix_commit_info
-                                    unsafe_reason = str(
-                                        postcommit.get("reason") or "unsafe_history"
-                                    )
-                                    postcommit_snapshot = (
-                                        _skipped_idle_postcommit_snapshot(
-                                            state=state,
-                                            unsafe_reason=unsafe_reason,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            prompt_prefix_len=(prompt_prefix_len),
-                                        )
-                                    )
-                                    if postcommit_snapshot is not None:
-                                        postcommit_snapshot = (
-                                            _attach_skipped_postcommit_cleanup(
-                                                state,
-                                                postcommit_snapshot,
-                                            )
-                                        )
-                                    else:
-                                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
-                                            state,
-                                            session_id=session_id,
-                                            messages=raw_messages_for_postcommit,
-                                            assistant_content=(
-                                                assistant_history_content
-                                            ),
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            thinking_enabled=thinking_enabled,
-                                            reasoning_effort=reasoning_effort,
-                                            policy_fingerprint=postcommit_policy_fingerprint,
-                                            unsafe_reason=unsafe_reason,
-                                            tool_specs=postcommit_tool_specs,
-                                            session=session,
-                                            expected_session_revision=getattr(
-                                                session, "revision", None
-                                            ),
-                                            keep_live_ref=session_keep_live_ref,
-                                            tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
-                                            committed_stream_ids=[
-                                                int(token) for token in prompt_ids
-                                            ]
-                                            + [
-                                                int(token)
-                                                for token in (
-                                                    generated.get("tokens") or []
-                                                )
-                                            ],
-                                        )
-                                    generated["stats"][
-                                        "session_postcommit_snapshot"
-                                    ] = postcommit_snapshot
                                 else:
                                     yield mark_sse_sent(
                                         error_chunk(
