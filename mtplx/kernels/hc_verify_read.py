@@ -115,15 +115,18 @@ inline U hc_sigmoid(U x, const device U* table) {
     return table[as_type<ushort>(x)];
 }
 
-// One projection row for NR vectors, reduced over K in the wide-gemv order:
-// lane k owns the blocks of four values at k, k + KL, k + 2 KL, ...; each
-// unrolled step of 8 blocks sums into a step partial that is then added to
-// the lane total; the tail blocks follow one by one; a halving shuffle tree
-// leaves the row's value on the slice's first lane.
+// One projection row for the NR vectors of a pass, reduced over K in the
+// wide-gemv order: lane k owns the blocks of four values at k, k + KL,
+// k + 2 KL, ...; each unrolled step of 8 blocks sums into a step partial that
+// is then added to the lane total; the tail blocks follow one by one; a
+// halving shuffle tree leaves the row's value on the slice's first lane.
+// Vectors past ``valid`` re-read the last valid one (their results are never
+// stored), as the library does for a short last pass.
 template <typename U, int KL, int K, int NR>
 inline void hc_wide_dot(
     const device U* w_row,
     const device U* x,
+    int valid,
     uint k_lane,
     thread float* acc) {
     constexpr int UNROLL = 8;
@@ -131,8 +134,10 @@ inline void hc_wide_dot(
     constexpr int MAIN = K4 - K4 % (KL * UNROLL);
     const device vec<U, 4>* w4 = (const device vec<U, 4>*)w_row;
     const device vec<U, 4>* x4 = (const device vec<U, 4>*)x;
+    int xo[NR];
     for (int r = 0; r < NR; ++r) {
         acc[r] = 0.0f;
+        xo[r] = min(r, valid - 1) * K4;
     }
     for (int base = 0; base < MAIN; base += KL * UNROLL) {
         float4 wv[UNROLL];
@@ -142,7 +147,7 @@ inline void hc_wide_dot(
         for (int r = 0; r < NR; ++r) {
             float step = 0.0f;
             for (int i = 0; i < UNROLL; ++i) {
-                step += dot(wv[i], float4(x4[r * K4 + base + i * KL + (int)k_lane]));
+                step += dot(wv[i], float4(x4[xo[r] + base + i * KL + (int)k_lane]));
             }
             acc[r] += step;
         }
@@ -150,7 +155,7 @@ inline void hc_wide_dot(
     for (int idx = MAIN + (int)k_lane; idx < K4; idx += KL) {
         const float4 wv = float4(w4[idx]);
         for (int r = 0; r < NR; ++r) {
-            acc[r] += dot(wv, float4(x4[r * K4 + idx]));
+            acc[r] += dot(wv, float4(x4[xo[r] + idx]));
         }
     }
     for (int r = 0; r < NR; ++r) {
@@ -236,31 +241,35 @@ _DOWN_SOURCE = r"""
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint group = threadgroup_position_in_grid.x;
-    float acc[ROWS];
+    // The library runs rows in ceil(rows / 5) passes of NV vectors each.
+    const int v0 = (int)threadgroup_position_in_grid.y * NV;
+    const int valid = min(NV, ROWS - v0);
+    const device T* xs = normed + (size_t)v0 * HCD;
+    float acc[NV];
     if (group < DOWN_GROUPS) {
         const uint n = (group * SIMDGROUPS + sg) * (32u / (uint)KL_DOWN) + lane / (uint)KL_DOWN;
         const uint k_lane = lane % (uint)KL_DOWN;
         const uint n_read = min(n, (uint)(LOWRANK - 1));
-        hc_wide_dot<T, KL_DOWN, HCD, ROWS>(
-            w_down + (size_t)n_read * HCD, normed, k_lane, acc);
+        hc_wide_dot<T, KL_DOWN, HCD, NV>(
+            w_down + (size_t)n_read * HCD, xs, valid, k_lane, acc);
         if (k_lane == 0 && n < (uint)LOWRANK) {
-            for (int r = 0; r < ROWS; ++r) {
+            for (int r = 0; r < valid; ++r) {
                 const T projected = static_cast<T>(acc[r]);
                 const T scaled = projected / T(HC);
-                mix[(size_t)r * LOWRANK + n] = scaled * hc_sigmoid(scaled, sigmoid);
+                mix[(size_t)(v0 + r) * LOWRANK + n] = scaled * hc_sigmoid(scaled, sigmoid);
             }
         }
     } else if (INJECT) {
         // The inject projection has hc_count outputs, so the library keeps
         // all 32 lanes on each row: one simdgroup per inject row.
         if (sg < (uint)HC) {
-            hc_wide_dot<T, 32, HCD, ROWS>(
-                w_inject + (size_t)sg * HCD, normed, lane, acc);
+            hc_wide_dot<T, 32, HCD, NV>(
+                w_inject + (size_t)sg * HCD, xs, valid, lane, acc);
             if (lane == 0) {
-                for (int r = 0; r < ROWS; ++r) {
+                for (int r = 0; r < valid; ++r) {
                     const T logit = static_cast<T>(acc[r]);
                     const T scaled = logit / T(HC);
-                    inject[(size_t)r * HC + sg] = T(2) * hc_sigmoid(scaled, sigmoid);
+                    inject[(size_t)(v0 + r) * HC + sg] = T(2) * hc_sigmoid(scaled, sigmoid);
                 }
             }
         }
@@ -275,14 +284,18 @@ _UP_SOURCE = r"""
     const uint column = (group * SIMDGROUPS + sg) * (32u / (uint)KL_UP) + lane / (uint)KL_UP;
     const uint k_lane = lane % (uint)KL_UP;
     const uint c = min(column, (uint)(D - 1));
-    float acc[ROWS];
-    T total[ROWS];
+    const int v0 = (int)threadgroup_position_in_grid.y * NV;
+    const int valid = min(NV, ROWS - v0);
+    float acc[NV];
+    T total[NV];
     for (int s = 0; s < HC; ++s) {
         const uint n = (uint)s * D + c;
-        hc_wide_dot<T, KL_UP, LOWRANK, ROWS>(w_up + (size_t)n * LOWRANK, mix, k_lane, acc);
-        for (int r = 0; r < ROWS; ++r) {
+        hc_wide_dot<T, KL_UP, LOWRANK, NV>(
+            w_up + (size_t)n * LOWRANK, mix + (size_t)v0 * LOWRANK, valid, k_lane, acc);
+        for (int r = 0; r < NV; ++r) {
+            const int rv = min(v0 + r, ROWS - 1);
             const T gate = hc_sigmoid(static_cast<T>(acc[r]), sigmoid + 65536);
-            const T product = gate * normed[(size_t)r * HCD + n];
+            const T product = gate * normed[(size_t)rv * HCD + n];
             // The small column reduce starts every stream's lane from +0 and
             // then adds the lanes in ascending stream order.
             const T lane_total = product + T(0);
@@ -290,11 +303,18 @@ _UP_SOURCE = r"""
         }
     }
     if (k_lane == 0 && column < (uint)D) {
-        for (int r = 0; r < ROWS; ++r) {
-            mixed[(size_t)r * D + column] = total[r] * T(INV_HC);
+        for (int r = 0; r < valid; ++r) {
+            mixed[(size_t)(v0 + r) * D + column] = total[r] * T(INV_HC);
         }
     }
 """
+
+
+def _passes(rows: int) -> tuple[int, int]:
+    """``(passes, vectors per pass)`` of the library's wide gemv for ``rows``."""
+
+    passes = (rows + 4) // 5
+    return passes, (rows + passes - 1) // passes
 
 
 def _k_lanes(rows: int, outputs: int) -> int:
@@ -351,6 +371,7 @@ def _down_kernel(hc: int, width: int, lowrank: int, eps: float, rows: int, injec
     per_group = _SIMDGROUPS * (32 // kl)
     header = _header(hc, width, lowrank, eps) + _COMMON + (
         f"constant constexpr int ROWS = {rows};\n"
+        f"constant constexpr int NV = {_passes(rows)[1]};\n"
         f"constant constexpr int KL_DOWN = {kl};\n"
         f"constant constexpr uint DOWN_GROUPS = {(lowrank + per_group - 1) // per_group}u;\n"
         f"constant constexpr bool INJECT = {'true' if inject else 'false'};\n"
@@ -369,6 +390,7 @@ def _up_kernel(hc: int, width: int, lowrank: int, eps: float, rows: int):
     kl = _k_lanes(rows, hc * width)
     header = _header(hc, width, lowrank, eps) + _COMMON + (
         f"constant constexpr int ROWS = {rows};\n"
+        f"constant constexpr int NV = {_passes(rows)[1]};\n"
         f"constant constexpr int KL_UP = {kl};\n"
     )
     return mx.fast.metal_kernel(
@@ -479,7 +501,7 @@ def read_rows(
     mix, inject_out = _down_kernel(hc, width, lowrank, float(eps), rows, has_inject)(
         inputs=[normed, w_down, w_inject if has_inject else w_down, sigmoid],
         template=[("T", dtype)],
-        grid=(groups * _THREADS, 1, 1),
+        grid=(groups * _THREADS, _passes(rows)[0], 1),
         threadgroup=(_THREADS, 1, 1),
         output_shapes=[(rows, lowrank), (rows, hc)],
         output_dtypes=[dtype, dtype],
@@ -491,7 +513,7 @@ def read_rows(
     (mixed,) = _up_kernel(hc, width, lowrank, float(eps), rows)(
         inputs=[mix, w_up, normed, sigmoid],
         template=[("T", dtype)],
-        grid=(up_groups * _THREADS, 1, 1),
+        grid=(up_groups * _THREADS, _passes(rows)[0], 1),
         threadgroup=(_THREADS, 1, 1),
         output_shapes=[(rows, width)],
         output_dtypes=[dtype],
