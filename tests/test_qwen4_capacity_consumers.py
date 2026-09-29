@@ -222,6 +222,7 @@ def _captured_session(pack, patch, bucket):
         assert bank.put(
             runtime=rt, token_ids=prefix, cache=final.final_trunk_cache,
             logits=final.final_logits, hidden=final.final_hidden,
+            hidden_variant=generation._resolve_runtime_base_hidden_variant(rt, None),
             mtp_history_policy="committed",
             mtp_history_snapshot=snapshot_cache(final.final_committed_mtp_cache),
         ) is not None

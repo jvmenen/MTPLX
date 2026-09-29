@@ -1201,11 +1201,12 @@ def _qwen4_fixed_m4_lane_fits(
                            live_bytes_after=live)
         if live + need <= line:
             return True
-    _announce_qwen4_fixed_m4_skip(
-        f"prompt {prompt_tokens} tokens: live {live / 1e9:.1f} GB + promotion "
-        f"{need / 1e9:.1f} GB over the {line / 1e9:.1f} GB line"
-        + (f" (allocator cache released: {released / 1e9:.1f} GB)" if released else "")
-    )
+    if promotion_rows is None:
+        _announce_qwen4_fixed_m4_skip(
+            f"prompt {prompt_tokens} tokens: live {live / 1e9:.1f} GB + promotion "
+            f"{need / 1e9:.1f} GB over the {line / 1e9:.1f} GB line"
+            + (f" (allocator cache released: {released / 1e9:.1f} GB)" if released else "")
+        )
     return False
 
 
@@ -10544,8 +10545,7 @@ def generate_mtpk(
     if qwen4_fixed_m4_compiled_verify:
         fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
             rt, prompt_tokens=len(prompt_ids), session_bank=session_bank,
-            prompt_ids=list(bank_commit_ids), capacity_plan=fixed_m4_capacity_plan,
-            promotion_rows=rows,
+            prompt_ids=list(bank_commit_ids), promotion_rows=rows,
         )
     _generic_compiled_verify = (
         verify_strategy in {"capture_commit", "graphbank_capture_commit"}

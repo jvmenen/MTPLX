@@ -15,7 +15,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 
@@ -810,7 +810,9 @@ class TensorOffsetQSACache:
         self.capacity_bucket = max(0, int(capacity_bucket))
         # The unbucketed parent's grant. Dense SDPA dispatch and rounding
         # depend on this width, even when its extra columns are masked out.
-        self.dense_capacity = self.capacity if dense_capacity is None else int(dense_capacity)
+        self.dense_capacity = (
+            self.capacity if dense_capacity is None else int(dense_capacity)
+        )
 
     @property
     def rope_delta(self) -> mx.array | None:
@@ -924,6 +926,7 @@ class TensorOffsetQSACache:
         from .models.qwen4_exp import (
             _qsa_gather_enabled,
             _qsa_gather_min_context,
+            _qsa_score_tile_rows,
         )
 
         rows_gather_enabled = _qsa_gather_enabled()
@@ -931,7 +934,6 @@ class TensorOffsetQSACache:
         rows_gather = rows_gather_enabled and offset >= rows_gather_min_context
         # A tiled-selector override makes M4 itself a dense consumer. Keep
         # its original allocation and graph signature for the whole request.
-        from .models.qwen4_exp import _qsa_score_tile_rows
         if _qsa_score_tile_rows() > 0:
             capacity_bucket = 0
 
@@ -949,11 +951,15 @@ class TensorOffsetQSACache:
         )
         pooled_capacity = raw_capacity // ratio
 
-        kv = TensorOffsetKVCache.from_kv_cache(
-            entry.kv, reserve_tokens=reserve_tokens
+        # Allocate the admitted width directly. Growing on the KV step and
+        # then padding again to the bucket can keep both copies live.
+        kv = TensorOffsetKVCache(
+            cls._fixed_bank(entry.kv.keys, raw_capacity, 2),
+            cls._fixed_bank(entry.kv.values, raw_capacity, 2),
+            offset,
+            step=getattr(entry.kv, "step", 256),
         )
-        kv.keys = cls._fixed_bank(kv.keys, raw_capacity, 2)
-        kv.values = cls._fixed_bank(kv.values, raw_capacity, 2)
+        kv._granted = True
         raw = cls._fixed_bank(entry.raw_keys, raw_capacity, 1)
         pooled = cls._fixed_bank(entry.pooled, pooled_capacity, 1)
         rows_gather_kv_m4 = entry.rows_gather_kv_m4
@@ -1016,10 +1022,13 @@ class TensorOffsetQSACache:
         return self.capacity
 
     def selector_pooled(self, pooled: mx.array, rows: int) -> mx.array:
-        return pooled[:, : self.attention_capacity(rows) // self.ratio]
+        blocks = self.attention_capacity(rows) // self.ratio
+        return pooled if blocks == pooled.shape[1] else pooled[:, :blocks]
 
     def attention_kv(self, keys: mx.array, values: mx.array, rows: int):
         capacity = self.attention_capacity(rows)
+        if capacity == keys.shape[2]:
+            return keys, values
         return keys[:, :, :capacity], values[:, :, :capacity]
 
     def ensure_capacity(self, needed: int) -> bool:
@@ -1027,8 +1036,9 @@ class TensorOffsetQSACache:
 
         self.dense_capacity = max(
             self.dense_capacity,
-            self._bank_capacity(needed, self.ratio, self.kv.step,
-                                rows_gather=self.fixed_rows_gather),
+            self._bank_capacity(
+                needed, self.ratio, self.kv.step, rows_gather=self.fixed_rows_gather
+            ),
         )
         if int(needed) <= self.capacity:
             return False
@@ -1135,10 +1145,9 @@ class TensorOffsetQSACache:
         offset = self.kv.size()
         entry = QSACache(self.ratio)
         entry.kv = self.kv.demote()
-        entry.kv.keys = entry.kv.keys[:, :, : self.dense_capacity]
-        entry.kv.values = entry.kv.values[:, :, : self.dense_capacity]
-        entry.raw_keys = self.raw_keys[:, : self.dense_capacity]
-        entry.pooled = self.pooled[:, : self.dense_capacity // self.ratio]
+        entry.kv.keys, entry.kv.values = self.attention_kv(entry.kv.keys, entry.kv.values, 1)
+        entry.raw_keys = self._fixed_bank(self.raw_keys, self.dense_capacity, 1)
+        entry.pooled = self.selector_pooled(self.pooled, 1)
         entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
         return entry
 
@@ -1944,7 +1953,7 @@ class FixedM4CapacityPlan:
 
     reserve_tokens: int
     bucket: int
-    admit_growth: Any = field(default=None, repr=False, compare=False)
+    admit_growth: Callable[[int], bool] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def for_request(cls, max_tokens: int | None, *, width: int = 4):
