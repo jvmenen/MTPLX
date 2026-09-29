@@ -124,10 +124,14 @@ def _run_stream(monkeypatch, texts):
     ],
     ids=["orphan_tool_markup", "stalled_promise"],
 )
-def test_steering_retries_run_in_the_default_posture(
-    monkeypatch, first_text, retry_kind
+@pytest.mark.parametrize("mode", [None, "on"], ids=["default", "on"])
+def test_steering_retries_run_in_the_default_and_on_postures(
+    monkeypatch, first_text, retry_kind, mode
 ):
-    monkeypatch.delenv("MTPLX_AGENT_REWRITES", raising=False)
+    if mode is None:
+        monkeypatch.delenv("MTPLX_AGENT_REWRITES", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_AGENT_REWRITES", mode)
 
     _prompts, kinds, _stats = _run_stream(monkeypatch, [first_text, ANSWER])
 
@@ -142,7 +146,7 @@ def test_steering_retries_run_in_the_default_posture(
 def test_agent_rewrites_off_disables_steering_retries(monkeypatch, first_text):
     monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
 
-    prompts, kinds, stats = _run_stream(monkeypatch, [first_text])
+    prompts, kinds, stats = _run_stream(monkeypatch, [first_text, ANSWER])
 
     assert kinds == ["first"]
     assert len(prompts) == 1
