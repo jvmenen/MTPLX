@@ -62,7 +62,7 @@ from mlx_lm.models.qwen3_next import (
     Qwen3NextSparseMoeBlock as _Qwen3NextSparseMoeBlock,
 )
 
-from mtplx import nax_detect
+from mtplx import moe_sorted_gather, nax_detect
 from mtplx.attention_context import current_attention_phase
 from mtplx.attention_math import attention_gate
 from mtplx.float32_operand import float32_operand
@@ -1452,7 +1452,10 @@ class _FusedGateUpSwitchGLU(nn.Module):
         # +0.31G per fused module straight into a Metal OOM).
 
     def _gu(self, x, idx, sorted_indices=False):
-        gu = mx.gather_qmm(
+        # Expert-sorted (prefill-width) calls take the sorted-rows guard; the
+        # decode and verify widths keep calling MLX directly.
+        gather = moe_sorted_gather.gather_qmm if sorted_indices else mx.gather_qmm
+        gu = gather(
             x,
             self.gu_weight,
             self.gu_scales,
@@ -1476,9 +1479,14 @@ class _FusedGateUpSwitchGLU(nn.Module):
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
         gate, up = self._gu(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
+        h = nn.silu(gate) * up
         if do_sort:
+            x = moe_sorted_gather.switch_linear(
+                self.down_proj, h, idx, sorted_indices=True
+            )
             x = _scatter_unsort(x, inv_order, indices.shape)
+        else:
+            x = self.down_proj(h, idx, sorted_indices=False)
         return x.squeeze(-2)
 
     def sorted_experts(self, x, indices):
@@ -1491,7 +1499,9 @@ class _FusedGateUpSwitchGLU(nn.Module):
         x = mx.expand_dims(x, (-2, -3))
         x, idx, inv_order = _gather_sort(x, indices)
         gate, up = self._gu(x, idx, sorted_indices=True)
-        y = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=True)
+        y = moe_sorted_gather.switch_linear(
+            self.down_proj, nn.silu(gate) * up, idx, sorted_indices=True
+        )
         return y.reshape(y.shape[0], -1), inv_order
 
 

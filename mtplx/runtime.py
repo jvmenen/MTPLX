@@ -623,6 +623,12 @@ def load(
     never reduced.
     """
     path = Path(model_path)
+    # Before any model can run a forward: mlx-lm's switch layers get the
+    # sorted-rows guard (mtplx.moe_sorted_gather; a no-op where MLX's kernel
+    # is correct).
+    from .moe_sorted_gather import install_switch_linear_guard
+
+    install_switch_linear_guard()
     engine_blocker = engine_version_blocker(_load_runtime_metadata(path))
     if engine_blocker:
         raise ModelCompatibilityError(engine_blocker)
