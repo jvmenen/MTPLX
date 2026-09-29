@@ -1,4 +1,5 @@
-"""A tiny quantized Qwen3.5-MoE with the A3B layout, for bit-identity tests.
+"""A tiny quantized Qwen3.5-MoE with the A3B layout (or the dense 27B layout),
+for bit-identity tests.
 
 Three GDN layers and one full-attention layer, routed plus shared experts,
 bf16 with 4-bit affine projections, optionally with a one-layer MTP draft
@@ -38,27 +39,37 @@ TEXT_CONFIG = {
 }
 
 
-def tiny_model(seed: int = 0, **overrides):
-    from mlx_lm.models import qwen3_5_moe
+#: The dense Qwen3.5 layout (the 27B): no experts, a plain MLP per layer.
+DENSE_TEXT_CONFIG = {
+    key: value
+    for key, value in dict(TEXT_CONFIG, model_type="qwen3_5_text").items()
+    if key not in ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size")
+}
 
-    text = dict(TEXT_CONFIG, **overrides)
-    args = qwen3_5_moe.ModelArgs(model_type="qwen3_5_moe", text_config=text)
+
+def tiny_model(seed: int = 0, *, dense: bool = False, **overrides):
+    from mlx_lm.models import qwen3_5, qwen3_5_moe
+
+    family = qwen3_5 if dense else qwen3_5_moe
+    text = dict(DENSE_TEXT_CONFIG if dense else TEXT_CONFIG, **overrides)
+    args = family.ModelArgs(model_type="qwen3_5" if dense else "qwen3_5_moe", text_config=text)
     mx.random.seed(seed)
-    model = qwen3_5_moe.Model(args)
+    model = family.Model(args)
     model.set_dtype(mx.bfloat16)
     nn.quantize(model, group_size=64, bits=4)
     mx.eval(model.parameters())
     return model
 
 
-def tiny_model_with_draft_head(tmp_path: Path, seed: int = 0, **overrides):
-    """``tiny_model`` plus a one-layer MoE MTP head, injected the product way."""
+def tiny_model_with_draft_head(tmp_path: Path, seed: int = 0, *, dense: bool = False, **overrides):
+    """``tiny_model`` plus a one-layer MTP head (MoE, or a dense MLP for the
+    dense layout), injected the product way."""
 
     from mlx_lm.models.qwen3_5 import DecoderLayer
 
     from mtplx.mtp_patch import inject_mtp_support
 
-    model = tiny_model(seed, **overrides)
+    model = tiny_model(seed, dense=dense, **overrides)
     args = model.language_model.args
     mx.random.seed(seed + 1)
     donor = DecoderLayer(args, layer_idx=args.full_attention_interval - 1)
@@ -73,9 +84,9 @@ def tiny_model_with_draft_head(tmp_path: Path, seed: int = 0, **overrides):
     for path, value in tree_flatten(donor.parameters()):
         tensors[f"mtp.layers.0.{path}"] = value
     mx.save_safetensors(str(tmp_path / "mtp.safetensors"), tensors)
-    text = dict(TEXT_CONFIG, **overrides, mtp_num_hidden_layers=1)
+    text = dict(DENSE_TEXT_CONFIG if dense else TEXT_CONFIG, **overrides, mtp_num_hidden_layers=1)
     config = {
-        "model_type": "qwen3_5_moe",
+        "model_type": "qwen3_5" if dense else "qwen3_5_moe",
         "text_config": text,
         "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
     }

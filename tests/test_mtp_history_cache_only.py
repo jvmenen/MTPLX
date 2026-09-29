@@ -1,12 +1,16 @@
 """Draft-head history appends in a prefill loop evaluate the cache only.
 
-On a tiny quantized Qwen3.5-MoE with a one-layer MoE draft head injected the
+On a tiny quantized Qwen3.5-MoE with a one-layer MoE draft head, and on the
+dense Qwen3.5 layout (the 27B) with a dense draft head, both injected the
 product way, these tests pin:
 
 * a prefill-phase append evaluates
   exactly the draft cache's key and value buffers, never the hidden;
 * the cache carries the same bits as with the full layer pass, chunk after
   chunk, and the first draft step after it gives the same logits and hidden;
+* the same with image embeddings in the appended rows, and when the append
+  lands on a cache restored from saved state (the next turn after a bank
+  restore);
 * on by default (``=0`` turns it off), and decode appends, other cache kinds
   and a missing cache keep evaluating the hidden.
 """
@@ -43,9 +47,11 @@ class _Runtime:
         )
 
 
-@pytest.fixture(scope="module")
-def model(tmp_path_factory):
-    return tiny_model_with_draft_head(tmp_path_factory.mktemp("draft-head"))
+@pytest.fixture(scope="module", params=["moe", "dense"])
+def model(request, tmp_path_factory):
+    return tiny_model_with_draft_head(
+        tmp_path_factory.mktemp(f"draft-head-{request.param}"), dense=request.param == "dense"
+    )
 
 
 def _trunk_hidden(model, tokens):
@@ -55,10 +61,12 @@ def _trunk_hidden(model, tokens):
     return hidden
 
 
-def _append_chunks(model, tokens, hidden, chunks, *, cache_only, monkeypatch, phase="prefill"):
+def _append_chunks(
+    model, tokens, hidden, chunks, *, cache_only, monkeypatch, phase="prefill", cache=None, embeddings=None
+):
     monkeypatch.setenv(ENV, "1" if cache_only else "0")
     rt = _Runtime(model)
-    cache = model.make_mtp_cache()
+    cache = model.make_mtp_cache() if cache is None else cache
     evaluated: list = []
     real_eval = generation._eval
 
@@ -76,6 +84,7 @@ def _append_chunks(model, tokens, hidden, chunks, *, cache_only, monkeypatch, ph
             phase=phase,
             mtp_hidden_variant="post_norm",
             force_eval=True,
+            input_embeddings=None if embeddings is None else embeddings[:, start:end, :],
         )
     monkeypatch.setattr(generation, "_eval", real_eval)
     return rt, cache, evaluated
@@ -153,6 +162,58 @@ def test_cache_only_append_leaves_the_same_cache_and_draft(model, monkeypatch, c
     )
     # The deeper draft state after that step is the same too.
     assert_bit_equal(cache[0].state, full_cache[0].state)
+
+
+def test_cache_only_append_with_image_embeddings(model, monkeypatch):
+    """Rows whose draft-head input is an embedding (image tokens) rather than
+    a token id: the same cache bits and the same first draft either way."""
+
+    tokens = prompt(121, seed=5)
+    hidden = _trunk_hidden(model, tokens[:120])
+    mx.random.seed(55)
+    embeddings = (mx.random.normal(hidden.shape) * 0.5).astype(hidden.dtype)
+    chunks = [(0, 48), (48, 120)]
+    _rt, full_cache, _ = _append_chunks(
+        model, tokens, hidden, chunks, cache_only=False, monkeypatch=monkeypatch, embeddings=embeddings
+    )
+    rt, cache, evals = _append_chunks(
+        model, tokens, hidden, chunks, cache_only=True, monkeypatch=monkeypatch, embeddings=embeddings
+    )
+    assert rt.diagnostic_counters["mtp_history_cache_only_appends"] == len(chunks)
+    assert all(len(values) == 2 for values in evals)
+    assert_bit_equal(cache[0].state, full_cache[0].state)
+    row = hidden[:, 119:120, :]
+    assert_bit_equal(_draft_step(model, cache, row, tokens[120]), _draft_step(model, full_cache, row, tokens[120]))
+
+
+def test_cache_only_append_onto_a_restored_cache(model, monkeypatch):
+    """The next turn after a bank restore: the draft cache comes back from
+    saved state (exact-length buffers), then the new turn's rows append."""
+
+    tokens = prompt(201, seed=9)
+    hidden = _trunk_hidden(model, tokens[:200])
+    _rt, first_turn, _ = _append_chunks(
+        model, tokens, hidden, [(0, 130)], cache_only=False, monkeypatch=monkeypatch
+    )
+    saved = [mx.array(leaf) for leaf in first_turn[0].state]
+    mx.eval(saved)
+
+    def restored():
+        cache = model.make_mtp_cache()
+        cache[0].state = tuple(saved)
+        return cache
+
+    _rt, full_cache, _ = _append_chunks(
+        model, tokens, hidden, [(130, 200)], cache_only=False, monkeypatch=monkeypatch, cache=restored()
+    )
+    rt, cache, evals = _append_chunks(
+        model, tokens, hidden, [(130, 200)], cache_only=True, monkeypatch=monkeypatch, cache=restored()
+    )
+    assert rt.diagnostic_counters["mtp_history_cache_only_appends"] == 1
+    assert cache[0].offset == full_cache[0].offset == 200
+    assert_bit_equal(cache[0].state, full_cache[0].state)
+    row = hidden[:, 199:200, :]
+    assert_bit_equal(_draft_step(model, cache, row, tokens[200]), _draft_step(model, full_cache, row, tokens[200]))
 
 
 def test_decode_appends_keep_evaluating_the_hidden(model, monkeypatch):
