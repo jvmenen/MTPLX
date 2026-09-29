@@ -11,12 +11,14 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 import time
 import weakref
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import mlx.core as mx
 import numpy as np
@@ -947,6 +949,7 @@ class SessionBank:
         self.active_pin_ttl_s = _active_session_pin_ttl_s()
         self._session_last_active: dict[str, float] = {}
         self.per_session_max_entries = _per_session_max_entries()
+        self._maintenance = threading.local()
         self.cold_tier = cold_tier
         # Optional idle-lane dispatcher for SSD cold-tier enqueues. Post-#169
         # put_entry encodes the full-KV payload at enqueue time, so calling it
@@ -966,6 +969,10 @@ class SessionBank:
         # cancels a key only when this entry is among the ones it frees, so
         # a kept sibling never loses its scheduled durable copy.
         self._persistence_pending: dict[str, "weakref.ref[SessionBankEntry]"] = {}
+        # Guards every read-then-write of that map (a job starting, a
+        # dispatch, a cancel, a job the dispatcher dropped): a leaf lock,
+        # never held while calling out.
+        self._persistence_pending_lock = threading.Lock()
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
@@ -1058,6 +1065,24 @@ class SessionBank:
         """
         for session_id in session_ids or ():
             self._touch_session(str(session_id))
+
+    @contextmanager
+    def maintenance_reads(self) -> Iterator[None]:
+        """Restores in this block (this thread only) keep the entry's recency.
+
+        The async postcommit re-renders a turn's history by restoring the
+        turn's own prompt-prefix entry. That read is bank maintenance, not a
+        client using the entry: letting it refresh last_access_s ranked the
+        superseded prompt prefix above a sibling lineage under the
+        per-session retention cap, and evicted the entry the next
+        tool-fed retry needed.
+        """
+        depth = getattr(self._maintenance, "depth", 0)
+        self._maintenance.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._maintenance.depth = depth
 
     def _touch_session(self, session_id: str | None) -> None:
         if not session_id or self.active_pin_ttl_s <= 0:
@@ -2115,7 +2140,8 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
         entry.hits += 1
-        entry.last_access_s = time.time()
+        if not getattr(self._maintenance, "depth", 0):
+            entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
         lookup_len = len(tuple(int(token) for token in token_ids))
@@ -2806,7 +2832,7 @@ class SessionBank:
         epoch = int(entry.snapshot_epoch)
         try:
             self._dispatch_persistence(
-                entry, lambda: self.run_live_ref_spill(token_ids, epoch)
+                entry, lambda: self.run_live_ref_spill(token_ids, epoch), pins=False
             )
         except BaseException as exc:
             self.eviction_log.append(
@@ -2887,6 +2913,7 @@ class SessionBank:
                     self._dispatch_persistence(
                         entry,
                         lambda: self.run_live_ref_spill(token_ids, snapshot_epoch),
+                        pins=False,
                     )
                 except Exception:
                     pass
@@ -3644,12 +3671,16 @@ class SessionBank:
         body: Callable[[], Any],
         *,
         key: str | None = None,
+        pins: bool = True,
     ) -> None:
         """File one idle-lane job for ``entry`` (raises what the dispatcher
         raises): its SSD encode, keyed by ``cold_persistence_key``, or its
         snapshot settle (``key``). The dispatcher keeps only the newest per
         key, and the pending map records which entry that newest job is
-        for: every queued job holds its entry's arrays until it runs."""
+        for: every queued job holds its entry's arrays until it runs.
+        ``pins`` is False for a job whose body holds no arrays (a live-ref
+        spill carries token ids and an epoch); the others carry the entry's
+        size as ``pinned_bytes`` for the dispatcher's pending-bytes budget."""
 
         key = cold_persistence_key(entry) if key is None else str(key)
         # A weak reference: the map must not pin what the job itself does
@@ -3657,16 +3688,52 @@ class SessionBank:
         entry_ref = weakref.ref(entry)
 
         def job() -> Any:
-            if self._persistence_pending.get(key) is entry_ref:
-                self._persistence_pending.pop(key, None)
+            self._retire_persistence_pending(key, entry_ref)
             return body()
 
         job.coalesce_key = key
+        if pins:
+            # Counted against the dispatcher's pending budget only once the
+            # bank has let the entry go: while the bank holds it, the job
+            # pins nothing extra and cancelling it only loses the SSD copy
+            # (a resident main session's persist must survive another
+            # session's commit).
+            token_ids = entry.token_ids
+            nbytes = int(entry.nbytes)
+            job.pinned_bytes = lambda: (
+                0 if self._entries.get(token_ids) is entry_ref() else nbytes
+            )
+        else:
+            job.pinned_bytes = 0
         dispatch = self.cold_enqueue_dispatch
         if dispatch is None:
             raise RuntimeError("no idle-lane dispatcher")
-        dispatch(job)
-        self._persistence_pending[key] = entry_ref
+        future = dispatch(job)
+        with self._persistence_pending_lock:
+            self._persistence_pending[key] = entry_ref
+        # A job the dispatcher drops unrun (its pending-bytes budget, or a
+        # newer job under the same key) never reaches its own retirement
+        # above: its cancelled future retires it here, only while the map
+        # still names this job's entry (the review of 4c9da1ba: 100 sessions
+        # through the budget left 99 dead rows behind).
+        add_done_callback = getattr(future, "add_done_callback", None)
+        if callable(add_done_callback):
+
+            def retire_if_cancelled(done: Any) -> None:
+                if done.cancelled():
+                    self._retire_persistence_pending(key, entry_ref)
+
+            add_done_callback(retire_if_cancelled)
+
+    def _retire_persistence_pending(
+        self, key: str, entry_ref: "weakref.ref[SessionBankEntry]"
+    ) -> None:
+        """Forget ``key``'s pending job if the map still names ``entry_ref``
+        (a newer job filed under the key keeps its row)."""
+
+        with self._persistence_pending_lock:
+            if self._persistence_pending.get(key) is entry_ref:
+                self._persistence_pending.pop(key, None)
 
     def _cancel_queued_persistence(self, released: set[int]) -> tuple[int, set[str]]:
         """Cancel the pending persistence jobs filed for released entries.
@@ -3683,11 +3750,13 @@ class SessionBank:
         cancelled = 0
         keys: set[str] = set()
         failures: list[tuple[str, str]] = []
-        for key, entry_ref in list(self._persistence_pending.items()):
+        with self._persistence_pending_lock:
+            pending = list(self._persistence_pending.items())
+        for key, entry_ref in pending:
             entry = entry_ref()
             if entry is None:
                 # Nothing holds it: the job ran or was dropped.
-                self._persistence_pending.pop(key, None)
+                self._retire_persistence_pending(key, entry_ref)
                 continue
             if id(entry) not in released:
                 continue
@@ -3712,8 +3781,7 @@ class SessionBank:
                 continue
             # Cancelled, or no longer queued under the key (it ran, or was
             # dropped): no queued job holds the entry for it any more.
-            if self._persistence_pending.get(key) is entry_ref:
-                self._persistence_pending.pop(key, None)
+            self._retire_persistence_pending(key, entry_ref)
             cancelled += count
             keys.add(key)
         if failures:
@@ -3741,9 +3809,16 @@ class SessionBank:
         """Entries out of RAM that a queued job still holds, one row each."""
 
         rows: dict[int, dict[str, Any]] = {}
-        for key, entry_ref in list(self._persistence_pending.items()):
+        with self._persistence_pending_lock:
+            pending = list(self._persistence_pending.items())
+        for key, entry_ref in pending:
             entry = entry_ref()
-            if entry is None or self._entries.get(entry.token_ids) is entry:
+            if entry is None:
+                # Nothing holds the entry any more: its job ran or was
+                # dropped, so the row is only history.
+                self._retire_persistence_pending(key, entry_ref)
+                continue
+            if self._entries.get(entry.token_ids) is entry:
                 continue
             row = rows.setdefault(id(entry), {"entry": entry, "keys": []})
             row["keys"].append(key)

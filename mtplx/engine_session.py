@@ -1022,6 +1022,14 @@ class EngineSession:
         # one bounded grace instead of one per record. See
         # `cross_session_postcommit_protection`.
         self._cross_session_protect_deadline_s: float | None = None
+        # The previous streamed turn's tail: its terminal frame went out at
+        # the last token and its generation-final commit (then the prompt
+        # prefix and the idle postcommit's scheduling) is still running on
+        # the stream worker, which holds this session's generation slot
+        # until it is done. The next request of this session waits for it
+        # before it reads the session (begin/end/wait_for_response_tail).
+        self._response_tail: Event | None = None
+        self.last_response_tail: dict[str, Any] | None = None
 
     @property
     def pending_postcommit(self) -> Any:
@@ -1343,6 +1351,40 @@ class EngineSession:
         self.last_postcommit_outcome = outcome
         record.mark_finished(outcome)
         return outcome
+
+    def begin_response_tail(self) -> Event:
+        """Mark a streamed turn whose commit runs after its terminal frame."""
+
+        tail = Event()
+        with self._postcommit_lock:
+            self._response_tail = tail
+        return tail
+
+    def end_response_tail(self, tail: Event, outcome: dict[str, Any] | None) -> None:
+        """The tail is done (commit landed, slot released): wake the waiter."""
+
+        with self._postcommit_lock:
+            if self._response_tail is tail:
+                self._response_tail = None
+            self.last_response_tail = dict(outcome or {})
+        tail.set()
+
+    def wait_for_response_tail(self, timeout_s: float) -> dict[str, Any] | None:
+        """Wait (bounded) for the previous turn's tail before this request
+        reads the session: the same state it read when the terminal frame
+        waited for the commit. None when no tail was running."""
+
+        with self._postcommit_lock:
+            tail = self._response_tail
+        if tail is None:
+            return None
+        started = time.monotonic()
+        finished = tail.wait(max(0.0, float(timeout_s)))
+        return {
+            "waited_s": round(time.monotonic() - started, 6),
+            "finished": bool(finished),
+            "tail": dict(self.last_response_tail or {}) if finished else None,
+        }
 
     def resolve_pending_postcommit_for_request(self) -> dict[str, Any]:
         """Foreground-request policy for a prior turn's pending postcommit.

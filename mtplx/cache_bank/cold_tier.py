@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 import json
 import logging
 import os
@@ -142,6 +142,12 @@ class PendingWrite:
     # Estimated bytes this write pins in memory until the writer drains it
     # (deferred payloads hold live KV arrays; encoded ones hold the buffers).
     pinned_nbytes: int = 0
+    # Incremental encode (MTPLX_SSD_INCREMENTAL_ENCODE): names referenced to
+    # blobs the store already holds ({"sha256", "nbytes"}, no bytes here),
+    # the content key of every fingerprinted name, and the memo to update.
+    reused_blobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fingerprints: dict[str, tuple] = field(default_factory=dict)
+    memo_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +433,23 @@ class SessionBankColdTier:
         self._encode_yield_enabled = _env_flag(
             "MTPLX_SSD_ENCODE_FOREGROUND_YIELD", default=True
         )
+        # Incremental encode (default on; MTPLX_SSD_INCREMENTAL_ENCODE=0 for
+        # the full encode): each agent turn re-encoded the whole session on
+        # the model-owner thread (eval + host copy of every KV block) and
+        # the writer re-hashed every blob, although only the new tail is new
+        # on disk. put_entry fingerprints every KV block on the GPU (one
+        # reduction per tensor) and references a block whose content key
+        # matches the session's last completed write instead of capturing
+        # it. The on-disk result is the same payload and the same blobs as a
+        # full encode (tests/test_cold_tier_incremental_encode.py).
+        self._incremental_encode = _env_flag(
+            "MTPLX_SSD_INCREMENTAL_ENCODE", default=True
+        )
+        # session_id -> {content key: {"sha256", "nbytes"}} of the newest
+        # completed write; written by the writer thread, read at encode.
+        self._block_memos: OrderedDict[str, dict[tuple, dict[str, Any]]] = OrderedDict()
+        self._block_memos_lock = threading.Lock()
+        self._block_memos_max = 16
         self._stop = threading.Event()
         self._base_lock = threading.RLock()
         self._disk_usage_lock = threading.Lock()
@@ -492,6 +515,11 @@ class SessionBankColdTier:
             "writer_foreground_pauses": 0,
             "writer_foreground_pause_s": 0.0,
             "writer_pause_expired_busy": 0,
+            "incremental_encode": self._incremental_encode,
+            "incremental_encodes": 0,
+            "incremental_reused_blobs": 0,
+            "incremental_reused_bytes": 0,
+            "incremental_missing_blobs": 0,
         }
         self._ensure_store()
         self._writer = threading.Thread(
@@ -568,6 +596,13 @@ class SessionBankColdTier:
         # corrupt persisted sessions that degrade on every restore. Bytes are
         # captured at snapshot time; the writer thread is pure file IO.
         should_abort = self.encode_should_abort()
+        memo_key: str | None = None
+        reuse: dict[tuple, dict[str, Any]] | None = None
+        if self._incremental_encode:
+            session_id = getattr(entry, "session_id", None)
+            memo_key = str(session_id) if session_id else None
+            # An empty memo still fingerprints, so the next turn can reuse.
+            reuse = dict(self._block_memo(memo_key))
         try:
             encoded = encode_payload(
                 cache_snapshot=getattr(entry, "cache_snapshot"),
@@ -579,6 +614,7 @@ class SessionBankColdTier:
                 block_size=self.block_size,
                 should_abort=should_abort,
                 on_unit=self._observe_encode_unit,
+                reuse=reuse,
             )
         except ColdEncodeInterrupted:
             self._release_pending(estimated_nbytes)
@@ -610,8 +646,12 @@ class SessionBankColdTier:
         metadata = self._metadata_for_entry(
             entry,
             capabilities=capabilities or (),
-            payload_nbytes=encoded.nbytes,
+            payload_nbytes=encoded.nbytes + encoded.reused_nbytes,
         )
+        if encoded.reused:
+            self._inc("incremental_encodes")
+            self._inc("incremental_reused_blobs", len(encoded.reused))
+            self._inc("incremental_reused_bytes", encoded.reused_nbytes)
         pending = PendingWrite(
             entry_id=str(metadata["entry_id"]),
             token_ids=token_ids,
@@ -619,6 +659,9 @@ class SessionBankColdTier:
             payload_spec=encoded.spec,
             tensors=encoded.tensors,
             pinned_nbytes=max(estimated_nbytes, int(encoded.nbytes)),
+            reused_blobs=encoded.reused,
+            fingerprints=encoded.fingerprints,
+            memo_key=memo_key,
         )
         try:
             self._queue.put_nowait(pending)
@@ -1656,11 +1699,16 @@ class SessionBankColdTier:
         tensor_blobs, missing_blob_bytes = self._plan_tensor_blobs(
             pending.tensors, pause_for_foreground=True
         )
+        # Incremental encode: referenced blobs carry their digest already.
+        # They are claimed with the rest below and must exist on disk then.
+        tensor_blobs.update(
+            {name: dict(blob) for name, blob in pending.reused_blobs.items()}
+        )
         payload = {
             "format_version": COLD_TIER_FORMAT_VERSION,
             "metadata": pending.metadata,
             "payload_spec": pending.payload_spec,
-            "tensor_names": sorted(pending.tensors),
+            "tensor_names": sorted(set(pending.tensors) | set(pending.reused_blobs)),
             "tensor_blobs": tensor_blobs,
         }
         payload_text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1670,13 +1718,25 @@ class SessionBankColdTier:
         # against (an orphan until its row lands) is kept, not rewritten.
         self._claim_inflight(entry_dirs=(entry_dir_rel,), digests=digests)
         try:
+            # The claim above keeps eviction and orphan cleanup away from
+            # these digests, so a blob seen here stays until the row lands.
+            # One gone already (its entries were evicted) means this write
+            # lacks bytes it needs: skip it and let the next turn encode in
+            # full.
+            if any(
+                not self._blob_path(str(blob["sha256"])).exists()
+                for blob in pending.reused_blobs.values()
+            ):
+                self._inc("incremental_missing_blobs")
+                self._drop_block_memo(pending.memo_key)
+                return False
             # Phase 0.5 (no lock): if the snapshot prices the store over the
             # cap and part of that is reclaimable garbage, reclaim it now, on
             # this thread. A walk here delays durability, never a request,
             # and it frees room before the gate below would evict live
             # entries for it.
             self._reclaim_orphans_if_over_cap(pending_bytes, inline=True)
-            return self._write_pending_admitted(
+            wrote = self._write_pending_admitted(
                 pending,
                 tensor_blobs=tensor_blobs,
                 payload_text=payload_text,
@@ -1684,6 +1744,9 @@ class SessionBankColdTier:
                 final_dir=final_dir,
                 entry_hash_prefix=entry_hash_prefix,
             )
+            if wrote and pending.fingerprints:
+                self._store_block_memo(pending, tensor_blobs)
+            return wrote
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=digests)
 
@@ -1762,6 +1825,45 @@ class SessionBankColdTier:
             self._insert_manifest(metadata)
             self._invalidate_disk_usage_cache()
             return True
+
+    def _block_memo(self, memo_key: str | None) -> dict[tuple, dict[str, Any]]:
+        if memo_key is None:
+            return {}
+        with self._block_memos_lock:
+            memo = self._block_memos.get(memo_key)
+            if memo is None:
+                return {}
+            self._block_memos.move_to_end(memo_key)
+            return memo
+
+    def _drop_block_memo(self, memo_key: str | None) -> None:
+        if memo_key is None:
+            return
+        with self._block_memos_lock:
+            self._block_memos.pop(memo_key, None)
+
+    def _store_block_memo(
+        self,
+        pending: PendingWrite,
+        tensor_blobs: dict[str, dict[str, Any]],
+    ) -> None:
+        """Newest completed write per session becomes the reuse source: its
+        content keys map to the digests the manifest row now references."""
+        if pending.memo_key is None:
+            return
+        memo = {
+            key: {
+                "sha256": str(tensor_blobs[name]["sha256"]),
+                "nbytes": int(tensor_blobs[name]["nbytes"]),
+            }
+            for name, key in pending.fingerprints.items()
+            if name in tensor_blobs
+        }
+        with self._block_memos_lock:
+            self._block_memos[pending.memo_key] = memo
+            self._block_memos.move_to_end(pending.memo_key)
+            while len(self._block_memos) > self._block_memos_max:
+                self._block_memos.popitem(last=False)
 
     def _plan_tensor_blobs(
         self,

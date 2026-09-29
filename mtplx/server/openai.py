@@ -164,9 +164,13 @@ from mtplx.mlx_process_env import (
     applied_command_buffer_mb as _applied_command_buffer_mb,
 )
 from mtplx.system_memory import (
+    CompressorEpisode as _SystemCompressorEpisode,
     ReadingWindow as _SystemReadingWindow,
     admission_floors as _system_admission_floors,
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
+    compressor_full as _system_compressor_full,
+    compressor_full_bytes as _system_compressor_full_bytes,
+    compressor_runaway as _system_compressor_runaway,
     memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
     reading_floors as _system_reading_floors,
@@ -209,6 +213,7 @@ from mtplx.server.mtp_batch import (
     MTPBatchGenerationService,
     MTPBatchJob,
 )
+from mtplx.server import request_spans
 from mtplx.server import responses as responses_api
 from mtplx.server.omlx_bridge import (
     ToolCallStreamFilter as OMLXToolCallStreamFilter,
@@ -1555,10 +1560,60 @@ def _memory_budget_bytes(args: argparse.Namespace | None = None) -> int | None:
 _ALLOWANCE_LIMIT_DIVISOR = 12
 
 
+_MEMORY_LIMIT_MAX_VALUES = {"max", "all"}
+
+
+def _resolve_memory_limit_env(total_ram_bytes: int | None = None) -> str | None:
+    """MTPLX_MEMORY_LIMIT_BYTES with ``max`` resolved to bytes.
+
+    ``max`` (``--memory-limit max``, issue #548) is everything outside
+    macOS's own reserve: a headless server has no desktop to leave room for.
+    The resolved number is written back to the environment, so every later
+    reader (the Metal caps, the planner, the guard's allowances, the n-gram
+    reader) sees the same plain byte count.
+    """
+
+    raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    if raw is None or str(raw).strip().lower() not in _MEMORY_LIMIT_MAX_VALUES:
+        return raw
+    total = total_ram_bytes if total_ram_bytes else _total_ram_bytes()
+    if not total or total <= 0:
+        # Without the machine's size "max" has no meaning; the default
+        # formula stays in charge rather than a guessed number.
+        return None
+    from mtplx.memory_plan import max_engine_bytes
+
+    resolved = str(int(max_engine_bytes(int(total))))
+    os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = resolved
+    return resolved
+
+
+def apply_memory_limit_setting(value: str | None) -> None:
+    """``--memory-limit``: a size (90G, 96GiB, bytes) or ``max``.
+
+    Mirrored into MTPLX_MEMORY_LIMIT_BYTES, the knob every consumer already
+    reads (the app writes the same variable from its Memory setting), so
+    ``mtplx serve``, ``mtplx start`` and the app resolve one limit.
+    """
+
+    if value is None or not str(value).strip():
+        return
+    text = str(value).strip()
+    if text.lower() not in _MEMORY_LIMIT_MAX_VALUES:
+        parsed = _parse_byte_limit(text)
+        if parsed is None or parsed <= 0:
+            raise ValueError(
+                f"--memory-limit {value!r}: expected a size such as 90G or 'max'"
+            )
+        text = str(int(parsed))
+    os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = text
+    _resolve_memory_limit_env()
+
+
 def _explicit_memory_limit_bytes() -> int | None:
     """MTPLX_MEMORY_LIMIT_BYTES as bytes when the operator set it, else None."""
 
-    raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    raw = _resolve_memory_limit_env()
     if not raw or not str(raw).strip():
         return None
     try:
@@ -2654,9 +2709,12 @@ def _apply_metal_memory_caps(
     and request pressure guards remain necessary. ``clear_cache`` releases
     unused allocator buffers; it does not clear the session bank.
 
-    Operators can override via env:
+    Operators can override via env (or ``--memory-limit``):
       MTPLX_MEMORY_LIMIT_BYTES   - allocation budget, default 75% of total RAM,
-                                   capped at 192 GiB on very large Macs
+                                   at most RAM - 38 GiB from 128 GB up (a
+                                   desktop's other apps; memory_plan) and
+                                   192 GiB on very large Macs; "max" is
+                                   everything outside macOS's reserve (#548)
       MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total
                                    RAM, capped at 160 GiB on very large Macs
 
@@ -2680,7 +2738,7 @@ def _apply_metal_memory_caps(
     else:
         total_ram = int(total_ram_bytes)
         total_ram_source = "explicit"
-    mem_raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    mem_raw = _resolve_memory_limit_env(total_ram)
     wired_raw = os.environ.get("MTPLX_WIRED_LIMIT_BYTES")
     if total_ram is None or total_ram <= 0:
         if not mem_raw and not wired_raw:
@@ -2690,13 +2748,13 @@ def _apply_metal_memory_caps(
     else:
         # Percentage-only caps scale badly on 512 GiB M3 Ultra systems: 75% /
         # 60% permits hundreds of GiB of allocator high-water before MLX is
-        # forced to release pressure. Keep the old behavior on 64-128 GiB Macs,
-        # but bound the default resident budget on large unified-memory boxes.
-        default_mem = min(
-            total_ram,
-            max(8 * 1024**3, int(total_ram * 0.75)),
-            192 * 1024**3,
-        )
+        # forced to release pressure. One rule with the planner
+        # (memory_plan.usable_engine_bytes): 75%, bounded on large
+        # unified-memory boxes, and leaving a desktop's apps room from
+        # 128 GB up.
+        from mtplx.memory_plan import usable_engine_bytes
+
+        default_mem = usable_engine_bytes(total_ram)
         default_wired = min(
             default_mem,
             max(4 * 1024**3, int(total_ram * 0.60)),
@@ -3222,6 +3280,7 @@ class ServerState:
         self.foreground_lock = Lock()
         self.foreground_active = 0
         self.model_scheduler = ModelWorkScheduler(name="mtplx-model")
+        _wire_owner_idle_pool_return(self, self.model_scheduler)
         # Compatibility shim for older tests/helpers that expect an executor
         # with submit()/shutdown(). New serving code uses model_scheduler
         # explicitly for foreground-vs-idle admission.
@@ -3818,6 +3877,9 @@ class ServerState:
                         job,
                         batch_key="ssd.cold_enqueue",
                         coalesce_key=getattr(job, "coalesce_key", None),
+                        # A count, or the bank's callable: what the job holds
+                        # once the bank itself no longer holds the entry.
+                        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
                     )
                 )
                 # The memory guard's idle-session release cancels a released
@@ -19837,6 +19899,28 @@ def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
 _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
 
+_COMPRESSOR_EPISODE_LOCK = threading.Lock()
+
+
+def _compressor_episode(state: Any) -> Any:
+    """The server's run-of-prefills compressor mark (``CompressorEpisode``),
+    made on first use; one per server, so the runaway line holds across
+    requests."""
+
+    episode = getattr(state, "compressor_episode", None)
+    if episode is not None:
+        return episode
+    with _COMPRESSOR_EPISODE_LOCK:
+        episode = getattr(state, "compressor_episode", None)
+        if episode is None:
+            episode = _SystemCompressorEpisode()
+            try:
+                state.compressor_episode = episode
+            except Exception:
+                pass
+        return episode
+
+
 class _PrefillSystemGuard:
     """What the Mac and the engine have left, read at the prefill's own abort site.
 
@@ -19852,13 +19936,24 @@ class _PrefillSystemGuard:
         under the abort floor;
       * free pages under the abort floor while the compressor or swap grew
         fast since any reading of the last ten seconds (``thrashing_base``);
+      * the compressor grown past an eighth of RAM since the lowest reading
+        of the current run of prefills (``compressor_runaway`` against the
+        server's ``CompressorEpisode``, so the line holds across requests);
+      * a quarter of RAM already compressed with free pages under the abort
+        floor (``compressor_full``), however slowly it got there;
       * what the engine has in use, plus host memory past its allowance,
         plus the chunk, over the engine's limit: an admission that
         under-priced the request stops here instead of past the limit.
 
-    Any of them stops the request with a 507 before the chunk. An unreadable
-    machine skips the Mac's lines, ``--allow-swap`` skips all of them, and
-    the trip belongs to this request only.
+    Before any of them stops the request, the engine gives back its own
+    reusable memory once (``_shed_reusable_memory``: the allocator pool and
+    the RAM state of every conversation that is not generating, conversations
+    already on SSD first) and reads the Mac again; only a line still crossed
+    after that stops the request with a 507 before the chunk (the E2d agent
+    replay, 2026-09-29: a request was refused while idle session snapshots
+    and the pool were still held). An unreadable machine skips the Mac's
+    lines, ``--allow-swap`` skips all of them, and the trip belongs to this
+    request only.
 
     Once the prefill's forwards are done, the check reserves only what the
     request still allocates (``after_prefill_reserve_bytes``: the repage's
@@ -19897,8 +19992,21 @@ class _PrefillSystemGuard:
         self.restore_bytes = max(0, int(restore_bytes))
         self.prefill_done_by: str | None = None
         self.window = _SystemReadingWindow()
+        # The prefill's first reading (reported), and the server's run of
+        # prefills that runaway compression is measured across.
+        self.baseline_reading: Any | None = None
+        self.episode = _compressor_episode(state)
+        # What the Mac did during this prefill, for the request's receipt
+        # (``trajectory``): the data the compression lines are calibrated on.
+        self._last_reading: Any | None = None
+        self._free_min: int | None = None
+        self._rate_5s_max: float | None = None
+        self._episode_growth_max: int | None = None
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
+        # What the engine gave back before deciding to stop this request
+        # (at most once per request), and whether the request then went on.
+        self.shed: dict[str, Any] | None = None
         self.checks = 0
         caps = getattr(state, "metal_memory_caps", None)
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
@@ -19948,6 +20056,60 @@ class _PrefillSystemGuard:
             return False
         self.last_read_s = now_s
         self.checks += 1
+        verdict = self._evaluate()
+        if verdict["reason"] is not None and self.shed is None:
+            # The engine's own reusable memory goes back before a request is
+            # refused, and the Mac is read again.
+            self.shed = self._shed_reusable_memory(verdict)
+            if self.shed.get("released_bytes") or self.shed.get("pool_bytes"):
+                verdict = self._evaluate()
+            self.shed["request_continued"] = verdict["reason"] is None
+            self.shed["reason_before"] = self.shed.pop("_reason_before", None)
+            _record_guard_event(self.state, dict(self.shed))
+            try:
+                print(
+                    "[mtplx] memory guard " + json.dumps(self.shed, default=str),
+                    flush=True,
+                )
+            except Exception:
+                pass
+        if verdict["reason"] is None:
+            return False
+        reading = verdict["reading"]
+        base = verdict["base"]
+        if verdict["reason"] == "compressor_runaway":
+            # The refusal ends the run it measured (CompressorEpisode.restart).
+            self.episode.restart(reading)
+        self.tripped = {
+            "action": "prefill_system_abort",
+            "reason": verdict["reason"],
+            "chunk_reserve_bytes": int(verdict["reserve"]),
+            "reserve_after_prefill": self.prefill_done_by is not None,
+            "prefill_done_by": self.prefill_done_by,
+            "engine_bytes": verdict["engine"],
+            "limit_bytes": int(self.limit) or None,
+            **verdict["fields"],
+            "allocator_pool_bytes": verdict["pool"],
+            "system_available_bytes": (
+                int(reading.available_bytes) if reading is not None else None
+            ),
+            "system_free_bytes": reading.free_bytes if reading is not None else None,
+            "abort_floor_bytes": verdict["abort_floor"],
+            "system_memory": reading.to_dict() if reading is not None else None,
+            "previous_system_memory": base.to_dict() if base is not None else None,
+            "interval_s": (
+                round(float(reading.monotonic_s) - float(base.monotonic_s), 3)
+                if reading is not None and base is not None
+                else None
+            ),
+            "checks": int(self.checks),
+            "shed_before_abort": dict(self.shed) if self.shed is not None else None,
+        }
+        return True
+
+    def _evaluate(self) -> dict[str, Any]:
+        """Read the engine and the Mac once and name the line crossed, if any."""
+
         reserve = self.chunk_reserve_bytes
         stats = _mlx_memory_stats_live()
         failure = _allocator_reading_failure(stats)
@@ -19987,41 +20149,161 @@ class _PrefillSystemGuard:
         base = None
         abort_floor = None
         if reading is not None:
+            if self.baseline_reading is None:
+                self.baseline_reading = reading
             self.window.add(reading)
+            episode_base = self.episode.note(reading)
+            self._note_trajectory(reading, earlier, episode_base)
             _shed_floor, abort_floor = _system_reading_floors(reading)
             if reason is None:
                 base = _system_thrashing_base(reading, earlier)
                 if base is not None:
                     reason = "death_signature"
+                elif _system_compressor_runaway(reading, episode_base):
+                    reason = "compressor_runaway"
+                    base = episode_base
+                elif _system_compressor_full(reading, earlier):
+                    reason = "compressor_full"
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
-        if reason is None:
-            return False
-        self.tripped = {
-            "action": "prefill_system_abort",
+        return {
             "reason": reason,
-            "chunk_reserve_bytes": int(reserve),
-            "reserve_after_prefill": self.prefill_done_by is not None,
-            "prefill_done_by": self.prefill_done_by,
-            "engine_bytes": engine,
-            "limit_bytes": int(self.limit) or None,
-            **fields,
-            "allocator_pool_bytes": pool,
-            "system_available_bytes": (
-                int(reading.available_bytes) if reading is not None else None
-            ),
-            "system_free_bytes": reading.free_bytes if reading is not None else None,
-            "abort_floor_bytes": abort_floor,
-            "system_memory": reading.to_dict() if reading is not None else None,
-            "previous_system_memory": base.to_dict() if base is not None else None,
-            "interval_s": (
-                round(float(reading.monotonic_s) - float(base.monotonic_s), 3)
-                if reading is not None and base is not None
-                else None
-            ),
-            "checks": int(self.checks),
+            "reserve": reserve,
+            "engine": engine,
+            "fields": fields,
+            "pool": pool,
+            "reading": reading,
+            "base": base,
+            "abort_floor": abort_floor,
         }
-        return True
+
+    def _note_trajectory(self, reading: Any, earlier: Any, episode_base: Any) -> None:
+        self._last_reading = reading
+        if reading.free_bytes is not None:
+            free = int(reading.free_bytes)
+            self._free_min = free if self._free_min is None else min(self._free_min, free)
+        if reading.compressor_bytes is None:
+            return
+        compressor = int(reading.compressor_bytes)
+        if episode_base is not None and episode_base.compressor_bytes is not None:
+            grown = compressor - int(episode_base.compressor_bytes)
+            if self._episode_growth_max is None or grown > self._episode_growth_max:
+                self._episode_growth_max = grown
+        # Net growth over at least five seconds: the newest earlier reading
+        # that far back (a single step between two readings is not a trend).
+        now_s = float(reading.monotonic_s)
+        for base in reversed(list(earlier or ())):
+            if base is None or base.compressor_bytes is None:
+                continue
+            elapsed = now_s - float(base.monotonic_s)
+            if elapsed >= 5.0:
+                rate = (compressor - int(base.compressor_bytes)) / elapsed
+                if self._rate_5s_max is None or rate > self._rate_5s_max:
+                    self._rate_5s_max = rate
+                break
+
+    def trajectory(self) -> dict[str, Any] | None:
+        """The Mac during this prefill, from the check's own readings: the
+        compressor (physical occupancy) at the first and last check, the
+        largest net growth rate over five seconds or more, the largest growth
+        since the run of prefills began, the lowest free pages, swap growth.
+        None when the Mac was never read."""
+
+        first, last = self.baseline_reading, self._last_reading
+        if first is None or last is None:
+            return None
+
+        def delta(name: str) -> int | None:
+            a, b = getattr(first, name, None), getattr(last, name, None)
+            return None if a is None or b is None else int(b) - int(a)
+
+        return {
+            "checks": int(self.checks),
+            "interval_s": round(float(last.monotonic_s) - float(first.monotonic_s), 3),
+            "compressor_start_bytes": first.compressor_bytes,
+            "compressor_end_bytes": last.compressor_bytes,
+            "compressor_growth_bytes": delta("compressor_bytes"),
+            "compressor_growth_5s_max_bytes_per_s": (
+                None if self._rate_5s_max is None else int(self._rate_5s_max)
+            ),
+            "episode_growth_max_bytes": self._episode_growth_max,
+            "free_min_bytes": self._free_min,
+            "swap_growth_bytes": delta("swap_used_bytes"),
+        }
+
+    def _shed_reusable_memory(self, verdict: Mapping[str, Any]) -> dict[str, Any]:
+        """Give back the allocator pool and the RAM state of conversations
+        that are not generating (the admission's last step,
+        ``EngineSessionManager.release_idle_sessions``: sessions already on
+        SSD first, then the rest least recently used first; never a session
+        in flight, this request's included). Never raises."""
+
+        receipt: dict[str, Any] = {
+            "action": "prefill_shed_before_abort",
+            "_reason_before": verdict.get("reason"),
+            "pool_bytes": int(verdict.get("pool") or 0),
+            "released_bytes": 0,
+            "released_sessions": [],
+        }
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+        except Exception as exc:
+            receipt["pool_error"] = repr(exc)
+        # A line with a size (the engine limit, the Mac's abort floor)
+        # releases whole conversations until that shortfall is covered;
+        # compression the Mac is losing to has no size, so every idle
+        # conversation goes.
+        reason = verdict.get("reason")
+        pool = int(verdict.get("pool") or 0)
+        reserve = int(verdict.get("reserve") or 0)
+        reading = verdict.get("reading")
+        target: int | None = None
+        if reason == "engine_limit" and verdict.get("engine") is not None:
+            target = max(0, int(verdict["engine"]) + reserve - int(self.limit))
+        elif (
+            reason == "under_abort_floor"
+            and reading is not None
+            and verdict.get("abort_floor") is not None
+        ):
+            target = max(
+                0,
+                int(verdict["abort_floor"])
+                + reserve
+                - int(reading.available_bytes)
+                - pool,
+            )
+        receipt["target_bytes"] = target
+        sessions = getattr(self.state, "sessions", None)
+        release = getattr(sessions, "release_idle_sessions", None)
+        if callable(release) and (target is None or target > 0):
+            try:
+                released = release(
+                    target,
+                    keep_session_ids=_in_flight_session_ids(self.state),
+                    reason="prefill_shed_before_abort",
+                )
+            except Exception as exc:  # noqa: BLE001
+                released = getattr(exc, "receipt", None)
+                receipt["release_error"] = repr(exc)
+                _note_guard_health(
+                    self.state, where="prefill_shed_before_abort", error=exc
+                )
+            if isinstance(released, dict):
+                receipt["released_bytes"] = int(released.get("held_bytes") or 0)
+                receipt["released_sessions"] = [
+                    row.get("session_id")
+                    for row in released.get("sessions") or []
+                    if isinstance(row, dict)
+                ]
+            try:
+                import mlx.core as _mx
+
+                _mx.clear_cache()
+            except Exception:
+                pass
+        return receipt
 
 
 def _admission_chunk_bytes(geometry: "_AdmissionGeometry", rows: int, scratch: int) -> int:
@@ -20134,6 +20416,25 @@ def _prefill_system_abort_exception(
             f"the engine held {_gib_text(tripped.get('engine_bytes'))} and its "
             f"next prefill chunk needs {_gib_text(reserve)}, past its "
             f"{_gib_text(tripped.get('limit_bytes'))} limit"
+        )
+    elif reason == "compressor_runaway":
+        current = tripped.get("system_memory") or {}
+        before = tripped.get("previous_system_memory") or {}
+        grown = int(current.get("compressor_bytes") or 0) - int(
+            before.get("compressor_bytes") or 0
+        )
+        cause = (
+            f"macOS compressed {_gib_text(grown)} more of other apps' memory "
+            f"over the last {tripped.get('interval_s')} s of prefills"
+        )
+    elif reason == "compressor_full":
+        current = tripped.get("system_memory") or {}
+        cause = (
+            f"macOS already holds {_gib_text(current.get('compressor_bytes'))} "
+            "of other apps' memory compressed (the line is "
+            f"{_gib_text(_system_compressor_full_bytes(int(current.get('total_bytes') or 0)))}) "
+            f"with free pages at {_gib_text(tripped.get('system_free_bytes'))}, "
+            f"under the {_gib_text(floor)} floor"
         )
     elif reason == "death_signature":
         current = tripped.get("system_memory") or {}
@@ -21862,8 +22163,50 @@ def _run_prefill_admission(
 
     models = price()
     chosen = widest_fit(now, models)
+    early_pool_clear: dict[str, Any] | None = None
+    early_pool_clear_error: BaseException | None = None
+    if (
+        chosen is not _ADMISSION_NO_FIT
+        and chosen != widths[0]
+        and now["cache"] > 0
+        and system_short(now, int(models[widths[0]]["growth_bytes"]), "shed") > 0
+    ):
+        # The engine's own freed buffers go back before the request gives up
+        # its chunk width: clearing the pool takes nothing from anyone and
+        # costs a few milliseconds, while a narrower chunk slows the whole
+        # prefill (E1, 2026-09-29, macOS 27: a 16K cold prompt narrowed to
+        # 2,048 rows for a 0.67 GB shortfall with 4.4 GB in the pool, 1,339
+        # against 2.12.0's 1,574 tok/s). The engine line leaves the pool out;
+        # only the Mac's line asks for it.
+        cache_before = int(now["cache"])
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+            now = measure()
+            chosen = widest_fit(now, models)
+            early_pool_clear = {
+                "cache_bytes_before": cache_before,
+                "cache_bytes_after": int(now["cache"]),
+            }
+        except _AllocatorReadingError:
+            raise
+        except Exception as exc:
+            # Reported with the reclamation steps below (cache_clear_error,
+            # the guard's health), never dropped: the review of 4c9da1ba.
+            early_pool_clear = {"error": repr(exc)}
+            early_pool_clear_error = exc
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         settle(models[chosen])
+        if early_pool_clear is not None:
+            return {
+                "action": "prefill_admission_pool_clear",
+                "prompt_tokens": int(prompt_tokens),
+                "prefill_chunk_requested": widths[0],
+                "prefill_chunk_tokens": widths[0],
+                "reclamation_steps": ["allocator_pool"],
+                **early_pool_clear,
+            }
         return None
     narrow = widths[-1]
     current = models[narrow if chosen is _ADMISSION_NO_FIT else chosen]
@@ -21903,6 +22246,11 @@ def _run_prefill_admission(
     # health reports it (_note_guard_health) until a later admission gets
     # through reclamation cleanly.
     step_errors: list[BaseException] = []
+    if early_pool_clear_error is not None:
+        receipt["cache_cleared"] = False
+        receipt["cache_clear_error"] = repr(early_pool_clear_error)
+        receipt["early_pool_clear"] = dict(early_pool_clear or {})
+        step_errors.append(early_pool_clear_error)
 
     def clear_pool() -> None:
         # Freed buffers sit in the allocator pool until it is cleared; only
@@ -22533,7 +22881,8 @@ async def _memory_pressure_loop(
     that supply is under its shed floor, and keeps the readings of the last
     ten seconds so free pages under the abort floor while the compressor or
     swap grew fast since any of them (the death signature of the crash
-    receipts) reads CRITICAL. A WARNING from that supply waits for an idle
+    receipts) reads CRITICAL, as does a quarter of RAM already compressed
+    with free pages under the abort floor (``compressor_full``). A WARNING from that supply waits for an idle
     engine like the others: the admission already priced the running request
     to stay above the abort floor, so a dip under the shed floor while it
     runs is expected, and trimming then only disturbs the request. Within a
@@ -22580,6 +22929,9 @@ async def _memory_pressure_loop(
                 system_memory, earlier_system_memory
             )
             system_thrashing = _system_memory_thrashing(
+                system_memory, earlier_system_memory
+            )
+            system_compressor_full = _system_compressor_full(
                 system_memory, earlier_system_memory
             )
             system_window.add(system_memory)
@@ -22736,6 +23088,7 @@ async def _memory_pressure_loop(
                         else None
                     ),
                     "system_thrashing": bool(system_thrashing),
+                    "system_compressor_full": bool(system_compressor_full),
                     "system_memory": (
                         system_memory.to_dict() if system_memory is not None else None
                     ),
@@ -23544,6 +23897,10 @@ def _clear_mlx_cache_after_request(
                 "trigger": reason,
                 "error": repr(exc),
             }
+        # What the return costs the request's tail (the review of 4c9da1ba:
+        # the response's elapsed_s is taken before it): the wait for the
+        # GPU's queued work and the release itself.
+        started = time.perf_counter()
         synchronize = getattr(mx, "synchronize", None)
         if callable(synchronize):
             synchronize()
@@ -23555,7 +23912,11 @@ def _clear_mlx_cache_after_request(
                 "trigger": reason,
             }
         clear_cache()
-        return {"cleared": True, "reason": reason}
+        return {
+            "cleared": True,
+            "reason": reason,
+            "elapsed_s": round(time.perf_counter() - started, 6),
+        }
     except Exception as exc:
         return {
             "cleared": False,
@@ -23568,12 +23929,50 @@ def _clear_mlx_cache_after_request(
             lock.release()
 
 
+def _return_mlx_pool_when_owner_idle(state: Any) -> dict[str, Any]:
+    """The model owner has had no work for its idle grace (a second): hand
+    the MLX buffer pool back to macOS.
+
+    The pool keeps its full bound while work runs: a prefill reuses its
+    per-layer buffers inside every chunk, and a 2 GiB bound (3863e9d8, since
+    reverted) cost 6 to 10% of the 16K and 64K prefill rate when the prompt
+    followed earlier requests in the same boot (2026-09-29, 128 GB, Flash-Next,
+    A B B A: 16K 1,533/1,550 against 1,700/1,617 tok/s, 64K 1,403/1,384
+    against 1,549/1,545). Between bursts of work nothing reuses it, so it is
+    returned here: after a request, and after the postcommits and SSD
+    encodes that follow it. MTPLX_CLEAR_CACHE_AFTER_REQUEST=off keeps it."""
+
+    pool = _mlx_allocator_public_stats().get("cache_memory_bytes")
+    if pool == 0:
+        return {"cleared": False, "reason": "pool_empty", "pool_bytes": 0}
+    receipt = _clear_mlx_cache_after_request(state, reason="owner_idle")
+    receipt["pool_bytes"] = pool
+    return receipt
+
+
+def _wire_owner_idle_pool_return(state: Any, scheduler: Any) -> None:
+    """Point the owner thread's idle turn at ``_return_mlx_pool_when_owner_idle``."""
+
+    if hasattr(scheduler, "on_owner_idle"):
+        scheduler.on_owner_idle = lambda: _return_mlx_pool_when_owner_idle(state)
+
+
 def _auto_clear_mlx_cache_after_completed_request(
     state: Any,
     *,
     session_id: str | None,
     request_observability: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    # Every completed request returns the allocator's freed buffers to macOS
+    # (default "auto"). The pool holds what decode freed, up to the MLX cache
+    # limit (8 GiB on a 128 GB Mac): 0.5 GiB at the median and 3.5 GiB at
+    # p90 of 4,104 logged requests, max 8.0 GiB, resident through the
+    # client's whole think-and-tool time for nothing. Prefill clears the pool
+    # after every chunk already, and decode-sized buffers cannot serve the
+    # next prefill's shapes, so the next request re-allocates only its first
+    # decode rounds' small buffers. clear_cache never touches a live array:
+    # outputs are bit-identical. MTPLX_CLEAR_CACHE_AFTER_REQUEST=off keeps
+    # the pool; "aime" restricts the clear to that client.
     raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
         return None
@@ -23584,9 +23983,7 @@ def _auto_clear_mlx_cache_after_completed_request(
     if raw in {"1", "true", "yes", "always"}:
         reason = "after_request_forced"
     elif raw == "auto":
-        if client != "aime" or session_id is not None:
-            return None
-        reason = "aime_stateless_question"
+        reason = "after_request"
     elif raw == "aime":
         if client != "aime":
             return None
@@ -24095,6 +24492,16 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "live_frontier_unknown_tool_result_count",
     "dynamic_paged_kv",
     "session_prompt_prefix_commit",
+    # Where the time to first token went (mtplx/server/request_spans.py) and
+    # the attempt receipt: a response a retry or repair path regenerated
+    # says so, with the wall time of what it threw away.
+    "ttft_spans",
+    "attempts",
+    "discarded_attempt_wall_s",
+    "retry_path",
+    # What this request waited for the previous turn's commit, when that
+    # turn's terminal frame went out before it.
+    "response_tail_wait",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
     "stored",
@@ -25141,6 +25548,12 @@ def _make_adaptive_policy(
     raise ValueError(f"unknown adaptive policy: {policy}")
 
 
+def _bank_maintenance_reads(state: Any) -> Any:
+    """Context in which bank restores do not count as use (postcommit)."""
+    maintenance_reads = getattr(state.sessions.bank, "maintenance_reads", None)
+    return maintenance_reads() if maintenance_reads is not None else nullcontext()
+
+
 def _store_retokenized_history_snapshot(
     state: ServerState,
     *,
@@ -25374,7 +25787,7 @@ def _store_retokenized_history_snapshot(
         try:
             if _abort_requested():
                 raise PostcommitAbort(_abort_reason())
-            with attention_phase("postcommit"):
+            with attention_phase("postcommit"), _bank_maintenance_reads(state):
                 prompt_state = restore_or_prefill_prompt_state(
                     state.runtime,
                     history_ids,
@@ -26318,6 +26731,139 @@ def _postcommit_cross_session_yield_enabled() -> bool:
         str(os.environ.get("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "1")).strip().lower()
     )
     return raw not in {"0", "false", "off", "no"}
+
+
+def _stream_terminal_frame_before_commit_enabled() -> bool:
+    """Write a stream's terminal frame and [DONE] at its last token.
+
+    The generation-final commit (history re-render and encode, bank write,
+    then the prompt-prefix commit and the idle postcommit's scheduling) runs
+    after the frame on the stream worker, which keeps the session's
+    generation slot until it is done; the next request of the same session
+    waits for it before reading the session, so it reads exactly what it read
+    when the frame waited for the commit. Other sessions never wait. The
+    client's tool call starts while the commit runs instead of after it (the
+    commit took 18 ms at the median and 160 ms at p90 in the flight logs, and
+    up to 30 s when another client's prefill held the model thread, #425).
+    Only for a session the client named (see
+    `_session_named_by_client`). Default on;
+    MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT=0 restores the wait. Adapted
+    from PR #557 (@jvmenen), without its admission barrier across sessions.
+    """
+    raw = os.environ.get("MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT", "1")
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+# The delta keys a client counts as its first token (the chat stream writes
+# each delta as json.dumps of a one-key dict after this prefix).
+_SSE_VISIBLE_DELTA_PREFIXES = (
+    '"delta": {"content": "',
+    '"delta": {"reasoning_content": "',
+    '"delta": {"reasoning": "',
+    '"delta": {"tool_calls": [',
+)
+
+
+def _sse_chunk_carries_visible_delta(chunk: str) -> bool:
+    """Whether an SSE chunk carries a non-empty content, reasoning or
+    tool-call delta (not the role chunk, a progress or heartbeat chunk, or
+    the terminal frame)."""
+
+    for prefix in _SSE_VISIBLE_DELTA_PREFIXES:
+        at = chunk.find(prefix)
+        if at >= 0:
+            return chunk[at + len(prefix) : at + len(prefix) + 1] not in {'"', "]"}
+    return False
+
+
+def _session_named_by_client(session_source: str | None) -> bool:
+    """The client named this session (a header, request metadata, or the
+    user / chat / conversation field), so its next turn resolves to the same
+    session whether or not this turn's commit has landed.
+
+    A session found by prompt inference is found through its committed
+    stream: a next turn that arrived before the commit landed would match
+    the older frontier or none at all (a second turn would start a new
+    session and prefill cold), so those turns keep the frame after the
+    commit.
+    """
+    source = str(session_source or "")
+    return source.startswith(("header.", "metadata.")) or source in {
+        "user",
+        "chat_id",
+        "conversation_id",
+    }
+
+
+# What a stream's terminal frame says when it went out before the commit: the
+# real outcome lands in the request's metrics row and in the session's
+# ``last_response_tail``, and the next turn's ``response_tail_wait``.
+_RESPONSE_TAIL_SNAPSHOT_MARKER: dict[str, Any] = {
+    "stored": None,
+    "mode": "after_response",
+    "reason": "terminal_frame_before_commit",
+}
+
+
+async def _await_session_response_tail(session: Any) -> dict[str, Any] | None:
+    """Wait until the previous streamed turn's commit landed (its response
+    tail ended) before this request reads the session. None when no tail
+    was running.
+
+    The wait has no deadline: the parent held the previous turn's terminal
+    frame until that commit landed, however long it queued behind other
+    clients' work (the commit runs as foreground model work; the review of
+    4c9da1ba: another client's long prefill can hold it past 30 s), so the
+    client could not send this request before it. A request that stopped
+    waiting and read the session would plan its prompt against the older
+    frontier. Each round is bounded by ``STREAM_COMMIT_WAIT_MAX_S`` only so
+    the receipt counts them; a disconnected client cancels the wait with
+    its request."""
+
+    wait = getattr(session, "wait_for_response_tail", None)
+    if not callable(wait):
+        return None
+    round_s = STREAM_COMMIT_WAIT_MAX_S if STREAM_COMMIT_WAIT_MAX_S > 0 else 30.0
+    waited_s = 0.0
+    rounds = 0
+    last: dict[str, Any] | None = None
+    while True:
+        outcome = await asyncio.to_thread(wait, round_s)
+        if outcome is None:
+            break
+        rounds += 1
+        waited_s += float(outcome.get("waited_s") or 0.0)
+        last = outcome
+        if outcome.get("finished"):
+            break
+    if last is None:
+        return None
+    tail = last.get("tail") if last.get("finished") else None
+    if tail is None:
+        tail = dict(getattr(session, "last_response_tail", None) or {})
+    return {
+        "waited_s": round(waited_s, 6),
+        "finished": True,
+        "rounds": rounds,
+        "tail": tail,
+    }
+
+
+def _merge_response_tail_into_metrics(
+    state: Any, response_id: str | None, fields: Mapping[str, Any]
+) -> None:
+    """Land a response tail's commit outcome in that request's own metrics
+    row (the RAM ring the dashboard reads), found by its request id. Runs on
+    the event loop, the thread that reads and updates those rows."""
+
+    rows = getattr(state, "last_metrics", None)
+    if not rows or not response_id:
+        return
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("request_id") == response_id:
+            for key, value in fields.items():
+                row[key] = _json_safe(value)
+            return
 
 
 def _idle_postcommit_foreground_grace_s() -> float:
@@ -28666,6 +29212,14 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    _ttft_clock = request_spans.clock_from_observability(request_observability_for_lane)
+    if _ttft_clock is not None:
+        if _ttft_clock.has_mark("dispatch"):
+            # A second generation for the same request: a repair or retry
+            # path threw the previous attempt away (its batch key names it).
+            _ttft_clock.discard_attempt(batch_key)
+        else:
+            _ttft_clock.mark("dispatch")
     if request_capture.capture_dir() and not bool(
         request_observability_for_lane.get("warmup")
     ):
@@ -29171,9 +29725,22 @@ def _run_generation(
     started = float((request_observability or {}).get("request_received_monotonic_s") or time.perf_counter())
     token_times: list[float] = []
     lock_wait_time_s = 0.0
+    ttft_clock = request_spans.clock_from_observability(request_observability)
+    if ttft_clock is not None:
+        ttft_clock.mark("scheduler_queue")
+        _owner = getattr(state, "model_scheduler", None)
+        _receipt = (
+            _owner.active_item_receipt()
+            if _owner is not None and hasattr(_owner, "active_item_receipt")
+            else None
+        )
+        if _receipt:
+            ttft_clock.detail("scheduler", _json_safe(_receipt))
 
     def record_tokens(new_tokens: list[int]) -> None:
         now = time.perf_counter()
+        if ttft_clock is not None and not token_times:
+            ttft_clock.mark("engine_first_token", now)
         token_times.extend([now for _token in new_tokens])
         if token_callback is not None:
             token_callback(new_tokens)
@@ -29218,6 +29785,8 @@ def _run_generation(
     for attempt in range(max_attempts):
         # Usage and TTFT describe the returned attempt, not discarded ones.
         token_times.clear()
+        if attempt and ttft_clock is not None:
+            ttft_clock.discard_attempt("blank_retry")
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
         smart_fan_lease: str | None = None
@@ -29250,6 +29819,8 @@ def _run_generation(
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
+        if ttft_clock is not None:
+            ttft_clock.mark("lock_wait")
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
@@ -29434,6 +30005,8 @@ def _run_generation(
                 _flight(state).emit_route(rec)
 
             set_route_tape_sink(_emit_route_tape)
+            if ttft_clock is not None:
+                ttft_clock.mark("admission")
             with (
                 _temporary_env(request_env),
                 prefill_chunk_size_override(prefill_chunk_tokens),
@@ -29622,6 +30195,14 @@ def _run_generation(
             completion_tokens=completion_tokens,
             elapsed_s=elapsed_s,
         )
+        if prefill_system_guard.shed is not None and request_observability is not None:
+            # The per-chunk check gave memory back and the request went on.
+            request_observability["prefill_shed_before_abort"] = dict(
+                prefill_system_guard.shed
+            )
+        _prefill_trajectory = prefill_system_guard.trajectory()
+        if _prefill_trajectory is not None and request_observability is not None:
+            request_observability["prefill_system_memory"] = _prefill_trajectory
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:
@@ -29808,6 +30389,7 @@ def _run_generation(
             # response (F8 — absent, not null-with-value).
             for key in [k for k in envelope if k.startswith("draft_sampler")]:
                 del envelope[key]
+        request_spans.publish(ttft_clock, envelope, stats=stats)
         cleanup = _auto_clear_mlx_cache_after_completed_request(
             state,
             session_id=session_id,
@@ -34117,6 +34699,10 @@ def create_app(state: ServerState) -> FastAPI:
     # preflights (which never carry credentials) are answered before the
     # key gate would 401 them.
     app.add_middleware(_OriginPolicyMiddleware, state=state)
+    # Outside every gate: the request's time-to-first-token clock starts when
+    # the request reaches the server, before the gates, the body read and the
+    # JSON parse (request_spans).
+    app.add_middleware(request_spans.RequestArrivalClock)
 
     browser_auth_tickets = _BrowserAuthTickets()
 
@@ -34372,6 +34958,9 @@ def create_app(state: ServerState) -> FastAPI:
             "dashboard_active_requests": dashboard_active,
             "active_requests": active_requests,
             "scheduler": scheduler_state,
+            # Where recent requests' time to first token went (p50/p90 per
+            # span, retried requests, discarded attempt wall).
+            "ttft_spans": request_spans.health_summary(),
             "session_bank": (
                 state.sessions.bank.to_dict()
                 if hasattr(getattr(state, "sessions", None), "bank")
@@ -35684,7 +36273,13 @@ def create_app(state: ServerState) -> FastAPI:
     async def chat_completions(
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
-        request_received_monotonic_s = time.perf_counter()
+        _handler_start_s = time.perf_counter()
+        request_received_monotonic_s = _handler_start_s
+        # The server-side TTFT starts at HTTP arrival (body read and parse
+        # included), the moment the client's clock is closest to.
+        _arrival_s = request_spans.arrival_s(raw_request)
+        if _arrival_s is not None and _arrival_s <= _handler_start_s:
+            request_received_monotonic_s = _arrival_s
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
@@ -35733,6 +36328,9 @@ def create_app(state: ServerState) -> FastAPI:
             headers=headers,
             metadata=metadata,
         )
+        ttft_clock = request_spans.open_clock(
+            response_id, arrival=_arrival_s, handler_start=_handler_start_s
+        )
         created = int(time.time())
         if _is_opencode_title_request(request):
             return _opencode_title_response(
@@ -35760,6 +36358,7 @@ def create_app(state: ServerState) -> FastAPI:
                 metadata=metadata,
                 endpoint="chat",
             )
+            ttft_clock.mark("policy")
         except BackgroundBusyBypass:
             return JSONResponse(
                 status_code=503,
@@ -35896,11 +36495,13 @@ def create_app(state: ServerState) -> FastAPI:
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
         )
+        ttft_clock.mark("encode")
         resolved_session_id: str | None = None
         resolved_session_source: str | None = None
         resolved_session_diagnostic: dict[str, Any] = {}
         early_postcommit_handled = False
         early_postcommit_wait: dict[str, Any] | None = None
+        early_response_tail_wait: dict[str, Any] | None = None
         early_cross_session_yield: dict[str, Any] | None = None
         # Image requests (2026-09-18): prompt_ids are still the TEXT ids here
         # (one placeholder pad per image), so the session resolution and the
@@ -35955,6 +36556,7 @@ def create_app(state: ServerState) -> FastAPI:
             except Exception:
                 resolved_session_id = None
                 resolved_session_source = None
+            ttft_clock.mark("session_resolve")
             # Canon-after-wait (2026-08-21): the committed-reasoning gate
             # below peeks the session's committed stream, but the pending
             # postcommit sweep + wait used to run ~690 lines later — every
@@ -35988,6 +36590,7 @@ def create_app(state: ServerState) -> FastAPI:
                         _early_sweep,
                         except_session_id=resolved_session_id,
                     )
+                ttft_clock.mark("postcommit_sweep")
                 _early_peek = getattr(
                     getattr(state, "sessions", None), "peek", None
                 )
@@ -35998,9 +36601,17 @@ def create_app(state: ServerState) -> FastAPI:
                     except Exception:
                         _pending_session = None
                 if _pending_session is not None:
+                    # The previous streamed turn's commit may still be
+                    # running after its terminal frame: read the session
+                    # only once it landed (and scheduled its postcommit).
+                    early_response_tail_wait = await _await_session_response_tail(
+                        _pending_session
+                    )
+                    ttft_clock.mark("response_tail_wait")
                     early_postcommit_wait = await asyncio.to_thread(
                         _pending_session.resolve_pending_postcommit_for_request
                     )
+                ttft_clock.mark("postcommit_wait")
             # Defect B (2.8 headline): if this conversation's session holds a
             # committed stream the raw encode diverges from inside a think
             # block, substitute the committed think bytes and re-encode so
@@ -36049,6 +36660,7 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             if _canonicalized is not None:
                 messages_for_generation, prompt_ids = _canonicalized
+            ttft_clock.mark("canonicalize")
         if vision_images:
             # Off the event loop (#487): the tower forwards for every image
             # of the prompt ran inside this coroutine, so a history whose
@@ -36792,6 +37404,8 @@ def create_app(state: ServerState) -> FastAPI:
                     except BaseException:
                         pass
             postcommit_wait_outcome = early_postcommit_wait
+            if early_response_tail_wait is not None:
+                request_observability["response_tail_wait"] = early_response_tail_wait
             if postcommit_wait_outcome is not None:
                 request_observability["postcommit_wait"] = postcommit_wait_outcome
         else:
@@ -36814,6 +37428,7 @@ def create_app(state: ServerState) -> FastAPI:
                     _cross_session_sweep,
                     except_session_id=session_id,
                 )
+                ttft_clock.mark("postcommit_sweep")
                 if cross_yield is not None:
                     request_observability["postcommit_cross_session_yield"] = (
                         cross_yield
@@ -36834,9 +37449,15 @@ def create_app(state: ServerState) -> FastAPI:
                         except BaseException:
                             pass
         if not early_postcommit_handled and session is not None:
+            if hasattr(session, "wait_for_response_tail"):
+                response_tail_wait = await _await_session_response_tail(session)
+                ttft_clock.mark("response_tail_wait")
+                if response_tail_wait is not None:
+                    request_observability["response_tail_wait"] = response_tail_wait
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request
             )
+            ttft_clock.mark("postcommit_wait")
             request_observability["postcommit_wait"] = postcommit_wait_outcome
             if (
                 postcommit_wait_outcome is not None
@@ -36858,11 +37479,13 @@ def create_app(state: ServerState) -> FastAPI:
                 except BaseException:
                     pass
 
+        ttft_clock.mark("prologue")
         if request.stream:
 
             async def event_stream():
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
+                first_delta_marked = False
                 last_token_s: float | None = None
                 # Enqueue stamp of the token item currently being drained
                 # (generation-thread perf_counter). The census subtracts it
@@ -36873,8 +37496,17 @@ def create_app(state: ServerState) -> FastAPI:
                 sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
                 def mark_sse_sent(chunk: str) -> str:
-                    nonlocal last_sse_sent_s
+                    nonlocal last_sse_sent_s, first_delta_marked
                     last_sse_sent_s = time.perf_counter()
+                    if not first_delta_marked and _sse_chunk_carries_visible_delta(
+                        chunk
+                    ):
+                        # The client's TTFT ends at its first non-empty
+                        # content, reasoning or tool-call delta, whichever
+                        # path writes it (a tool call held until its markup
+                        # is whole goes out after the engine's first token).
+                        first_delta_marked = True
+                        ttft_clock.mark("first_delta_sent")
                     if _STREAM_CENSUS_DIR is not None:
                         _stream_census_record(
                             response_id,
@@ -36902,7 +37534,8 @@ def create_app(state: ServerState) -> FastAPI:
                 }
                 yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
 
-                queue = _LoopFedStreamQueue(asyncio.get_running_loop())
+                stream_loop = asyncio.get_running_loop()
+                queue = _LoopFedStreamQueue(stream_loop)
                 cancel_event = _AttributedCancelEvent()
                 # Register this request in the dashboard's in-flight registry
                 # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
@@ -37846,6 +38479,192 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return retry_generated
 
+                def finish_released_commit(
+                    generated: dict[str, Any],
+                    postcommit: dict[str, Any],
+                    *,
+                    assistant_history_content: str,
+                    assistant_tool_calls: list[dict[str, Any]] | None,
+                ) -> None:
+                    """The generation-final commit did not store this turn: commit
+                    the prompt prefix and schedule the idle retokenized postcommit.
+
+                    Runs on the event loop before the terminal frame, or on the
+                    stream worker after it when the frame went out first.
+                    """
+                    prompt_prefix_boundary_kind = (
+                        "tool_call_prompt_prefix"
+                        if assistant_tool_calls
+                        else "postcommit_prompt_prefix"
+                    )
+                    if read_only_force_answer_contract_active or vision_splice is not None:
+                        prompt_prefix_commit_info = {
+                            "committed": False,
+                            "reason": (
+                                "vision_session_frontier_skip"
+                                if vision_splice is not None
+                                else "transient_generation_contract"
+                            ),
+                            "prefix_len": int(
+                                getattr(session, "prefix_len", 0) or 0
+                            ),
+                            "boundary_kind": prompt_prefix_boundary_kind,
+                        }
+                        prompt_prefix_len = int(
+                            prompt_prefix_commit_info["prefix_len"]
+                        )
+                    else:
+                        # The trailing tool-result continuation
+                        # hint is transient: the client never
+                        # echoes it, so a committed stream that
+                        # includes it can never be extended by
+                        # any future prompt (strict prefix rule)
+                        # - the committed frontier froze exactly
+                        # there (2026-08-21: 15,389 while the
+                        # true stream passed 76k). Commit only
+                        # the stable prefix; the hint's KV stays
+                        # live for this turn regardless.
+                        _stable_prefix = template_observability.get(
+                            "stable_prefix_len"
+                        )
+                        _prefix_commit_ids = prompt_ids
+                        if (
+                            isinstance(_stable_prefix, int)
+                            and 0 < _stable_prefix < len(prompt_ids)
+                        ):
+                            _prefix_commit_ids = prompt_ids[
+                                :_stable_prefix
+                            ]
+                        prompt_prefix_commit = session.commit_prompt_prefix(
+                            prompt_ids=_prefix_commit_ids,
+                            finish_reason=str(
+                                generated.get("finish_reason") or "stop"
+                            ),
+                            boundary_kind=prompt_prefix_boundary_kind,
+                        )
+                        prompt_prefix_commit_info = {
+                            "committed": bool(
+                                prompt_prefix_commit.committed
+                            ),
+                            "reason": prompt_prefix_commit.reason,
+                            "prefix_len": int(
+                                prompt_prefix_commit.prefix_len
+                            ),
+                            "boundary_kind": prompt_prefix_boundary_kind,
+                        }
+                        prompt_prefix_len = int(
+                            prompt_prefix_commit.prefix_len
+                        )
+                    generated["stats"][
+                        "session_prompt_prefix_commit"
+                    ] = prompt_prefix_commit_info
+                    unsafe_reason = str(
+                        postcommit.get("reason") or "unsafe_history"
+                    )
+                    postcommit_snapshot = (
+                        _skipped_idle_postcommit_snapshot(
+                            state=state,
+                            unsafe_reason=unsafe_reason,
+                            assistant_tool_calls=assistant_tool_calls,
+                            prompt_prefix_len=(prompt_prefix_len),
+                        )
+                    )
+                    if postcommit_snapshot is not None:
+                        postcommit_snapshot = (
+                            _attach_skipped_postcommit_cleanup(
+                                state,
+                                postcommit_snapshot,
+                            )
+                        )
+                    else:
+                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
+                            state,
+                            session_id=session_id,
+                            messages=raw_messages_for_postcommit,
+                            assistant_content=(
+                                assistant_history_content
+                            ),
+                            assistant_tool_calls=assistant_tool_calls,
+                            thinking_enabled=thinking_enabled,
+                            reasoning_effort=reasoning_effort,
+                            policy_fingerprint=postcommit_policy_fingerprint,
+                            unsafe_reason=unsafe_reason,
+                            tool_specs=postcommit_tool_specs,
+                            session=session,
+                            expected_session_revision=getattr(
+                                session, "revision", None
+                            ),
+                            keep_live_ref=session_keep_live_ref,
+                            tool_prompt_mode=postcommit_tool_prompt_mode,
+                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                            committed_stream_ids=[
+                                int(token) for token in prompt_ids
+                            ]
+                            + [
+                                int(token)
+                                for token in (
+                                    generated.get("tokens") or []
+                                )
+                            ],
+                        )
+                    generated["stats"][
+                        "session_postcommit_snapshot"
+                    ] = postcommit_snapshot
+
+                def hand_off_commit(
+                    kind: str,
+                    generated: dict[str, Any],
+                    postcommit: dict[str, Any] | None,
+                ) -> None:
+                    """Give the commit's outcome to the stream, or, when the
+                    terminal frame already went out, finish it here on the
+                    worker and land the outcome in this request's row."""
+
+                    if not commit_state.get("early"):
+                        if kind == "committed":
+                            queue.put(("committed", generated))
+                        else:
+                            queue.put(
+                                (
+                                    "released",
+                                    {"generated": generated, "postcommit": postcommit},
+                                )
+                            )
+                        return
+                    if kind == "released":
+                        finish_released_commit(
+                            generated,
+                            postcommit or {},
+                            assistant_history_content=str(
+                                commit_state.get("assistant_history_content") or ""
+                            ),
+                            assistant_tool_calls=commit_state.get(
+                                "assistant_tool_calls"
+                            ),
+                        )
+                    tail_stats = generated.get("stats") or {}
+                    outcome = {
+                        key: tail_stats[key]
+                        for key in (
+                            "session_postcommit_snapshot",
+                            "session_prompt_prefix_commit",
+                        )
+                        if key in tail_stats
+                    }
+                    commit_state["tail_outcome"] = outcome
+                    try:
+                        # Queued before the tail ends, so a request that
+                        # waited for the tail runs after the row is updated.
+                        stream_loop.call_soon_threadsafe(
+                            _merge_response_tail_into_metrics,
+                            state,
+                            response_id,
+                            outcome,
+                        )
+                    except RuntimeError:
+                        # The loop is closed (server shutdown).
+                        pass
+
                 def worker() -> None:
                     try:
                         _raise_if_stream_cancelled(cancel_event)
@@ -38045,15 +38864,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         generated["stats"][
                                             "session_postcommit_snapshot"
                                         ] = postcommit
-                                        queue.put(
-                                            (
-                                                "released",
-                                                {
-                                                    "generated": generated,
-                                                    "postcommit": postcommit,
-                                                },
-                                            )
-                                        )
+                                        hand_off_commit("released", generated, postcommit)
                                         return
                                     else:
                                         postcommit = _submit_foreground_model_work(
@@ -38089,14 +38900,8 @@ def create_app(state: ServerState) -> FastAPI:
                                             generated["stats"][
                                                 "session_postcommit_snapshot"
                                             ] = postcommit
-                                            queue.put(
-                                                (
-                                                    "released",
-                                                    {
-                                                        "generated": generated,
-                                                        "postcommit": postcommit,
-                                                    },
-                                                )
+                                            hand_off_commit(
+                                                "released", generated, postcommit
                                             )
                                             return
                                     generated["stats"][
@@ -38114,7 +38919,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             nbytes=int(postcommit.get("nbytes") or 0),
                                         )
-                                    queue.put(("committed", generated))
+                                    hand_off_commit("committed", generated, postcommit)
                                 else:
                                     queue.put(("released", None))
                                 return
@@ -38133,9 +38938,22 @@ def create_app(state: ServerState) -> FastAPI:
                             _safe_stdout_print(
                                 f"[mtplx] async session postcommit failed: {exc!r}"
                             )
+                        if commit_state.get("early"):
+                            commit_state["tail_outcome"] = {
+                                "error": f"{type(exc).__name__}: {exc}"
+                            }
                         queue.put(("error", exc))
                     else:
                         queue.put(("done", generated))
+                    finally:
+                        # After the generation slot was released: the next
+                        # request of this session may now read and take it.
+                        tail = commit_state.get("tail")
+                        tail_session = commit_state.get("tail_session")
+                        if tail is not None and tail_session is not None:
+                            tail_session.end_response_tail(
+                                tail, commit_state.get("tail_outcome")
+                            )
 
                 generation_future: Future = Future()
 
@@ -39471,6 +40289,27 @@ def create_app(state: ServerState) -> FastAPI:
                                 commit_state["retokenize_inline"] = (
                                     state.args.session_postcommit_mode == "inline"
                                 )
+                                early_terminal_frame = bool(
+                                    not commit_state["retokenize_inline"]
+                                    and _stream_terminal_frame_before_commit_enabled()
+                                    and _session_named_by_client(session_source)
+                                    and hasattr(session, "begin_response_tail")
+                                )
+                                if early_terminal_frame:
+                                    # The frame goes out now. The worker keeps
+                                    # the result it built and commits it; this
+                                    # stream renders its own copy, so the two
+                                    # threads never write one stats dict.
+                                    generated = {
+                                        **generated,
+                                        "stats": dict(generated.get("stats") or {}),
+                                    }
+                                    generated["stats"][
+                                        "session_postcommit_snapshot"
+                                    ] = dict(_RESPONSE_TAIL_SNAPSHOT_MARKER)
+                                    commit_state["tail_session"] = session
+                                    commit_state["tail"] = session.begin_response_tail()
+                                    commit_state["early"] = True
                                 commit_state["commit"] = True
                                 commit_event.set()
                                 # Bounded commit wait (#F34): the session
@@ -39488,7 +40327,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     deadline_s=STREAM_STALL_DEADLINE_S
                                 )
                                 commit_wait_started_s = time.perf_counter()
-                                while True:
+                                commit_kind, commit_item = "after_response", None
+                                while not early_terminal_frame:
                                     try:
                                         commit_kind, commit_item = await queue.get(
                                             0.25
@@ -39590,6 +40430,11 @@ def create_app(state: ServerState) -> FastAPI:
                                     break
                                 if commit_kind == "committed":
                                     generated = commit_item
+                                elif commit_kind == "after_response":
+                                    # The worker commits after the frame and
+                                    # lands the outcome in this request's
+                                    # metrics row.
+                                    pass
                                 elif commit_kind == "error":
                                     yield mark_sse_sent(error_chunk(commit_item))
                                     yield mark_sse_sent("data: [DONE]\n\n")
@@ -39605,124 +40450,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     )
                                     generated = release.get("generated") or generated
                                     postcommit = release.get("postcommit") or {}
-                                    prompt_prefix_boundary_kind = (
-                                        "tool_call_prompt_prefix"
-                                        if assistant_tool_calls
-                                        else "postcommit_prompt_prefix"
+                                    finish_released_commit(
+                                        generated,
+                                        postcommit,
+                                        assistant_history_content=(
+                                            assistant_history_content
+                                        ),
+                                        assistant_tool_calls=assistant_tool_calls,
                                     )
-                                    if read_only_force_answer_contract_active or vision_splice is not None:
-                                        prompt_prefix_commit_info = {
-                                            "committed": False,
-                                            "reason": (
-                                                "vision_session_frontier_skip"
-                                                if vision_splice is not None
-                                                else "transient_generation_contract"
-                                            ),
-                                            "prefix_len": int(
-                                                getattr(session, "prefix_len", 0) or 0
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit_info["prefix_len"]
-                                        )
-                                    else:
-                                        # The trailing tool-result continuation
-                                        # hint is transient: the client never
-                                        # echoes it, so a committed stream that
-                                        # includes it can never be extended by
-                                        # any future prompt (strict prefix rule)
-                                        # - the committed frontier froze exactly
-                                        # there (2026-08-21: 15,389 while the
-                                        # true stream passed 76k). Commit only
-                                        # the stable prefix; the hint's KV stays
-                                        # live for this turn regardless.
-                                        _stable_prefix = template_observability.get(
-                                            "stable_prefix_len"
-                                        )
-                                        _prefix_commit_ids = prompt_ids
-                                        if (
-                                            isinstance(_stable_prefix, int)
-                                            and 0 < _stable_prefix < len(prompt_ids)
-                                        ):
-                                            _prefix_commit_ids = prompt_ids[
-                                                :_stable_prefix
-                                            ]
-                                        prompt_prefix_commit = session.commit_prompt_prefix(
-                                            prompt_ids=_prefix_commit_ids,
-                                            finish_reason=str(
-                                                generated.get("finish_reason") or "stop"
-                                            ),
-                                            boundary_kind=prompt_prefix_boundary_kind,
-                                        )
-                                        prompt_prefix_commit_info = {
-                                            "committed": bool(
-                                                prompt_prefix_commit.committed
-                                            ),
-                                            "reason": prompt_prefix_commit.reason,
-                                            "prefix_len": int(
-                                                prompt_prefix_commit.prefix_len
-                                            ),
-                                            "boundary_kind": prompt_prefix_boundary_kind,
-                                        }
-                                        prompt_prefix_len = int(
-                                            prompt_prefix_commit.prefix_len
-                                        )
-                                    generated["stats"][
-                                        "session_prompt_prefix_commit"
-                                    ] = prompt_prefix_commit_info
-                                    unsafe_reason = str(
-                                        postcommit.get("reason") or "unsafe_history"
-                                    )
-                                    postcommit_snapshot = (
-                                        _skipped_idle_postcommit_snapshot(
-                                            state=state,
-                                            unsafe_reason=unsafe_reason,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            prompt_prefix_len=(prompt_prefix_len),
-                                        )
-                                    )
-                                    if postcommit_snapshot is not None:
-                                        postcommit_snapshot = (
-                                            _attach_skipped_postcommit_cleanup(
-                                                state,
-                                                postcommit_snapshot,
-                                            )
-                                        )
-                                    else:
-                                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
-                                            state,
-                                            session_id=session_id,
-                                            messages=raw_messages_for_postcommit,
-                                            assistant_content=(
-                                                assistant_history_content
-                                            ),
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            thinking_enabled=thinking_enabled,
-                                            reasoning_effort=reasoning_effort,
-                                            policy_fingerprint=postcommit_policy_fingerprint,
-                                            unsafe_reason=unsafe_reason,
-                                            tool_specs=postcommit_tool_specs,
-                                            session=session,
-                                            expected_session_revision=getattr(
-                                                session, "revision", None
-                                            ),
-                                            keep_live_ref=session_keep_live_ref,
-                                            tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
-                                            committed_stream_ids=[
-                                                int(token) for token in prompt_ids
-                                            ]
-                                            + [
-                                                int(token)
-                                                for token in (
-                                                    generated.get("tokens") or []
-                                                )
-                                            ],
-                                        )
-                                    generated["stats"][
-                                        "session_postcommit_snapshot"
-                                    ] = postcommit_snapshot
                                 else:
                                     yield mark_sse_sent(
                                         error_chunk(
@@ -40048,6 +40783,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
+                request_spans.refresh(ttft_clock, generated["stats"])
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -40396,6 +41132,8 @@ def create_app(state: ServerState) -> FastAPI:
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text
             finish_reason = generated.get("finish_reason", "stop")
+        # A batched lane's result was never published by _run_generation.
+        request_spans.refresh(ttft_clock, generated.setdefault("stats", {}))
         chat_choice: dict[str, Any] = {
             "index": 0,
             "message": message,
@@ -40554,10 +41292,20 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        # The same span clock as chat (request_spans): arrival, the prologue,
+        # the engine's marks, and the first text written to the stream.
+        _handler_start_s = time.perf_counter()
+        response_id = f"cmpl-{uuid.uuid4().hex}"
+        ttft_clock = request_spans.open_clock(
+            response_id,
+            arrival=request_spans.arrival_s(raw_request),
+            handler_start=_handler_start_s,
+        )
         headers = dict(raw_request.headers)
         raw_metadata = _request_extra(request, "metadata", {})
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
+        ttft_clock.mark("encode")
         if not prompt_ids:
             # An empty body used to fall through into generation machinery and
             # surface as a 500 with a Python exception string — external
@@ -40579,6 +41327,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _completions_sweep,
                 except_session_id=None,
             )
+        ttft_clock.mark("postcommit_sweep")
         policy = resolve_request_policy(
             state,
             request,
@@ -40587,6 +41336,7 @@ def create_app(state: ServerState) -> FastAPI:
             endpoint="completions",
             prompt_tokens=len(prompt_ids),
         )
+        ttft_clock.mark("policy")
         request_generation_mode = policy.request_generation_mode
         request_depth = policy.request_depth
         effective_request_depth = policy.effective_request_depth
@@ -40609,7 +41359,6 @@ def create_app(state: ServerState) -> FastAPI:
             )
         stop_sequences = _normalize_stop_sequences(request.stop)
         model = state.model_id
-        response_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
         # OpenAI semantics: logprobs=0 is a real request ("sampled token
@@ -40651,6 +41400,7 @@ def create_app(state: ServerState) -> FastAPI:
                 top_k_field="logprobs",
             )
 
+        ttft_clock.mark("prologue")
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
             # generation worker and are decoded as they arrive, mirroring the
@@ -40795,6 +41545,9 @@ def create_app(state: ServerState) -> FastAPI:
                             )
                         if not text:
                             return []
+                    # Yielded as soon as it is returned: the client's first
+                    # token (the first mark of the name wins).
+                    ttft_clock.mark("first_delta_sent")
                     return [text_chunk(text)]
 
                 try:
@@ -40983,6 +41736,8 @@ def create_app(state: ServerState) -> FastAPI:
                         for chunk in emit_text(f"\n\n{footer}", monitor=False):
                             yield chunk
                 stats["finish_reason"] = finish_reason
+                # The first text can go out after the engine published.
+                request_spans.refresh(ttft_clock, stats)
                 final_payload = {
                     "id": response_id,
                     "object": "text_completion",
@@ -41078,6 +41833,8 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.setdefault("stats", {})["stop_sequence_hit"] = True
                 generated["stats"]["stop_sequence_matched"] = matched_stop
         generated.setdefault("stats", {})["finish_reason"] = finish_reason
+        # A batched lane's result was never published by _run_generation.
+        request_spans.refresh(ttft_clock, generated["stats"])
         display_text = _display_text(
             state,
             generated,
@@ -41941,6 +42698,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE|max",
+        help=(
+            "The engine's memory limit, e.g. 90G. Default: 75%% of RAM, and "
+            "on 128 GB Macs and up at most RAM minus 38 GiB so a desktop's "
+            "other apps keep room (90 GiB on a 128 GB Mac). 'max' uses "
+            "everything outside macOS's own reserve, for a headless server "
+            "with no desktop (112 GiB on 128 GB). The memory guard's safety "
+            "floors apply either way. MTPLX_MEMORY_LIMIT_BYTES is the env "
+            "form."
+        ),
+    )
+    parser.add_argument(
         "--temperature",
         "--default-temperature",
         dest="temperature",
@@ -42470,6 +43241,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
     set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
+    try:
+        apply_memory_limit_setting(getattr(args, "memory_limit", None))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     _start_aime_parent_watchdog_from_env()
     try:
         state = ServerState(args)

@@ -3750,6 +3750,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     serve_p.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE|max",
+        help=(
+            "The engine's memory limit, e.g. 90G. Default: 75%% of RAM, and "
+            "on 128 GB Macs and up at most RAM minus 38 GiB so a desktop's "
+            "other apps keep room (90 GiB on a 128 GB Mac). 'max' uses "
+            "everything outside macOS's own reserve, for a headless server "
+            "with no desktop (issue #548). The memory guard's safety floors "
+            "apply either way."
+        ),
+    )
+    serve_p.add_argument(
         "--default-temperature",
         "--temperature",
         dest="temperature",

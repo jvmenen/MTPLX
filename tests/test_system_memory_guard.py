@@ -291,9 +291,24 @@ class TestWiredFloorsAndDeathSignature:
         reading = _machine(free_gib=3.5, file_gib=12.0, wired_gib=88.0, compressor_gib=3.7)
         assert sm.system_pressure_level(reading) == 1
 
+    # Free pages under the kernel's own free-page target (4,000 x 16 KiB =
+    # 62.5 MiB, system_memory.starved_free_bytes), where the recorded deaths
+    # sat (09-03 at 0.0 GB free, the 09-23 panic at 878 pages). With 20 GiB
+    # of file cache, 0.2 GiB free is healthy on macOS 27: the 2026-09-29
+    # agent replay ran 0.1 to 0.6 GB free with the compressor stepping 0.3 to
+    # 0.5 GB/s and swap flat (b15ddcfb), so the mechanism tests below read a
+    # starved Mac.
+    STARVED_FREE_GIB = 16 / 1024
+
     def test_death_signature_between_two_readings_is_critical(self):
-        before = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=10, at_s=100.0)
-        after = _machine(free_gib=0.2, file_gib=20, wired_gib=88, compressor_gib=11.2, at_s=102.0)
+        before = _machine(
+            free_gib=self.STARVED_FREE_GIB, file_gib=20, wired_gib=88,
+            compressor_gib=10, at_s=100.0,
+        )
+        after = _machine(
+            free_gib=self.STARVED_FREE_GIB, file_gib=20, wired_gib=88,
+            compressor_gib=11.2, at_s=102.0,
+        )
         # Plenty of file cache: the supply alone reads normal ...
         assert sm.system_pressure_level(after) == 1
         # ... but free pages under the floor while the compressor grew
@@ -329,7 +344,7 @@ class TestWiredFloorsAndDeathSignature:
         tripped_at = None
         for i in range(8):
             reading = _machine(
-                free_gib=0.2,
+                free_gib=self.STARVED_FREE_GIB,
                 file_gib=20,
                 wired_gib=88,
                 compressor_gib=10 + i * 80 / 1024,

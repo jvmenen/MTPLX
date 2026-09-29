@@ -10084,6 +10084,10 @@ def cmd_serve_public(args: Any) -> int:
         )
     if bool(getattr(args, "allow_swap", False)):
         cmd.append("--allow-swap")
+    memory_limit = getattr(args, "memory_limit", None)
+    if memory_limit is not None and str(memory_limit).strip():
+        # Issue #548: the module resolves 'max' against this Mac's RAM.
+        cmd.extend(["--memory-limit", str(memory_limit).strip()])
     mtp_adapter = getattr(args, "mtp_adapter", None)
     if mtp_adapter:
         cmd.extend(["--mtp-adapter", str(mtp_adapter)])
