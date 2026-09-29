@@ -106,14 +106,43 @@ _KERNEL_PAGE_SIZE_FALLBACK_BYTES = 16 * 1024
 # cold prefill: the compressor grew 27 GB (32.5 GB total) with 20.6 GB still
 # reading available and swap flat, the 2026-09-23 crash's pattern (57.7 GB
 # compressed at the panic). The same Mac served 64K cold prefills with the
-# compressor growing about 0.3 GB/s (E1: 0.85 GB in 2.9 s), roughly 12 GB
-# over a 42 s prefill, and the 128K run crossed an eighth of RAM (16 GiB on
-# 128 GB) about a minute in, well before the 27 GB it reached. Measured from
-# the prefill's first reading, so compression that happened before the
-# request (a model load compresses 5 to 8 GB of idle pages on macOS 27) is
-# not charged to it.
+# compressor stepping about 0.3 GB/s in bursts (E1: 0.85 GB in 2.9 s) and
+# ending each boot of cold 4K, 16K and 64K prefills at 4.5 to 7.5 GB
+# compressed (E3, 2026-09-29), and the 128K run crossed an eighth of RAM
+# (16 GiB on 128 GB) about a minute in, well before the 27 GB it reached.
+# Compression that happened before the first request (a model load
+# compresses 5 to 8 GB of idle pages on macOS 27) is not charged to it.
 _RUNAWAY_COMPRESSOR_RAM_DIVISOR = 8
 _RUNAWAY_COMPRESSOR_MIN_BYTES = 4 * GIB
+# The line holds across a burst of requests, not per prefill (the
+# 2026-09-29 review of 4c9da1ba: five requests that each compressed 10 GiB
+# in 32 s at 1 GiB free and 16 GiB of file cache reached 55 GiB compressed
+# with no check firing, because every prefill measured from its own first
+# reading). The growth is measured from the lowest compressor reading of the
+# current run of prefills (``CompressorEpisode``): a run ends when no prefill
+# has read the Mac for five minutes, so a desktop that compresses more over
+# an afternoon is never charged to one request, and compression the kernel
+# gives back lowers the mark. The healthy 2026-09-29 replays (48 agent turns,
+# cold 4K/16K/64K boots on Flash-Next) held the compressor at 4.5 to 7.9 GB
+# from first request to teardown.
+_RUNAWAY_EPISODE_QUIET_S = 300.0
+# A Mac that already holds a quarter of its RAM compressed, with free pages
+# under the abort floor, is past the point where another prefill is safe,
+# however slowly it got there (the same review: 878 free pages and 58 GB
+# compressed, swap creeping 160 MiB in 10 s, passed both checks because
+# nothing grew fast). The healthy macOS 27 readings of 2026-09-29 held 4.5
+# to 7.9 GB compressed on 128 GB; 2.12.0's 128K runaway reached 32.5 GB and
+# the 2026-09-23 panic sat at 57.7 GB. A quarter is 32 GiB on 128 GB, and
+# never under 8 GiB, so a 16 GB Mac is not refused for the few GB its
+# desktop normally keeps compressed.
+_FULL_COMPRESSOR_RAM_DIVISOR = 4
+_FULL_COMPRESSOR_MIN_BYTES = 8 * GIB
+# At free pages under the kernel's own target, swap growth counts at any
+# rate once it reaches 64 MiB within the window: the kernel is writing
+# compressed memory to disk because it has nowhere else to put it (the same
+# review's 160 MiB in 10 s at 878 free pages). None of the healthy replays
+# read free pages under the target or grew swap.
+_STARVED_SWAP_MIN_GROWTH_BYTES = 64 * MIB
 # Growth is measured from every reading of the last ten seconds (and the
 # newest one before them), not only from the previous reading: the per-chunk
 # check reads every 0.2 s, and 320 MiB/s arriving in 80 MiB steps never grew
@@ -462,8 +491,9 @@ def thrashing_base(
     The signature: free pages under the abort floor while swap grew fast
     since one of the ``previous`` readings (one reading, or several from a
     ``ReadingWindow``), or while the compressor grew fast and either the
-    supply is under the shed floor or free pages are starved. Needs the page
-    counters; anything missing reads as not thrashing.
+    supply is under the shed floor or free pages are starved; and free pages
+    under the kernel's target while swap grew 64 MiB at any rate. Needs the
+    page counters; anything missing reads as not thrashing.
     """
 
     if reading is None or previous is None:
@@ -474,13 +504,12 @@ def thrashing_base(
     free = int(reading.free_bytes)
     if free >= abort:
         return None
+    starved = free < starved_free_bytes()
     # Compression counts when the kernel has little else to reclaim or its
     # free pages are under its own target; with a large clean file cache and
     # free pages above the target it is the kernel's own choice (see
-    # starved_free_bytes). Swap always does.
-    compression_counts = (
-        int(reading.available_bytes) < shed or free < starved_free_bytes()
-    )
+    # starved_free_bytes), bounded by the runaway line. Swap always does.
+    compression_counts = int(reading.available_bytes) < shed or starved
     earlier = [previous] if isinstance(previous, SystemMemory) else list(previous)
     for base in earlier:
         if base is None or base is reading:
@@ -501,6 +530,15 @@ def thrashing_base(
             _THRASH_SWAP_BYTES_PER_S,
         ):
             return base
+        if (
+            starved
+            and elapsed > 0
+            and reading.swap_used_bytes is not None
+            and base.swap_used_bytes is not None
+            and int(reading.swap_used_bytes) - int(base.swap_used_bytes)
+            >= _STARVED_SWAP_MIN_GROWTH_BYTES
+        ):
+            return base
     return None
 
 
@@ -517,7 +555,8 @@ def compressor_runaway(
     reading: SystemMemory | None, baseline: SystemMemory | None
 ) -> bool:
     """Whether the compressor grew past the runaway line since ``baseline``
-    (the prefill's first reading). Missing counters read as no runaway."""
+    (the run of prefills' lowest reading, ``CompressorEpisode``). Missing
+    counters read as no runaway."""
 
     if reading is None or baseline is None or reading is baseline:
         return False
@@ -525,6 +564,68 @@ def compressor_runaway(
         return False
     growth = int(reading.compressor_bytes) - int(baseline.compressor_bytes)
     return growth >= compressor_runaway_bytes(reading.total_bytes)
+
+
+class CompressorEpisode:
+    """The lowest compressor reading of the current run of prefills.
+
+    Every prefill's per-chunk check adds its readings (``note``); the one
+    returned is what the runaway line measures from. A reading more than
+    ``quiet_s`` after the previous one starts a new run, so what the desktop
+    compresses between bursts of work (or while a model loads) is never
+    charged to a request, and compression the kernel gives back lowers the
+    mark. One per server; thread-safe."""
+
+    def __init__(self, quiet_s: float = _RUNAWAY_EPISODE_QUIET_S) -> None:
+        self.quiet_s = float(quiet_s)
+        self._lock = threading.Lock()
+        self._base: SystemMemory | None = None
+        self._last_s: float | None = None
+
+    def note(self, reading: SystemMemory | None) -> SystemMemory | None:
+        if reading is None or reading.compressor_bytes is None:
+            with self._lock:
+                return self._base
+        now_s = float(reading.monotonic_s)
+        with self._lock:
+            base = self._base
+            if (
+                base is None
+                or base.compressor_bytes is None
+                or self._last_s is None
+                or now_s - self._last_s > self.quiet_s
+                or int(reading.compressor_bytes) < int(base.compressor_bytes)
+            ):
+                self._base = reading
+            # Two prefills can note out of order by a few milliseconds; the
+            # run's clock only moves forward.
+            self._last_s = now_s if self._last_s is None else max(self._last_s, now_s)
+            return self._base
+
+
+def compressor_full_bytes(total_bytes: int) -> int:
+    """Compressed memory that, with free pages under the abort floor, is
+    already too much for another prefill (a quarter of RAM, at least 8 GiB)."""
+
+    return max(
+        _FULL_COMPRESSOR_MIN_BYTES,
+        int(total_bytes) // _FULL_COMPRESSOR_RAM_DIVISOR,
+    )
+
+
+def compressor_full(reading: SystemMemory | None) -> bool:
+    """Whether the Mac already holds ``compressor_full_bytes`` compressed
+    while its free pages are under the abort floor, however slowly it got
+    there. Missing counters read as not full."""
+
+    if reading is None or reading.free_bytes is None:
+        return False
+    if reading.compressor_bytes is None:
+        return False
+    _shed, abort = reading_floors(reading)
+    return int(reading.free_bytes) < abort and int(
+        reading.compressor_bytes
+    ) >= compressor_full_bytes(reading.total_bytes)
 
 
 def memory_thrashing(
@@ -571,7 +672,7 @@ def system_pressure_level(
     if reading is None:
         return 1
     shed_floor, abort_floor = reading_floors(reading)
-    if memory_thrashing(reading, previous):
+    if memory_thrashing(reading, previous) or compressor_full(reading):
         return 4
     if reading.available_bytes < abort_floor:
         return 4
@@ -610,10 +711,13 @@ def admission_shortfall_bytes(
 
 
 __all__ = [
+    "CompressorEpisode",
     "ReadingWindow",
     "SystemMemory",
     "admission_floors",
     "admission_shortfall_bytes",
+    "compressor_full",
+    "compressor_full_bytes",
     "compressor_runaway",
     "compressor_runaway_bytes",
     "memory_thrashing",

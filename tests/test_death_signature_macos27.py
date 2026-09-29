@@ -627,3 +627,237 @@ def test_starved_free_pages_that_recover_after_the_shed_let_the_request_go_on(
     assert guard.shed["reason_before"] == "death_signature"
     assert guard.shed["request_continued"] is True
     assert guard.shed["released_bytes"] >= 3 * GIB
+
+
+# ---------------------------------------------------------------------------
+# The 2026-09-29 review of 4c9da1ba: the relaxed signature must still catch a
+# dangerous Mac. Runaway compression is measured across a run of requests,
+# and a Mac already holding a quarter of its RAM compressed (or swapping at
+# free pages under the kernel's target) is stopped however slowly it got
+# there. Each of these passed every check on 4c9da1ba and 3863e9d8.
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+
+def _requests_sharing_a_server(monkeypatch, requests):
+    """Run each request's readings through its own per-chunk check, all on
+    one server (one ``CompressorEpisode``). Returns (request index, reading,
+    tripped receipt) for the first trip, or None."""
+
+    state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False)
+    current = {"reading": None}
+    monkeypatch.setattr(sm, "_reader", lambda: current["reading"])
+    monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {"ok": True, "active_memory_bytes": 80 * GIB, "cache_memory_bytes": 0},
+    )
+    monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+    for index, readings in enumerate(requests):
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+        for reading in readings:
+            current["reading"] = reading
+            if guard():
+                return index, reading, guard.tripped
+    return None
+
+
+def _compressing_request(*, start_s, start_gib, grow_gib=10, seconds=32, free=GIB,
+                         file_backed=16 * GIB, swap=int(0.1 * GB)):
+    """One request's prefill that compresses ``grow_gib`` over ``seconds``
+    at 1 GiB free and 16 GiB of file cache, swap flat (the review's shape)."""
+
+    return [
+        _reading(
+            free=free,
+            file_backed=file_backed,
+            wired=88 * GIB,
+            compressor=int((start_gib + grow_gib * i / seconds) * GIB),
+            swap=swap,
+            at_s=start_s + i,
+        )
+        for i in range(seconds + 1)
+    ]
+
+
+def test_five_requests_that_each_compress_10_gib_are_stopped_before_the_second_ends(
+    monkeypatch,
+):
+    # 5 GiB compressed at the start, each request adds 10 GiB in 32 s with a
+    # 2 s turn between them. On 4c9da1ba none of the five tripped and the
+    # Mac reached 55 GiB compressed.
+    requests = []
+    start_s = 0.0
+    for n in range(5):
+        requests.append(_compressing_request(start_s=start_s, start_gib=5 + 10 * n))
+        start_s += 34.0
+    trip = _requests_sharing_a_server(monkeypatch, requests)
+    assert trip is not None
+    index, reading, tripped = trip
+    assert index == 1
+    assert tripped["reason"] == "compressor_runaway"
+    assert reading.compressor_bytes <= 5 * GIB + 17 * GIB
+    grown = (
+        tripped["system_memory"]["compressor_bytes"]
+        - tripped["previous_system_memory"]["compressor_bytes"]
+    )
+    assert grown >= 16 * GIB
+    error = srv._prefill_system_abort_exception(SimpleNamespace(), tripped)
+    assert error.status_code == 507
+    assert "of prefills" in error.detail["message"]
+
+
+def test_the_same_requests_spread_over_the_afternoon_meet_the_full_line(monkeypatch):
+    # Requests ten minutes apart each start a new run (the desktop's own
+    # compression between them is not charged to one request), so the
+    # quarter-of-RAM line is what stops the third, at 32 GiB compressed.
+    requests = [
+        _compressing_request(start_s=600.0 * n, start_gib=5 + 10 * n) for n in range(5)
+    ]
+    trip = _requests_sharing_a_server(monkeypatch, requests)
+    assert trip is not None
+    index, reading, tripped = trip
+    assert index == 2
+    assert tripped["reason"] == "compressor_full"
+    assert 32 * GIB <= reading.compressor_bytes < 33 * GIB
+    error = srv._prefill_system_abort_exception(SimpleNamespace(), tripped)
+    assert error.status_code == 507
+    assert "already holds" in error.detail["message"]
+
+
+def test_a_run_is_charged_its_net_compression_not_every_requests_sum(monkeypatch):
+    # Each request compresses 10 GiB and the kernel gives 9 back before the
+    # next: 40 GiB compressed in all, 13 GiB net, nothing trips.
+    requests = []
+    for n in range(4):
+        requests.append(_compressing_request(start_s=40.0 * n, start_gib=5 + n))
+    assert _requests_sharing_a_server(monkeypatch, requests) is None
+
+
+def test_compression_given_back_lowers_the_mark():
+    episode = sm.CompressorEpisode()
+    first = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                     compressor=10 * GIB, swap=0, at_s=0.0)
+    lower = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                     compressor=4 * GIB, swap=0, at_s=40.0)
+    higher = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                      compressor=21 * GIB, swap=0, at_s=70.0)
+    assert episode.note(first) is first
+    assert episode.note(lower) is lower
+    assert episode.note(higher) is lower
+    assert sm.compressor_runaway(higher, lower)
+
+
+@pytest.mark.parametrize("file_backed", [1 * GIB, 30 * GIB])
+def test_878_free_pages_with_58_gb_compressed_and_swap_creeping_is_stopped(
+    monkeypatch, file_backed
+):
+    # The review's second counterexample on the real per-chunk check: both
+    # calls returned False on 4c9da1ba.
+    readings = [
+        _reading(
+            free=878 * 16384,
+            file_backed=file_backed,
+            wired=90 * GIB,
+            compressor=58 * GB,
+            swap=2 * GIB + 160 * MIB * i,
+            at_s=10.0 * i,
+        )
+        for i in range(2)
+    ]
+    trip = _requests_sharing_a_server(monkeypatch, [readings])
+    assert trip is not None
+    _index, _reading_at, tripped = trip
+    assert tripped["reason"] == "compressor_full"
+    # The pressure loop reads it as critical from one reading.
+    assert sm.system_pressure_level(readings[0]) == 4
+
+
+def test_starved_free_pages_with_swap_creeping_is_the_death_signature():
+    # Under the full line, slow swap growth at free pages under the kernel's
+    # target still trips: 160 MiB in 10 s.
+    before = _reading(
+        free=878 * 16384, file_backed=20 * GIB, wired=90 * GIB,
+        compressor=10 * GIB, swap=2 * GIB, at_s=0.0,
+    )
+    after = _reading(
+        free=878 * 16384, file_backed=20 * GIB, wired=90 * GIB,
+        compressor=10 * GIB, swap=2 * GIB + 160 * MIB, at_s=10.0,
+    )
+    assert not sm.compressor_full(after)
+    assert sm.memory_thrashing(after, before)
+    # Above the kernel's target the same creep is not (the E2d replays read
+    # 109 MiB free at their lowest, with swap flat).
+    above = [
+        _reading(
+            free=200 * MIB, file_backed=20 * GIB, wired=90 * GIB,
+            compressor=10 * GIB, swap=r.swap_used_bytes, at_s=r.monotonic_s,
+        )
+        for r in (before, after)
+    ]
+    assert not sm.memory_thrashing(above[1], above[0])
+
+
+def test_the_full_line_is_a_quarter_of_ram_and_never_under_8_gib():
+    assert sm.compressor_full_bytes(128 * GIB) == 32 * GIB
+    assert sm.compressor_full_bytes(64 * GIB) == 16 * GIB
+    assert sm.compressor_full_bytes(16 * GIB) == 8 * GIB
+    healthy = _reading(
+        free=int(0.5 * GB), file_backed=18 * GIB, wired=91 * GIB,
+        compressor=int(7.9 * GB), swap=int(0.1 * GB),
+    )
+    assert not sm.compressor_full(healthy)
+    # Free pages above the abort floor: not full, whatever is compressed.
+    roomy = _reading(
+        free=12 * GIB, file_backed=18 * GIB, wired=60 * GIB,
+        compressor=40 * GIB, swap=0,
+    )
+    assert not sm.compressor_full(roomy)
+
+
+def _e2d_rows():
+    path = Path(__file__).parent / "fixtures" / "e2d_replay_vm_rows.json"
+    data = json.loads(path.read_text())
+    total = int(data["total_bytes"])
+    out = {}
+    for arm, rows in data["arms"].items():
+        out[arm] = [
+            _reading(
+                free=int(free), file_backed=int(file_backed), wired=int(wired),
+                compressor=int(compressor), swap=int(swap), at_s=float(t), total=total,
+            )
+            for t, free, file_backed, wired, compressor, swap in rows
+        ]
+    return out
+
+
+@pytest.mark.parametrize("arm", ["A", "B"])
+def test_the_whole_e2d_replay_passes_every_mac_line_as_one_run(arm):
+    # Every vm_stat row of each arm's replay (one a second, 106 and 146
+    # rows), read as one run of prefills: no death signature, no runaway,
+    # not full.
+    episode = sm.CompressorEpisode()
+    window = sm.ReadingWindow()
+    for reading in _e2d_rows()[arm]:
+        base = episode.note(reading)
+        assert not sm.memory_thrashing(reading, window.readings()), reading
+        assert not sm.compressor_runaway(reading, base), reading
+        assert not sm.compressor_full(reading), reading
+        assert sm.system_pressure_level(reading, window.readings()) < 4
+        window.add(reading)
+
+
+def test_a_new_run_starts_after_five_quiet_minutes():
+    episode = sm.CompressorEpisode()
+    first = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                     compressor=5 * GIB, swap=0, at_s=0.0)
+    later = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                     compressor=20 * GIB, swap=0, at_s=301.0)
+    assert episode.note(first) is first
+    assert episode.note(later) is later
+    soon = _reading(free=GIB, file_backed=16 * GIB, wired=88 * GIB,
+                    compressor=30 * GIB, swap=0, at_s=400.0)
+    assert episode.note(soon) is later
+    assert not sm.compressor_runaway(soon, later)

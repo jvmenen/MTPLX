@@ -164,9 +164,12 @@ from mtplx.mlx_process_env import (
     applied_command_buffer_mb as _applied_command_buffer_mb,
 )
 from mtplx.system_memory import (
+    CompressorEpisode as _SystemCompressorEpisode,
     ReadingWindow as _SystemReadingWindow,
     admission_floors as _system_admission_floors,
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
+    compressor_full as _system_compressor_full,
+    compressor_full_bytes as _system_compressor_full_bytes,
     compressor_runaway as _system_compressor_runaway,
     memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
@@ -19916,6 +19919,28 @@ def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
 _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
 
+_COMPRESSOR_EPISODE_LOCK = threading.Lock()
+
+
+def _compressor_episode(state: Any) -> Any:
+    """The server's run-of-prefills compressor mark (``CompressorEpisode``),
+    made on first use; one per server, so the runaway line holds across
+    requests."""
+
+    episode = getattr(state, "compressor_episode", None)
+    if episode is not None:
+        return episode
+    with _COMPRESSOR_EPISODE_LOCK:
+        episode = getattr(state, "compressor_episode", None)
+        if episode is None:
+            episode = _SystemCompressorEpisode()
+            try:
+                state.compressor_episode = episode
+            except Exception:
+                pass
+        return episode
+
+
 class _PrefillSystemGuard:
     """What the Mac and the engine have left, read at the prefill's own abort site.
 
@@ -19931,6 +19956,11 @@ class _PrefillSystemGuard:
         under the abort floor;
       * free pages under the abort floor while the compressor or swap grew
         fast since any reading of the last ten seconds (``thrashing_base``);
+      * the compressor grown past an eighth of RAM since the lowest reading
+        of the current run of prefills (``compressor_runaway`` against the
+        server's ``CompressorEpisode``, so the line holds across requests);
+      * a quarter of RAM already compressed with free pages under the abort
+        floor (``compressor_full``), however slowly it got there;
       * what the engine has in use, plus host memory past its allowance,
         plus the chunk, over the engine's limit: an admission that
         under-priced the request stops here instead of past the limit.
@@ -19982,9 +20012,10 @@ class _PrefillSystemGuard:
         self.restore_bytes = max(0, int(restore_bytes))
         self.prefill_done_by: str | None = None
         self.window = _SystemReadingWindow()
-        # The prefill's first reading: runaway compression is measured from
-        # it, so what the Mac compressed before this request is not charged.
+        # The prefill's first reading (reported), and the server's run of
+        # prefills that runaway compression is measured across.
         self.baseline_reading: Any | None = None
+        self.episode = _compressor_episode(state)
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
         # What the engine gave back before deciding to stop this request
@@ -20132,14 +20163,17 @@ class _PrefillSystemGuard:
             if self.baseline_reading is None:
                 self.baseline_reading = reading
             self.window.add(reading)
+            episode_base = self.episode.note(reading)
             _shed_floor, abort_floor = _system_reading_floors(reading)
             if reason is None:
                 base = _system_thrashing_base(reading, earlier)
                 if base is not None:
                     reason = "death_signature"
-                elif _system_compressor_runaway(reading, self.baseline_reading):
+                elif _system_compressor_runaway(reading, episode_base):
                     reason = "compressor_runaway"
-                    base = self.baseline_reading
+                    base = episode_base
+                elif _system_compressor_full(reading):
+                    reason = "compressor_full"
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
         return {
@@ -20347,7 +20381,16 @@ def _prefill_system_abort_exception(
         )
         cause = (
             f"macOS compressed {_gib_text(grown)} more of other apps' memory "
-            "during this prefill"
+            f"over the last {tripped.get('interval_s')} s of prefills"
+        )
+    elif reason == "compressor_full":
+        current = tripped.get("system_memory") or {}
+        cause = (
+            f"macOS already holds {_gib_text(current.get('compressor_bytes'))} "
+            "of other apps' memory compressed (the line is "
+            f"{_gib_text(_system_compressor_full_bytes(int(current.get('total_bytes') or 0)))}) "
+            f"with free pages at {_gib_text(tripped.get('system_free_bytes'))}, "
+            f"under the {_gib_text(floor)} floor"
         )
     elif reason == "death_signature":
         current = tripped.get("system_memory") or {}
@@ -22785,7 +22828,8 @@ async def _memory_pressure_loop(
     that supply is under its shed floor, and keeps the readings of the last
     ten seconds so free pages under the abort floor while the compressor or
     swap grew fast since any of them (the death signature of the crash
-    receipts) reads CRITICAL. A WARNING from that supply waits for an idle
+    receipts) reads CRITICAL, as does a quarter of RAM already compressed
+    with free pages under the abort floor (``compressor_full``). A WARNING from that supply waits for an idle
     engine like the others: the admission already priced the running request
     to stay above the abort floor, so a dip under the shed floor while it
     runs is expected, and trimming then only disturbs the request. Within a
@@ -22988,6 +23032,9 @@ async def _memory_pressure_loop(
                         else None
                     ),
                     "system_thrashing": bool(system_thrashing),
+                    "system_compressor_full": bool(
+                        _system_compressor_full(system_memory)
+                    ),
                     "system_memory": (
                         system_memory.to_dict() if system_memory is not None else None
                     ),
