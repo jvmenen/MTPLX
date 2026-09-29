@@ -434,14 +434,16 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
 
 
 @pytest.mark.parametrize("offset", [16_384, 63_000])
-def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, offset):
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("poison", [float("nan"), 60_000.0], ids=["nan", "large"])
+def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, offset, dtype, poison):
     from mtplx.models.qwen4_exp import Attention, TextArgs
     import mlx.utils
 
     if not mx.metal.is_available():
         pytest.skip("production fused gather requires Metal")
     lane.setenv("MTPLX_QSA_GATHER", "1")
-    lane.setenv("MTPLX_QSA_M4_FUSED_KV_GATHER", "1")
+    lane.setenv("MTPLX_QSA_M4_FUSED_KV_GATHER", "1" if dtype == mx.bfloat16 else "0")
     lane.setenv("MTPLX_QWEN4_FIXED_M4_VERIFY", "1")
     previous = mx.default_device()
     mx.set_default_device(mx.gpu)
@@ -453,25 +455,35 @@ def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, o
             indexer_kv_heads=1, indexer_head_dim=128, indexer_budget=2048,
             indexer_compress_ratio=4,
         ))
-        layer.update(mlx.utils.tree_map(lambda p: p.astype(mx.bfloat16), layer.parameters()))
+        layer.update(mlx.utils.tree_map(lambda p: p.astype(dtype), layer.parameters()))
         entry = QSACache(4)
         entry.indexer_budget = 2048
-        entry.kv.keys = mx.zeros((1, 2, offset, 256), dtype=mx.bfloat16)
-        entry.kv.values = ((mx.arange(2 * offset * 256).reshape(1, 2, offset, 256) % 31) - 15).astype(mx.bfloat16)
+        entry.kv.keys = (mx.random.normal((1, 2, offset, 256)) * 0.25).astype(dtype)
+        entry.kv.values = (mx.random.normal((1, 2, offset, 256)) * 0.5).astype(dtype)
         entry.kv.offset = offset
-        entry.raw_keys = mx.zeros((1, offset, 128), dtype=mx.bfloat16)
-        entry.pooled = mx.zeros((1, offset // 4, 128), dtype=mx.bfloat16)
+        entry.raw_keys = mx.random.normal((1, offset, 128)).astype(dtype)
+        entry.pooled = mx.random.normal((1, offset // 4, 128)).astype(dtype)
         entry.pooled_len = offset // 4
         banks = [graphbank.TensorOffsetQSACache.from_qsa_cache(
             entry, reserve_tokens=1024, capacity_bucket=bucket,
-        ) for bucket in (0, 8192)]
+        ) for bucket in (0, 8192, 8192)]
         assert banks[0].capacity != banks[1].capacity
-        assert all(bank.fused_rows_gather_kv_m4 for bank in banks)
+        assert all(bank.fused_rows_gather_kv_m4 == (dtype == mx.bfloat16) for bank in banks)
+        poisoned = banks[2]
+        # Poison every row added by bucketing, in every owned array. The
+        # original step-rounded consumer width remains a separate control.
+        start = poisoned.dense_capacity
+        poisoned.kv.keys[:, :, start:] = poison
+        poisoned.kv.values[:, :, start:] = poison
+        poisoned.raw_keys[:, start:] = poison
+        poisoned.pooled[:, start // 4:] = poison
         for rows in (4, 1, 4, 1):
-            x = mx.random.normal((1, rows, 64)).astype(mx.bfloat16)
+            x = mx.random.normal((1, rows, 64)).astype(dtype)
             out = [layer(x, bank) for bank in banks]
-            _equal(_leaves(out[0]), _leaves(out[1]))
-            _equal(_state([banks[0]]), _state([banks[1]]))
+            for other in (1, 2):
+                assert bool(mx.all(mx.isfinite(out[other])).item())
+                _equal(_leaves(out[0]), _leaves(out[other]))
+                _equal(_state([banks[0]]), _state([banks[other]]))
             if rows == 4:
                 for bank in banks:
                     bank.trim(3)
