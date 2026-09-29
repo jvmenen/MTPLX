@@ -1556,10 +1556,60 @@ def _memory_budget_bytes(args: argparse.Namespace | None = None) -> int | None:
 _ALLOWANCE_LIMIT_DIVISOR = 12
 
 
+_MEMORY_LIMIT_MAX_VALUES = {"max", "all"}
+
+
+def _resolve_memory_limit_env(total_ram_bytes: int | None = None) -> str | None:
+    """MTPLX_MEMORY_LIMIT_BYTES with ``max`` resolved to bytes.
+
+    ``max`` (``--memory-limit max``, issue #548) is everything outside
+    macOS's own reserve: a headless server has no desktop to leave room for.
+    The resolved number is written back to the environment, so every later
+    reader (the Metal caps, the planner, the guard's allowances, the n-gram
+    reader) sees the same plain byte count.
+    """
+
+    raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    if raw is None or str(raw).strip().lower() not in _MEMORY_LIMIT_MAX_VALUES:
+        return raw
+    total = total_ram_bytes if total_ram_bytes else _total_ram_bytes()
+    if not total or total <= 0:
+        # Without the machine's size "max" has no meaning; the default
+        # formula stays in charge rather than a guessed number.
+        return None
+    from mtplx.memory_plan import max_engine_bytes
+
+    resolved = str(int(max_engine_bytes(int(total))))
+    os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = resolved
+    return resolved
+
+
+def apply_memory_limit_setting(value: str | None) -> None:
+    """``--memory-limit``: a size (90G, 96GiB, bytes) or ``max``.
+
+    Mirrored into MTPLX_MEMORY_LIMIT_BYTES, the knob every consumer already
+    reads (the app writes the same variable from its Memory setting), so
+    ``mtplx serve``, ``mtplx start`` and the app resolve one limit.
+    """
+
+    if value is None or not str(value).strip():
+        return
+    text = str(value).strip()
+    if text.lower() not in _MEMORY_LIMIT_MAX_VALUES:
+        parsed = _parse_byte_limit(text)
+        if parsed is None or parsed <= 0:
+            raise ValueError(
+                f"--memory-limit {value!r}: expected a size such as 90G or 'max'"
+            )
+        text = str(int(parsed))
+    os.environ["MTPLX_MEMORY_LIMIT_BYTES"] = text
+    _resolve_memory_limit_env()
+
+
 def _explicit_memory_limit_bytes() -> int | None:
     """MTPLX_MEMORY_LIMIT_BYTES as bytes when the operator set it, else None."""
 
-    raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    raw = _resolve_memory_limit_env()
     if not raw or not str(raw).strip():
         return None
     try:
@@ -2655,9 +2705,12 @@ def _apply_metal_memory_caps(
     and request pressure guards remain necessary. ``clear_cache`` releases
     unused allocator buffers; it does not clear the session bank.
 
-    Operators can override via env:
+    Operators can override via env (or ``--memory-limit``):
       MTPLX_MEMORY_LIMIT_BYTES   - allocation budget, default 75% of total RAM,
-                                   capped at 192 GiB on very large Macs
+                                   at most RAM - 38 GiB from 128 GB up (a
+                                   desktop's other apps; memory_plan) and
+                                   192 GiB on very large Macs; "max" is
+                                   everything outside macOS's reserve (#548)
       MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total
                                    RAM, capped at 160 GiB on very large Macs
 
@@ -2681,7 +2734,7 @@ def _apply_metal_memory_caps(
     else:
         total_ram = int(total_ram_bytes)
         total_ram_source = "explicit"
-    mem_raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    mem_raw = _resolve_memory_limit_env(total_ram)
     wired_raw = os.environ.get("MTPLX_WIRED_LIMIT_BYTES")
     if total_ram is None or total_ram <= 0:
         if not mem_raw and not wired_raw:
@@ -2691,13 +2744,13 @@ def _apply_metal_memory_caps(
     else:
         # Percentage-only caps scale badly on 512 GiB M3 Ultra systems: 75% /
         # 60% permits hundreds of GiB of allocator high-water before MLX is
-        # forced to release pressure. Keep the old behavior on 64-128 GiB Macs,
-        # but bound the default resident budget on large unified-memory boxes.
-        default_mem = min(
-            total_ram,
-            max(8 * 1024**3, int(total_ram * 0.75)),
-            192 * 1024**3,
-        )
+        # forced to release pressure. One rule with the planner
+        # (memory_plan.usable_engine_bytes): 75%, bounded on large
+        # unified-memory boxes, and leaving a desktop's apps room from
+        # 128 GB up.
+        from mtplx.memory_plan import usable_engine_bytes
+
+        default_mem = usable_engine_bytes(total_ram)
         default_wired = min(
             default_mem,
             max(4 * 1024**3, int(total_ram * 0.60)),
@@ -42008,6 +42061,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE|max",
+        help=(
+            "The engine's memory limit, e.g. 90G. Default: 75%% of RAM, and "
+            "on 128 GB Macs and up at most RAM minus 38 GiB so a desktop's "
+            "other apps keep room (90 GiB on a 128 GB Mac). 'max' uses "
+            "everything outside macOS's own reserve, for a headless server "
+            "with no desktop (112 GiB on 128 GB). The memory guard's safety "
+            "floors apply either way. MTPLX_MEMORY_LIMIT_BYTES is the env "
+            "form."
+        ),
+    )
+    parser.add_argument(
         "--temperature",
         "--default-temperature",
         dest="temperature",
@@ -42537,6 +42604,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
     set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
+    try:
+        apply_memory_limit_setting(getattr(args, "memory_limit", None))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     _start_aime_parent_watchdog_from_env()
     try:
         state = ServerState(args)

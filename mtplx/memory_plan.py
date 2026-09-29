@@ -37,14 +37,26 @@ from typing import Any
 
 GIB = 1024**3
 
-# Mirrors the server's Metal memory-limit default (_configure_metal_memory_caps):
-# min(ram, max(8 GiB, 75% of ram), 192 GiB). Everything the engine allocates
+# The server's Metal memory-limit default (_apply_metal_memory_caps reads
+# usable_engine_bytes): min(ram, max(8 GiB, 75% of ram), 192 GiB), and from
+# 128 GB up at most ram - 38 GiB. Everything the engine allocates
 # through MLX (weights, KV, bank snapshots, transients) lives under that
 # allocator bound, so it is the honest "usable" envelope; macOS, other apps,
 # and the Python side of the process live in the remaining 25%.
 ENGINE_RAM_FRACTION = 0.75
 ENGINE_RAM_FLOOR_BYTES = 8 * GIB
 ENGINE_RAM_CAP_BYTES = 192 * GIB
+# A desktop keeps other apps open beside the engine. On a 128 GB Mac with
+# 16 GB of other apps, the 75% rule (a 96 GiB limit) left too little outside
+# the engine for a compaction-size prefill: the guard kept the Mac alive by
+# refusing it with a 507, while at 90 GiB the same request was served with the
+# Mac safe (09-27 final-guard receipts, founder decision G5 on 09-29). From
+# 128 GB up the default therefore leaves at least this much outside the
+# allocator; at 192 GB and up the 75% rule already leaves more, and Macs under
+# 128 GB keep the 75% rule until a desktop receipt says otherwise. A headless
+# server chooses ``--memory-limit max`` instead (issue #548).
+DESKTOP_HEADROOM_BYTES = 38 * GIB
+DESKTOP_HEADROOM_MIN_RAM_BYTES = 128 * GIB
 
 # Decode/prefill working memory that is neither weights, KV, nor bank:
 # graphbank compiled buffers, logits_keep tail, draft-head activations,
@@ -279,13 +291,27 @@ def detect_total_ram_bytes() -> int | None:
 
 
 def usable_engine_bytes(total_ram_bytes: int) -> int:
-    """The engine's allocator envelope for a machine of this size."""
+    """The engine's default allocator envelope for a machine of this size."""
     total = int(total_ram_bytes)
-    return min(
+    usable = min(
         total,
         max(ENGINE_RAM_FLOOR_BYTES, int(total * ENGINE_RAM_FRACTION)),
         ENGINE_RAM_CAP_BYTES,
     )
+    if total >= DESKTOP_HEADROOM_MIN_RAM_BYTES:
+        usable = min(usable, total - DESKTOP_HEADROOM_BYTES)
+    return usable
+
+
+def max_engine_bytes(total_ram_bytes: int) -> int:
+    """``--memory-limit max``: everything outside macOS's own reserve.
+
+    For a headless server with no desktop to leave room for (issue #548).
+    The guard's whole-Mac floors still apply; only the engine's own budget
+    grows.
+    """
+    total = int(total_ram_bytes)
+    return max(usable_engine_bytes(total), total - system_reserve_bytes(total))
 
 
 def system_reserve_bytes(total_ram_bytes: int) -> int:
