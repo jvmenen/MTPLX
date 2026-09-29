@@ -3692,7 +3692,7 @@ class QSAIndexer(nn.Module):
             # compiled graph keeps one shape; ``causal`` below hides every
             # column past the live frontier, so the math matches the stock
             # mask over the visible set.
-            mask_width = int(cache.raw_keys.shape[1])
+            mask_width = int(pooled.shape[1]) * self.ratio
         else:
             if nb_total * self.ratio < total:
                 pad = mx.zeros((S, total - nb_total * self.ratio), dtype=mx.bool_)
@@ -4289,6 +4289,7 @@ class QSAIndexer(nn.Module):
         """Shared arithmetic behind the explicit prefill/decode entry points."""
 
         B, S, _ = hidden.shape
+        cache.indexer_budget = self.block_topk * self.ratio
         if decode != (S == 1):
             raise ValueError(
                 f"QSA decode route requires S=1 and prefill requires S>1; got S={S}"
@@ -4345,7 +4346,7 @@ class QSAIndexer(nn.Module):
                 q = self._prepare_queries_plain(q, rope_start)
             cache.write_raw(k)
             cache._last_write_rows = int(S)
-            pooled = self._extend_pooled(cache, T)
+            pooled = cache.selector_pooled(self._extend_pooled(cache, T), S)
             return self._select_eager(q, pos_start, cache, pooled, T)
         q = self._prepare_queries(q, pos_start)
 
@@ -4819,6 +4820,7 @@ class Attention(nn.Module):
             # replay, so they never build a backlog; see the helper.
             k = _after_index_block_writes(k, cache)
         k, v = cache.kv.update_and_fetch(k, v)
+        k, v = cache.attention_kv(k, v, S) if fixed else (k, v)
         if _QSA_HISTORY_ONLY.get():
             # Draft-head history append: the cache holds this chunk now, and
             # the caller evaluates the cache arrays instead of an output.

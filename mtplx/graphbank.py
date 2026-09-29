@@ -15,7 +15,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 
@@ -791,6 +791,9 @@ class TensorOffsetQSACache:
         rows_gather_min_context: int = 0,
         fused_rows_gather_kv_m4: bool = False,
         rope_delta: mx.array | int | None = None,
+        capacity_bucket: int = 0,
+        dense_capacity: int | None = None,
+        indexer_budget: int = 0,
     ) -> None:
         self.kv = kv
         self.raw_keys = raw_keys
@@ -803,6 +806,15 @@ class TensorOffsetQSACache:
         self.rows_gather_min_context = max(0, int(rows_gather_min_context))
         self.fused_rows_gather_kv_m4 = bool(fused_rows_gather_kv_m4)
         self.rope_delta = rope_delta
+        # Rows the capacity rounds up to while the bank is on the rows-gather
+        # lane (_bank_capacity); 0 for every bank but the strict fixed-M4 one.
+        self.capacity_bucket = max(0, int(capacity_bucket))
+        # The unbucketed parent's grant. Dense SDPA dispatch and rounding
+        # depend on this width, even when its extra columns are masked out.
+        self.dense_capacity = (
+            self.capacity if dense_capacity is None else int(dense_capacity)
+        )
+        self.indexer_budget = int(indexer_budget)
 
     @property
     def rope_delta(self) -> mx.array | None:
@@ -829,7 +841,7 @@ class TensorOffsetQSACache:
 
     @staticmethod
     def _bank_capacity(
-        needed: int, ratio: int, kv_step: int, *, rows_gather: bool
+        needed: int, ratio: int, kv_step: int, *, rows_gather: bool, bucket: int = 0
     ) -> int:
         """Rows of a fixed bank that holds ``needed`` tokens.
 
@@ -855,11 +867,31 @@ class TensorOffsetQSACache:
         already depends on the padded length (capacity 28 and capacity 64
         differ from the stock cache by 2e-8 on the tiny test geometry), so
         its capacity is left exactly as it was.
+
+        ``bucket`` (the strict fixed-M4 bank's, _fixed_m4_capacity_bucket)
+        rounds a rows-gather capacity further up to a multiple of that many
+        rows, itself rounded up to the step, so a growing session keeps one
+        compiled verify trace across turns. The dense lane ignores it, for a
+        reason beyond the last bit above: MLX 0.32.2 picks the vector SDPA
+        kernel (one pass or two) and its number of key blocks from the key
+        length, which here is the capacity
+        (mlx/backend/metal/scaled_dot_product_attention.cpp 487-517, 875-877),
+        and the block a key reduces in is its index modulo that count.
+        Receipt 2026-09-27, one Flash-Next attention layer on synthetic
+        weights with MLX_METAL_GPU_ARCH choosing the dispatch class: capacity
+        3,524 against 8,192 differed in 53 to 55% of the bfloat16 outputs of
+        each verify step under the base/Pro class, 9,024 against 16,384 in 58
+        to 59% under the Ultra class, while the rows-gather lane was bit-equal
+        in every cell. The compiled-verify form of the rows-gather invariant is
+        tests/test_qwen4_fixed_m4_capacity_bucket.py.
         """
 
         quantum = max(1, int(ratio))
         if rows_gather:
             quantum = math.lcm(quantum, max(1, int(kv_step)))
+            bucket = int(bucket)
+            if bucket > 0:
+                quantum *= (bucket + quantum - 1) // quantum
         return ((max(1, int(needed)) + quantum - 1) // quantum) * quantum
 
     @staticmethod
@@ -879,8 +911,18 @@ class TensorOffsetQSACache:
 
     @classmethod
     def from_qsa_cache(
-        cls, entry: Any, *, reserve_tokens: int
+        cls, entry: Any, *, reserve_tokens: int, capacity_bucket: int = 0,
+        capacity_plan: FixedM4CapacityPlan | None = None,
     ) -> "TensorOffsetQSACache":
+        if capacity_plan is not None:
+            reserve_tokens = capacity_plan.reserve_tokens
+            capacity_bucket = capacity_plan.bucket
+        indexer_budget = (
+            capacity_plan.indexer_budget if capacity_plan is not None
+            else getattr(entry, "indexer_budget", None)
+        )
+        if indexer_budget is None:
+            capacity_bucket = 0
         reserve_tokens = max(1, int(reserve_tokens))
         offset = int(entry.offset)
         ratio = max(1, int(entry.ratio))
@@ -892,26 +934,45 @@ class TensorOffsetQSACache:
         from .models.qwen4_exp import (
             _qsa_gather_enabled,
             _qsa_gather_min_context,
+            _qsa_score_tile_rows,
         )
 
         rows_gather_enabled = _qsa_gather_enabled()
         rows_gather_min_context = _qsa_gather_min_context()
         rows_gather = rows_gather_enabled and offset >= rows_gather_min_context
+        # With fewer than block_topk visible blocks, capacity can change both
+        # k_eff and the placement of valid blocks among padded top-k slots.
+        # Keep the parent's bank for such an early-gather request.
+        if indexer_budget is not None and rows_gather and offset < indexer_budget:
+            capacity_bucket = 0
+        # A tiled-selector override makes M4 itself a dense consumer. Keep
+        # its original allocation and graph signature for the whole request.
+        if _qsa_score_tile_rows() > 0:
+            capacity_bucket = 0
 
         logical_capacity = offset + reserve_tokens
+        dense_capacity = cls._bank_capacity(
+            logical_capacity, ratio, getattr(entry.kv, "step", 256),
+            rows_gather=rows_gather,
+        )
         raw_capacity = cls._bank_capacity(
             logical_capacity,
             ratio,
             getattr(entry.kv, "step", 256),
             rows_gather=rows_gather,
+            bucket=capacity_bucket,
         )
         pooled_capacity = raw_capacity // ratio
 
-        kv = TensorOffsetKVCache.from_kv_cache(
-            entry.kv, reserve_tokens=reserve_tokens
+        # Allocate the admitted width directly. Growing on the KV step and
+        # then padding again to the bucket can keep both copies live.
+        kv = TensorOffsetKVCache(
+            cls._fixed_bank(entry.kv.keys, raw_capacity, 2),
+            cls._fixed_bank(entry.kv.values, raw_capacity, 2),
+            offset,
+            step=getattr(entry.kv, "step", 256),
         )
-        kv.keys = cls._fixed_bank(kv.keys, raw_capacity, 2)
-        kv.values = cls._fixed_bank(kv.values, raw_capacity, 2)
+        kv._granted = True
         raw = cls._fixed_bank(entry.raw_keys, raw_capacity, 1)
         pooled = cls._fixed_bank(entry.pooled, pooled_capacity, 1)
         rows_gather_kv_m4 = entry.rows_gather_kv_m4
@@ -955,15 +1016,42 @@ class TensorOffsetQSACache:
             rows_gather_enabled=rows_gather_enabled,
             rows_gather_min_context=rows_gather_min_context,
             fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
+            capacity_bucket=capacity_bucket,
+            dense_capacity=dense_capacity,
+            indexer_budget=int(indexer_budget or 0),
         )
 
     @property
     def capacity(self) -> int:
         return int(self.raw_keys.shape[1])
 
+    def attention_capacity(self, rows: int) -> int:
+        """Read the parent's width on every dense consumer, including S=1."""
+
+        from .models.qwen4_exp import _qsa_score_tile_rows
+
+        tile = _qsa_score_tile_rows()
+        if rows == 1 or not self.fixed_rows_gather or 0 < tile < rows:
+            return self.dense_capacity
+        return self.capacity
+
+    def selector_pooled(self, pooled: mx.array, rows: int) -> mx.array:
+        blocks = self.attention_capacity(rows) // self.ratio
+        return pooled if blocks == pooled.shape[1] else pooled[:, :blocks]
+
+    def attention_kv(self, keys: mx.array, values: mx.array, rows: int):
+        capacity = self.attention_capacity(rows)
+        if capacity == keys.shape[2]:
+            return keys, values
+        return keys[:, :, :capacity], values[:, :, :capacity]
+
     def ensure_capacity(self, needed: int) -> bool:
         """Grow this installed QSA generation without changing its offset."""
 
+        if int(needed) > self.dense_capacity:
+            self.dense_capacity = self._bank_capacity(
+                needed, self.ratio, self.kv.step, rows_gather=self.fixed_rows_gather
+            )
         if int(needed) <= self.capacity:
             return False
         raw_capacity = self._bank_capacity(
@@ -971,6 +1059,7 @@ class TensorOffsetQSACache:
             self.ratio,
             getattr(self.kv, "step", 256),
             rows_gather=self.fixed_rows_gather,
+            bucket=self.capacity_bucket,
         )
         pooled_capacity = raw_capacity // self.ratio
         self.kv.keys = self._fixed_bank(self.kv.keys, raw_capacity, 2)
@@ -1067,10 +1156,22 @@ class TensorOffsetQSACache:
 
         offset = self.kv.size()
         entry = QSACache(self.ratio)
+        entry.indexer_budget = self.indexer_budget
         entry.kv = self.kv.demote()
-        entry.raw_keys = self.raw_keys
-        entry.pooled = self.pooled
+        entry.kv.keys, entry.kv.values = self.attention_kv(entry.kv.keys, entry.kv.values, 1)
+        entry.raw_keys = self._fixed_bank(self.raw_keys, self.dense_capacity, 1)
+        entry.pooled = self.selector_pooled(self.pooled, 1)
         entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
+        if self.capacity > self.dense_capacity:
+            # Prefix views retain the entire bucket, while SessionBank
+            # charges the logical state. Publish owned logical arrays and
+            # finish their copies here so lazy snapshots retain no bucket.
+            state = tuple(
+                mx.asarray(leaf, copy=True) if leaf is not None else None
+                for leaf in entry.state
+            )
+            mx.eval(*state)
+            entry.state = state
         return entry
 
 
@@ -1105,6 +1206,8 @@ def promote_kv_cache_offsets(
     reserve_tokens: int,
     preserve_paged: bool | None = None,
     initial_reserve_tokens: int | None = None,
+    qsa_capacity_bucket: int = 0,
+    qsa_capacity_plan: FixedM4CapacityPlan | None = None,
 ) -> tuple[int, dict[str, int]]:
     """Replace stock full-attention KV caches with tensor-offset adapters.
 
@@ -1117,6 +1220,10 @@ def promote_kv_cache_offsets(
     lost.  The default (``None``) preserves the historical behavior of the
     ``MTPLX_GRAPHBANK_PRESERVE_PAGED_KV`` env switch; callers that must never
     densify paged KV (e.g. ``CompiledVerifyBank``) pass ``True`` explicitly.
+
+    ``qsa_capacity_bucket`` is the strict fixed-M4 bank's capacity bucket for
+    the QSA banks it promotes (``TensorOffsetQSACache._bank_capacity``); every
+    other caller leaves it 0.
     """
     promoted = 0
     failures: dict[str, int] = {}
@@ -1145,6 +1252,8 @@ def promote_kv_cache_offsets(
                         if initial_reserve_tokens is not None
                         else reserve_tokens
                     ),
+                    capacity_bucket=qsa_capacity_bucket,
+                    capacity_plan=qsa_capacity_plan,
                 )
             except (TypeError, ValueError):
                 failures["auxiliary_qsa_state"] = (
@@ -1816,6 +1925,84 @@ def _fixed_m4_initial_growth_reserve() -> int:
     return 1024
 
 
+#: Rows a strict fixed-M4 rows-gather bank's capacity is rounded up to
+#: (MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET); see _fixed_m4_capacity_bucket.
+_FIXED_M4_CAPACITY_BUCKET = 8192
+
+
+def _fixed_m4_capacity_bucket() -> int:
+    """Rows a strict fixed-M4 bank on the rows-gather lane is rounded up to.
+
+    The compiled verify step keeps one trace per input-shape signature for as
+    long as it lives, and the bank capacity is part of that signature. Sized
+    prompt + reserve on the 256-row step, every turn of a growing agent
+    session arrived with a capacity the process had not traced and paid a
+    fresh trace (and a fresh fused K/V gather kernel). Rounded up to a bucket
+    edge, consecutive turns replay one trace until the session crosses the
+    edge. The price is the extra rows per QSA layer up to the edge, which the
+    lane's memory gate prices (generation._qwen4_fixed_m4_lane_fits).
+
+    Rows-gather only; see ``TensorOffsetQSACache._bank_capacity`` for why the
+    dense lane keeps its exact capacity. 0 turns the bucket off (the 256-row
+    step alone); a value that is not a multiple of the step is rounded up to
+    one. 8,192 rows by default, at most 7,936 rows over the 256-row step
+    (215 MiB at the Flash-Next geometry's 28,416 bytes a row). Replaying the
+    capacities of 1,202 logged requests through the rule (2026-09-27) left
+    0.03 capacities per request the process had not seen between 16K and
+    64K, where the 256-row step left 0.61, and 0.11 above 64K, where it left
+    1.20.
+    """
+
+    from .models.qwen4_exp import _qsa_score_tile_rows
+
+    if _qsa_score_tile_rows() > 0:
+        return 0
+    raw = str(os.environ.get("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", "")).strip()
+    if not raw:
+        return _FIXED_M4_CAPACITY_BUCKET
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _FIXED_M4_CAPACITY_BUCKET
+
+
+@dataclass
+class FixedM4CapacityPlan:
+    """One request's reserve and bucket, shared by admission and allocation.
+
+    Admission may remove the bucket when only the parent's allocation fits.
+    It never changes the reserve or the parent's dense reduction width.
+    """
+
+    reserve_tokens: int
+    bucket: int
+    indexer_budget: int = 2048
+    admit_growth: Callable[[int], bool] | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def for_request(cls, max_tokens: int | None, *, width: int = 4, runtime: Any = None):
+        reserve = _fixed_m4_initial_growth_reserve()
+        if max_tokens is not None:
+            reserve = min(max(0, int(max_tokens)) + width, max(reserve, width))
+        model = getattr(runtime, "model", None)
+        text = getattr(model, "language_model", model)
+        args = getattr(text, "args", None) or getattr(getattr(text, "model", None), "args", None)
+        ratio = max(1, int(getattr(args, "indexer_compress_ratio", 4) or 4))
+        budget = int(getattr(args, "indexer_budget", 2048) or 2048)
+        return cls(max(width, reserve), _fixed_m4_capacity_bucket(), (budget // ratio) * ratio)
+
+    def rows(self, offset: int, ratio: int, kv_step: int = 256) -> int:
+        from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
+
+        rows_gather = _qsa_gather_enabled() and offset >= _qsa_gather_min_context()
+        if rows_gather and offset < self.indexer_budget:
+            self.bucket = 0
+        return TensorOffsetQSACache._bank_capacity(
+            offset + self.reserve_tokens, ratio, kv_step,
+            rows_gather=rows_gather, bucket=self.bucket,
+        )
+
+
 _FIXED_M4_MAX_GROWTH_TOKENS = 16384
 
 
@@ -2163,6 +2350,7 @@ class CompiledVerifyBank:
         parity2: bool = False,
         restored_tokens: int = 0,
         rope_delta: mx.array | int | None = None,
+        capacity_plan: FixedM4CapacityPlan | None = None,
     ) -> None:
         self.runtime = runtime
         # The request's rotary delta (an image request on the QSA family) or
@@ -2188,6 +2376,15 @@ class CompiledVerifyBank:
         self.strict_no_fallback = bool(
             getattr(runtime, "qwen4_fixed_m4_compiled_verify", False)
         )
+        # The strict lane's QSA banks round their rows-gather capacity up to
+        # this bucket so consecutive requests replay one verify trace
+        # (_fixed_m4_capacity_bucket); generic banks keep the exact rule.
+        self.capacity_plan = (
+            capacity_plan or FixedM4CapacityPlan.for_request(
+                self.request_max_tokens, width=self.max_verify_len, runtime=runtime
+            )
+        ) if self.strict_no_fallback else None
+        self.fixed_m4_capacity_bucket = self.capacity_plan.bucket if self.capacity_plan else 0
         # Generic banks let the request budget only TIGHTEN the reserve; it
         # never raises it past the env ceiling. Server requests default max_tokens to the
         # whole remaining context window (~262k on a 256k model), and
@@ -2221,6 +2418,8 @@ class CompiledVerifyBank:
             if self.request_max_tokens is not None
             else reserve_ceiling
         )
+        if self.capacity_plan is not None:
+            self.growth_reserve_tokens = self.capacity_plan.reserve_tokens
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
         self.parity2 = bool(parity2)
@@ -2476,6 +2675,9 @@ class CompiledVerifyBank:
         )
         if not qsa_entries:
             raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
+        self.fixed_m4_capacity_bucket = min(entry.capacity_bucket for entry in qsa_entries)
+        if self.capacity_plan is not None:
+            self.capacity_plan.bucket = self.fixed_m4_capacity_bucket
         route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
         key = self._verify_key(4, hidden_variant, route_key)
         fn = self._verify_program(key, 4, hidden_variant)
@@ -2542,6 +2744,8 @@ class CompiledVerifyBank:
             "boundary": boundary,
             "base_offset": len(prompt_ids),
             "capacity": min(entry.capacity for entry in qsa_entries),
+            "dense_capacity": min(entry.dense_capacity for entry in qsa_entries),
+            "capacity_bucket": self.fixed_m4_capacity_bucket,
             "growth_tokens": _next_fixed_m4_growth_tokens(
                 initial_growth_tokens
             ),
@@ -2584,6 +2788,25 @@ class CompiledVerifyBank:
                 + ("text" if self._rope_delta is None else "vision_delta"),
                 flush=True,
             )
+
+    def fixed_m4_capacity_receipt(self) -> dict[str, Any] | None:
+        """The installed fixed-M4 bank's capacity, for the Route Tape.
+
+        None when no fixed-M4 replay is installed. ``capacity_bucket`` is the
+        configured bucket; it shapes the capacity only while ``rows_gather``.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return None
+        return {
+            "capacity": int(dispatch["capacity"]),
+            "capacity_bucket": int(dispatch["capacity_bucket"]),
+            "rows_gather": all(
+                entry.fixed_rows_gather for entry in dispatch["qsa_entries"]
+            ),
+            "base_offset": int(dispatch["base_offset"]),
+        }
 
     def prefetch_fixed_m4_aux(
         self,
@@ -2648,7 +2871,9 @@ class CompiledVerifyBank:
             else dispatch["qsa_entries"][0].size()
         )
         required_end = logical_start + max(4, int(window_tokens))
-        capacity_needed = required_end > int(dispatch["capacity"])
+        # Follow the parent's grants independently of the larger allocation.
+        # A rejection trims the offset, not these already granted widths.
+        capacity_needed = required_end > int(dispatch["dense_capacity"])
         route_transition_at = dispatch["route_transition_at"]
         route_needed = (
             route_transition_at is not None
@@ -2662,18 +2887,44 @@ class CompiledVerifyBank:
         next_growth_tokens = int(dispatch["growth_tokens"])
         if capacity_needed:
             next_capacity, next_growth_tokens = _fixed_m4_capacity_growth(
-                capacity=int(dispatch["capacity"]),
+                capacity=int(dispatch["dense_capacity"]),
                 required_end=required_end,
                 growth_tokens=int(dispatch["growth_tokens"]),
                 capacity_limit=dispatch["capacity_limit"],
             )
+            planned = [
+                entry._bank_capacity(next_capacity, entry.ratio, entry.kv.step,
+                                     rows_gather=entry.fixed_rows_gather,
+                                     bucket=entry.capacity_bucket)
+                for entry in qsa_entries
+            ]
+            admit = self.capacity_plan.admit_growth if self.capacity_plan else None
+            if any(rows > entry.capacity for rows, entry in zip(planned, qsa_entries)):
+                if admit is not None and not admit(max(planned)):
+                    # Check the original allocation before giving up the
+                    # request. No cache leaf changes before this admission.
+                    planned = [
+                        entry._bank_capacity(next_capacity, entry.ratio, entry.kv.step,
+                                             rows_gather=entry.fixed_rows_gather)
+                        for entry in qsa_entries
+                    ]
+                    if not admit(max(planned)):
+                        raise MemoryError("fixed-M4 bank growth exceeds memory admission")
+                    for entry in qsa_entries:
+                        entry.capacity_bucket = 0
+                    self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0
+                    dispatch["capacity_bucket"] = 0
             for entry in qsa_entries:
                 capacity_changed = (
                     entry.ensure_capacity(next_capacity) or capacity_changed
                 )
+            dispatch["dense_capacity"] = min(entry.dense_capacity for entry in qsa_entries)
+            dispatch["growth_tokens"] = next_growth_tokens
         route_changed = False
         if route_needed:
             for entry in qsa_entries:
+                if logical_start < entry.indexer_budget:
+                    entry.capacity_bucket = 0
                 route_changed = (
                     entry.activate_rows_gather(required_end) or route_changed
                 )
@@ -2687,6 +2938,10 @@ class CompiledVerifyBank:
                 if pending_route_thresholds
                 else None
             )
+            self.fixed_m4_capacity_bucket = min(entry.capacity_bucket for entry in qsa_entries)
+            dispatch["capacity_bucket"] = self.fixed_m4_capacity_bucket
+            if self.capacity_plan is not None:
+                self.capacity_plan.bucket = self.fixed_m4_capacity_bucket
         if not capacity_changed and not route_changed:
             return
 
@@ -4253,7 +4508,16 @@ class CompiledVerifyBank:
                 # request outgrew its first grant and stayed on the lane.
                 "base_offset": int(dispatch["base_offset"]),
                 "capacity": int(dispatch["capacity"]),
+                "dense_capacity": int(dispatch["dense_capacity"]),
                 "growth_tokens": int(dispatch["growth_tokens"]),
+                # The bucket the capacity rounds up to while every QSA bank is
+                # on the rows-gather lane (the dense lane keeps its exact
+                # capacity); the trace count above says whether this request
+                # replayed a capacity the process had already traced.
+                "capacity_bucket": int(dispatch["capacity_bucket"]),
+                "rows_gather": all(
+                    entry.fixed_rows_gather for entry in dispatch["qsa_entries"]
+                ),
                 # Image requests replay the trace that takes the rotary delta
                 # as an input; text requests replay the text trace.
                 "rope_delta_input": bool(dispatch["rope_args"]),
@@ -4342,6 +4606,8 @@ class CompiledVerifyBank:
             reserve_tokens=length,
             preserve_paged=True,
             initial_reserve_tokens=max(length, self.growth_reserve_tokens),
+            qsa_capacity_bucket=self.fixed_m4_capacity_bucket,
+            qsa_capacity_plan=self.capacity_plan,
         )
         self.stats["promoted"] += promoted
         self._stamp_rope_delta(cache)
@@ -4489,6 +4755,9 @@ class CompiledVerifyBank:
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
                     rope_delta=entry.rope_delta,
+                    capacity_bucket=entry.capacity_bucket,
+                    dense_capacity=entry.dense_capacity,
+                    indexer_budget=entry.indexer_budget,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 # The twin carries the request's rotary origin like every
@@ -5129,6 +5398,9 @@ class CompiledVerifyBank:
                     # The eager leg of the generic parity modes runs on this
                     # fixed twin, so it rotates where the real entry does.
                     rope_delta=entry.rope_delta,
+                    capacity_bucket=entry.capacity_bucket,
+                    dense_capacity=entry.dense_capacity,
+                    indexer_budget=entry.indexer_budget,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 # No rotary delta on the reference leg, on purpose: the eager
