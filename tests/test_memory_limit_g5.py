@@ -80,6 +80,54 @@ def test_max_is_everything_outside_the_system_reserve(ram_gib, max_gib):
     assert max_engine_bytes(ram_gib * GIB) == max_gib * GIB
 
 
+@pytest.mark.parametrize("ram_gib, max_gib", [(8, 8), (16, 12), (24, 18), (32, 24)])
+def test_max_is_never_under_the_default_on_small_macs(ram_gib, max_gib):
+    # The review of 4c9da1ba: 'max' read 8/12/18 GiB on 8/16/24 GB Macs
+    # against a documented 8 GiB reserve. Those Macs' default (75% of RAM,
+    # at least 8 GiB) already reaches past the reserve, and 'max' asks for
+    # more than the default, never less: it is the default there.
+    total = ram_gib * GIB
+    assert max_engine_bytes(total) == usable_engine_bytes(total) == max_gib * GIB
+
+
+@pytest.mark.parametrize(
+    "floor_gib, limit_gib, source",
+    [
+        (83, 90, "default"),  # Flash-Next Optimized Speed: 77.3 GiB + 6
+        (92, 96, "resident_floor"),  # 86 GiB of weights + 6: the 75% rule, as before
+        (96, 96, "resident_floor"),
+        (100, 112, "resident_floor"),  # above the 75% rule: unchanged since #400
+    ],
+)
+def test_a_model_larger_than_the_flagship_keeps_the_limit_it_had(
+    monkeypatch, floor_gib, limit_gib, source
+):
+    # The review of 4c9da1ba: lowering the 128 GB default to 90 GiB turned a
+    # 92 GiB resident floor into the whole envelope outside the system
+    # reserve (112 GiB, source resident_floor), where 50de43bb gave it 96.
+    # The desktop headroom now gives way only back to the 75% rule.
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    mx, _calls = _fake_mx()
+
+    caps = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GIB,
+        minimum_resident_bytes=floor_gib * GIB,
+    )
+    plan = plan_memory(
+        total_ram_bytes=128 * GIB,
+        model_weights_bytes=(floor_gib - 6) * GIB,
+        kv_bytes_per_token=65536,
+        model_max_context=262144,
+        resident_floor_bytes=floor_gib * GIB,
+    )
+
+    assert caps["memory_limit_bytes"] == limit_gib * GIB
+    assert caps["memory_limit_source"] == source
+    assert plan.usable_bytes == limit_gib * GIB
+
+
 def test_memory_limit_max_sets_the_engine_limit(monkeypatch):
     monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
     monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)

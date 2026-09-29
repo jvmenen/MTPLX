@@ -290,25 +290,35 @@ def detect_total_ram_bytes() -> int | None:
     return None
 
 
-def usable_engine_bytes(total_ram_bytes: int) -> int:
-    """The engine's default allocator envelope for a machine of this size."""
+def _ram_share_bytes(total_ram_bytes: int) -> int:
+    """The 75% rule: min(ram, max(8 GiB, 75% of ram), 192 GiB)."""
     total = int(total_ram_bytes)
-    usable = min(
+    return min(
         total,
         max(ENGINE_RAM_FLOOR_BYTES, int(total * ENGINE_RAM_FRACTION)),
         ENGINE_RAM_CAP_BYTES,
     )
+
+
+def usable_engine_bytes(total_ram_bytes: int) -> int:
+    """The engine's default allocator envelope for a machine of this size."""
+    total = int(total_ram_bytes)
+    usable = _ram_share_bytes(total)
     if total >= DESKTOP_HEADROOM_MIN_RAM_BYTES:
         usable = min(usable, total - DESKTOP_HEADROOM_BYTES)
     return usable
 
 
 def max_engine_bytes(total_ram_bytes: int) -> int:
-    """``--memory-limit max``: everything outside macOS's own reserve.
+    """``--memory-limit max``: everything outside macOS's own reserve, and
+    never less than the default.
 
-    For a headless server with no desktop to leave room for (issue #548).
-    The guard's whole-Mac floors still apply; only the engine's own budget
-    grows.
+    For a headless server with no desktop to leave room for (issue #548):
+    112 GiB on a 128 GB Mac, 56 GiB on 64 GB. On Macs of 32 GB and under the
+    default (75% of RAM, at least 8 GiB) already reaches past the reserve
+    (8 GiB there), so ``max`` is the default: 8, 12, 18 and 24 GiB on 8, 16,
+    24 and 32 GB. The guard's whole-Mac floors still apply; only the
+    engine's own budget grows.
     """
     total = int(total_ram_bytes)
     return max(usable_engine_bytes(total), total - system_reserve_bytes(total))
@@ -347,12 +357,22 @@ def engine_envelope_bytes(
 
     Never below the floor; seats whose 75% envelope already covers the
     floor (128 GB and up for Flash-Next) are unchanged.
+
+    The desktop headroom (``usable_engine_bytes`` from 128 GB up) gives way
+    to a model whose floor is above it only as far as the 75% rule, the
+    default before that headroom: a 128 GB Mac and a 92 GiB floor get
+    96 GiB, as they did, not the whole envelope outside the system reserve
+    (112 GiB; the review of 4c9da1ba found the lower default turning that
+    floor into 112 GiB).
     """
     total = int(total_ram_bytes)
     base = usable_engine_bytes(total)
     floor = max(0, int(resident_floor_bytes or 0))
     if floor <= base:
         return base
+    share = _ram_share_bytes(total)
+    if floor <= share:
+        return share
     return min(total, max(floor, total - system_reserve_bytes(total)))
 
 
