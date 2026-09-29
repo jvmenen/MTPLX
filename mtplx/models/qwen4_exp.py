@@ -3271,6 +3271,16 @@ class QSAIndexer(nn.Module):
             return None
         return cache.pooled[:, :nb_total, :]
 
+    def _pooled_row_applies(self, cache, pooled: mx.array) -> bool:
+        # The one-kernel pooled-key row reproduces the compiled update (its
+        # rotation and sum spellings were matched against that lowering at
+        # install), so it engages only inside a compiled step body.
+        if not in_compiled_step_body():
+            return False
+        from mtplx.kernels import qsa_pooled_row
+
+        return qsa_pooled_row.serves(self, pooled, cache.raw_keys)
+
     def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
         """Update only newly completed blocks in a fixed QSA bank.
 
@@ -3294,11 +3304,32 @@ class QSAIndexer(nn.Module):
         # (``_call_rows`` has already read ``cache.rope_offset`` strictly by
         # the time a forward gets here.)
         rope_delta = getattr(cache, "rope_delta", None)
+        fused_row = self._pooled_row_applies(cache, pooled)
         for rel in range(max_new):
             block = nb_old + rel
             safe_block = mx.minimum(
                 block, mx.array(pooled_capacity - 1, dtype=block.dtype)
             )
+            if fused_row:
+                # The row below (mean, norm, rotation, select) in one kernel,
+                # bit for bit with it (mtplx.kernels.qsa_pooled_row).
+                from mtplx.kernels import qsa_pooled_row
+
+                merged = qsa_pooled_row.pooled_row(
+                    cache.raw_keys,
+                    pooled,
+                    block,
+                    nb_total,
+                    rope_delta,
+                    self.k_layernorm.weight,
+                    self._inv_freq,
+                    ratio=self.ratio,
+                    eps=self.k_layernorm.eps,
+                    amplitude=self._rope_attention_scaling,
+                )
+                qsa_pooled_row.note_engaged()
+                pooled = mx.slice_update(pooled, merged, safe_block, axes=(1,))
+                continue
             start = safe_block * self.ratio
             fresh = mx.slice(
                 cache.raw_keys,

@@ -10,6 +10,7 @@ bit patterns:
 * the hyper-connection verify read installs at widths 2 to 8 (its probe
   compares every width with the compiled stock chain);
 * the QSA verify selection installs at widths 1 to 8, both lanes;
+* the fixed bank's pooled-key row installs (its probe compares the bank);
 * the one-dispatch routed-down tail equals its two-dispatch parent.
 
 Every threadgroup these kernels launch is at most 256 threads (issue #400:
@@ -106,6 +107,33 @@ report = qsa_verify_select.install(
 )
 out["qsa"] = {"installed": report["installed"], "reason": report["disabled_reason"], "cases": report["probe_cases"]}
 
+from mtplx.kernels import qsa_pooled_row
+
+pooled_args = TextArgs.from_dict(
+    {
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "vocab_size": 128,
+        "layer_types": ["full_attention"] * 2,
+        "rope_parameters": {"partial_rotary_factor": 0.25, "rope_theta": 10000000, "rope_type": "default"},
+        "indexer_n_heads": 4,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 128,
+        "indexer_budget": 2048,
+        "indexer_compress_ratio": 4,
+    }
+)
+pooled_indexer = QSAIndexer(pooled_args)
+pooled_indexer.k_layernorm.weight = pooled_indexer.k_layernorm.weight.astype(mx.bfloat16)
+mx.eval(pooled_indexer.parameters(), pooled_indexer._inv_freq)
+report = qsa_pooled_row.install(
+    SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(indexer=pooled_indexer))])
+)
+out["pooled"] = {"installed": report["installed"], "reason": report["disabled_reason"], "cases": report["probe_cases"]}
+
 experts, hidden, inter, rows, top_k = 16, 2560, 640, 4, 10
 keys = mx.random.split(mx.random.key(31), 8)
 weights = mx.random.randint(-(2**31), 2**31 - 1, (experts, hidden, inter // 8), dtype=mx.int32, key=keys[0]).view(mx.uint32)
@@ -139,6 +167,7 @@ def test_the_verify_kernels_hold_under_the_rehearsal_switch():
     )
     env.pop("MTPLX_QWEN4_HC_VERIFY_READ", None)
     env.pop("MTPLX_QWEN4_QSA_VERIFY_SELECT", None)
+    env.pop("MTPLX_QWEN4_QSA_POOLED_ROW", None)
     proc = subprocess.run(
         [sys.executable, "-c", CHILD],
         cwd=ROOT,
@@ -154,5 +183,7 @@ def test_the_verify_kernels_hold_under_the_rehearsal_switch():
     assert result["hc"]["cases"] >= 1 + 3 * 7
     assert result["qsa"]["installed"], result["qsa"]["reason"]
     assert result["qsa"]["cases"] >= 1 + 6 * 8
+    assert result["pooled"]["installed"], result["pooled"]["reason"]
+    assert result["pooled"]["cases"] >= 12
     assert result["down_mismatches"] == 0
     assert result["down_threads"] <= 256
