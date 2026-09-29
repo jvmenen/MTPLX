@@ -23964,6 +23964,11 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_fed_empty_retry_prompt_tokens",
     "tool_fed_empty_retry_completion_tokens",
     "tool_fed_empty_retry_finish_reason",
+    "stream_attempts",
+    "stream_attempts_first_ttft_s",
+    "stream_attempts_prompt_eval_time_s",
+    "stream_attempts_new_prefill_tokens",
+    "stream_attempts_completion_tokens",
     "stalled_agent_retry_attempted",
     "stalled_agent_retry_succeeded",
     "stalled_agent_retry_reason",
@@ -31918,6 +31923,92 @@ def _reasoning_completion_repair_prompt_ids(
     ]
 
 
+_STREAM_RECOVERY_STAT_PREFIXES = (
+    "inspection_empty_retry_",
+    "tool_fed_empty_retry_",
+    "reasoning_completion_repair_",
+    "read_only_force_answer_retry_",
+    "stalled_agent_retry_",
+)
+# Key on a recovery pass's result naming the prompt it was generated from,
+# when that prompt is not the request's own (the tool-fed empty retry).
+_ATTEMPT_PROMPT_IDS_KEY = "_mtplx_attempt_prompt_ids"
+
+
+def _reasoning_repair_follows_retry_prompt() -> bool:
+    """MTPLX_REASONING_REPAIR_FOLLOWS_RETRY_PROMPT (default on).
+
+    On: the reasoning-completion repair continues a retried pass from the
+    retry prompt that produced its tokens. "0" restores the historical
+    splice onto the request's original prompt.
+    """
+
+    raw = os.environ.get("MTPLX_REASONING_REPAIR_FOLLOWS_RETRY_PROMPT", "")
+    return raw.strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _stream_attempt_totals(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Totals over every generation pass of one streamed request.
+
+    Each pass's stats describe only itself (``ttft_s`` runs from arrival to
+    that pass's first token), so after a retry or repair the final envelope
+    hid the earlier prefills. ``request_elapsed_s`` already spans arrival to
+    the last token and needs no total.
+    """
+
+    per_pass = [dict(attempt.get("stats") or {}) for attempt in attempts]
+    totals: dict[str, Any] = {
+        "stream_attempts": len(attempts),
+        "stream_attempts_prompt_eval_time_s": sum(
+            float(stats.get("prompt_eval_time_s") or 0.0) for stats in per_pass
+        ),
+        "stream_attempts_new_prefill_tokens": sum(
+            int(stats.get("new_prefill_tokens") or 0) for stats in per_pass
+        ),
+        "stream_attempts_completion_tokens": sum(
+            int(attempt.get("completion_tokens") or 0) for attempt in attempts
+        ),
+    }
+    first_ttft_s = per_pass[0].get("ttft_s")
+    if first_ttft_s is not None:
+        totals["stream_attempts_first_ttft_s"] = float(first_ttft_s)
+    return totals
+
+
+def _run_stream_recovery_chain(
+    state: ServerState,
+    generated: dict[str, Any],
+    steps: list[Callable[[dict[str, Any]], dict[str, Any]]],
+) -> dict[str, Any]:
+    """Run the stream worker's recovery passes and account for all of them.
+
+    A step returns its input unchanged or the result of a new pass. When
+    more than one pass ran, the final stats gain the ``stream_attempts*``
+    totals and keep the recovery fields of earlier passes (a repair after a
+    retry used to drop the ``tool_fed_empty_retry_*`` fields). Existing
+    fields keep the last pass's values; single-pass envelopes are untouched.
+    """
+
+    attempts = [generated]
+    for step in steps:
+        result = step(generated)
+        if result is not generated:
+            attempts.append(result)
+        generated = result
+    if len(attempts) == 1:
+        return generated
+    stats = generated.setdefault("stats", {})
+    for earlier in attempts[:-1]:
+        for key, value in (earlier.get("stats") or {}).items():
+            if key.startswith(_STREAM_RECOVERY_STAT_PREFIXES):
+                stats.setdefault(key, value)
+    totals = _stream_attempt_totals(attempts)
+    stats.update(totals)
+    if state.last_metrics:
+        state.last_metrics[-1].update(totals)
+    return generated
+
+
 def _display_text(
     state: ServerState,
     generated: dict[str, Any],
@@ -37274,6 +37365,7 @@ def create_app(state: ServerState) -> FastAPI:
                     retry_stats["tool_fed_empty_retry_finish_reason"] = str(
                         retry_generated.get("finish_reason") or "stop"
                     )
+                    retry_generated[_ATTEMPT_PROMPT_IDS_KEY] = repair_prompt_ids
                     if state.last_metrics:
                         state.last_metrics[-1].update(
                             {
@@ -37384,9 +37476,17 @@ def create_app(state: ServerState) -> FastAPI:
                     ):
                         return generated
                     first_stats = dict(generated.get("stats") or {})
+                    # Continue the pass from the prompt that generated its
+                    # tokens: after a tool-fed retry that is the retry prompt,
+                    # not the request's own.
+                    attempt_prompt_ids = (
+                        generated.get(_ATTEMPT_PROMPT_IDS_KEY)
+                        if _reasoning_repair_follows_retry_prompt()
+                        else None
+                    ) or prompt_ids
                     repair_prompt_ids = _reasoning_completion_repair_prompt_ids(
                         state.runtime.tokenizer,
-                        prompt_ids,
+                        attempt_prompt_ids,
                         [int(token) for token in generated.get("tokens") or []],
                     )
                     retry_observability = dict(request_observability)
@@ -37846,6 +37946,14 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return retry_generated
 
+                recovery_steps = [
+                    maybe_retry_degenerate_read_only_inspection,
+                    maybe_retry_degenerate_tool_fed_empty_completion,
+                    maybe_repair_tool_fed_reasoning_only_completion,
+                    maybe_retry_read_only_force_answer,
+                    maybe_retry_stalled_agent_tool_promise,
+                ]
+
                 def worker() -> None:
                     try:
                         _raise_if_stream_cancelled(cancel_event)
@@ -37886,20 +37994,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     mtp_batch_finalize_ownership
                                 ),
                             )
-                            generated = maybe_retry_degenerate_read_only_inspection(
-                                generated
-                            )
-                            generated = (
-                                maybe_retry_degenerate_tool_fed_empty_completion(
-                                    generated
-                                )
-                            )
-                            generated = maybe_repair_tool_fed_reasoning_only_completion(
-                                generated
-                            )
-                            generated = maybe_retry_read_only_force_answer(generated)
-                            generated = maybe_retry_stalled_agent_tool_promise(
-                                generated
+                            generated = _run_stream_recovery_chain(
+                                state, generated, recovery_steps
                             )
                         else:
                             with state.sessions.generation_slot(
@@ -37945,24 +38041,8 @@ def create_app(state: ServerState) -> FastAPI:
                                         mtp_batch_finalize_ownership
                                     ),
                                 )
-                                generated = maybe_retry_degenerate_read_only_inspection(
-                                    generated
-                                )
-                                generated = (
-                                    maybe_retry_degenerate_tool_fed_empty_completion(
-                                        generated
-                                    )
-                                )
-                                generated = (
-                                    maybe_repair_tool_fed_reasoning_only_completion(
-                                        generated
-                                    )
-                                )
-                                generated = maybe_retry_read_only_force_answer(
-                                    generated
-                                )
-                                generated = maybe_retry_stalled_agent_tool_promise(
-                                    generated
+                                generated = _run_stream_recovery_chain(
+                                    state, generated, recovery_steps
                                 )
                                 queue.put(("done", generated))
                                 commit_event.wait()
