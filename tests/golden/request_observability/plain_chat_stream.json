@@ -379,12 +379,13 @@
    }
   },
   "discarded_attempt_wall_s": "<float>",
-  "endpoint": "engine_first_token",
+  "endpoint": "first_delta_sent",
   "exclusive_s": {
    "admission_s": "<float>",
    "dispatch_s": "<float>",
    "encode_s": "<float>",
    "engine_first_token_s": "<float>",
+   "first_delta_sent_s": "<float>",
    "http_parse_s": "<float>",
    "lock_wait_s": "<float>",
    "policy_s": "<float>",

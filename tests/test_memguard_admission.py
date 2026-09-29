@@ -792,6 +792,15 @@ class TestTheLimitIsTheLimit:
         assert at_90["refused"] is True
 
 
+# Free pages under the kernel's own free-page target (4,000 x 16 KiB = 62.5 MiB;
+# system_memory.starved_free_bytes): the recorded deaths sat there (09-03 at
+# 0.0 GB free, the 09-23 panic at 878 pages). At 0.3 GiB with 20 GiB of file
+# cache the Mac is healthy on macOS 27: the 2026-09-29 agent replay ran 0.1 to
+# 0.6 GB free with the compressor stepping 0.3 to 0.5 GB/s and swap flat
+# (b15ddcfb), so these mechanism tests use a starved reading.
+STARVED_FREE_GIB = 16 / 1024
+
+
 class TestPerChunkSupplyCheck:
     def _reading(self, *, available_gib, free_gib, compressor_gib, at_s, wired_gib=88):
         return sm.SystemMemory(
@@ -869,8 +878,8 @@ class TestPerChunkSupplyCheck:
         guard = self._guard(
             monkeypatch,
             [
-                self._reading(available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0),
-                self._reading(available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0),
+                self._reading(available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=10, at_s=0.0),
+                self._reading(available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=12, at_s=1.0),
             ],
         )
         assert guard() is False
@@ -891,7 +900,7 @@ class TestPerChunkSupplyCheck:
         step = 80 / 1024
         readings = [
             self._reading(
-                available_gib=20, free_gib=0.3, compressor_gib=10 + i * step, at_s=i * 0.25
+                available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=10 + i * step, at_s=i * 0.25
             )
             for i in range(21)
         ]
@@ -1009,8 +1018,8 @@ class TestPerChunkSupplyCheck:
         guard = self._guard(
             monkeypatch,
             [
-                self._reading(available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0),
-                self._reading(available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0),
+                self._reading(available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=10, at_s=0.0),
+                self._reading(available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=12, at_s=1.0),
             ],
         )
         guard()
@@ -1090,10 +1099,10 @@ class TestPressureLoop:
         )
         readings = [
             TestPerChunkSupplyCheck._reading(
-                None, available_gib=20, free_gib=0.3, compressor_gib=10, at_s=0.0
+                None, available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=10, at_s=0.0
             ),
             TestPerChunkSupplyCheck._reading(
-                None, available_gib=20, free_gib=0.3, compressor_gib=12, at_s=1.0
+                None, available_gib=20, free_gib=STARVED_FREE_GIB, compressor_gib=12, at_s=1.0
             ),
         ]
         sequence = iter(readings)
@@ -1132,7 +1141,7 @@ class TestPressureLoop:
             TestPerChunkSupplyCheck._reading(
                 None,
                 available_gib=20,
-                free_gib=0.3,
+                free_gib=STARVED_FREE_GIB,
                 compressor_gib=10 + i * step,
                 at_s=i * 0.25,
             )

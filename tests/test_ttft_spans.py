@@ -397,11 +397,12 @@ def test_streamed_repair_retry_names_the_discarded_attempt(monkeypatch):
 
 
 def test_a_tool_call_answer_ends_its_ttft_at_the_tool_call_delta(monkeypatch):
-    """E2d: every warm agent turn (a tool call) reported its spans ending at
-    the engine's first token, 0.37 s before the client's first delta (the
-    tool call goes out once its markup is whole), so the span sum missed
-    that share of the client's TTFT. The first visible delta of any kind
-    now ends the clock."""
+    """E2d: every warm agent turn (a tool call after tool results) reported
+    its spans ending at the engine's first token, 0.36 to 0.38 s before the
+    client's first delta: with tool results in the history the stream holds
+    the call until its markup is whole and writes it outside the content
+    loop, where first_delta_sent was marked. The first visible delta of any
+    kind now ends the clock."""
 
     state = _fake_streaming_session_state()
     state.draft_sampler = None
@@ -410,7 +411,7 @@ def test_a_tool_call_answer_ends_its_ttft_at_the_tool_call_delta(monkeypatch):
     _fake_engine(
         monkeypatch,
         [
-            "<tool_call>\n<function=read>\n<parameter=path>\nnotes.txt\n"
+            "<tool_call>\n<function=count_lines>\n<parameter=part>\n2\n"
             "</parameter>\n</function>\n</tool_call>"
         ],
     )
@@ -420,17 +421,34 @@ def test_a_tool_call_answer_ends_its_ttft_at_the_tool_call_delta(monkeypatch):
             "POST",
             "/v1/chat/completions",
             json={
-                "messages": [{"role": "user", "content": "Read notes.txt"}],
+                "messages": [
+                    {"role": "user", "content": "Count the lines of each part."},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "count_lines",
+                                    "arguments": '{"part": 1}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "93 lines"},
+                ],
                 "tools": [
                     {
                         "type": "function",
                         "function": {
-                            "name": "read",
-                            "description": "Read a file.",
+                            "name": "count_lines",
+                            "description": "Count the lines in one part.",
                             "parameters": {
                                 "type": "object",
-                                "properties": {"path": {"type": "string"}},
-                                "required": ["path"],
+                                "properties": {"part": {"type": "integer"}},
+                                "required": ["part"],
                             },
                         },
                     }
