@@ -969,6 +969,10 @@ class SessionBank:
         # cancels a key only when this entry is among the ones it frees, so
         # a kept sibling never loses its scheduled durable copy.
         self._persistence_pending: dict[str, "weakref.ref[SessionBankEntry]"] = {}
+        # Guards every read-then-write of that map (a job starting, a
+        # dispatch, a cancel, a job the dispatcher dropped): a leaf lock,
+        # never held while calling out.
+        self._persistence_pending_lock = threading.Lock()
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
@@ -3684,8 +3688,7 @@ class SessionBank:
         entry_ref = weakref.ref(entry)
 
         def job() -> Any:
-            if self._persistence_pending.get(key) is entry_ref:
-                self._persistence_pending.pop(key, None)
+            self._retire_persistence_pending(key, entry_ref)
             return body()
 
         job.coalesce_key = key
@@ -3705,8 +3708,32 @@ class SessionBank:
         dispatch = self.cold_enqueue_dispatch
         if dispatch is None:
             raise RuntimeError("no idle-lane dispatcher")
-        dispatch(job)
-        self._persistence_pending[key] = entry_ref
+        future = dispatch(job)
+        with self._persistence_pending_lock:
+            self._persistence_pending[key] = entry_ref
+        # A job the dispatcher drops unrun (its pending-bytes budget, or a
+        # newer job under the same key) never reaches its own retirement
+        # above: its cancelled future retires it here, only while the map
+        # still names this job's entry (the review of 4c9da1ba: 100 sessions
+        # through the budget left 99 dead rows behind).
+        add_done_callback = getattr(future, "add_done_callback", None)
+        if callable(add_done_callback):
+
+            def retire_if_cancelled(done: Any) -> None:
+                if done.cancelled():
+                    self._retire_persistence_pending(key, entry_ref)
+
+            add_done_callback(retire_if_cancelled)
+
+    def _retire_persistence_pending(
+        self, key: str, entry_ref: "weakref.ref[SessionBankEntry]"
+    ) -> None:
+        """Forget ``key``'s pending job if the map still names ``entry_ref``
+        (a newer job filed under the key keeps its row)."""
+
+        with self._persistence_pending_lock:
+            if self._persistence_pending.get(key) is entry_ref:
+                self._persistence_pending.pop(key, None)
 
     def _cancel_queued_persistence(self, released: set[int]) -> tuple[int, set[str]]:
         """Cancel the pending persistence jobs filed for released entries.
@@ -3723,11 +3750,13 @@ class SessionBank:
         cancelled = 0
         keys: set[str] = set()
         failures: list[tuple[str, str]] = []
-        for key, entry_ref in list(self._persistence_pending.items()):
+        with self._persistence_pending_lock:
+            pending = list(self._persistence_pending.items())
+        for key, entry_ref in pending:
             entry = entry_ref()
             if entry is None:
                 # Nothing holds it: the job ran or was dropped.
-                self._persistence_pending.pop(key, None)
+                self._retire_persistence_pending(key, entry_ref)
                 continue
             if id(entry) not in released:
                 continue
@@ -3752,8 +3781,7 @@ class SessionBank:
                 continue
             # Cancelled, or no longer queued under the key (it ran, or was
             # dropped): no queued job holds the entry for it any more.
-            if self._persistence_pending.get(key) is entry_ref:
-                self._persistence_pending.pop(key, None)
+            self._retire_persistence_pending(key, entry_ref)
             cancelled += count
             keys.add(key)
         if failures:
@@ -3781,9 +3809,16 @@ class SessionBank:
         """Entries out of RAM that a queued job still holds, one row each."""
 
         rows: dict[int, dict[str, Any]] = {}
-        for key, entry_ref in list(self._persistence_pending.items()):
+        with self._persistence_pending_lock:
+            pending = list(self._persistence_pending.items())
+        for key, entry_ref in pending:
             entry = entry_ref()
-            if entry is None or self._entries.get(entry.token_ids) is entry:
+            if entry is None:
+                # Nothing holds the entry any more: its job ran or was
+                # dropped, so the row is only history.
+                self._retire_persistence_pending(key, entry_ref)
+                continue
+            if self._entries.get(entry.token_ids) is entry:
                 continue
             row = rows.setdefault(id(entry), {"entry": entry, "keys": []})
             row["keys"].append(key)

@@ -798,3 +798,112 @@ def test_resident_session_persist_survives_another_sessions_commit():
     finally:
         release.set()
         scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_jobs_the_budget_drops_leave_no_pending_rows_in_the_bank():
+    """The review of 4c9da1ba: the budget cancelled queued SSD encodes, but
+    the bank's pending map is cleared only by a job that runs, so 100
+    sessions through the budget left 99 rows behind (the parent left none).
+    A dropped job's cancelled future now retires its row, and only while the
+    row still names that job's entry."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from mtplx.cache_state import CacheSnapshot
+    from mtplx.session_bank import SessionBank
+
+    persisted: list[str] = []
+    scheduler = _scheduler(persistence_max_pending_bytes=64 * 1024**2)
+    bank = SessionBank(
+        max_entries=1,
+        max_bytes=8 * 1024**3,
+        per_session_max_bytes=8 * 1024**3,
+        cold_tier=SimpleNamespace(
+            put_entry=lambda entry, capabilities=None: persisted.append(
+                entry.session_id
+            )
+            or True
+        ),
+    )
+    bank.cold_enqueue_dispatch = lambda job: scheduler.submit_idle_persistence(
+        job,
+        coalesce_key=getattr(job, "coalesce_key", None),
+        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
+    )
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    held, release = _hold_owner(scheduler)
+    try:
+        for n in range(100):
+            tokens = [1000 * (n + 1) + i for i in range(8)]
+            bank.put_snapshot(
+                runtime=runtime,
+                token_ids=tokens,
+                cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+                logits=None,
+                hidden=None,
+                session_id=f"session-{n}",
+                snapshot_epoch=len(tokens),
+                nbytes_override=16 * 1024**2,
+            )
+        stats = scheduler.stats()
+        assert stats["persistence_budget_dropped"] > 0
+        release.set()
+        held.result(timeout=2)
+        deadline = time.monotonic() + 5.0
+        while scheduler.stats()["persistence_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert scheduler.stats()["persistence_pending"] == 0
+        time.sleep(0.05)
+        assert persisted, "the kept jobs ran"
+        assert len(bank._persistence_pending) == 0
+        assert bank.queued_persistence() == []
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_a_dropped_job_never_retires_a_newer_row_for_its_key():
+    import weakref
+
+    from mtplx.session_bank import SessionBank
+
+    bank = SessionBank(max_entries=4, max_bytes=1024**3, per_session_max_bytes=1024**3)
+    futures = []
+
+    class _Future:
+        def __init__(self):
+            self.callbacks = []
+            self._cancelled = False
+
+        def add_done_callback(self, fn):
+            self.callbacks.append(fn)
+
+        def cancelled(self):
+            return self._cancelled
+
+        def cancel(self):
+            self._cancelled = True
+            for fn in self.callbacks:
+                fn(self)
+
+    def dispatch(job):
+        future = _Future()
+        futures.append(future)
+        return future
+
+    class _Entry:
+        def __init__(self, token_ids):
+            self.token_ids = token_ids
+            self.nbytes = 10
+            self.session_id = "s"
+
+    bank.cold_enqueue_dispatch = dispatch
+    old = _Entry((1, 2))
+    new = _Entry((1, 2, 3))
+    bank._dispatch_persistence(old, lambda: None, key="k")
+    bank._dispatch_persistence(new, lambda: None, key="k")
+    # The older job is dropped after the newer one filed under the key.
+    futures[0].cancel()
+    assert bank._persistence_pending["k"] is weakref.ref(new)
+    futures[1].cancel()
+    assert "k" not in bank._persistence_pending
