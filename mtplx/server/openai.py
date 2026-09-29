@@ -20155,7 +20155,7 @@ class _PrefillSystemGuard:
                 elif _system_compressor_runaway(reading, episode_base):
                     reason = "compressor_runaway"
                     base = episode_base
-                elif _system_compressor_full(reading):
+                elif _system_compressor_full(reading, earlier):
                     reason = "compressor_full"
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
@@ -22870,6 +22870,9 @@ async def _memory_pressure_loop(
             system_thrashing = _system_memory_thrashing(
                 system_memory, earlier_system_memory
             )
+            system_compressor_full = _system_compressor_full(
+                system_memory, earlier_system_memory
+            )
             system_window.add(system_memory)
             if system_level > level:
                 level = system_level
@@ -23024,9 +23027,7 @@ async def _memory_pressure_loop(
                         else None
                     ),
                     "system_thrashing": bool(system_thrashing),
-                    "system_compressor_full": bool(
-                        _system_compressor_full(system_memory)
-                    ),
+                    "system_compressor_full": bool(system_compressor_full),
                     "system_memory": (
                         system_memory.to_dict() if system_memory is not None else None
                     ),

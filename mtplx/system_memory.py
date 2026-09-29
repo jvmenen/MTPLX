@@ -127,14 +127,16 @@ _RUNAWAY_COMPRESSOR_MIN_BYTES = 4 * GIB
 # from first request to teardown.
 _RUNAWAY_EPISODE_QUIET_S = 300.0
 # A Mac that already holds a quarter of its RAM compressed, with free pages
-# under the abort floor, is past the point where another prefill is safe,
-# however slowly it got there (the same review: 878 free pages and 58 GB
-# compressed, swap creeping 160 MiB in 10 s, passed both checks because
-# nothing grew fast). The healthy macOS 27 readings of 2026-09-29 held 4.5
-# to 7.9 GB compressed on 128 GB; 2.12.0's 128K runaway reached 32.5 GB and
-# the 2026-09-23 panic sat at 57.7 GB. A quarter is 32 GiB on 128 GB, and
-# never under 8 GiB, so a 16 GB Mac is not refused for the few GB its
-# desktop normally keeps compressed.
+# under the abort floor, is past the point where another prefill is safe
+# while it is still losing ground, however slowly it got there (the same
+# review: 878 free pages and 58 GB compressed, swap creeping 160 MiB in
+# 10 s, passed both checks because nothing grew fast). The healthy macOS 27
+# readings of 2026-09-29 held 4.5 to 7.9 GB compressed on 128 GB; 2.12.0's
+# 128K runaway reached 32.5 GB and the 2026-09-23 panic sat at 57.7 GB. A
+# quarter is 32 GiB on 128 GB, and never under 8 GiB, so a 16 GB Mac is not
+# refused for the few GB its desktop normally keeps compressed; a desktop
+# that holds that much and is steady (no growth, free pages above the
+# kernel's target) is not refused either (compressor_full).
 _FULL_COMPRESSOR_RAM_DIVISOR = 4
 _FULL_COMPRESSOR_MIN_BYTES = 8 * GIB
 # At free pages under the kernel's own target, swap growth counts at any
@@ -628,19 +630,53 @@ def compressor_full_bytes(total_bytes: int) -> int:
     )
 
 
-def compressor_full(reading: SystemMemory | None) -> bool:
-    """Whether the Mac already holds ``compressor_full_bytes`` compressed
-    while its free pages are under the abort floor, however slowly it got
-    there. Missing counters read as not full."""
+def compressor_full(
+    reading: SystemMemory | None,
+    previous: SystemMemory | Sequence[SystemMemory | None] | None = None,
+) -> bool:
+    """Whether the Mac already holds ``compressor_full_bytes`` compressed,
+    with free pages under the abort floor, and is still losing ground: free
+    pages under the kernel's target, or the compressor (256 MiB) or swap
+    (64 MiB) grew since one of the ``previous`` readings, at any rate. A
+    desktop that holds that much compressed and is steady is not refused (a
+    heavy 64 GB desktop can keep 16 GB compressed); one a request keeps
+    compressing is, however slowly it got there. Missing counters read as
+    not full."""
 
     if reading is None or reading.free_bytes is None:
         return False
     if reading.compressor_bytes is None:
         return False
     _shed, abort = reading_floors(reading)
-    return int(reading.free_bytes) < abort and int(
-        reading.compressor_bytes
-    ) >= compressor_full_bytes(reading.total_bytes)
+    free = int(reading.free_bytes)
+    if free >= abort or int(reading.compressor_bytes) < compressor_full_bytes(
+        reading.total_bytes
+    ):
+        return False
+    if free < starved_free_bytes():
+        return True
+    if previous is None:
+        return False
+    earlier = [previous] if isinstance(previous, SystemMemory) else list(previous)
+    for base in earlier:
+        if base is None or base is reading:
+            continue
+        if float(reading.monotonic_s) <= float(base.monotonic_s):
+            continue
+        if (
+            base.compressor_bytes is not None
+            and int(reading.compressor_bytes) - int(base.compressor_bytes)
+            >= _THRASH_MIN_GROWTH_BYTES
+        ):
+            return True
+        if (
+            reading.swap_used_bytes is not None
+            and base.swap_used_bytes is not None
+            and int(reading.swap_used_bytes) - int(base.swap_used_bytes)
+            >= _STARVED_SWAP_MIN_GROWTH_BYTES
+        ):
+            return True
+    return False
 
 
 def memory_thrashing(
@@ -687,7 +723,7 @@ def system_pressure_level(
     if reading is None:
         return 1
     shed_floor, abort_floor = reading_floors(reading)
-    if memory_thrashing(reading, previous) or compressor_full(reading):
+    if memory_thrashing(reading, previous) or compressor_full(reading, previous):
         return 4
     if reading.available_bytes < abort_floor:
         return 4

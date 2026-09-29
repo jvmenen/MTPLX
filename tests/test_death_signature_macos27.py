@@ -887,6 +887,30 @@ def test_the_full_line_is_a_quarter_of_ram_and_never_under_8_gib():
     assert not sm.compressor_full(roomy)
 
 
+def test_a_steady_heavy_desktop_is_not_full_but_one_still_compressing_is():
+    # 40 GiB compressed on a 128 GB Mac with 1 GiB free (under the abort
+    # floor, above the kernel's target), nothing moving: a heavy desktop
+    # that copes, not refused and not critical.
+    steady = [
+        _reading(free=GIB, file_backed=10 * GIB, wired=70 * GIB,
+                 compressor=40 * GIB, swap=int(0.5 * GB), at_s=float(t))
+        for t in (0.0, 5.0, 10.0)
+    ]
+    assert not sm.compressor_full(steady[-1], steady[:-1])
+    assert sm.system_pressure_level(steady[-1], steady[:-1]) < 4
+    # The same Mac while a request compresses 512 MiB more in 5 s, or swaps
+    # 64 MiB: still losing ground at a quarter of RAM compressed.
+    compressing = _reading(free=GIB, file_backed=10 * GIB, wired=70 * GIB,
+                           compressor=40 * GIB + 512 * MIB, swap=int(0.5 * GB),
+                           at_s=15.0)
+    swapping = _reading(free=GIB, file_backed=10 * GIB, wired=70 * GIB,
+                        compressor=40 * GIB, swap=int(0.5 * GB) + 64 * MIB,
+                        at_s=15.0)
+    for moving in (compressing, swapping):
+        assert sm.compressor_full(moving, steady)
+        assert sm.system_pressure_level(moving, steady) == 4
+
+
 def _e2d_rows():
     path = Path(__file__).parent / "fixtures" / "e2d_replay_vm_rows.json"
     data = json.loads(path.read_text())
