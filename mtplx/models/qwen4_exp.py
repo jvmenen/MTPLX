@@ -62,7 +62,7 @@ from mlx_lm.models.qwen3_next import (
     Qwen3NextSparseMoeBlock as _Qwen3NextSparseMoeBlock,
 )
 
-from mtplx import nax_detect
+from mtplx import moe_sorted_gather, nax_detect
 from mtplx.attention_context import current_attention_phase
 from mtplx.attention_math import attention_gate
 from mtplx.float32_operand import float32_operand
@@ -1452,7 +1452,10 @@ class _FusedGateUpSwitchGLU(nn.Module):
         # +0.31G per fused module straight into a Metal OOM).
 
     def _gu(self, x, idx, sorted_indices=False):
-        gu = mx.gather_qmm(
+        # Expert-sorted (prefill-width) calls take the sorted-rows guard; the
+        # decode and verify widths keep calling MLX directly.
+        gather = moe_sorted_gather.gather_qmm if sorted_indices else mx.gather_qmm
+        gu = gather(
             x,
             self.gu_weight,
             self.gu_scales,
@@ -1467,31 +1470,46 @@ class _FusedGateUpSwitchGLU(nn.Module):
         return mx.split(gu, 2, axis=-1)
 
     def __call__(self, x, indices) -> mx.array:
-        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+        from mlx_lm.models.switch_layers import _scatter_unsort
 
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
-        idx = indices
-        inv_order = None
-        if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
-        gate, up = self._gu(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
-        if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
+        if indices.size < 64:
+            # Decode and verify widths: unsorted, straight to MLX.
+            x = mx.expand_dims(x, (-2, -3))
+            gate, up = self._gu(x, indices, sorted_indices=False)
+            x = self.down_proj(nn.silu(gate) * up, indices, sorted_indices=False)
+            return x.squeeze(-2)
+        y, inv_order = self._sorted(x, indices)
+        return _scatter_unsort(y, inv_order, indices.shape).squeeze(-2)
+
+    def _sorted(self, x, indices):
+        """Expert outputs ``[rows * top_k, 1, hidden]`` in expert-sorted order and
+        the permutation that unsorts them.  The rows are sorted the way mlx-lm's
+        gather-sort sorts them; on a tensor-unit GPU one kernel reads each token
+        row in place through the sort's row map and writes ``silu(gate) * up``
+        (mtplx.moe_sorted_gather.swiglu_rows, bit-identical to the gather, split
+        and ``nn.silu(gate) * up`` chain it replaces)."""
+
+        tokens, row_map, idx, inv_order = moe_sorted_gather.sort_rows(x, indices)
+        h = moe_sorted_gather.swiglu_rows(
+            tokens,
+            row_map,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            idx,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        y = moe_sorted_gather.switch_linear(self.down_proj, h, idx, sorted_indices=True)
+        return y, inv_order
 
     def sorted_experts(self, x, indices):
         """The expert outputs in expert-sorted order, ``[rows * top_k, hidden]``,
         with the inverse permutation that unsorts them: ``__call__`` for the
         sorted regime (64 or more routed rows) minus its final unsort."""
 
-        from mlx_lm.models.switch_layers import _gather_sort
-
-        x = mx.expand_dims(x, (-2, -3))
-        x, idx, inv_order = _gather_sort(x, indices)
-        gate, up = self._gu(x, idx, sorted_indices=True)
-        y = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=True)
+        y, inv_order = self._sorted(x, indices)
         return y.reshape(y.shape[0], -1), inv_order
 
 
