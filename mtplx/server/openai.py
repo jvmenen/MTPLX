@@ -19914,9 +19914,15 @@ class _PrefillSystemGuard:
         plus the chunk, over the engine's limit: an admission that
         under-priced the request stops here instead of past the limit.
 
-    Any of them stops the request with a 507 before the chunk. An unreadable
-    machine skips the Mac's lines, ``--allow-swap`` skips all of them, and
-    the trip belongs to this request only.
+    Before any of them stops the request, the engine gives back its own
+    reusable memory once (``_shed_reusable_memory``: the allocator pool and
+    the RAM state of every conversation that is not generating, conversations
+    already on SSD first) and reads the Mac again; only a line still crossed
+    after that stops the request with a 507 before the chunk (the E2d agent
+    replay, 2026-09-29: a request was refused while idle session snapshots
+    and the pool were still held). An unreadable machine skips the Mac's
+    lines, ``--allow-swap`` skips all of them, and the trip belongs to this
+    request only.
 
     Once the prefill's forwards are done, the check reserves only what the
     request still allocates (``after_prefill_reserve_bytes``: the repage's
@@ -19960,6 +19966,9 @@ class _PrefillSystemGuard:
         self.baseline_reading: Any | None = None
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
+        # What the engine gave back before deciding to stop this request
+        # (at most once per request), and whether the request then went on.
+        self.shed: dict[str, Any] | None = None
         self.checks = 0
         caps = getattr(state, "metal_memory_caps", None)
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
@@ -20009,6 +20018,57 @@ class _PrefillSystemGuard:
             return False
         self.last_read_s = now_s
         self.checks += 1
+        verdict = self._evaluate()
+        if verdict["reason"] is not None and self.shed is None:
+            # The engine's own reusable memory goes back before a request is
+            # refused, and the Mac is read again.
+            self.shed = self._shed_reusable_memory(verdict)
+            if self.shed.get("released_bytes") or self.shed.get("pool_bytes"):
+                verdict = self._evaluate()
+            self.shed["request_continued"] = verdict["reason"] is None
+            self.shed["reason_before"] = self.shed.pop("_reason_before", None)
+            _record_guard_event(self.state, dict(self.shed))
+            try:
+                print(
+                    "[mtplx] memory guard " + json.dumps(self.shed, default=str),
+                    flush=True,
+                )
+            except Exception:
+                pass
+        if verdict["reason"] is None:
+            return False
+        reading = verdict["reading"]
+        base = verdict["base"]
+        self.tripped = {
+            "action": "prefill_system_abort",
+            "reason": verdict["reason"],
+            "chunk_reserve_bytes": int(verdict["reserve"]),
+            "reserve_after_prefill": self.prefill_done_by is not None,
+            "prefill_done_by": self.prefill_done_by,
+            "engine_bytes": verdict["engine"],
+            "limit_bytes": int(self.limit) or None,
+            **verdict["fields"],
+            "allocator_pool_bytes": verdict["pool"],
+            "system_available_bytes": (
+                int(reading.available_bytes) if reading is not None else None
+            ),
+            "system_free_bytes": reading.free_bytes if reading is not None else None,
+            "abort_floor_bytes": verdict["abort_floor"],
+            "system_memory": reading.to_dict() if reading is not None else None,
+            "previous_system_memory": base.to_dict() if base is not None else None,
+            "interval_s": (
+                round(float(reading.monotonic_s) - float(base.monotonic_s), 3)
+                if reading is not None and base is not None
+                else None
+            ),
+            "checks": int(self.checks),
+            "shed_before_abort": dict(self.shed) if self.shed is not None else None,
+        }
+        return True
+
+    def _evaluate(self) -> dict[str, Any]:
+        """Read the engine and the Mac once and name the line crossed, if any."""
+
         reserve = self.chunk_reserve_bytes
         stats = _mlx_memory_stats_live()
         failure = _allocator_reading_failure(stats)
@@ -20061,33 +20121,90 @@ class _PrefillSystemGuard:
                     base = self.baseline_reading
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
-        if reason is None:
-            return False
-        self.tripped = {
-            "action": "prefill_system_abort",
+        return {
             "reason": reason,
-            "chunk_reserve_bytes": int(reserve),
-            "reserve_after_prefill": self.prefill_done_by is not None,
-            "prefill_done_by": self.prefill_done_by,
-            "engine_bytes": engine,
-            "limit_bytes": int(self.limit) or None,
-            **fields,
-            "allocator_pool_bytes": pool,
-            "system_available_bytes": (
-                int(reading.available_bytes) if reading is not None else None
-            ),
-            "system_free_bytes": reading.free_bytes if reading is not None else None,
-            "abort_floor_bytes": abort_floor,
-            "system_memory": reading.to_dict() if reading is not None else None,
-            "previous_system_memory": base.to_dict() if base is not None else None,
-            "interval_s": (
-                round(float(reading.monotonic_s) - float(base.monotonic_s), 3)
-                if reading is not None and base is not None
-                else None
-            ),
-            "checks": int(self.checks),
+            "reserve": reserve,
+            "engine": engine,
+            "fields": fields,
+            "pool": pool,
+            "reading": reading,
+            "base": base,
+            "abort_floor": abort_floor,
         }
-        return True
+
+    def _shed_reusable_memory(self, verdict: Mapping[str, Any]) -> dict[str, Any]:
+        """Give back the allocator pool and the RAM state of conversations
+        that are not generating (the admission's last step,
+        ``EngineSessionManager.release_idle_sessions``: sessions already on
+        SSD first, then the rest least recently used first; never a session
+        in flight, this request's included). Never raises."""
+
+        receipt: dict[str, Any] = {
+            "action": "prefill_shed_before_abort",
+            "_reason_before": verdict.get("reason"),
+            "pool_bytes": int(verdict.get("pool") or 0),
+            "released_bytes": 0,
+            "released_sessions": [],
+        }
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+        except Exception as exc:
+            receipt["pool_error"] = repr(exc)
+        # A line with a size (the engine limit, the Mac's abort floor)
+        # releases whole conversations until that shortfall is covered;
+        # compression the Mac is losing to has no size, so every idle
+        # conversation goes.
+        reason = verdict.get("reason")
+        pool = int(verdict.get("pool") or 0)
+        reserve = int(verdict.get("reserve") or 0)
+        reading = verdict.get("reading")
+        target: int | None = None
+        if reason == "engine_limit" and verdict.get("engine") is not None:
+            target = max(0, int(verdict["engine"]) + reserve - int(self.limit))
+        elif (
+            reason == "under_abort_floor"
+            and reading is not None
+            and verdict.get("abort_floor") is not None
+        ):
+            target = max(
+                0,
+                int(verdict["abort_floor"])
+                + reserve
+                - int(reading.available_bytes)
+                - pool,
+            )
+        receipt["target_bytes"] = target
+        sessions = getattr(self.state, "sessions", None)
+        release = getattr(sessions, "release_idle_sessions", None)
+        if callable(release) and (target is None or target > 0):
+            try:
+                released = release(
+                    target,
+                    keep_session_ids=_in_flight_session_ids(self.state),
+                    reason="prefill_shed_before_abort",
+                )
+            except Exception as exc:  # noqa: BLE001
+                released = getattr(exc, "receipt", None)
+                receipt["release_error"] = repr(exc)
+                _note_guard_health(
+                    self.state, where="prefill_shed_before_abort", error=exc
+                )
+            if isinstance(released, dict):
+                receipt["released_bytes"] = int(released.get("held_bytes") or 0)
+                receipt["released_sessions"] = [
+                    row.get("session_id")
+                    for row in released.get("sessions") or []
+                    if isinstance(row, dict)
+                ]
+            try:
+                import mlx.core as _mx
+
+                _mx.clear_cache()
+            except Exception:
+                pass
+        return receipt
 
 
 def _admission_chunk_bytes(geometry: "_AdmissionGeometry", rows: int, scratch: int) -> int:
@@ -29854,6 +29971,11 @@ def _run_generation(
             completion_tokens=completion_tokens,
             elapsed_s=elapsed_s,
         )
+        if prefill_system_guard.shed is not None and request_observability is not None:
+            # The per-chunk check gave memory back and the request went on.
+            request_observability["prefill_shed_before_abort"] = dict(
+                prefill_system_guard.shed
+            )
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:

@@ -483,3 +483,147 @@ def test_the_pool_goes_back_before_the_chunk_narrows(monkeypatch):
     assert receipt["reclamation_steps"] == ["allocator_pool"]
     assert receipt["prefill_chunk_tokens"] == 4096
     assert receipt["prefill_chunk_requested"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# Before the per-chunk check refuses a request, the engine gives back its own
+# reusable memory and reads the Mac again (E2d, 2026-09-29: a request was
+# refused while idle session snapshots and the allocator pool were held).
+
+
+def _shed_guard(monkeypatch, readings_by_bank_bytes, *, pool_bytes=0):
+    """A per-chunk check on a real SessionBank: the Mac's reading follows
+    what the bank still holds (``readings_by_bank_bytes(bank_bytes)``)."""
+
+    from pathlib import Path
+
+    from mtplx.engine_session import EngineSessionManager
+    from mtplx.session_bank import SessionBank
+
+    manager = EngineSessionManager(
+        bank=SessionBank(max_entries=64, max_bytes=60 * GIB, per_session_max_bytes=30 * GIB),
+        idle_ttl_s=3600,
+    )
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    for session_id, tokens, nbytes in (
+        ("idle-16k-a", range(1, 16_385), 3 * GIB),
+        ("idle-16k-b", range(20_000, 36_384), 3 * GIB),
+        ("generating", range(50_000, 82_768), 6 * GIB),
+    ):
+        entry = manager.bank.put(
+            runtime=runtime,
+            token_ids=list(tokens),
+            cache=[],
+            logits=None,
+            hidden=None,
+            session_id=session_id,
+            nbytes_override=nbytes,
+        )
+        assert entry is not None
+    generating = manager.get_or_create("generating")
+    assert generating.try_begin_generation()
+    pool = {"bytes": int(pool_bytes)}
+    clock = {"t": 0.0}
+
+    def read():
+        clock["t"] += 1.0
+        return readings_by_bank_bytes(manager.bank.total_nbytes, pool["bytes"], clock["t"])
+
+    def clear_cache():
+        pool["bytes"] = 0
+
+    import mlx.core as mx
+
+    monkeypatch.setattr(mx, "clear_cache", clear_cache)
+    monkeypatch.setattr(srv, "_read_system_memory", read)
+    monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {
+            "ok": True,
+            "active_memory_bytes": 80 * GIB,
+            "cache_memory_bytes": pool["bytes"],
+        },
+    )
+    monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+    state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False, sessions=manager)
+    guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+    return guard, manager, generating
+
+
+def _supply_reading(available, *, free=None, compressor=int(6.0 * GB), t=0.0):
+    free = int(0.2 * GB) if free is None else int(free)
+    return _reading(
+        free=free,
+        file_backed=max(0, int(available) - free),
+        wired=int(94.0 * GB),
+        compressor=compressor,
+        swap=int(0.1 * GB),
+        at_s=t,
+    )
+
+
+def test_idle_state_goes_back_before_a_request_is_refused(monkeypatch):
+    # Under the abort floor with the pool and two idle 16K sessions held;
+    # what the release gives back reaches the Mac's supply.
+    def read(bank_bytes, pool_bytes, t):
+        freed = 12 * GIB - bank_bytes
+        return _supply_reading(3 * GIB + freed, t=t)
+
+    guard, manager, generating = _shed_guard(monkeypatch, read, pool_bytes=GIB)
+    try:
+        assert guard() is False
+    finally:
+        generating.end_generation()
+    assert guard.tripped is None
+    assert guard.shed["request_continued"] is True
+    assert guard.shed["reason_before"] == "under_abort_floor"
+    assert guard.shed["pool_bytes"] == GIB
+    assert set(guard.shed["released_sessions"]) <= {"idle-16k-a", "idle-16k-b"}
+    assert guard.shed["released_bytes"] >= 3 * GIB
+    # Never the conversation that is generating.
+    assert manager.bank.has_session_entries("generating")
+
+
+def test_a_mac_still_short_after_the_shed_is_refused_with_its_receipt(monkeypatch):
+    def read(bank_bytes, pool_bytes, t):
+        return _supply_reading(2 * GIB, t=t)
+
+    guard, manager, generating = _shed_guard(monkeypatch, read, pool_bytes=GIB)
+    try:
+        assert guard() is True
+    finally:
+        generating.end_generation()
+    tripped = guard.tripped
+    assert tripped["reason"] == "under_abort_floor"
+    shed = tripped["shed_before_abort"]
+    assert shed["request_continued"] is False
+    assert shed["pool_bytes"] == GIB
+    assert shed["released_bytes"] >= 3 * GIB
+    assert manager.bank.has_session_entries("generating")
+    # One shed per request: the next check does not release again.
+    assert guard() is True
+
+
+def test_starved_free_pages_that_recover_after_the_shed_let_the_request_go_on(
+    monkeypatch,
+):
+    # Free pages under the kernel's target while the compressor grows fast:
+    # the death signature. The idle sessions' 6 GiB go back to the free
+    # list, the next reading is above the target, and the request goes on.
+    def read(bank_bytes, pool_bytes, t):
+        freed = 12 * GIB - bank_bytes
+        free = 16 * MIB + freed
+        compressor = int(6.0 * GB) + (int(0.6 * GB) if t >= 2.0 else 0)
+        return _supply_reading(20 * GIB + freed, free=free, compressor=compressor, t=t)
+
+    guard, manager, generating = _shed_guard(monkeypatch, read)
+    try:
+        assert guard() is False  # first reading: nothing to compare yet
+        assert guard() is False
+    finally:
+        generating.end_generation()
+    assert guard.shed["reason_before"] == "death_signature"
+    assert guard.shed["request_continued"] is True
+    assert guard.shed["released_bytes"] >= 3 * GIB
