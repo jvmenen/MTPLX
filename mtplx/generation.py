@@ -8509,6 +8509,9 @@ def first_token_logprobs(
     )
 
 
+PROMPT_SCORING_CHUNK_SIZE = 256
+
+
 def _prompt_scoring_logit_chunks(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8533,9 +8536,6 @@ def _prompt_scoring_logit_chunks(
     cache = _make_target_prefill_cache(rt)
     n = len(prompt_ids)
     prompt_array = mx.array([prompt_ids])
-    width = current_prefill_chunk_override()
-    if width is not None:
-        chunk_size = min(chunk_size, max(1, width))
     for start in range(0, n, chunk_size):
         _check_postcommit_abort(abort_check)
         end = min(n, start + chunk_size)
@@ -8557,7 +8557,7 @@ def score_prompt_logprobs(
     prompt_ids: list[int],
     *,
     top_k: int,
-    chunk_size: int = 256,
+    chunk_size: int = PROMPT_SCORING_CHUNK_SIZE,
     abort_check: Callable[[], bool] | None = None,
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:

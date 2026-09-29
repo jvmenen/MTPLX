@@ -65,3 +65,26 @@ def test_scoring_abort_restores_rotating_cache_update_mode(tiny_pair, cpu, monke
     assert len(calls) == 1
     windows = [c for c in caches[0] if isinstance(c, Gemma4RollbackRotatingKVCache)]
     assert windows and all(c._record_updates and c._last_update is None for c in windows)
+
+
+def test_scoring_repeats_exactly_and_bounds_width_rounding(tiny_pair, cpu):
+    runtime = tiny_pair(8, seed=4)
+    prompt = _prompt(67)
+    with generation.prefill_chunk_size_override(16):
+        first = generation.score_prompt_logprobs(runtime, prompt, top_k=3)
+        repeated = generation.score_prompt_logprobs(runtime, prompt, top_k=3)
+    with generation.prefill_chunk_size_override(32):
+        wider = generation.score_prompt_logprobs(runtime, prompt, top_k=3)
+
+    assert first["positions"] == repeated["positions"]
+    assert first["token_logprobs"] == repeated["token_logprobs"]
+    for scored in (first, repeated, wider):
+        assert np.isfinite(scored["token_logprobs"]).all()
+        assert all(np.isfinite(value) for row in scored["positions"] for _, value in row)
+    # Different attention widths can round differently; this is class C,
+    # never a claim of bit identity against the pre-#551 HTTP 500.
+    np.testing.assert_allclose(
+        first["token_logprobs"], wider["token_logprobs"], rtol=0, atol=OUTPUT_ATOL
+    )
+    delta = np.max(np.abs(np.array(first["token_logprobs"]) - wider["token_logprobs"]))
+    print({"widths": [16, 32], "max_abs_logprob_delta": float(delta), "bound": OUTPUT_ATOL})
