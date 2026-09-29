@@ -467,6 +467,39 @@ def test_a_pending_write_of_another_dtype_keeps_the_stock_promotion():
                                       np.array(b.astype(mx.float32)).view(np.uint32))
 
 
+def test_the_projections_call_the_installed_library_template():
+    # The down, inject and up projections run MLX's own GemvWide template, read
+    # from the installed package's header when the kernels are built; nothing
+    # of it is kept in this tree.
+    source, reason = hc_verify_read._gemv_template()
+    assert source is not None, reason
+    assert "struct GemvWide" in source and "static METAL_FUNC void run(" in source
+    assert "gemv_wide_do_axpby" not in source  # the bias branch is fixed off
+    module_text = open(hc_verify_read.__file__).read()
+    assert "simd_shuffle_down" not in module_text
+    assert "GemvWide<T, NV, KL_DOWN>::run(" in module_text
+
+
+@needs_the_read
+def test_an_unreadable_library_header_keeps_the_stock_chain(monkeypatch, capsys):
+    monkeypatch.setattr(
+        hc_verify_read, "_gemv_template", lambda: (None, "the installed MLX gemv header is not readable here")
+    )
+    model, report = _installed_model()
+    assert not report["installed"]
+    assert "gemv header is not readable" in report["disabled_reason"]
+    assert "hyper-connection verify read off" in capsys.readouterr().out
+    reader = model.layers[0].attn_hyper_connection
+    x, _block, _gates = _stream(FAMILY, 4, seed=22)
+    with compiled_step_body():
+        got = mx.compile(lambda s: reader(s))(x)
+    want = _stock(reader, x, None)
+    mx.eval(*got, *want)
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(_bits(a), _bits(b))
+    assert hc_verify_read.engagement()["traces"] == 0
+
+
 @needs_the_read
 def test_a_kernel_that_fails_to_build_leaves_the_stock_chain(monkeypatch):
     def refuse(*_args, **_kwargs):

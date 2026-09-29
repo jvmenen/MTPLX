@@ -25,14 +25,14 @@ kernel repeats MLX 0.32.2's own arithmetic in the same order:
   in order, a ``simd_sum`` per 32 virtual lanes, one ``simd_sum`` over the 32
   partial slots, IEEE division by the width, precise ``rsqrt``, a cast to the
   element type before the weight multiply;
-* each projection row is summed in the order MLX's wide gemv gives it (the
-  route MLX takes for 2 to 15 rows on GPU generation 15 and newer), which
-  the probe observes on this GPU: lanes own interleaved blocks of four
-  values, the blocks of the grouped region summed eight at a time from zero
-  before joining the lane's total, the remaining blocks one at a time, then
-  the lanes combined pairwise at halving distances; 32 lanes per row when all
-  rows fit one pass or the projection has at most 64 outputs, else 16. The
-  kernels' code is this module's own (``hc_row_dot``);
+* the projections ARE the library's wide gemv: the kernels call the
+  ``GemvWide`` template of the installed MLX (read from its
+  ``mlx/backend/metal/kernels/gemv.h`` when the kernels are built; no copy
+  lives in this tree), the code MLX itself runs for 2 to 15 rows on GPU
+  generation 15 and newer, with the lane count it picks (32 lanes per row when
+  all rows fit one pass or the projection has at most 64 outputs, else 16).
+  An install without a readable header, or with a template these kernels do
+  not recognise, keeps the stock chain with a printed reason;
 * the stock read evaluates its sigmoids two ways, and the kernels read each
   from a table of the stock values at every 16-bit input, made at install:
   the silu and the inject gate fuse into a JIT kernel (fast ``exp``), while
@@ -116,70 +116,60 @@ template <typename U>
 inline U hc_sigmoid(U x, const device U* table) {
     return table[as_type<ushort>(x)];
 }
-
-// One projection row for the NR vectors of a pass, over K values shared by
-// KL lanes. The row is read in blocks of four values and lane k takes blocks
-// k, k + KL, k + 2 KL, ... in that order. Inside the grouped region (the
-// longest prefix that is a whole number of groups of eight blocks per lane)
-// each group's eight block products are summed from zero and the group sum
-// then joins the lane's running total; each block after it joins the total on
-// its own. The lanes' totals then combine over a butterfly, partners at
-// distance KL / 2, KL / 4, ..., 1, which gives the first lane of every slice
-// the association the library's reduction gives it on this route. That order
-// is the specification; install's probe compares the result with the
-// library's own output bit for bit before anything uses it.
-// Vectors past ``valid`` re-read the last valid one (their results are never
-// stored), as the library does for a short last pass.
-template <typename U, int KL, int K, int NR>
-inline void hc_row_dot(
-    const device U* w_row,
-    const device U* x,
-    int valid,
-    uint k_lane,
-    thread float* acc) {
-    constexpr int BLOCKS = K / 4;
-    constexpr int GROUP = 8;
-    constexpr int GROUPED = BLOCKS - BLOCKS % (KL * GROUP);
-    const device vec<U, 4>* w_blocks = (const device vec<U, 4>*)w_row;
-    const device vec<U, 4>* x_blocks = (const device vec<U, 4>*)x;
-    int vector_base[NR];
-    for (int r = 0; r < NR; ++r) {
-        acc[r] = 0.0f;
-        vector_base[r] = min(r, valid - 1) * BLOCKS;
-    }
-    int block = (int)k_lane;
-    for (; block < GROUPED; block += GROUP * KL) {
-        // The group's weight blocks are read before any product is formed.
-        float4 w_group[GROUP];
-        for (int g = 0; g < GROUP; ++g) {
-            w_group[g] = float4(w_blocks[block + g * KL]);
-        }
-        float group_sum[NR];
-        for (int r = 0; r < NR; ++r) {
-            group_sum[r] = 0.0f;
-        }
-        for (int g = 0; g < GROUP; ++g) {
-            for (int r = 0; r < NR; ++r) {
-                group_sum[r] += dot(w_group[g], float4(x_blocks[vector_base[r] + block + g * KL]));
-            }
-        }
-        for (int r = 0; r < NR; ++r) {
-            acc[r] += group_sum[r];
-        }
-    }
-    for (; block < BLOCKS; block += KL) {
-        const float4 w = float4(w_blocks[block]);
-        for (int r = 0; r < NR; ++r) {
-            acc[r] += dot(w, float4(x_blocks[vector_base[r] + block]));
-        }
-    }
-    for (int r = 0; r < NR; ++r) {
-        for (ushort distance = KL / 2; distance > 0; distance >>= 1) {
-            acc[r] += simd_shuffle_xor(acc[r], distance);
-        }
-    }
-}
 """
+
+#: The projections run the library's own wide-gemv template (``GemvWide`` in
+#: the installed ``mlx/backend/metal/kernels/gemv.h``), read from the installed
+#: package when the kernels are built: it is the code the stock chain runs for
+#: these projections, so the sums are the stock sums by construction. Its
+#: bias/axpby branch (a function constant in the header) is off for these
+#: projections and is written as ``false``.
+_GEMV_HEADER = "mlx/backend/metal/kernels/gemv.h"
+_GEMV_THREADS = 128  # four simdgroups: GemvWide's layout at 32 lanes per row
+
+
+def _balanced_block(text: str, anchor: str) -> str:
+    """The declaration that contains ``anchor``: from the ``template <`` that
+    opens it to the ``};`` that closes its braces."""
+
+    at = text.index(anchor)
+    start = text.rindex("template <", 0, at)
+    depth = 0
+    i = text.index("{", at)
+    while True:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    close = text.index(";", i)
+    return text[start : close + 1]
+
+
+@lru_cache(maxsize=1)
+def _gemv_template() -> tuple[Optional[str], Optional[str]]:
+    """``(source, None)`` with the installed library's ``DefaultAccT`` and
+    ``GemvWide`` templates, or ``(None, reason)`` when the installed package
+    has no readable header or the template is not the one these kernels call."""
+
+    from pathlib import Path
+
+    try:
+        root = Path(mx.__file__).resolve().parent / "include"
+        text = (root / _GEMV_HEADER).read_text()
+        acc = _balanced_block(text, "struct DefaultAccT {")
+        acc_complex = _balanced_block(text, "struct DefaultAccT<complex64_t> {")
+        wide = _balanced_block(text, "struct GemvWide {")
+    except (OSError, ValueError) as exc:
+        return None, f"the installed MLX gemv header is not readable here ({type(exc).__name__}: {exc})"
+    for needle in ("static METAL_FUNC void run(", "uint simd_gid", "uint simd_lid", "gemv_wide_do_axpby"):
+        if needle not in wide:
+            return None, f"the installed GemvWide template has no {needle!r}"
+    wide = wide.replace("gemv_wide_do_axpby", "false")
+    return "\n".join((acc, acc_complex, wide)) + "\n", None
+
 
 # Kernel 1: the pending write and the grouped RMS norm. One threadgroup per
 # (row, stream); its 256 threads play the norm's VL virtual lanes, VS virtual
@@ -251,76 +241,75 @@ _NORM_SOURCE = r"""
     }
 """
 
-# Kernel 2: the down rows, then (in one more threadgroup) the inject rows.
+# Kernel 2: the down rows, then (in the last threadgroups) the inject rows.
+# GemvWide writes each row's projection for every vector as the element type;
+# the lane that stored it then reads it back and applies the row's gate.
 _DOWN_SOURCE = r"""
-    const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    const uint group = threadgroup_position_in_grid.x;
-    // The library runs rows in ceil(rows / 5) passes of NV vectors each.
-    const int v0 = (int)threadgroup_position_in_grid.y * NV;
-    const int valid = min(NV, ROWS - v0);
-    const device T* xs = normed + (size_t)v0 * HCD;
-    float acc[NV];
-    if (group < DOWN_GROUPS) {
-        const uint n = (group * SIMDGROUPS + sg) * (32u / (uint)KL_DOWN) + lane / (uint)KL_DOWN;
-        const uint k_lane = lane % (uint)KL_DOWN;
-        const uint n_read = min(n, (uint)(LOWRANK - 1));
-        hc_row_dot<T, KL_DOWN, HCD, NV>(
-            w_down + (size_t)n_read * HCD, xs, valid, k_lane, acc);
-        if (k_lane == 0 && n < (uint)LOWRANK) {
-            for (int r = 0; r < valid; ++r) {
-                const T projected = static_cast<T>(acc[r]);
-                const T scaled = projected / T(HC);
-                mix[(size_t)(v0 + r) * LOWRANK + n] = scaled * hc_sigmoid(scaled, sigmoid);
+    const uint lane = thread_index_in_simdgroup;
+    const uint block = threadgroup_position_in_grid.y;
+    const device T* no_bias = nullptr;
+    if (block < DOWN_BLOCKS) {
+        if (sg < (uint)(KL_DOWN / 8)) {
+            GemvWide<T, NV, KL_DOWN>::run(
+                w_down, normed, no_bias, down_raw, HCD, LOWRANK, ROWS, HCD, HCD,
+                1.0f, 0.0f, 0, 0, uint3(0, block, 0), uint3(1, DOWN_BLOCKS, 1), sg, lane);
+            const int out_row = (int)block * 4 + (32 / KL_DOWN) * (int)sg + (int)lane / KL_DOWN;
+            if ((int)lane % KL_DOWN == 0 && out_row < LOWRANK) {
+                for (int r = 0; r < ROWS; ++r) {
+                    const T projected = down_raw[(size_t)r * LOWRANK + out_row];
+                    const T scaled = projected / T(HC);
+                    mix[(size_t)r * LOWRANK + out_row] = scaled * hc_sigmoid(scaled, sigmoid);
+                }
             }
         }
     } else if (INJECT) {
-        // The inject projection has hc_count outputs, so the library keeps
-        // all 32 lanes on each row: one simdgroup per inject row.
-        if (sg < (uint)HC) {
-            hc_row_dot<T, 32, HCD, NV>(
-                w_inject + (size_t)sg * HCD, xs, valid, lane, acc);
-            if (lane == 0) {
-                for (int r = 0; r < valid; ++r) {
-                    const T logit = static_cast<T>(acc[r]);
-                    const T scaled = logit / T(HC);
-                    inject[(size_t)(v0 + r) * HC + sg] = T(2) * hc_sigmoid(scaled, sigmoid);
-                }
+        // The inject projection has hc_count outputs: 32 lanes per row.
+        const uint iblock = block - DOWN_BLOCKS;
+        GemvWide<T, NV, 32>::run(
+            w_inject, normed, no_bias, inject_raw, HCD, HC, ROWS, HCD, HCD,
+            1.0f, 0.0f, 0, 0, uint3(0, iblock, 0), uint3(1, INJECT_BLOCKS, 1), sg, lane);
+        const int out_row = (int)iblock * 4 + (int)sg;
+        if (lane == 0 && out_row < HC) {
+            for (int r = 0; r < ROWS; ++r) {
+                const T logit = inject_raw[(size_t)r * HC + out_row];
+                const T scaled = logit / T(HC);
+                inject[(size_t)r * HC + out_row] = T(2) * hc_sigmoid(scaled, sigmoid);
             }
         }
     }
 """
 
-# Kernel 3: output column c takes up rows c, D + c, ... (one per stream).
+# Kernel 3: one threadgroup per output column c. Its hc_count up rows (c,
+# D + c, ...) are a matrix of hc_count rows with row stride D * LOWRANK, which
+# GemvWide projects for every vector; then one thread per vector applies the
+# gate, the product with the normed value, the stream sum and the 1 / hc scale.
 _UP_SOURCE = r"""
-    const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    const uint group = threadgroup_position_in_grid.x;
-    const uint column = (group * SIMDGROUPS + sg) * (32u / (uint)KL_UP) + lane / (uint)KL_UP;
-    const uint k_lane = lane % (uint)KL_UP;
-    const uint c = min(column, (uint)(D - 1));
-    const int v0 = (int)threadgroup_position_in_grid.y * NV;
-    const int valid = min(NV, ROWS - v0);
-    float acc[NV];
-    T total[NV];
-    for (int s = 0; s < HC; ++s) {
-        const uint n = (uint)s * D + c;
-        hc_row_dot<T, KL_UP, LOWRANK, NV>(
-            w_up + (size_t)n * LOWRANK, mix + (size_t)v0 * LOWRANK, valid, k_lane, acc);
-        for (int r = 0; r < NV; ++r) {
-            const int rv = min(v0 + r, ROWS - 1);
-            const T gate = hc_sigmoid(static_cast<T>(acc[r]), sigmoid + 65536);
-            const T product = gate * normed[(size_t)rv * HCD + n];
+    const uint lane = thread_index_in_simdgroup;
+    const uint c = threadgroup_position_in_grid.y;
+    const device T* no_bias = nullptr;
+    device T* raw = up_raw + (size_t)c * (ROWS * HC);
+    if (sg < (uint)(KL_UP / 8)) {
+        for (int b = 0; b < UP_BLOCKS; ++b) {
+            GemvWide<T, NV, KL_UP>::run(
+                w_up + (size_t)c * LOWRANK, mix, no_bias, raw, LOWRANK, HC, ROWS, D * LOWRANK, LOWRANK,
+                1.0f, 0.0f, 0, 0, uint3(0, b, 0), uint3(1, UP_BLOCKS, 1), sg, lane);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint t = thread_position_in_threadgroup.x;
+    if (t < (uint)ROWS) {
+        T total = T(0);
+        for (int s = 0; s < HC; ++s) {
+            const T gate = hc_sigmoid(raw[t * HC + s], sigmoid + 65536);
+            const T product = gate * normed[(size_t)t * HCD + (size_t)s * D + c];
             // The small column reduce starts every stream's lane from +0 and
             // then adds the lanes in ascending stream order.
             const T lane_total = product + T(0);
-            total[r] = (s == 0) ? lane_total : T(lane_total + total[r]);
+            total = (s == 0) ? lane_total : T(lane_total + total);
         }
-    }
-    if (k_lane == 0 && column < (uint)D) {
-        for (int r = 0; r < valid; ++r) {
-            mixed[(size_t)(v0 + r) * D + column] = total[r] * T(INV_HC);
-        }
+        mixed[(size_t)t * D + c] = total * T(INV_HC);
     }
 """
 
@@ -380,21 +369,27 @@ def _norm_kernel(hc: int, width: int, lowrank: int, eps: float, pending: bool):
     )
 
 
+def _gemv_source() -> str:
+    source, reason = _gemv_template()
+    if source is None:
+        raise RuntimeError(reason)
+    return source
+
+
 @lru_cache(maxsize=None)
 def _down_kernel(hc: int, width: int, lowrank: int, eps: float, rows: int, inject: bool):
-    kl = _k_lanes(rows, lowrank)
-    per_group = _SIMDGROUPS * (32 // kl)
-    header = _header(hc, width, lowrank, eps) + _COMMON + (
+    header = _header(hc, width, lowrank, eps) + _COMMON + _gemv_source() + (
         f"constant constexpr int ROWS = {rows};\n"
         f"constant constexpr int NV = {_passes(rows)[1]};\n"
-        f"constant constexpr int KL_DOWN = {kl};\n"
-        f"constant constexpr uint DOWN_GROUPS = {(lowrank + per_group - 1) // per_group}u;\n"
+        f"constant constexpr int KL_DOWN = {_k_lanes(rows, lowrank)};\n"
+        f"constant constexpr uint DOWN_BLOCKS = {(lowrank + 3) // 4}u;\n"
+        f"constant constexpr uint INJECT_BLOCKS = {(hc + 3) // 4}u;\n"
         f"constant constexpr bool INJECT = {'true' if inject else 'false'};\n"
     )
     return mx.fast.metal_kernel(
         name=f"mtplx_hc_verify_down_h{hc}_d{width}_l{lowrank}_r{rows}_i{int(inject)}",
         input_names=["normed", "w_down", "w_inject", "sigmoid"],
-        output_names=["mix", "inject"],
+        output_names=["mix", "inject", "down_raw", "inject_raw"],
         header=header,
         source=_DOWN_SOURCE,
     )
@@ -402,16 +397,16 @@ def _down_kernel(hc: int, width: int, lowrank: int, eps: float, rows: int, injec
 
 @lru_cache(maxsize=None)
 def _up_kernel(hc: int, width: int, lowrank: int, eps: float, rows: int):
-    kl = _k_lanes(rows, hc * width)
-    header = _header(hc, width, lowrank, eps) + _COMMON + (
+    header = _header(hc, width, lowrank, eps) + _COMMON + _gemv_source() + (
         f"constant constexpr int ROWS = {rows};\n"
         f"constant constexpr int NV = {_passes(rows)[1]};\n"
-        f"constant constexpr int KL_UP = {kl};\n"
+        f"constant constexpr int KL_UP = {_k_lanes(rows, hc * width)};\n"
+        f"constant constexpr int UP_BLOCKS = {(hc + 3) // 4};\n"
     )
     return mx.fast.metal_kernel(
         name=f"mtplx_hc_verify_up_h{hc}_d{width}_l{lowrank}_r{rows}",
         input_names=["mix", "w_up", "normed", "sigmoid"],
-        output_names=["mixed"],
+        output_names=["mixed", "up_raw"],
         header=header,
         source=_UP_SOURCE,
     )
@@ -509,29 +504,23 @@ def read_rows(
         )
         written = x
 
-    kl_down = _k_lanes(rows, lowrank)
-    per_group = _SIMDGROUPS * (32 // kl_down)
-    down_groups = (lowrank + per_group - 1) // per_group
-    groups = down_groups + (1 if has_inject else 0)
-    mix, inject_out = _down_kernel(hc, width, lowrank, float(eps), rows, has_inject)(
+    blocks = (lowrank + 3) // 4 + ((hc + 3) // 4 if has_inject else 0)
+    mix, inject_out, _down_raw, _inject_raw = _down_kernel(hc, width, lowrank, float(eps), rows, has_inject)(
         inputs=[normed, w_down, w_inject if has_inject else w_down, sigmoid],
         template=[("T", dtype)],
-        grid=(groups * _THREADS, _passes(rows)[0], 1),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[(rows, lowrank), (rows, hc)],
-        output_dtypes=[dtype, dtype],
+        grid=(_GEMV_THREADS, blocks, 1),
+        threadgroup=(_GEMV_THREADS, 1, 1),
+        output_shapes=[(rows, lowrank), (rows, hc), (rows, lowrank), (rows, hc)],
+        output_dtypes=[dtype, dtype, dtype, dtype],
     )
 
-    kl_up = _k_lanes(rows, hcd)
-    per_group = _SIMDGROUPS * (32 // kl_up)
-    up_groups = (width + per_group - 1) // per_group
-    (mixed,) = _up_kernel(hc, width, lowrank, float(eps), rows)(
+    mixed, _up_raw = _up_kernel(hc, width, lowrank, float(eps), rows)(
         inputs=[mix, w_up, normed, sigmoid],
         template=[("T", dtype)],
-        grid=(up_groups * _THREADS, _passes(rows)[0], 1),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[(rows, width)],
-        output_dtypes=[dtype],
+        grid=(_GEMV_THREADS, width, 1),
+        threadgroup=(_GEMV_THREADS, 1, 1),
+        output_shapes=[(rows, width), (width, rows, hc)],
+        output_dtypes=[dtype, dtype],
     )
     return mixed, written, (inject_out if has_inject else None)
 
@@ -807,6 +796,9 @@ def install(model: Any, *, rows: Iterable[int] = (4,), architecture: Optional[st
         return _off(f"{dtype} mixers (the kernels serve bfloat16 and float16)")
     if not (_module_dtypes_match(reader, dtype) and _module_dtypes_match(mixer, dtype)):
         return _off("mixed-dtype hyper-connection weights")
+    _source, why = _gemv_template()
+    if _source is None:
+        return _off(why)
 
     cases = 1
     _COUNTS["probe_cases"] += 1
