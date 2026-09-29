@@ -151,15 +151,15 @@ def test_reasoning_repair_after_retry_continues_the_retry_prompt(monkeypatch):
     assert not _is_prefix(original + [ord(c) for c in THINKING_ONLY], repair)
 
 
-def test_reasoning_repair_follow_switch_off_restores_original_splice(monkeypatch):
+def test_reasoning_repair_always_uses_the_prompt_that_produced_its_tokens(monkeypatch):
     monkeypatch.setenv("MTPLX_REASONING_REPAIR_FOLLOWS_RETRY_PROMPT", "0")
 
     prompts, _batch_keys, _stats = _run_chain(
         monkeypatch, [ORPHAN_TAIL, THINKING_ONLY, ANSWER]
     )
 
-    original, _retry, repair = prompts
-    assert _is_prefix(original + [ord(c) for c in THINKING_ONLY], repair)
+    _original, retry, repair = prompts
+    assert _is_prefix(retry + [ord(c) for c in THINKING_ONLY], repair)
 
 
 def test_reasoning_repair_without_retry_still_uses_request_prompt(monkeypatch):
@@ -233,3 +233,31 @@ def test_recovery_chain_keeps_last_pass_values_and_updates_metrics():
     assert result["stats"]["stream_attempts_new_prefill_tokens"] == 7
     assert result["stats"]["stream_attempts_completion_tokens"] == 7
     assert state.last_metrics[-1]["stream_attempts"] == 2
+
+
+def test_recovery_chain_releases_discarded_generation_state():
+    """Only scalar receipts may survive into later passes, never old KV."""
+    import weakref
+
+    class CacheState:
+        pass
+
+    old_state = CacheState()
+    old_ref = weakref.ref(old_state)
+
+    def first_result():
+        nonlocal old_state
+        result = {"_final_state": old_state, "completion_tokens": 3, "stats": {}}
+        old_state = None
+        return result
+
+    def third_pass(second):
+        assert old_ref() is None, "discarded pass retains its model cache"
+        return {"completion_tokens": 5, "stats": {}}
+
+    result = _run_stream_recovery_chain(
+        SimpleNamespace(last_metrics=[]),
+        first_result(),
+        [lambda first: {"completion_tokens": 4, "stats": {}}, third_pass],
+    )
+    assert result["stats"]["stream_attempts_completion_tokens"] == 12
