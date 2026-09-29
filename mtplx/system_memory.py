@@ -82,6 +82,20 @@ _SHED_FLOOR_MULTIPLE = 2
 _THRASH_COMPRESSOR_BYTES_PER_S = 256 * MIB
 _THRASH_SWAP_BYTES_PER_S = 64 * MIB
 _THRASH_MIN_GROWTH_BYTES = 256 * MIB
+# Compressor growth alone is not the signature while the kernel still has a
+# large clean file cache to drop (supply at or above the shed floor) and its
+# free pages are not starved. macOS 27 compresses other apps' idle pages
+# early and runs with fewer free pages: on 2026-09-29 (E1, 128 GB, Flash-Next,
+# macOS 27.0.1) a healthy 65K prefill was aborted twice as "death_signature"
+# at 2.4 and 1.45 GB free with 25.0 and 23.2 GB of file-backed pages, the
+# compressor growing 0.8 GB in 2.8 s and swap flat. Every recorded death
+# shape stays caught: the freezes and the 09-23 panic had free pages at 0.0
+# to 0.5 GiB (under this line) or little file cache (supply under the shed
+# floor, where compressor growth counts as before), and swap growth counts at
+# the abort floor whatever the file cache. 512 MiB is eight times the
+# kernel's own free-page target on a 16 KiB-page Mac (vm_page_free_target
+# 4,000 pages), where reclaim is not yet under way.
+_THRASH_STARVED_FREE_BYTES = 512 * MIB
 # Growth is measured from every reading of the last ten seconds (and the
 # newest one before them), not only from the previous reading: the per-chunk
 # check reads every 0.2 s, and 320 MiB/s arriving in 80 MiB steps never grew
@@ -406,29 +420,40 @@ def thrashing_base(
 ) -> SystemMemory | None:
     """The earlier reading the death signature is measured from, or None.
 
-    The signature: free pages under the abort floor while the compressor or
-    swap grew fast since one of the ``previous`` readings (one reading, or
-    several from a ``ReadingWindow``). Needs the page counters; anything
-    missing reads as not thrashing.
+    The signature: free pages under the abort floor while swap grew fast
+    since one of the ``previous`` readings (one reading, or several from a
+    ``ReadingWindow``), or while the compressor grew fast and either the
+    supply is under the shed floor or free pages are starved. Needs the page
+    counters; anything missing reads as not thrashing.
     """
 
     if reading is None or previous is None:
         return None
     if reading.free_bytes is None:
         return None
-    _shed, abort = reading_floors(reading)
-    if int(reading.free_bytes) >= abort:
+    shed, abort = reading_floors(reading)
+    free = int(reading.free_bytes)
+    if free >= abort:
         return None
+    # Compression counts when the kernel has little else to reclaim or its
+    # free pages are starved; with a large clean file cache it is the
+    # kernel's own choice (see _THRASH_STARVED_FREE_BYTES). Swap always does.
+    compression_counts = (
+        int(reading.available_bytes) < shed or free < _THRASH_STARVED_FREE_BYTES
+    )
     earlier = [previous] if isinstance(previous, SystemMemory) else list(previous)
     for base in earlier:
         if base is None or base is reading:
             continue
         elapsed = float(reading.monotonic_s) - float(base.monotonic_s)
-        if _grew_fast(
-            reading.compressor_bytes,
-            base.compressor_bytes,
-            elapsed,
-            _THRASH_COMPRESSOR_BYTES_PER_S,
+        if (
+            compression_counts
+            and _grew_fast(
+                reading.compressor_bytes,
+                base.compressor_bytes,
+                elapsed,
+                _THRASH_COMPRESSOR_BYTES_PER_S,
+            )
         ) or _grew_fast(
             reading.swap_used_bytes,
             base.swap_used_bytes,
