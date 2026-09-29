@@ -241,8 +241,8 @@ def test_final_pending_capture_and_next_session_bank_turn_are_identical(pack, la
     _equal(narrow, wide)
 
 
-def _grant_boundary_session(pack, patch, bucket):
-    """Run the production loop from synthetic 16K history to a stop bonus.
+def _grant_boundary_session(pack, patch, bucket, *, final_keep=4, deny_growth=False):
+    """Run from synthetic 16K history to a stop bonus or correction.
 
     Only the cold history and accept coins are controlled. Verification,
     the final one-row forward, publication, and the next turn use the real
@@ -260,6 +260,8 @@ def _grant_boundary_session(pack, patch, bucket):
     patch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
     patch.setenv("MTPLX_BATCH_TARGET_DISTS", "0")
     patch.setenv("MTPLX_DROP_EVENTS", "0")
+    if final_keep < 4:
+        patch.setenv("MTPLX_FAMILY_CAPTURE_COMMIT", "1")
     rt = smoke._tiny_runtime(model)
     install_qwen4_fixed_verify_route(rt)
     session = SessionBank(max_bytes=2**28, per_session_max_bytes=2**28)
@@ -291,8 +293,13 @@ def _grant_boundary_session(pack, patch, bucket):
     class AcceptAll:
         def __init__(self, seed):
             self.delegate = default_rng(seed)
+            self.final_draws = 0
 
         def random(self, *args, **kwargs):
+            if len(windows) == 256 and final_keep < 4:
+                self.final_draws += 1
+                if self.final_draws == final_keep:
+                    return float("inf")  # force the final rejection, even p == 1
             return 0.0  # force all three draft accepts, including p == 0
 
         def __getattr__(self, name):
@@ -304,6 +311,7 @@ def _grant_boundary_session(pack, patch, bucket):
     windows, pending = [], []
     stop = 127
     sample = generation._sample_from_logits
+    sample_distribution = generation.sample_from_distribution
     is_stop = generation._is_stop
     bonus_sampled = False
 
@@ -317,6 +325,22 @@ def _grant_boundary_session(pack, patch, bucket):
         elif token == stop:
             token = 126
         return token, distribution
+
+    def correction_at_boundary(*args, **kwargs):
+        nonlocal bonus_sampled
+        if len(windows) == 256 and final_keep < 4:
+            bonus_sampled = True
+            return stop
+        return sample_distribution(*args, **kwargs)
+
+    if deny_growth:
+        install = graphbank.CompiledVerifyBank.install_fixed_m4
+
+        def install_with_no_growth(self, *args, **kwargs):
+            install(self, *args, **kwargs)
+            self.capacity_plan.admit_growth = lambda rows: False
+
+        patch.setattr(graphbank.CompiledVerifyBank, "install_fixed_m4", install_with_no_growth)
 
     def verify(self, input_ids, host_input_ids, completion_tokens, committed_count, cache):
         result = real_verify(self, input_ids, host_input_ids, completion_tokens,
@@ -333,6 +357,7 @@ def _grant_boundary_session(pack, patch, bucket):
         return real_forward(ids, **kwargs)
 
     patch.setattr(generation, "_sample_from_logits", sample_at_boundary)
+    patch.setattr(generation, "sample_from_distribution", correction_at_boundary)
     patch.setattr(generation, "_is_stop", lambda token, stops: bonus_sampled and is_stop(token, stops))
     patch.setattr(graphbank.CompiledVerifyBank, "_forward_installed_fixed_m4", verify)
     patch.setattr(rt, "forward_ar", forward)
@@ -345,16 +370,23 @@ def _grant_boundary_session(pack, patch, bucket):
     final = first.final_state
     assert len(windows) == 256 and windows[-1][:2] == (17_408, 17_408)
     assert windows[-1][2] == (24_576 if bucket else 17_408)
-    assert len(first.tokens) == 1025 and first.tokens[-1] == stop
-    assert first.finish_reason == "stop" and first.stats.finish_stop_origin == "bonus"
-    assert pending[-1][0] == 17_408
-    assert pending[-1][1] >= 17_409, "final capture must reserve its attention row"
+    final_offset = 17_404 + final_keep
+    assert len(first.tokens) == 1021 + final_keep and first.tokens[-1] == stop
+    assert first.finish_reason == "stop"
+    assert first.stats.finish_stop_origin == ("bonus" if final_keep == 4 else "residual_correction")
+    if final_keep < 4:
+        assert first.stats.deferred_correction_repairs == 1
     assert final is not None and final.safe_to_commit
+    assert pending[-1][0] == final_offset
+    if final_keep < 4:
+        assert pending[-1][1] == 17_408, "a final row inside the grant must not widen attention"
+    else:
+        assert pending[-1][1] >= 17_409, "final capture must reserve its attention row"
     qsa = next(e for e in final.final_trunk_cache if isinstance(e, QSACache))
-    assert qsa.offset == qsa.state[0].shape[2] == 17_409
+    assert qsa.offset == qsa.state[0].shape[2] == final_offset + 1
     restored = model.make_cache()
     restore_cache(restored, snapshot_cache(final.final_trunk_cache))
-    assert next(e.offset for e in restored if isinstance(e, QSACache)) == 17_409
+    assert next(e.offset for e in restored if isinstance(e, QSACache)) == final_offset + 1
     records = _leaves((final.final_logits, final.final_hidden)) + _state(restored)
     prefix = prompt + list(first.tokens)
     assert session.put(
@@ -367,6 +399,7 @@ def _grant_boundary_session(pack, patch, bucket):
     # Restore normal sampling for the next turn; the cached boundary is real.
     patch.setattr(np.random, "default_rng", default_rng)
     patch.setattr(generation, "_sample_from_logits", sample)
+    patch.setattr(generation, "sample_from_distribution", sample_distribution)
     patch.setattr(generation, "_is_stop", is_stop)
     second = generation.generate_mtpk(
         rt, prefix + [31, 37, 41, 43], max_tokens=16,
@@ -375,7 +408,7 @@ def _grant_boundary_session(pack, patch, bucket):
         verify_strategy="batched", stop_token_ids=set(), capture_final_state=True,
         session_bank=session,
     )
-    assert second.stats.cached_tokens == 17_409
+    assert second.stats.cached_tokens == final_offset + 1
     assert second.final_state.safe_to_commit
     records += _leaves((second.final_state.final_logits, second.final_state.final_hidden))
     records += _state(second.final_state.final_trunk_cache)
@@ -391,6 +424,22 @@ def test_grant_boundary_capture_and_next_session_bank_turn(pack, lane):
         narrow = _grant_boundary_session(pack, patch, 0)
     assert narrow[:3] == wide[:3]
     _equal(narrow[3], wide[3])
+
+
+@pytest.mark.parametrize("final_keep", [1, 2, 3])
+def test_final_correction_inside_grant_keeps_width_and_restored_bits(pack, lane, final_keep):
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    with lane.context() as patch:
+        wide = _grant_boundary_session(pack, patch, 8192, final_keep=final_keep)
+    with lane.context() as patch:
+        narrow = _grant_boundary_session(pack, patch, 0, final_keep=final_keep)
+    assert narrow[:3] == wide[:3]
+    _equal(narrow[3], wide[3])
+
+
+def test_final_correction_inside_grant_survives_denied_growth(pack, lane):
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    _grant_boundary_session(pack, lane, 0, final_keep=3, deny_growth=True)
 
 
 @pytest.mark.parametrize("allow_step", [False, True])

@@ -2859,7 +2859,9 @@ class CompiledVerifyBank:
         runs eager. They must renew capacity before writing, too. Generation
         supplies its host ledger to avoid a device sync; standalone callers
         without that ledger use the live cache offset. Generic banks are
-        unchanged. Keep four rows reserved for a possible lazy bonus write.
+        unchanged. Multi-row windows keep four rows for a possible lazy
+        bonus. A one-row final capture has no bonus and reserves only its
+        write, preserving the attention width when it fits the grant.
         """
 
         dispatch = self._fixed_m4_dispatch
@@ -2870,7 +2872,8 @@ class CompiledVerifyBank:
             if committed_count is not None
             else dispatch["qsa_entries"][0].size()
         )
-        required_end = logical_start + max(4, int(window_tokens))
+        window_tokens = int(window_tokens)
+        required_end = logical_start + (1 if window_tokens == 1 else max(4, window_tokens))
         # Follow the parent's grants independently of the larger allocation.
         # A rejection trims the offset, not these already granted widths.
         capacity_needed = required_end > int(dispatch["dense_capacity"])
