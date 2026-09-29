@@ -100,9 +100,16 @@ def prompt(tokens: int, seed: int = 7, vocab: int = 256) -> list[int]:
     return [int(token) for token in rng.integers(0, vocab, size=tokens)]
 
 
+_BIT_VIEWS = {mx.bfloat16: mx.uint16, mx.float16: mx.uint16, mx.float32: mx.uint32}
+
+
 def as_numpy(value: mx.array) -> np.ndarray:
-    if value.dtype == mx.bfloat16:
-        value = value.view(mx.uint16)
+    """The array's bit patterns for floats (so +0.0 and -0.0 differ and a NaN
+    equals itself), its values for every other dtype."""
+
+    view = _BIT_VIEWS.get(value.dtype)
+    if view is not None:
+        value = value.view(view)
     return np.array(value)
 
 

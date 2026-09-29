@@ -99,6 +99,21 @@ def _draft_step(model, cache, hidden_row, token):
     return logits, draft_hidden
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_bit_equality_compares_bit_patterns(dtype):
+    """Every "same bits" assertion here and in the kernel tests goes through
+    ``assert_bit_equal``: a sign-of-zero difference must fail it and the same
+    NaN must pass it, in every float dtype the caches hold."""
+
+    zero = mx.array([0.0, 1.0], dtype=dtype)
+    negative_zero = mx.array([-0.0, 1.0], dtype=dtype)
+    assert bool(mx.array_equal(zero, negative_zero).item())  # equal as values ...
+    with pytest.raises(AssertionError):
+        assert_bit_equal([zero], [negative_zero])  # ... not as bits
+    nan = mx.array([float("nan"), 1.0], dtype=dtype)
+    assert_bit_equal([nan], [nan])
+
+
 def test_on_by_default_and_off_with_a_false_value(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     assert mtp_history_cache_only_enabled() is True
