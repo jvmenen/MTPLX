@@ -96,6 +96,20 @@ _THRASH_MIN_GROWTH_BYTES = 256 * MIB
 # kernel's own free-page target on a 16 KiB-page Mac (vm_page_free_target
 # 4,000 pages), where reclaim is not yet under way.
 _THRASH_STARVED_FREE_BYTES = 512 * MIB
+# Runaway compression during one prefill, whatever the supply reads: macOS 27
+# can compress other apps' memory by tens of GB while clean file pages keep
+# the supply looking healthy. 2026-09-29, 128 GB, 2.12.0, a 131,072-token
+# cold prefill: the compressor grew 27 GB (32.5 GB total) with 20.6 GB still
+# reading available and swap flat, the 2026-09-23 crash's pattern (57.7 GB
+# compressed at the panic). The same Mac served 64K cold prefills with the
+# compressor growing about 0.3 GB/s (E1: 0.85 GB in 2.9 s), roughly 12 GB
+# over a 42 s prefill, and the 128K run crossed an eighth of RAM (16 GiB on
+# 128 GB) about a minute in, well before the 27 GB it reached. Measured from
+# the prefill's first reading, so compression that happened before the
+# request (a model load compresses 5 to 8 GB of idle pages on macOS 27) is
+# not charged to it.
+_RUNAWAY_COMPRESSOR_RAM_DIVISOR = 8
+_RUNAWAY_COMPRESSOR_MIN_BYTES = 4 * GIB
 # Growth is measured from every reading of the last ten seconds (and the
 # newest one before them), not only from the previous reading: the per-chunk
 # check reads every 0.2 s, and 320 MiB/s arriving in 80 MiB steps never grew
@@ -464,6 +478,29 @@ def thrashing_base(
     return None
 
 
+def compressor_runaway_bytes(total_bytes: int) -> int:
+    """Compressor growth within one prefill that stops it (an eighth of RAM)."""
+
+    return max(
+        _RUNAWAY_COMPRESSOR_MIN_BYTES,
+        int(total_bytes) // _RUNAWAY_COMPRESSOR_RAM_DIVISOR,
+    )
+
+
+def compressor_runaway(
+    reading: SystemMemory | None, baseline: SystemMemory | None
+) -> bool:
+    """Whether the compressor grew past the runaway line since ``baseline``
+    (the prefill's first reading). Missing counters read as no runaway."""
+
+    if reading is None or baseline is None or reading is baseline:
+        return False
+    if reading.compressor_bytes is None or baseline.compressor_bytes is None:
+        return False
+    growth = int(reading.compressor_bytes) - int(baseline.compressor_bytes)
+    return growth >= compressor_runaway_bytes(reading.total_bytes)
+
+
 def memory_thrashing(
     reading: SystemMemory | None,
     previous: SystemMemory | Sequence[SystemMemory | None] | None,
@@ -551,6 +588,8 @@ __all__ = [
     "SystemMemory",
     "admission_floors",
     "admission_shortfall_bytes",
+    "compressor_runaway",
+    "compressor_runaway_bytes",
     "memory_thrashing",
     "read_system_memory",
     "thrashing_base",

@@ -167,6 +167,7 @@ from mtplx.system_memory import (
     ReadingWindow as _SystemReadingWindow,
     admission_floors as _system_admission_floors,
     admission_shortfall_bytes as _system_admission_shortfall_bytes,
+    compressor_runaway as _system_compressor_runaway,
     memory_thrashing as _system_memory_thrashing,
     read_system_memory as _read_system_memory,
     reading_floors as _system_reading_floors,
@@ -19951,6 +19952,9 @@ class _PrefillSystemGuard:
         self.restore_bytes = max(0, int(restore_bytes))
         self.prefill_done_by: str | None = None
         self.window = _SystemReadingWindow()
+        # The prefill's first reading: runaway compression is measured from
+        # it, so what the Mac compressed before this request is not charged.
+        self.baseline_reading: Any | None = None
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
         self.checks = 0
@@ -20041,12 +20045,17 @@ class _PrefillSystemGuard:
         base = None
         abort_floor = None
         if reading is not None:
+            if self.baseline_reading is None:
+                self.baseline_reading = reading
             self.window.add(reading)
             _shed_floor, abort_floor = _system_reading_floors(reading)
             if reason is None:
                 base = _system_thrashing_base(reading, earlier)
                 if base is not None:
                     reason = "death_signature"
+                elif _system_compressor_runaway(reading, self.baseline_reading):
+                    reason = "compressor_runaway"
+                    base = self.baseline_reading
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
         if reason is None:
@@ -20188,6 +20197,16 @@ def _prefill_system_abort_exception(
             f"the engine held {_gib_text(tripped.get('engine_bytes'))} and its "
             f"next prefill chunk needs {_gib_text(reserve)}, past its "
             f"{_gib_text(tripped.get('limit_bytes'))} limit"
+        )
+    elif reason == "compressor_runaway":
+        current = tripped.get("system_memory") or {}
+        before = tripped.get("previous_system_memory") or {}
+        grown = int(current.get("compressor_bytes") or 0) - int(
+            before.get("compressor_bytes") or 0
+        )
+        cause = (
+            f"macOS compressed {_gib_text(grown)} more of other apps' memory "
+            "during this prefill"
         )
     elif reason == "death_signature":
         current = tripped.get("system_memory") or {}
@@ -21916,8 +21935,46 @@ def _run_prefill_admission(
 
     models = price()
     chosen = widest_fit(now, models)
+    early_pool_clear: dict[str, Any] | None = None
+    if (
+        chosen is not _ADMISSION_NO_FIT
+        and chosen != widths[0]
+        and now["cache"] > 0
+        and system_short(now, int(models[widths[0]]["growth_bytes"]), "shed") > 0
+    ):
+        # The engine's own freed buffers go back before the request gives up
+        # its chunk width: clearing the pool takes nothing from anyone and
+        # costs a few milliseconds, while a narrower chunk slows the whole
+        # prefill (E1, 2026-09-29, macOS 27: a 16K cold prompt narrowed to
+        # 2,048 rows for a 0.67 GB shortfall with 4.4 GB in the pool, 1,339
+        # against 2.12.0's 1,574 tok/s). The engine line leaves the pool out;
+        # only the Mac's line asks for it.
+        cache_before = int(now["cache"])
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+            now = measure()
+            chosen = widest_fit(now, models)
+            early_pool_clear = {
+                "cache_bytes_before": cache_before,
+                "cache_bytes_after": int(now["cache"]),
+            }
+        except _AllocatorReadingError:
+            raise
+        except Exception as exc:
+            early_pool_clear = {"error": repr(exc)}
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         settle(models[chosen])
+        if early_pool_clear is not None:
+            return {
+                "action": "prefill_admission_pool_clear",
+                "prompt_tokens": int(prompt_tokens),
+                "prefill_chunk_requested": widths[0],
+                "prefill_chunk_tokens": widths[0],
+                "reclamation_steps": ["allocator_pool"],
+                **early_pool_clear,
+            }
         return None
     narrow = widths[-1]
     current = models[narrow if chosen is _ADMISSION_NO_FIT else chosen]

@@ -179,3 +179,174 @@ def test_a_thin_supply_keeps_the_abort_floor_sensitivity():
     assert after.free_bytes < abort and after.available_bytes < shed
     assert after.free_bytes > 512 * MIB
     assert sm.memory_thrashing(after, before)
+
+
+# ---------------------------------------------------------------------------
+# Runaway compression inside one prefill, and the per-chunk check that stops it
+
+from types import SimpleNamespace  # noqa: E402
+
+import mtplx.server.openai as srv  # noqa: E402
+
+
+def test_the_runaway_line_is_an_eighth_of_ram():
+    assert sm.compressor_runaway_bytes(128 * GIB) == 16 * GIB
+    assert sm.compressor_runaway_bytes(64 * GIB) == 8 * GIB
+    assert sm.compressor_runaway_bytes(16 * GIB) == 4 * GIB
+
+
+def _prefill_guard(monkeypatch, readings):
+    sequence = iter(readings)
+    last = [None]
+
+    def reader():
+        try:
+            last[0] = next(sequence)
+        except StopIteration:
+            pass
+        return last[0]
+
+    monkeypatch.setattr(sm, "_reader", reader)
+    monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {"ok": True, "active_memory_bytes": 80 * GIB, "cache_memory_bytes": 0},
+    )
+    monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+    state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False)
+    return srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+
+
+def _trajectory(*, rate_gb_s: float, seconds: float, step_s: float = 1.0):
+    """A cold prefill on the E1 Mac: the compressor grows at ``rate_gb_s``
+    from 5.5 GB while 20+ GB of clean file cache keeps the supply healthy,
+    free pages sit near 2 GB and swap stays flat."""
+
+    out = []
+    t = 0.0
+    while t <= seconds + 1e-9:
+        out.append(
+            _reading(
+                free=int(2.0 * GB),
+                file_backed=int(21.0 * GB),
+                wired=int(94.5 * GB),
+                compressor=int(5.5 * GB + rate_gb_s * GB * t),
+                swap=int(0.25 * GB),
+                at_s=t,
+            )
+        )
+        t += step_s
+    return out
+
+
+def test_the_2120_131k_runaway_is_stopped_well_before_27_gb(monkeypatch):
+    # 2.12.0's 131,072-token cold prefill: 27 GB compressed in about a
+    # minute with 20.6 GB still available and swap flat (run/guard.log
+    # 04:29:54). At 0.45 GB/s the check stops it once the growth passes
+    # 16 GiB, about 38 s in.
+    readings = _trajectory(rate_gb_s=0.45, seconds=70)
+    guard = _prefill_guard(monkeypatch, readings)
+    tripped_at = None
+    for reading in readings:
+        if guard():
+            tripped_at = reading.monotonic_s
+            break
+    assert tripped_at is not None
+    assert guard.tripped["reason"] == "compressor_runaway"
+    grown = (
+        guard.tripped["system_memory"]["compressor_bytes"]
+        - guard.tripped["previous_system_memory"]["compressor_bytes"]
+    )
+    assert 16 * GIB <= grown < 20 * GB
+    assert tripped_at < 45.0
+    error = srv._prefill_system_abort_exception(SimpleNamespace(), guard.tripped)
+    assert error.status_code == 507
+    assert "compressed" in error.detail["message"]
+
+
+def test_a_served_64k_cold_prefill_is_not_stopped(monkeypatch):
+    # The same Mac's 64K cold prefills: about 0.3 GB/s for 42 s, 12.6 GB in
+    # all (E1's readings: 0.85 GB in 2.9 s), which 2.12.0 served safely.
+    readings = _trajectory(rate_gb_s=0.3, seconds=42)
+    guard = _prefill_guard(monkeypatch, readings)
+    assert not any(guard() for _ in readings)
+    assert guard.tripped is None
+
+
+def test_e1_readings_pass_the_per_chunk_check(monkeypatch):
+    for before, after in (E1_FIRST, E1_SECOND):
+        guard = _prefill_guard(monkeypatch, [before, after])
+        assert guard() is False
+        assert guard() is False, guard.tripped
+
+
+# ---------------------------------------------------------------------------
+# The admission gives back the allocator pool before it narrows the chunk
+
+
+def test_the_pool_goes_back_before_the_chunk_narrows(monkeypatch):
+    from test_memguard_admission import _flash_next_state, _install, _Machine, _manager
+
+    # The served profile's chunked prefill (the widths the admission prices).
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
+    monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
+    manager = _manager()
+    machine = _Machine(manager.bank, base_gib=80.0, cache_gib=0.0, host_gib=1.0)
+    _install(monkeypatch, machine)
+    supply = {"base": 0}
+
+    def read():
+        pool_given_back = pool_bytes - machine.cache
+        available = supply["base"] + pool_given_back
+        return sm.SystemMemory(
+            available_bytes=available,
+            total_bytes=RAM,
+            level_percent=22,
+            free_bytes=int(0.13 * GB),
+            file_backed_bytes=available - int(0.13 * GB),
+            wired_bytes=int(94.7 * GB),
+            compressor_bytes=int(10.7 * GB),
+            swap_used_bytes=int(0.28 * GB),
+            monotonic_s=0.0,
+        )
+
+    monkeypatch.setattr(srv, "_read_system_memory", read)
+    prompt = list(range(16_384))
+
+    # Price both widths on a tight Mac with an empty pool (E1's 16K cell).
+    pool_bytes = 0
+    supply["base"] = 12 * GIB
+    probe = srv._prefill_admission_shed(
+        _flash_next_state(manager),
+        prompt_ids=prompt,
+        session_bank=manager.bank,
+        session_id=None,
+        prefill_chunk_tokens=4096,
+    )
+    assert probe is not None and probe["prefill_chunk_requested"] == 4096
+    growth = {int(k): int(v) for k, v in probe["growth_by_chunk"].items()}
+    shed_4096, _abort = sm.admission_floors(read(), growth[4096])
+    assert growth[2048] < growth[4096] - GIB
+
+    # The wide chunk is short by 1 GiB on the Mac's line and the pool holds 4.
+    pool_bytes = 4 * GIB
+    machine.cache = pool_bytes
+    supply["base"] = growth[4096] + shed_4096 - GIB
+    receipt = srv._prefill_admission_shed(
+        _flash_next_state(manager),
+        prompt_ids=prompt,
+        session_bank=manager.bank,
+        session_id=None,
+        prefill_chunk_tokens=4096,
+    )
+
+    # On 50de43bb: "narrower_prefill_chunk" at 2,048 rows, the pool untouched.
+    assert machine.cache == 0
+    assert receipt["action"] == "prefill_admission_pool_clear"
+    assert receipt["reclamation_steps"] == ["allocator_pool"]
+    assert receipt["prefill_chunk_tokens"] == 4096
+    assert receipt["prefill_chunk_requested"] == 4096
