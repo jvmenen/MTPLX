@@ -602,6 +602,21 @@ class CompressorEpisode:
             self._last_s = now_s if self._last_s is None else max(self._last_s, now_s)
             return self._base
 
+    def restart(self, reading: SystemMemory | None) -> None:
+        """Start a new run at ``reading``: a request the runaway line refused
+        ends the run it measured. Otherwise a client retrying within five
+        minutes would be refused at its first chunk for as long as the
+        compressed pages stay compressed, whatever the Mac gave back; its
+        retries are measured from here, and a Mac that keeps compressing
+        meets the line again or the quarter-of-RAM line."""
+
+        if reading is None or reading.compressor_bytes is None:
+            return
+        with self._lock:
+            self._base = reading
+            now_s = float(reading.monotonic_s)
+            self._last_s = now_s if self._last_s is None else max(self._last_s, now_s)
+
 
 def compressor_full_bytes(total_bytes: int) -> int:
     """Compressed memory that, with free pages under the abort floor, is

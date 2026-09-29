@@ -931,3 +931,54 @@ def test_a_new_run_starts_after_five_quiet_minutes():
                     compressor=30 * GIB, swap=0, at_s=400.0)
     assert episode.note(soon) is later
     assert not sm.compressor_runaway(soon, later)
+
+
+def _each_request_on_one_server(monkeypatch, requests):
+    """Like _requests_sharing_a_server, but every request runs: returns, per
+    request, None when it was served or (reading, reason) where it stopped."""
+
+    state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False)
+    current = {"reading": None}
+    monkeypatch.setattr(sm, "_reader", lambda: current["reading"])
+    monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {"ok": True, "active_memory_bytes": 80 * GIB, "cache_memory_bytes": 0},
+    )
+    monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+    outcomes = []
+    for readings in requests:
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=2 * GIB)
+        outcome = None
+        for reading in readings:
+            current["reading"] = reading
+            if guard():
+                outcome = (reading, guard.tripped["reason"])
+                break
+        outcomes.append(outcome)
+    return outcomes
+
+
+def test_a_refusal_ends_the_run_and_the_full_line_bounds_the_retries(monkeypatch):
+    # The second request is refused at 21.25 GiB. Its retry starts a new run
+    # there instead of being refused at its first chunk for as long as the
+    # pages stay compressed (a client retrying inside five minutes would
+    # otherwise never be served), and a Mac that keeps compressing meets the
+    # quarter-of-RAM line: the fourth request stops at 32 GiB.
+    refused_at = 15 + 10 * 20 / 32
+    requests = [
+        _compressing_request(start_s=0.0, start_gib=5),
+        _compressing_request(start_s=34.0, start_gib=15),
+        _compressing_request(start_s=68.0, start_gib=refused_at),
+        _compressing_request(start_s=102.0, start_gib=refused_at + 10),
+    ]
+    outcomes = _each_request_on_one_server(monkeypatch, requests)
+    assert outcomes[0] is None
+    reading, reason = outcomes[1]
+    assert reason == "compressor_runaway"
+    assert reading.compressor_bytes == int(refused_at * GIB)
+    assert outcomes[2] is None
+    reading, reason = outcomes[3]
+    assert reason == "compressor_full"
+    assert 32 * GIB <= reading.compressor_bytes < 33 * GIB

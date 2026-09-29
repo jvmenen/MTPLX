@@ -20071,6 +20071,9 @@ class _PrefillSystemGuard:
             return False
         reading = verdict["reading"]
         base = verdict["base"]
+        if verdict["reason"] == "compressor_runaway":
+            # The refusal ends the run it measured (CompressorEpisode.restart).
+            self.episode.restart(reading)
         self.tripped = {
             "action": "prefill_system_abort",
             "reason": verdict["reason"],
