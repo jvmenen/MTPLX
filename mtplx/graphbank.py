@@ -1162,6 +1162,16 @@ class TensorOffsetQSACache:
         entry.raw_keys = self._fixed_bank(self.raw_keys, self.dense_capacity, 1)
         entry.pooled = self.selector_pooled(self.pooled, 1)
         entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
+        if self.capacity > self.dense_capacity:
+            # Prefix views retain the entire bucket, while SessionBank
+            # charges the logical state. Publish owned logical arrays and
+            # finish their copies here so lazy snapshots retain no bucket.
+            state = tuple(
+                mx.asarray(leaf, copy=True) if leaf is not None else None
+                for leaf in entry.state
+            )
+            mx.eval(*state)
+            entry.state = state
         return entry
 
 
