@@ -22120,6 +22120,7 @@ def _run_prefill_admission(
     models = price()
     chosen = widest_fit(now, models)
     early_pool_clear: dict[str, Any] | None = None
+    early_pool_clear_error: BaseException | None = None
     if (
         chosen is not _ADMISSION_NO_FIT
         and chosen != widths[0]
@@ -22147,7 +22148,10 @@ def _run_prefill_admission(
         except _AllocatorReadingError:
             raise
         except Exception as exc:
+            # Reported with the reclamation steps below (cache_clear_error,
+            # the guard's health), never dropped: the review of 4c9da1ba.
             early_pool_clear = {"error": repr(exc)}
+            early_pool_clear_error = exc
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         settle(models[chosen])
         if early_pool_clear is not None:
@@ -22198,6 +22202,11 @@ def _run_prefill_admission(
     # health reports it (_note_guard_health) until a later admission gets
     # through reclamation cleanly.
     step_errors: list[BaseException] = []
+    if early_pool_clear_error is not None:
+        receipt["cache_cleared"] = False
+        receipt["cache_clear_error"] = repr(early_pool_clear_error)
+        receipt["early_pool_clear"] = dict(early_pool_clear or {})
+        step_errors.append(early_pool_clear_error)
 
     def clear_pool() -> None:
         # Freed buffers sit in the allocator pool until it is cleared; only

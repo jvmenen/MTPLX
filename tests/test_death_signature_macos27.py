@@ -485,6 +485,76 @@ def test_the_pool_goes_back_before_the_chunk_narrows(monkeypatch):
     assert receipt["prefill_chunk_requested"] == 4096
 
 
+def test_a_pool_clear_that_fails_is_reported_not_dropped(monkeypatch):
+    # The review of 4c9da1ba: when mx.clear_cache() raised here and the
+    # narrower chunk already fit, the error was dropped: the receipt read as
+    # an ordinary narrowing and the guard's health stayed clean.
+    import mlx.core as mx
+
+    from test_memguard_admission import _flash_next_state, _install, _Machine, _manager
+
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "auto")
+    monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "131072")
+    monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: None)
+    manager = _manager()
+    machine = _Machine(manager.bank, base_gib=80.0, cache_gib=0.0, host_gib=1.0)
+    _install(monkeypatch, machine)
+    supply = {"base": 0}
+
+    def read():
+        return sm.SystemMemory(
+            available_bytes=supply["base"],
+            total_bytes=RAM,
+            level_percent=22,
+            free_bytes=int(0.13 * GB),
+            file_backed_bytes=supply["base"] - int(0.13 * GB),
+            wired_bytes=int(94.7 * GB),
+            compressor_bytes=int(10.7 * GB),
+            swap_used_bytes=int(0.28 * GB),
+            monotonic_s=0.0,
+        )
+
+    monkeypatch.setattr(srv, "_read_system_memory", read)
+    prompt = list(range(16_384))
+    supply["base"] = 12 * GIB
+    probe = srv._prefill_admission_shed(
+        _flash_next_state(manager),
+        prompt_ids=prompt,
+        session_bank=manager.bank,
+        session_id=None,
+        prefill_chunk_tokens=4096,
+    )
+    growth = {int(k): int(v) for k, v in probe["growth_by_chunk"].items()}
+    shed_4096, _abort = sm.admission_floors(read(), growth[4096])
+
+    def failing_clear():
+        raise RuntimeError("clear_cache failed")
+
+    monkeypatch.setattr(mx, "clear_cache", failing_clear)
+    machine.cache = 4 * GIB
+    supply["base"] = growth[4096] + shed_4096 - GIB
+    state = _flash_next_state(manager)
+    receipt = srv._prefill_admission_shed(
+        state,
+        prompt_ids=prompt,
+        session_bank=manager.bank,
+        session_id=None,
+        prefill_chunk_tokens=4096,
+    )
+
+    assert receipt["prefill_chunk_tokens"] == 2048
+    assert receipt["cache_cleared"] is False
+    assert "clear_cache failed" in receipt["cache_clear_error"]
+    assert receipt["guard_degraded"] is True
+    health = srv._memory_guard_health(state)
+    assert health["guard_degraded"] is True
+    assert any(
+        row["where"] == "prefill_admission_reclamation" for row in health["degraded"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Before the per-chunk check refuses a request, the engine gives back its own
 # reusable memory and reads the Mac again (E2d, 2026-09-29: a request was
