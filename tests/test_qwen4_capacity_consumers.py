@@ -241,6 +241,158 @@ def test_final_pending_capture_and_next_session_bank_turn_are_identical(pack, la
     _equal(narrow, wide)
 
 
+def _grant_boundary_session(pack, patch, bucket):
+    """Run the production loop from synthetic 16K history to a stop bonus.
+
+    Only the cold history and accept coins are controlled. Verification,
+    the final one-row forward, publication, and the next turn use the real
+    implementations. No caller reserves on behalf of final capture.
+    """
+    from dataclasses import replace
+
+    from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
+    from mtplx.session_bank import SessionBank
+
+    smoke, model = pack
+    patch.setenv("MTPLX_COMPILED_VERIFY", "1")
+    patch.setenv("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "1024")
+    patch.setenv("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", str(bucket))
+    patch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
+    patch.setenv("MTPLX_BATCH_TARGET_DISTS", "0")
+    patch.setenv("MTPLX_DROP_EVENTS", "0")
+    rt = smoke._tiny_runtime(model)
+    install_qwen4_fixed_verify_route(rt)
+    session = SessionBank(max_bytes=2**28, per_session_max_bytes=2**28)
+    restore_or_prefill = generation.restore_or_prefill_prompt_state
+    prompt = _prompt(16_384)
+
+    def prefill(runtime, ids, **kwargs):
+        if ids != prompt:
+            return restore_or_prefill(runtime, ids, **kwargs)
+        state = restore_or_prefill(runtime, PROMPT, **kwargs)
+        for entry in state.trunk_cache:
+            if isinstance(entry, QSACache):
+                keys, values, raw, pooled = entry.state
+
+                def repeat(value, rows, axis):
+                    repeats = [1] * value.ndim
+                    repeats[axis] = (rows + value.shape[axis] - 1) // value.shape[axis]
+                    return graphbank.TensorOffsetQSACache._fixed_bank(
+                        mx.tile(value, repeats), rows, axis,
+                    )
+
+                entry.state = (repeat(keys, 16_384, 2), repeat(values, 16_384, 2),
+                               repeat(raw, 16_384, 1), repeat(pooled, 4096, 1))
+        return replace(state, token_prefix=tuple(ids), suffix_tokens=len(ids))
+
+    patch.setattr(generation, "restore_or_prefill_prompt_state", prefill)
+    default_rng = np.random.default_rng
+
+    class AcceptAll:
+        def __init__(self, seed):
+            self.delegate = default_rng(seed)
+
+        def random(self, *args, **kwargs):
+            return 0.0  # force all three draft accepts, including p == 0
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+    patch.setattr(np.random, "default_rng", AcceptAll)
+    real_forward = rt.forward_ar
+    real_verify = graphbank.CompiledVerifyBank._forward_installed_fixed_m4
+    windows, pending = [], []
+    stop = 127
+    sample = generation._sample_from_logits
+    is_stop = generation._is_stop
+    bonus_sampled = False
+
+    def sample_at_boundary(*args, **kwargs):
+        nonlocal bonus_sampled
+        token, distribution = sample(*args, **kwargs)
+        # The sampler call after the 256th accepted M4 window is the bonus.
+        if len(windows) == 256:
+            token = stop
+            bonus_sampled = True
+        elif token == stop:
+            token = 126
+        return token, distribution
+
+    def verify(self, input_ids, host_input_ids, completion_tokens, committed_count, cache):
+        result = real_verify(self, input_ids, host_input_ids, completion_tokens,
+                             committed_count, cache)
+        qsa = next(e for e in cache if isinstance(e, graphbank.TensorOffsetQSACache))
+        windows.append((qsa.size(), qsa.dense_capacity, qsa.capacity))
+        return result
+
+    def forward(ids, **kwargs):
+        qsa = next((e for e in kwargs.get("cache", ())
+                    if isinstance(e, graphbank.TensorOffsetQSACache)), None)
+        if qsa is not None and ids.shape[1] == 1:
+            pending.append((qsa.size(), qsa.dense_capacity, qsa.capacity))
+        return real_forward(ids, **kwargs)
+
+    patch.setattr(generation, "_sample_from_logits", sample_at_boundary)
+    patch.setattr(generation, "_is_stop", lambda token, stops: bonus_sampled and is_stop(token, stops))
+    patch.setattr(graphbank.CompiledVerifyBank, "_forward_installed_fixed_m4", verify)
+    patch.setattr(rt, "forward_ar", forward)
+    first = generation.generate_mtpk(
+        rt, prompt, max_tokens=1032, sampler=NATIVE, draft_sampler=NATIVE,
+        speculative_depth=3, seed=SEED, mtp_cache_policy="persistent",
+        mtp_history_policy="committed", verify_strategy="batched",
+        stop_token_ids={stop}, capture_final_state=True, session_bank=session,
+    )
+    final = first.final_state
+    assert len(windows) == 256 and windows[-1][:2] == (17_408, 17_408)
+    assert windows[-1][2] == (24_576 if bucket else 17_408)
+    assert len(first.tokens) == 1025 and first.tokens[-1] == stop
+    assert first.finish_reason == "stop" and first.stats.finish_stop_origin == "bonus"
+    assert pending[-1][0] == 17_408
+    assert pending[-1][1] >= 17_409, "final capture must reserve its attention row"
+    assert final is not None and final.safe_to_commit
+    qsa = next(e for e in final.final_trunk_cache if isinstance(e, QSACache))
+    assert qsa.offset == qsa.state[0].shape[2] == 17_409
+    restored = model.make_cache()
+    restore_cache(restored, snapshot_cache(final.final_trunk_cache))
+    assert next(e.offset for e in restored if isinstance(e, QSACache)) == 17_409
+    records = _leaves((final.final_logits, final.final_hidden)) + _state(restored)
+    prefix = prompt + list(first.tokens)
+    assert session.put(
+        runtime=rt, token_ids=prefix, cache=final.final_trunk_cache,
+        logits=final.final_logits, hidden=final.final_hidden,
+        hidden_variant=generation._resolve_runtime_base_hidden_variant(rt, None),
+        mtp_history_policy="committed",
+        mtp_history_snapshot=snapshot_cache(final.final_committed_mtp_cache),
+    ) is not None
+    # Restore normal sampling for the next turn; the cached boundary is real.
+    patch.setattr(np.random, "default_rng", default_rng)
+    patch.setattr(generation, "_sample_from_logits", sample)
+    patch.setattr(generation, "_is_stop", is_stop)
+    second = generation.generate_mtpk(
+        rt, prefix + [31, 37, 41, 43], max_tokens=16,
+        sampler=NATIVE, draft_sampler=NATIVE, speculative_depth=3, seed=SEED,
+        mtp_cache_policy="persistent", mtp_history_policy="committed",
+        verify_strategy="batched", stop_token_ids=set(), capture_final_state=True,
+        session_bank=session,
+    )
+    assert second.stats.cached_tokens == 17_409
+    assert second.final_state.safe_to_commit
+    records += _leaves((second.final_state.final_logits, second.final_state.final_hidden))
+    records += _state(second.final_state.final_trunk_cache)
+    records += _state(second.final_state.final_committed_mtp_cache)
+    return list(first.tokens), list(second.tokens), second.stats.cached_tokens, records
+
+
+def test_grant_boundary_capture_and_next_session_bank_turn(pack, lane):
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    with lane.context() as patch:
+        wide = _grant_boundary_session(pack, patch, 8192)
+    with lane.context() as patch:
+        narrow = _grant_boundary_session(pack, patch, 0)
+    assert narrow[:3] == wide[:3]
+    _equal(narrow[3], wide[3])
+
+
 @pytest.mark.parametrize("allow_step", [False, True])
 def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
     from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route

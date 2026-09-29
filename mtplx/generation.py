@@ -15660,6 +15660,13 @@ def generate_mtpk(
     ):
         try:
             pending_token = int(pending_primary)
+            if compiled_verify_bank is not None:
+                # A fully accepted window can consume the last granted row.
+                # Reserve the bonus before either final cache is advanced;
+                # bucket slack alone does not widen one-row attention.
+                compiled_verify_bank.reserve_fixed_m4_window(
+                    cache, committed_count=len(tokens) - 1, window_tokens=1,
+                )
             if (
                 _mtp_history_uses_committed_cache(mtp_history_policy)
                 and mtp_history_cache is not None
