@@ -3409,6 +3409,62 @@ class QSAIndexer(nn.Module):
             parts.append(top_t)
         return mx.concatenate(parts, axis=0)
 
+    def _verify_select_fused(
+        self,
+        q: mx.array,
+        pos_start,
+        cache,
+        pooled_t: mx.array,
+        nb_total: int,
+        k_eff: int,
+        tile: int,
+    ):
+        """A fixed bank's selection in two kernels around the score GEMM and
+        ``argpartition`` (mtplx.kernels.qsa_verify_select), bit for bit with
+        the stock chain below; None keeps that chain.
+
+        The lane choice mirrors the stock one: rows-gather when the bank chose
+        it at promotion, for more than one row, and no score tile splits the
+        rows; the dense mask otherwise.
+        """
+
+        from mtplx.kernels import qsa_verify_select
+
+        if not in_compiled_step_body():
+            # The kernels spell the division and the tie-break the way the
+            # compiled graph's fused kernels evaluate them; an eager call has
+            # the library's standalone kernels as its parent.
+            return None
+        S = int(q.shape[1])
+        rows_gather = (
+            S > 1
+            and not (0 < tile < S)
+            and bool(getattr(cache, "fixed_rows_gather", False))
+        )
+        if not qsa_verify_select.serves(self, S, nb_total, dense=not rows_gather):
+            return None
+        if not rows_gather and int(cache.raw_keys.shape[1]) != nb_total * self.ratio:
+            return None
+        raw = mx.matmul(q.astype(mx.float32), pooled_t)  # [1, S, H, nb]
+        masked = qsa_verify_select.block_scores(
+            raw,
+            pos_start,
+            self._score_divisor(),
+            ratio=self.ratio,
+            topk=self.block_topk,
+        )
+        part = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)
+        if rows_gather:
+            qsa_verify_select.note_engaged(S, "rows-gather")
+            token_idx, token_ok = qsa_verify_select.token_lists(
+                part, pos_start, ratio=self.ratio, topk=self.block_topk
+            )
+            return ("gather_rows", token_idx, token_ok)
+        qsa_verify_select.note_engaged(S, "dense")
+        return qsa_verify_select.dense_mask(
+            part, pos_start, ratio=self.ratio, topk=self.block_topk
+        )
+
     def _select_eager(
         self,
         q: mx.array,
@@ -3439,6 +3495,12 @@ class QSAIndexer(nn.Module):
         k_eff = min(self.block_topk, nb_total)
 
         tile = _qsa_score_tile_rows()
+        if fixed_capacity:
+            fused = self._verify_select_fused(
+                q, pos_start, cache, pooled_t, nb_total, k_eff, tile
+            )
+            if fused is not None:
+                return fused
         if S > 1 and not fixed_capacity and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.

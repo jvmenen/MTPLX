@@ -395,6 +395,12 @@ def install_qwen4_fixed_verify_route(runtime: Any) -> dict[str, Any]:
 
     runtime._mtplx_hc_verify_read = hc_verify_read.install(inner, rows=(4,))
 
+    # The fixed bank's QSA selection around the score GEMM and argpartition:
+    # two kernels proved against the compiled stock selector the same way.
+    from mtplx.kernels import qsa_verify_select
+
+    runtime._mtplx_qsa_verify_select = qsa_verify_select.install(inner, rows=(4,))
+
     return {"installed": True, "linear_layers": len(linear), "rows": 4}
 
 

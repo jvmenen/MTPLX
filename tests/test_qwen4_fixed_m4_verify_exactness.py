@@ -281,6 +281,25 @@ def test_the_hyper_connection_read_engages_in_the_compiled_verifier(monkeypatch)
     assert 4 in hc_verify_read.engagement()["engaged_rows"]
 
 
+def test_the_qsa_verify_selection_engages_in_the_compiled_verifier(monkeypatch):
+    # The route install proves the fixed bank's two-kernel QSA selection on
+    # this GPU; the compiled verifier traces it into every round (the tiny
+    # pack keeps 2 of its blocks per query, so the selection is real), and
+    # every round still equals the eager verifier.
+    from mtplx.kernels import qsa_verify_select
+
+    rt = _runtime()
+    report = rt._mtplx_qsa_verify_select
+    assert report["installed"], report
+    assert report["rows"] == (4,)
+    traced_before = qsa_verify_select.engagement()["traces"]
+    result = _generate(rt, "parity2", monkeypatch)
+    assert result.stats.fixed_m4_admission["reason"] == "admitted"
+    _assert_every_round_exact(result)
+    assert qsa_verify_select.engagement()["traces"] > traced_before
+    assert (4, "dense") in qsa_verify_select.engagement()["engaged"]
+
+
 def _raw_bytes(a: mx.array) -> np.ndarray:
     """The array's storage as unsigned integers: equality here is bit equality
     (a signed zero or a NaN payload counts as a difference)."""
@@ -316,25 +335,31 @@ def _record_compiled_rounds(monkeypatch) -> list[dict]:
 
 def test_the_compiled_verifier_with_the_kernels_equals_its_parent_bit_for_bit(monkeypatch):
     # The parent is the same compiled verifier with the verify-width
-    # hyper-connection read switched off at install: the stock chain
-    # traced into the compiled body. Every compiled round's
+    # hyper-connection read and the QSA selection switched off at install:
+    # the stock chains traced into the compiled body. Every compiled round's
     # logits, hidden state, captures and cache leaves must match it in their
     # raw bits, and so must the tokens.
-    from mtplx.kernels import hc_verify_read
+    from mtplx.kernels import hc_verify_read, qsa_verify_select
 
     rounds = _record_compiled_rounds(monkeypatch)
     monkeypatch.setenv(hc_verify_read.ENV, "0")
+    monkeypatch.setenv(qsa_verify_select.ENV, "0")
     parent_rt = _runtime()
     assert not parent_rt._mtplx_hc_verify_read["installed"]
+    assert not parent_rt._mtplx_qsa_verify_select["installed"]
     hc_before = hc_verify_read.engagement()["traces"]
+    qsa_before = qsa_verify_select.engagement()["traces"]
     parent = _generate(parent_rt, "parity2", monkeypatch)
     assert hc_verify_read.engagement()["traces"] == hc_before
+    assert qsa_verify_select.engagement()["traces"] == qsa_before
     parent_rounds = list(rounds)
     rounds.clear()
 
     monkeypatch.delenv(hc_verify_read.ENV)
+    monkeypatch.delenv(qsa_verify_select.ENV)
     rt = _runtime()
     candidate = _generate(rt, "parity2", monkeypatch)
+    assert qsa_verify_select.engagement()["traces"] > qsa_before
     if _hc_read_served_here():
         assert hc_verify_read.engagement()["traces"] > hc_before
 
