@@ -248,18 +248,26 @@ def encode_gemma4_messages(
             reasoning = _content_to_text(
                 item.get("reasoning_content") or item.get("reasoning")
             )
-            if enable_thinking and reasoning:
-                content = (
-                    f"{GEMMA4_THINK_OPEN}{GEMMA4_THOUGHT_PREFIX}"
-                    f"{reasoning}{GEMMA4_THINK_CLOSE}{content}"
-                )
             tool_call_text = _gemma4_tool_calls_text(item.get("tool_calls"))
             if tool_call_text:
+                # A newline only after visible text: the model writes
+                # `<channel|><tool_call>` straight after its thought block.
                 content = (
                     f"{content.rstrip()}\n{tool_call_text}"
                     if content.strip()
                     else tool_call_text
                 )
+            if enable_thinking and reasoning:
+                content = (
+                    f"{GEMMA4_THINK_OPEN}{GEMMA4_THOUGHT_PREFIX}"
+                    f"{reasoning}{GEMMA4_THINK_CLOSE}{content}"
+                )
+            elif not enable_thinking and content.strip():
+                # With thinking off the generation prompt ends in an empty
+                # thought block and the model writes its turn right after it.
+                # Render the same scaffold on history turns, or every thinking-
+                # off turn diverges from the next prompt four tokens early.
+                content = f"{GEMMA4_EMPTY_THOUGHT_BLOCK}{content.strip()}"
         elif role == "tool":
             role = "tool_response"
         if role not in {"user", "model", "tool_response"}:

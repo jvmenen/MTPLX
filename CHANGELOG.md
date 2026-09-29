@@ -81,6 +81,9 @@ All notable user-facing changes to MTPLX. The format is based on
 
 - **Prompt scoring works on the Gemma 4 assistant pair.** `/v1/completions` with `echo`, `logprobs` and `max_tokens: 0` no longer calls the missing `forward_ar` method. Scoring uses the target prefill spans and a shared cache, with attention bounded by the configured prefill width and logits produced in chunks of at most 256 rows by default. Other backends keep their existing scoring path. Regression tests cover returned probabilities, chunk boundaries and the HTTP response.
 
+- **Gemma 4 sees its own tool calls in the format it is asked to use.** Gemma 4 packs ship no chat template, so mlx-lm reports no tool calling and the message normalizer flattened the tool history: the model's own calls became `[Calling tool: name({...})]` text and tool results became user turns (`[Tool Result (id)]: ...`), while the tool contract in the same prompt asks for `<tool_call><function=...>` XML. With thinking off the model copied the flattened form back instead of the instructed one, with thinking on it left tool calls unterminated more often, and every tool turn's banked prefix stopped matching the next prompt. The history now reaches MTPLX's own Gemma 4 encoder structured: calls render as the contract's XML, results as `tool_response` turns. Other tokenizers without tool calling keep the text fallback.
+- **Gemma 4 history turns render the bytes the model generated.** With thinking off the generation prompt ends in an empty thought block (`<|channel>thought\n<channel|>`), but history turns rendered without it, so each turn diverged from the next prompt four tokens early. With thinking on the encoder put a newline between the thought block and a tool call the model writes directly after `<channel|>`. Both now match the generation.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
