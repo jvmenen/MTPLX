@@ -457,7 +457,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     fits = _qwen4_fixed_m4_lane_fits(
         rt, prompt_tokens=int(prompt_tokens), session_bank=session_bank,
         prompt_ids=prompt_ids, receipt=receipt,
-        capacity_plan=capacity_plan or FixedM4CapacityPlan.for_request(max_tokens),
+        capacity_plan=capacity_plan or FixedM4CapacityPlan.for_request(max_tokens, runtime=rt),
     )
     if receipt is not None:
         receipt.update(engaged=fits, reason="admitted" if fits else "memory_gate")
@@ -745,7 +745,7 @@ def _qwen4_fixed_m4_bank_rows(
     prompt_tokens = max(0, int(prompt_tokens))
     args = _qwen4_text_args(rt)
     ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
-    plan = capacity_plan or FixedM4CapacityPlan.for_request(None)
+    plan = capacity_plan or FixedM4CapacityPlan.for_request(None, runtime=rt)
     return plan.rows(prompt_tokens, ratio, TensorOffsetQSACache.step)
 
 
@@ -1146,7 +1146,7 @@ def _qwen4_fixed_m4_lane_fits(
     limit = _metal_memory_limit_bytes(rt)
     if limit <= 0:
         return True
-    plan = capacity_plan or FixedM4CapacityPlan.for_request(None)
+    plan = capacity_plan or FixedM4CapacityPlan.for_request(None, runtime=rt)
     bank_rows = (
         _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
         if promotion_rows is None else int(promotion_rows)
@@ -10527,7 +10527,7 @@ def generate_mtpk(
     # is ever sliced by a tensor offset (_qwen4_vision_compiled_verify_admission
     # names the shapes and settings that stay eager).
     fixed_m4_admission: dict[str, object] = {}
-    fixed_m4_capacity_plan = FixedM4CapacityPlan.for_request(max_tokens)
+    fixed_m4_capacity_plan = FixedM4CapacityPlan.for_request(max_tokens, runtime=rt)
     qwen4_fixed_m4_compiled_verify, fixed_m4_rope_delta = _qwen4_fixed_m4_admission(
         rt,
         vision_splice=vision_splice,

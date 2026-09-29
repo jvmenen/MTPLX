@@ -4105,6 +4105,7 @@ class QSAIndexer(nn.Module):
         """Shared arithmetic behind the explicit prefill/decode entry points."""
 
         B, S, _ = hidden.shape
+        cache.indexer_budget = self.block_topk * self.ratio
         if decode != (S == 1):
             raise ValueError(
                 f"QSA decode route requires S=1 and prefill requires S>1; got S={S}"

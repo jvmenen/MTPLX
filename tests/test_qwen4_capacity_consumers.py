@@ -254,7 +254,7 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
     install_qwen4_fixed_verify_route(rt)
     cache = model.make_cache()
     rt.forward_ar(mx.array([PROMPT]), cache=cache, return_hidden=True)
-    plan = graphbank.FixedM4CapacityPlan.for_request(1000)
+    plan = graphbank.FixedM4CapacityPlan.for_request(1000, runtime=rt)
     bank = graphbank.CompiledVerifyBank(rt, max_verify_len=4, request_max_tokens=1000,
                                         capacity_plan=plan)
     bank.install_fixed_m4(cache, prompt_ids=PROMPT, hidden_variant=None)
@@ -303,6 +303,7 @@ def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, o
         ))
         layer.update(mlx.utils.tree_map(lambda p: p.astype(mx.bfloat16), layer.parameters()))
         entry = QSACache(4)
+        entry.indexer_budget = 2048
         entry.kv.keys = mx.zeros((1, 2, offset, 256), dtype=mx.bfloat16)
         entry.kv.values = ((mx.arange(2 * offset * 256).reshape(1, 2, offset, 256) % 31) - 15).astype(mx.bfloat16)
         entry.kv.offset = offset
@@ -324,3 +325,35 @@ def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, o
                     bank.trim(3)
     finally:
         mx.set_default_device(previous)
+
+
+def test_early_gather_keeps_the_parent_capacity_for_the_request(cpu_layer, lane):
+    """A lowered gather threshold must not widen k_eff and gathered SDPA."""
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    lane.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "8")
+    cpu_layer.indexer.budget = 512
+    cpu_layer.indexer.block_topk = 256  # ratio 2; larger than the first bank
+    banks = [graphbank.TensorOffsetQSACache.from_qsa_cache(
+        _prefilled_entry(cpu_layer), reserve_tokens=32, capacity_bucket=bucket,
+    ) for bucket in (0, 1024)]
+    assert [bank.capacity for bank in banks] == [256, 256]
+    for grow in (False, True):
+        if grow:
+            for bank in banks:
+                bank.ensure_capacity(257)
+            assert [bank.capacity for bank in banks] == [512, 512]
+        x = mx.random.normal((1, 4, 64)).astype(mx.bfloat16)
+        out = [cpu_layer(x, bank) for bank in banks]
+        _equal(_leaves(out[0]), _leaves(out[1]))
+        _equal(_state([banks[0]]), _state([banks[1]]))
+
+
+def test_admission_respects_a_larger_selection_budget(lane):
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    lane.setenv("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", "8192")
+    rt = SimpleNamespace(model=SimpleNamespace(args=SimpleNamespace(
+        indexer_budget=32_768, indexer_compress_ratio=4,
+    )))
+    plan = graphbank.FixedM4CapacityPlan.for_request(32, runtime=rt)
+    assert plan.rows(16_384, 4) == 16_640  # both allocation and admission keep k_eff
+    assert plan.rows(32_768, 4) == 40_960
