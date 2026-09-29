@@ -624,11 +624,12 @@ def load(
     """
     path = Path(model_path)
     # Before any model can run a forward: mlx-lm's switch layers get the
-    # sorted-rows guard (mtplx.moe_sorted_gather; a no-op where MLX's kernel
-    # is correct).
-    from .moe_sorted_gather import install_switch_linear_guard
+    # sorted-rows guard and, on tensor-unit GPUs, the row-map SwiGLU route
+    # (mtplx.moe_sorted_gather; each a no-op where it cannot apply).
+    from .moe_sorted_gather import install_switch_glu_rows, install_switch_linear_guard
 
     install_switch_linear_guard()
+    install_switch_glu_rows()
     engine_blocker = engine_version_blocker(_load_runtime_metadata(path))
     if engine_blocker:
         raise ModelCompatibilityError(engine_blocker)

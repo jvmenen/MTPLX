@@ -395,3 +395,87 @@ def install_switch_linear_guard() -> bool:
     setattr(guarded_call, _GUARD_MARK, True)
     cls.__call__ = guarded_call
     return True
+
+
+_GLU_MARK = "_mtplx_switch_glu_rows"
+
+
+def _glu_projections(module: Any):
+    """The gate and up projections of a quantized mlx-lm ``SwitchGLU`` with the
+    standard SwiGLU activation and no bias, or None for any other layout."""
+
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwiGLU
+
+    if type(getattr(module, "activation", None)) is not SwiGLU:
+        return None
+    gate, up = getattr(module, "gate_proj", None), getattr(module, "up_proj", None)
+    for proj in (gate, up):
+        if type(proj) is not QuantizedSwitchLinear or "bias" in proj or _module_mode(proj) != "affine":
+            return None
+    if gate.group_size != up.group_size or gate.bits != up.bits:
+        return None
+    return gate, up
+
+
+def switch_glu_rows(module: Any, x: mx.array, indices: mx.array, original) -> mx.array:
+    """mlx-lm's ``SwitchGLU.__call__`` with its sorted regime on the row-map kernel.
+
+    The rows are sorted as mlx-lm sorts them, the gate and up gathers, the row
+    copy and the SwiGLU run as one tensor-unit kernel reading token rows in
+    place (bit-identical to ``activation(up_proj(x), gate_proj(x))``; checked
+    on first use per shape), and the down projection and the unsort are
+    mlx-lm's own calls.  Every other case (training, decode and verify widths,
+    another activation or layout, M1 to M4, a failed check) runs ``original``.
+    """
+
+    from mtplx.kernels import moe_sorted_gather_nax as kernel
+
+    if getattr(module, "training", False) or int(indices.size) < kernel.min_rows():
+        return original(module, x, indices)
+    projections = _glu_projections(module)
+    if projections is None or not kernel.available():
+        return original(module, x, indices)
+    gate, up = projections
+    up_weights = (up.weight, up.scales, up.biases)
+    tokens, row_map, idx, inv_order = sort_rows(x, indices)
+    kw = dict(group_size=int(gate.group_size), bits=int(gate.bits))
+    if not kernel.applies(
+        tokens, row_map, gate.weight, gate.scales, gate.biases, idx, mode="affine", up=up_weights, **kw
+    ):
+        return original(module, x, indices)
+    h = kernel.gather_rows_qmm(
+        tokens, row_map, gate.weight, gate.scales, gate.biases, idx,
+        swiglu=True, up=up_weights, act=module.activation, **kw,
+    )
+    if h is None:
+        return original(module, x, indices)
+    from mlx_lm.models.switch_layers import _scatter_unsort
+
+    y = module.down_proj(h, idx, sorted_indices=True)
+    return _scatter_unsort(y, inv_order, indices.shape).squeeze(-2)
+
+
+def install_switch_glu_rows() -> bool:
+    """Route mlx-lm's quantized ``SwitchGLU`` (Qwen3.5 and 3.6 MoE and every
+    other mlx-lm family built on it) through :func:`switch_glu_rows` on
+    tensor-unit GPUs.  Wraps the class's current ``__call__``; idempotent; a
+    no-op where the kernel cannot run.  Returns whether it is installed."""
+
+    from mtplx.kernels import moe_sorted_gather_nax as kernel
+
+    if not kernel.available():
+        return False
+    from mlx_lm.models import switch_layers
+
+    cls = switch_layers.SwitchGLU
+    current = cls.__call__
+    if getattr(current, _GLU_MARK, False):
+        return True
+
+    @functools.wraps(current)
+    def rows_call(self, x, indices):
+        return switch_glu_rows(self, x, indices, current)
+
+    setattr(rows_call, _GLU_MARK, True)
+    cls.__call__ = rows_call
+    return True

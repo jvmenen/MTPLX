@@ -308,3 +308,110 @@ def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
         assert np.array_equal(np.array(inv), np.array(inv_ref)), label
         assert np.array_equal(_bits(y), _bits(y_ref.reshape(y_ref.shape[0], -1))), label
         assert np.array_equal(_bits(block), _bits(block_ref)), label
+
+
+# mlx-lm's SwitchGLU (separate gate and up weights; Qwen3.5 and 3.6 MoE).
+
+
+def _switch_glu(experts, hidden, inter, group_size, bits, dtype, seed):
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    mx.random.seed(seed)
+    glu = SwitchGLU(hidden, inter, experts)
+    for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
+        proj.weight = (mx.random.normal(proj.weight.shape) * 0.05).astype(dtype)
+    nn.quantize(glu, group_size=group_size, bits=bits)
+    mx.eval(glu.parameters())
+    return glu.eval()  # inference mode, as mlx-lm's loader leaves every model
+
+
+def _original_switch_glu_call():
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    return getattr(SwitchGLU.__call__, "__wrapped__", SwitchGLU.__call__)
+
+
+@needs_tensor_units
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size,bits", [(64, 4), (32, 4), (64, 8)])
+def test_split_gate_up_bit_identical_to_the_stock_chain(dtype, group_size, bits):
+    from mlx_lm.models.switch_layers import SwiGLU
+
+    glu = _switch_glu(64, 256, 128, group_size, bits, dtype, seed=31)
+    tok, row_map, idx = _routed(500, 64, 8, 256, dtype, seed=32)
+    gate, up = glu.gate_proj, glu.up_proj
+    ours = nax_gather.gather_rows_qmm(
+        tok, row_map, gate.weight, gate.scales, gate.biases, idx, group_size=group_size, bits=bits,
+        swiglu=True, up=(up.weight, up.scales, up.biases), act=SwiGLU(),
+    )
+    assert ours is not None, nax_gather.stats()
+    x = tok[row_map]
+    stock = SwiGLU()(up(x, idx, sorted_indices=True), gate(x, idx, sorted_indices=True))
+    assert tuple(ours.shape) == tuple(stock.shape) == (4000, 1, 128)
+    assert np.array_equal(_bits(ours), _bits(stock))
+
+
+def test_mlx_lm_switch_glu_equals_its_own_call():
+    """A quantized mlx-lm SwitchGLU at a 2,100-token chunk, top-8 of 64
+    experts (16,800 routed rows, past the threshold under either MLX): the
+    row-map route equals the module's own call bit for bit, through the
+    kernel on an M5 and through the original call everywhere else."""
+
+    from mtplx import moe_sorted_gather as entry
+
+    glu = _switch_glu(64, 256, 128, 64, 4, mx.bfloat16, seed=41)
+    mx.random.seed(42)
+    x = (mx.random.normal((1, 2100, 256)) * 0.5).astype(mx.bfloat16)
+    inds = mx.argsort(mx.random.uniform(shape=(2100, 64)), axis=-1)[:, :8]
+    inds = inds.astype(mx.uint32).reshape(1, 2100, 8)
+    original = _original_switch_glu_call()
+    reference = original(glu, x, inds)
+    calls = nax_gather.stats()["calls"]
+    routed = entry.switch_glu_rows(glu, x, inds, original)
+    mx.eval(reference, routed)
+    assert tuple(routed.shape) == tuple(reference.shape) == (1, 2100, 8, 256)
+    assert np.array_equal(_bits(routed), _bits(reference))
+    assert nax_gather.stats()["calls"] - calls == (1 if nax_gather.available() else 0)
+
+
+def test_switch_glu_other_widths_and_layouts_keep_the_original_call():
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from mtplx import moe_sorted_gather as entry
+
+    seen = []
+
+    def original(module, x, indices):
+        seen.append(int(indices.size))
+        return x
+
+    glu = _switch_glu(64, 256, 128, 64, 4, mx.bfloat16, seed=51)
+    x = mx.zeros((1, 4, 256), dtype=mx.bfloat16)
+    decode = mx.zeros((1, 4, 8), dtype=mx.uint32)
+    entry.switch_glu_rows(glu, x, decode, original)  # verify width
+    wide = mx.zeros((1, 2100, 8), dtype=mx.uint32)
+    wide_x = mx.zeros((1, 2100, 256), dtype=mx.bfloat16)
+    other = SwitchGLU(256, 128, 64, activation=nn.GELU()).eval()
+    entry.switch_glu_rows(other, wide_x, wide, original)  # not SwiGLU
+    dense = SwitchGLU(256, 128, 64).eval()
+    entry.switch_glu_rows(dense, wide_x, wide, original)  # not quantized
+    entry.switch_glu_rows(glu.train(), wide_x, wide, original)  # training: keeps the gradient path
+    assert seen == [32, 16800, 16800, 16800]
+
+
+def test_install_switch_glu_rows_is_idempotent_and_off_without_the_kernel(monkeypatch):
+    from mlx_lm.models import switch_layers
+
+    from mtplx import moe_sorted_gather as entry
+
+    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", _original_switch_glu_call())
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    assert entry.install_switch_glu_rows() is False
+    assert not hasattr(switch_layers.SwitchGLU.__call__, "__wrapped__")
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK")
+    installed = entry.install_switch_glu_rows()
+    assert installed is nax_gather.available()
+    if installed:
+        wrapped = switch_layers.SwitchGLU.__call__
+        assert entry.install_switch_glu_rows() is True
+        assert switch_layers.SwitchGLU.__call__ is wrapped

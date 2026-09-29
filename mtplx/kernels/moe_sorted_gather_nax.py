@@ -15,15 +15,17 @@ Streaming rows that are already sorted (the down projection) is not faster
 this way (0.88x to 0.94x at 4,096 and 8,192-token chunks), so that stays on
 MLX's kernel.
 
-With ``swiglu=True`` the weight's rows are Flash-Next's fused ``[gate | up]``
-and the kernel writes ``silu(gate) * up`` directly: each threadgroup holds 32
-gate rows and the 32 matching up rows, so a lane's gate and up values meet in
-one threadgroup, and the 1,280-wide gate/up output, the split and the two
-elementwise passes over it are never materialized.  The epilogue rounds the
-accumulators to the activation dtype and applies MLX's own ``Sigmoid`` and
-``Multiply`` functors (read from the installed headers) with the same rounding
-after each op as ``nn.silu(gate) * up``, which a probe over all 65,536 bf16 and
-fp16 inputs matched exactly.
+With ``swiglu=True`` the kernel writes ``silu(gate) * up`` directly, for
+Flash-Next's fused ``[gate | up]`` weight or for separate gate and up weights
+(mlx-lm's ``SwitchGLU``, as the Qwen3.5 and 3.6 MoE families use it): each
+threadgroup holds 32 gate rows and the 32 matching up rows, so a lane's gate
+and up values meet in one threadgroup, and the full gate/up output, the split
+and the elementwise passes over it are never materialized.  The epilogue
+rounds the accumulators to the activation dtype and applies MLX's own
+``Sigmoid`` and ``Multiply`` functors (read from the installed headers) with
+the same rounding after each op as ``nn.silu(gate) * up`` and mlx-lm's
+compiled ``swiglu``, which a probe over all 65,536 bf16 and fp16 inputs
+matched exactly.
 
 Measured on an M5 Max (MLX 0.32.2, 2026-09-29; E 512, top-10, 4-bit gate/up
 2,560 -> 1,280, median of 15 synchronized calls) against the chain it
@@ -65,7 +67,7 @@ import mlx.core as mx
 
 from mtplx import nax_detect
 
-__all__ = ["applies", "gather_rows_qmm", "min_rows", "stats"]
+__all__ = ["applies", "available", "gather_rows_qmm", "min_rows", "stats"]
 
 BM = 64
 BN = 64
@@ -172,10 +174,12 @@ def _mlx_headers() -> str | None:
     return "\n".join(out) + "\nusing namespace mlx::steel;\n"
 
 
-# Our kernel body.  Template constants: T (activation dtype), GS, BITS, KD, ND,
-# ED (reduction width, weight rows, experts) and SWIGLU: the weight's rows are
-# [gate | up] and the kernel writes silu(gate) * up (ND / 2 columns), each
-# threadgroup holding 32 gate rows and the 32 matching up rows.
+# Our kernel body.  Template constants: T (activation dtype), GS, BITS, KD (the
+# reduction width), ND (rows per expert of w), OUTC (output columns), ED
+# (experts) and SWIGLU: the kernel then writes silu(gate) * up, each
+# threadgroup holding 32 gate rows of w and the 32 matching up rows of wu (UD
+# rows per expert, starting at UOFF; wu is w itself at UOFF = ND / 2 for a
+# fused [gate | up] weight).
 _SOURCE = r"""
     constexpr int BM = 64;
     constexpr int BN = 64;
@@ -192,7 +196,7 @@ _SOURCE = r"""
     constexpr int BK_PAD = BK + 16 / sizeof(T);
     constexpr int ROW_BYTES = KD * PACK_BYTES / PACK;
     constexpr int ROW_GROUPS = KD / GS;
-    constexpr int OUT_COLS = SWIGLU ? ND / 2 : ND;
+    constexpr int OUT_COLS = OUTC;
     // SWIGLU: the tile's first 32 weight rows are gate rows, the last 32 the
     // matching up rows, each half loaded by 64 threads from its own row range.
     using WeightLoader = metal::conditional_t<
@@ -230,19 +234,33 @@ _SOURCE = r"""
     // Rows of this tile that fall in this simdgroup's 32-row half (0 to 32).
     const short rows = short(clamp(tile_rows - int(tm), 0, int(SM)));
 
+    ushort load_sg = sg;
+    const device uint8_t* w_src = (const device uint8_t*)w;
+    const device T* s_src = scales;
+    const device T* b_src = biases;
     size_t w_row = size_t(expert) * ND + size_t(col0);
     threadgroup T* w_dst = w_tile;
-    ushort load_sg = sg;
     if (SWIGLU) {
-        const int up_half = int(sg / 2);
-        w_row = size_t(expert) * ND + size_t(up_half * (ND / 2)) + size_t(col0 / 2);
+        // Output columns [col0 / 2, col0 / 2 + 32): the matching gate rows
+        // of w and up rows of wu (the same array at an offset when the
+        // weight is a fused [gate | up]).
+        const int up_half = int(load_sg / 2);
+        const size_t c = size_t(col0 / 2);
+        if (up_half) {
+            w_src = (const device uint8_t*)wu;
+            s_src = scales_u;
+            b_src = biases_u;
+            w_row = size_t(expert) * UD + size_t(UOFF) + c;
+        } else {
+            w_row = size_t(expert) * ND + c;
+        }
         w_dst = w_tile + up_half * (BN / 2) * BK_PAD;
-        load_sg = sg % 2;
+        load_sg = load_sg % 2;
     }
     thread WeightLoader loader(
-        (const device uint8_t*)w + w_row * ROW_BYTES,
-        scales + w_row * ROW_GROUPS,
-        biases + w_row * ROW_GROUPS,
+        w_src + w_row * ROW_BYTES,
+        s_src + w_row * ROW_GROUPS,
+        b_src + w_row * ROW_GROUPS,
         KD,
         w_dst,
         load_sg,
@@ -370,7 +388,10 @@ def _kernel():
         return None
     return mx.fast.metal_kernel(
         name="mtplx_moe_gather_rows",
-        input_names=["x", "w", "scales", "biases", "tile_start", "row_start", "row_map"],
+        input_names=[
+            "x", "w", "scales", "biases", "wu", "scales_u", "biases_u",
+            "tile_start", "row_start", "row_map",
+        ],
         output_names=["y"],
         source=_SOURCE,
         header=headers,
@@ -404,12 +425,24 @@ def applies(
     group_size,
     bits,
     mode,
+    up: tuple | None = None,
 ) -> bool:
     """Whether this gather can take the kernel (shape, dtype and device).
 
     ``tokens`` is ``[n_tokens, 1, K]``; ``row_map`` and ``rhs_indices`` are the
-    ``[rows]`` token index and expert of every sorted row.
+    ``[rows]`` token index and expert of every sorted row.  ``up`` is a
+    separate up projection's ``(weight, scales, biases)`` for the SwiGLU
+    epilogue (``w`` then holds the gate rows only).
     """
+
+    if up is not None:
+        wu, su, bu = up
+        if tuple(wu.shape) != tuple(w.shape) or wu.dtype != w.dtype:
+            return False
+        if tuple(su.shape) != tuple(scales.shape) or su.dtype != scales.dtype:
+            return False
+        if bu is None or biases is None or tuple(bu.shape) != tuple(biases.shape) or bu.dtype != biases.dtype:
+            return False
 
     if mode != "affine" or bits not in _BITS or group_size not in _GROUPS:
         return False
@@ -444,26 +477,35 @@ def _schedule(rhs_indices: mx.array, experts: int) -> tuple[mx.array, mx.array]:
     return tile_start, row_start
 
 
-def _launch(tokens, row_map, w, scales, biases, rhs_indices, *, group_size, bits, swiglu=False):
+def _launch(tokens, row_map, w, scales, biases, rhs_indices, *, group_size, bits, swiglu=False, up=None):
     rows = int(rhs_indices.shape[0])
     experts = int(w.shape[0])
     n = int(w.shape[1])
     k = int(w.shape[2]) * 32 // int(bits)
-    out_cols = n // 2 if swiglu else n
+    if not swiglu:
+        wu, su, bu, up_rows, up_offset, out_cols, cols = w, scales, biases, n, 0, n, n
+    elif up is None:  # fused [gate | up] rows in w
+        wu, su, bu, up_rows, up_offset, out_cols, cols = w, scales, biases, n, n // 2, n // 2, n
+    else:  # gate rows in w, up rows in up[0]
+        wu, su, bu = up
+        up_rows, up_offset, out_cols, cols = int(wu.shape[1]), 0, n, 2 * n
     tile_start, row_start = _schedule(rhs_indices, experts)
     (y,) = _kernel()(
-        inputs=[tokens.reshape(-1, k), w, scales, biases, tile_start, row_start, row_map],
+        inputs=[tokens.reshape(-1, k), w, scales, biases, wu, su, bu, tile_start, row_start, row_map],
         template=[
             ("T", tokens.dtype),
             ("GS", int(group_size)),
             ("BITS", int(bits)),
             ("KD", k),
             ("ND", n),
+            ("UD", up_rows),
+            ("UOFF", up_offset),
+            ("OUTC", out_cols),
             ("ED", experts),
             ("SWIGLU", bool(swiglu)),
         ],
         # Every expert adds at most one partial tile.
-        grid=((n // BN) * THREADS, (rows + BM - 1) // BM + experts, 1),
+        grid=((cols // BN) * THREADS, (rows + BM - 1) // BM + experts, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, out_cols)],
         output_dtypes=[tokens.dtype],
@@ -482,23 +524,34 @@ def _fail(key: tuple, reason: str) -> None:
     )
 
 
-def _stock(tokens, rows, w, scales, biases, idx, *, group_size, bits, swiglu):
-    """What the kernel replaces: the copy, the stock sorted gather and, for
-    ``swiglu``, Flash-Next's split and ``nn.silu(gate) * up``."""
+def _stock(tokens, rows, w, scales, biases, idx, *, group_size, bits, swiglu, up=None, act=None):
+    """What the kernel replaces: the copy and the stock sorted gather and, for
+    ``swiglu``, the gate and up halves (split from a fused weight, or ``up``'s
+    own gather) through ``act(up, gate)`` (default ``nn.silu(gate) * up``)."""
 
-    y = mx.gather_qmm(
-        tokens[rows], w, scales, biases, rhs_indices=idx, transpose=True,
-        group_size=group_size, bits=bits, sorted_indices=True,
-    )
-    if swiglu:
-        import mlx.nn as nn
+    def gather(wq, sq, bq):
+        return mx.gather_qmm(
+            tokens[rows], wq, sq, bq, rhs_indices=idx, transpose=True,
+            group_size=group_size, bits=bits, sorted_indices=True,
+        )
 
-        gate, up = mx.split(y, 2, axis=-1)
-        y = nn.silu(gate) * up
-    return y
+    y = gather(w, scales, biases)
+    if not swiglu:
+        return y
+    if up is None:
+        gate, upv = mx.split(y, 2, axis=-1)
+    else:
+        gate, upv = y, gather(*up)
+    if act is not None:
+        return act(upv, gate)
+    import mlx.nn as nn
+
+    return nn.silu(gate) * upv
 
 
-def _canary(key, tokens, row_map, w, scales, biases, rhs_indices, *, group_size, bits, swiglu) -> bool:
+def _canary(
+    key, tokens, row_map, w, scales, biases, rhs_indices, *, group_size, bits, swiglu, up=None, act=None
+) -> bool:
     """First use of an instantiation: the kernel against the stock chain on
     the copied rows, bit for bit, over a sample of the real call's rows."""
 
@@ -512,10 +565,10 @@ def _canary(key, tokens, row_map, w, scales, biases, rhs_indices, *, group_size,
     sample = mx.arange(0, total, step, dtype=mx.uint32)[:_CANARY_ROWS]
     idx = rhs_indices[sample]
     rows = row_map[sample]
-    kw = dict(group_size=group_size, bits=bits, swiglu=swiglu)
+    kw = dict(group_size=group_size, bits=bits, swiglu=swiglu, up=up)
     try:
         ours = _launch(tokens, rows, w, scales, biases, idx, **kw)
-        stock = _stock(tokens, rows, w, scales, biases, idx, **kw)
+        stock = _stock(tokens, rows, w, scales, biases, idx, act=act, **kw)
         mx.eval(ours, stock)
         same = bool(mx.array_equal(ours, stock).item())
     except Exception as exc:  # a compile or dispatch failure on this GPU
@@ -539,16 +592,31 @@ def gather_rows_qmm(
     group_size: int,
     bits: int,
     swiglu: bool = False,
+    up: tuple | None = None,
+    act=None,
 ) -> mx.array | None:
     """``gather_qmm(tokens[row_map], w, ..., sorted_indices=True)`` as
-    ``[rows, 1, N]`` without the copy, or with ``swiglu`` Flash-Next's
-    ``silu(gate) * up`` of that ``[gate | up]`` output as ``[rows, 1, N / 2]``;
-    None when the stock path must run."""
+    ``[rows, 1, N]`` without the copy; with ``swiglu``, ``silu(gate) * up``
+    as ``[rows, 1, I]``, where ``w`` is a fused ``[gate | up]`` weight
+    (``up`` None, I = N / 2) or the gate weight with ``up`` the up
+    projection's ``(weight, scales, biases)`` (I = N).  ``act(up, gate)`` is
+    the chain the first-use check compares against (default
+    ``nn.silu(gate) * up``).  None when the stock path must run."""
 
-    key = (tokens.dtype, int(group_size), int(bits), tuple(w.shape), bool(swiglu))
-    kw = dict(group_size=int(group_size), bits=int(bits), swiglu=bool(swiglu))
-    if not _canary(key, tokens, row_map, w, scales, biases, rhs_indices, **kw):
+    key = (
+        tokens.dtype, int(group_size), int(bits), tuple(w.shape), bool(swiglu),
+        up is not None, type(act).__name__,
+    )
+    kw = dict(group_size=int(group_size), bits=int(bits), swiglu=bool(swiglu), up=up)
+    if not _canary(key, tokens, row_map, w, scales, biases, rhs_indices, act=act, **kw):
         _STATS["fallbacks"] += 1
         return None
     _STATS["calls"] += 1
     return _launch(tokens, row_map, w, scales, biases, rhs_indices, **kw)
+
+
+def available() -> bool:
+    """Whether the kernel can run in this process at all (device, headers,
+    switch), before any per-call shape check."""
+
+    return _enabled() and nax_detect.nax_available() and _mlx_headers() is not None
