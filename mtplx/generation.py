@@ -10544,8 +10544,7 @@ def generate_mtpk(
     )
     if qwen4_fixed_m4_compiled_verify:
         fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
-            rt, prompt_tokens=len(prompt_ids), session_bank=session_bank,
-            prompt_ids=list(bank_commit_ids), promotion_rows=rows,
+            rt, prompt_tokens=len(prompt_ids), promotion_rows=rows,
         )
     _generic_compiled_verify = (
         verify_strategy in {"capture_commit", "graphbank_capture_commit"}

@@ -1034,12 +1034,10 @@ class TensorOffsetQSACache:
     def ensure_capacity(self, needed: int) -> bool:
         """Grow this installed QSA generation without changing its offset."""
 
-        self.dense_capacity = max(
-            self.dense_capacity,
-            self._bank_capacity(
+        if int(needed) > self.dense_capacity:
+            self.dense_capacity = self._bank_capacity(
                 needed, self.ratio, self.kv.step, rows_gather=self.fixed_rows_gather
-            ),
-        )
+            )
         if int(needed) <= self.capacity:
             return False
         raw_capacity = self._bank_capacity(
@@ -4468,6 +4466,7 @@ class CompiledVerifyBank:
                 # request outgrew its first grant and stayed on the lane.
                 "base_offset": int(dispatch["base_offset"]),
                 "capacity": int(dispatch["capacity"]),
+                "dense_capacity": int(dispatch["dense_capacity"]),
                 "growth_tokens": int(dispatch["growth_tokens"]),
                 # The bucket the capacity rounds up to while every QSA bank is
                 # on the rows-gather lane (the dense lane keeps its exact

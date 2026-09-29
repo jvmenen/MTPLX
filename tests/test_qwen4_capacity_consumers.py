@@ -279,3 +279,48 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
         assert qsa.capacity == 512 and qsa.dense_capacity == 256
         assert all(a is b for a, b in zip(refs, qsa.state_leaves))
     assert requests == [1024, 768]
+
+
+@pytest.mark.parametrize("offset", [16_384, 63_000])
+def test_production_fused_gather_and_one_row_capture_keep_identical_bits(lane, offset):
+    from mtplx.models.qwen4_exp import Attention, TextArgs
+    import mlx.utils
+
+    if not mx.metal.is_available():
+        pytest.skip("production fused gather requires Metal")
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    lane.setenv("MTPLX_QSA_M4_FUSED_KV_GATHER", "1")
+    lane.setenv("MTPLX_QWEN4_FIXED_M4_VERIFY", "1")
+    previous = mx.default_device()
+    mx.set_default_device(mx.gpu)
+    try:
+        mx.random.seed(28)
+        layer = Attention(TextArgs(
+            hidden_size=64, num_hidden_layers=4, num_attention_heads=24,
+            num_key_value_heads=2, head_dim=256, indexer_n_heads=4,
+            indexer_kv_heads=1, indexer_head_dim=128, indexer_budget=2048,
+            indexer_compress_ratio=4,
+        ))
+        layer.update(mlx.utils.tree_map(lambda p: p.astype(mx.bfloat16), layer.parameters()))
+        entry = QSACache(4)
+        entry.kv.keys = mx.zeros((1, 2, offset, 256), dtype=mx.bfloat16)
+        entry.kv.values = ((mx.arange(2 * offset * 256).reshape(1, 2, offset, 256) % 31) - 15).astype(mx.bfloat16)
+        entry.kv.offset = offset
+        entry.raw_keys = mx.zeros((1, offset, 128), dtype=mx.bfloat16)
+        entry.pooled = mx.zeros((1, offset // 4, 128), dtype=mx.bfloat16)
+        entry.pooled_len = offset // 4
+        banks = [graphbank.TensorOffsetQSACache.from_qsa_cache(
+            entry, reserve_tokens=1024, capacity_bucket=bucket,
+        ) for bucket in (0, 8192)]
+        assert banks[0].capacity != banks[1].capacity
+        assert all(bank.fused_rows_gather_kv_m4 for bank in banks)
+        for rows in (4, 1, 4, 1):
+            x = mx.random.normal((1, rows, 64)).astype(mx.bfloat16)
+            out = [layer(x, bank) for bank in banks]
+            _equal(_leaves(out[0]), _leaves(out[1]))
+            _equal(_state([banks[0]]), _state([banks[1]]))
+            if rows == 4:
+                for bank in banks:
+                    bank.trim(3)
+    finally:
+        mx.set_default_device(previous)
