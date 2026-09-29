@@ -38,6 +38,17 @@ It engages only where the defect can occur: MLX's own tensor-unit test
 turns it off exactly as it turns off MLX's kernel, and the route switch
 ``MTPLX_FORCE_GPU_FAMILY_FALLBACK`` does not, because MLX does not read it) and
 an MLX release before 0.32.3.  Every other call passes through unchanged.
+
+Token rows in place
+-------------------
+:func:`sort_rows` orders the routed rows exactly as mlx-lm's gather-sort does
+but returns a row map instead of copying each token row once per expert it is
+routed to.  :func:`gather_qmm_rows` (a sorted gather) and :func:`swiglu_rows`
+(Flash-Next's fused gate/up gather followed by ``silu(gate) * up``) take that
+map: on a tensor-unit GPU our kernel (``mtplx.kernels.moe_sorted_gather_nax``)
+reads the rows through it, bit-identical to the copy plus stock chain and
+with no row bound; everywhere else, and whenever the kernel declines, the rows
+are copied and the stock op runs behind the guard.
 """
 
 from __future__ import annotations
@@ -205,6 +216,116 @@ def gather_qmm(
         sorted_indices=sorted_indices,
     )
     return y[: x.shape[0] - pad] if pad else y
+
+
+def sort_rows(x: mx.array, indices: mx.array):
+    """Expert-sort the routed rows of ``x`` without copying them.
+
+    ``x`` is ``[..., K]`` tokens and ``indices`` ``[..., top_k]`` experts.
+    Returns ``(tokens, row_map, sorted_indices, inv_order)``: ``tokens`` is
+    ``[n_tokens, 1, K]``, sorted row ``i`` is token ``row_map[i]`` routed to
+    expert ``sorted_indices[i]``, and ``inv_order`` unsorts, exactly as
+    mlx-lm's gather-sort orders them (whose ``x[order // top_k]`` copy is what
+    :func:`gather_qmm_rows` avoids on the tensor-unit kernel).
+    """
+
+    top_k = int(indices.shape[-1])
+    flat = indices.flatten()
+    order = mx.argsort(flat)
+    inv_order = mx.argsort(order)
+    row_map = (order // top_k).astype(mx.uint32)
+    tokens = x.reshape(-1, 1, x.shape[-1])
+    return tokens, row_map, flat[order], inv_order
+
+
+def gather_qmm_rows(
+    tokens: mx.array,
+    row_map: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array | None,
+    rhs_indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
+) -> mx.array:
+    """``gather_qmm(tokens[row_map], ..., sorted_indices=True)``.
+
+    On a tensor-unit GPU the kernel in ``mtplx.kernels.moe_sorted_gather_nax``
+    reads each token row in place through the map instead of copying it
+    (bit-identical; the ten routed copies of a token row then come from cache).
+    Elsewhere, and whenever that kernel declines, the rows are copied and the
+    stock op runs behind the row guard.
+    """
+
+    from mtplx.kernels import moe_sorted_gather_nax as kernel
+
+    if kernel.applies(
+        tokens, row_map, w, scales, biases, rhs_indices,
+        group_size=group_size, bits=bits, mode=mode,
+    ):
+        y = kernel.gather_rows_qmm(
+            tokens, row_map, w, scales, biases, rhs_indices,
+            group_size=int(group_size), bits=int(bits),
+        )
+        if y is not None:
+            return y
+    return gather_qmm(
+        tokens[row_map],
+        w,
+        scales,
+        biases,
+        rhs_indices=rhs_indices,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        sorted_indices=True,
+    )
+
+
+def swiglu_rows(
+    tokens: mx.array,
+    row_map: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array | None,
+    rhs_indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
+) -> mx.array:
+    """``nn.silu(gate) * up`` of the fused ``[gate | up]`` sorted gather
+    ``gather_qmm(tokens[row_map], w, ...)``, as ``[rows, 1, N / 2]``.
+
+    On a tensor-unit GPU one kernel computes it without the row copy or the
+    full-width gate/up output (bit-identical to the chain below).  Elsewhere,
+    and whenever that kernel declines, the chain runs: :func:`gather_qmm_rows`,
+    the split and ``nn.silu(gate) * up``.
+    """
+
+    from mtplx.kernels import moe_sorted_gather_nax as kernel
+
+    if kernel.applies(
+        tokens, row_map, w, scales, biases, rhs_indices,
+        group_size=group_size, bits=bits, mode=mode,
+    ):
+        y = kernel.gather_rows_qmm(
+            tokens, row_map, w, scales, biases, rhs_indices,
+            group_size=int(group_size), bits=int(bits), swiglu=True,
+        )
+        if y is not None:
+            return y
+    import mlx.nn as nn
+
+    gu = gather_qmm_rows(
+        tokens, row_map, w, scales, biases, rhs_indices,
+        group_size=group_size, bits=bits, mode=mode,
+    )
+    gate, up = mx.split(gu, 2, axis=-1)
+    return nn.silu(gate) * up
 
 
 def _module_mode(module: Any) -> Any:
