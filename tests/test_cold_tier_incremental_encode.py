@@ -1,4 +1,4 @@
-"""Incremental SSD encode (MTPLX_SSD_INCREMENTAL_ENCODE, opt-in).
+"""Incremental SSD encode (MTPLX_SSD_INCREMENTAL_ENCODE, on by default).
 
 The switch must leave the store byte-identical to a full encode: the same
 payload spec, the same tensor names, the same blob digests and the same blob
@@ -14,6 +14,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mtplx.cache_bank.codec import content_fingerprints, encode_payload
 from mtplx.cache_bank.cold_tier import SessionBankColdTier
@@ -120,8 +121,16 @@ def test_fingerprint_sees_every_bit():
     assert content_fingerprints(a, rows=256)[0] != content_fingerprints(b, rows=256)[0]
 
 
-def test_switch_is_off_by_default(tmp_path, monkeypatch):
+def test_switch_is_on_by_default_and_zero_restores_the_full_encode(
+    tmp_path, monkeypatch
+):
     monkeypatch.delenv("MTPLX_SSD_INCREMENTAL_ENCODE", raising=False)
+    tier = _tier(tmp_path / "default")
+    try:
+        assert tier.stats()["incremental_encode"] is True
+    finally:
+        tier.close()
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
     tier = _tier(tmp_path / "off")
     try:
         turn1, turn2 = _turns()
@@ -134,6 +143,92 @@ def test_switch_is_off_by_default(tmp_path, monkeypatch):
         assert tier._block_memos == {}
     finally:
         tier.close()
+
+
+def _session_turns(dtype, seed):
+    """Five banked turns of one session, the shapes an agent session takes:
+    a first turn, an extension (the prefix restored bit for bit), an
+    extension whose recurrent state changed, an extension whose block 1
+    differs in one element's lowest bit (a re-prefill with other numerics),
+    and a turn whose history was rewritten from block 2 on (a compaction or
+    an edit)."""
+
+    def kv(tokens, salt):
+        return (
+            _rand((1, 2, tokens, 64), dtype, seed * 100 + salt),
+            _rand((1, 2, tokens, 64), dtype, seed * 100 + salt + 1),
+        )
+
+    def entry(tokens, k, v, gdn, mtp):
+        return _Entry(tokens=range(tokens), kv=(k, v), gdn=gdn, mtp=mtp)
+
+    k1, v1 = kv(700, 1)
+    mtp1 = _rand((1, 1, 700, 32), dtype, seed * 100 + 3)
+    gdn1 = _rand((1, 8, 128, 256), mx.float32, seed * 100 + 4)
+    turns = [entry(700, k1, v1, gdn1, mtp1)]
+
+    k_tail, v_tail = kv(400, 5)
+    k2 = mx.concatenate([k1, k_tail], axis=2)
+    v2 = mx.concatenate([v1, v_tail], axis=2)
+    mtp2 = mx.concatenate([mtp1, _rand((1, 1, 400, 32), dtype, seed * 100 + 7)], axis=2)
+    turns.append(entry(1100, k2, v2, gdn1, mtp2))
+
+    gdn3 = _rand((1, 8, 128, 256), mx.float32, seed * 100 + 8)
+    k_tail, v_tail = kv(300, 9)
+    k3 = mx.concatenate([k2, k_tail], axis=2)
+    v3 = mx.concatenate([v2, v_tail], axis=2)
+    mtp3 = mx.concatenate([mtp2, _rand((1, 1, 300, 32), dtype, seed * 100 + 11)], axis=2)
+    turns.append(entry(1400, k3, v3, gdn3, mtp3))
+
+    view = {2: mx.uint16, 4: mx.uint32}[dtype.size]
+    bits = k3.view(view)
+    flipped = bits[:, :, 300:301] ^ mx.array(1, dtype=view)
+    k_flip = mx.concatenate(
+        [bits[:, :, :300], flipped, bits[:, :, 301:]], axis=2
+    ).view(dtype)
+    k_tail, v_tail = kv(100, 17)
+    k4 = mx.concatenate([k_flip, k_tail], axis=2)
+    v4 = mx.concatenate([v3, v_tail], axis=2)
+    mtp4 = mx.concatenate([mtp3, _rand((1, 1, 100, 32), dtype, seed * 100 + 19)], axis=2)
+    turns.append(entry(1500, k4, v4, gdn3, mtp4))
+
+    k_new, v_new = kv(1000 - 512, 13)
+    k5 = mx.concatenate([k4[:, :, :512], k_new], axis=2)
+    v5 = mx.concatenate([v3[:, :, :512], v_new], axis=2)
+    mtp5 = mx.concatenate(
+        [mtp3[:, :, :512], _rand((1, 1, 1000 - 512, 32), dtype, seed * 100 + 15)],
+        axis=2,
+    )
+    turns.append(entry(1000, k5, v5, gdn3, mtp5))
+    return turns
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_every_turn_shape_stores_what_the_full_encode_stores(
+    tmp_path, monkeypatch, dtype, seed
+):
+    """The default-on proof: across dtypes, seeds and every turn shape an
+    agent session produces, each incremental write is the full encode's
+    payload (spec, names, digests) and the store holds the same blob bytes;
+    the one-bit and rewritten blocks were captured, not borrowed."""
+
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    full = _tier(tmp_path / "full")
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    incremental = _tier(tmp_path / "incremental")
+    try:
+        for turn in _session_turns(dtype, seed):
+            entry_id = _write(full, turn)
+            assert _write(incremental, turn) == entry_id
+            assert _payload(incremental, entry_id) == _payload(full, entry_id)
+        assert _blobs(incremental) == _blobs(full)
+        stats = incremental.stats()
+        assert stats["incremental_reused_blobs"] > 0
+        assert stats["incremental_missing_blobs"] == 0
+    finally:
+        full.close()
+        incremental.close()
 
 
 def test_incremental_store_is_identical_to_full_encode(tmp_path, monkeypatch):

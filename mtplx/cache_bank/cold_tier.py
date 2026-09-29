@@ -433,16 +433,17 @@ class SessionBankColdTier:
         self._encode_yield_enabled = _env_flag(
             "MTPLX_SSD_ENCODE_FOREGROUND_YIELD", default=True
         )
-        # Incremental encode (opt-in, default off): each agent turn re-encodes
-        # the whole session on the model-owner thread (eval + host copy of
-        # every KV block) and the writer re-hashes every blob, although only
-        # the new tail is new on disk. With this on, put_entry fingerprints
-        # every KV block on the GPU (one reduction per tensor) and references
-        # a block whose content key matches the session's last completed
-        # write instead of capturing it. The on-disk result is the same
-        # payload and the same blobs as a full encode.
+        # Incremental encode (default on; MTPLX_SSD_INCREMENTAL_ENCODE=0 for
+        # the full encode): each agent turn re-encoded the whole session on
+        # the model-owner thread (eval + host copy of every KV block) and
+        # the writer re-hashed every blob, although only the new tail is new
+        # on disk. put_entry fingerprints every KV block on the GPU (one
+        # reduction per tensor) and references a block whose content key
+        # matches the session's last completed write instead of capturing
+        # it. The on-disk result is the same payload and the same blobs as a
+        # full encode (tests/test_cold_tier_incremental_encode.py).
         self._incremental_encode = _env_flag(
-            "MTPLX_SSD_INCREMENTAL_ENCODE", default=False
+            "MTPLX_SSD_INCREMENTAL_ENCODE", default=True
         )
         # session_id -> {content key: {"sha256", "nbytes"}} of the newest
         # completed write; written by the writer thread, read at encode.
