@@ -561,3 +561,54 @@ def test_a_streamed_completion_carries_spans_that_end_at_its_first_text(monkeypa
     plain = nonstream.json()["mtplx_stats"]["ttft_spans"]
     assert plain["endpoint"] == "engine_first_token"
     assert plain["sum_s"] == pytest.approx(plain["ttft_s"], abs=1e-4)
+
+
+def test_a_response_from_a_lane_that_does_not_publish_still_carries_spans(
+    monkeypatch,
+):
+    # The batched lanes finalize outside _run_generation, whose envelope is
+    # where the spans were published (the review of 4c9da1ba). A generation
+    # result without ttft_spans is published by the handler before the
+    # response is written.
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    def lane_result(_state, prompt_ids, **kwargs):
+        observability = dict(kwargs["request_observability"])
+        return {
+            "text": "OK",
+            "tokens": [ord("O"), ord("K")],
+            "stats": {
+                **observability,
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", lane_result)
+    with TestClient(create_app(state)) as client:
+        chat = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Say OK"}],
+                "enable_thinking": False,
+                "stream": False,
+                "max_tokens": 4,
+            },
+        )
+        completion = client.post(
+            "/v1/completions",
+            json={"prompt": "Say OK", "stream": False, "max_tokens": 4},
+        )
+
+    for response in (chat, completion):
+        assert response.status_code == 200, response.text
+        spans = response.json()["mtplx_stats"]["ttft_spans"]
+        assert spans["origin"] == "http_arrival"
+        for name in ("encode", "policy", "prologue", "dispatch"):
+            assert f"{name}_s" in spans["exclusive_s"], (name, spans)

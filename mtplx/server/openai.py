@@ -41064,6 +41064,8 @@ def create_app(state: ServerState) -> FastAPI:
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text
             finish_reason = generated.get("finish_reason", "stop")
+        # A batched lane's result was never published by _run_generation.
+        request_spans.refresh(ttft_clock, generated.setdefault("stats", {}))
         chat_choice: dict[str, Any] = {
             "index": 0,
             "message": message,
@@ -41763,6 +41765,8 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.setdefault("stats", {})["stop_sequence_hit"] = True
                 generated["stats"]["stop_sequence_matched"] = matched_stop
         generated.setdefault("stats", {})["finish_reason"] = finish_reason
+        # A batched lane's result was never published by _run_generation.
+        request_spans.refresh(ttft_clock, generated["stats"])
         display_text = _display_text(
             state,
             generated,

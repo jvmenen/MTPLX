@@ -313,15 +313,20 @@ def publish(
 
 
 def refresh(clock: RequestClock | None, stats: dict[str, Any]) -> None:
-    """Re-read the clock into a response that was already published.
+    """Re-read the clock into a response just before it is written.
 
     The owner thread publishes when the generation ends; a stream writes its
     first delta on the event loop, which for a very short answer can land
     after that. The stream refreshes its final stats (and the /health row)
-    just before it writes them.
+    just before it writes them. A response whose generation path did not
+    publish (the batched lanes finalize outside ``_run_generation``) is
+    published here.
     """
 
-    if clock is None or "ttft_spans" not in stats:
+    if clock is None:
+        return
+    if "ttft_spans" not in stats:
+        publish(clock, stats)
         return
     summary = _write(clock, stats)
     with _WINDOW_LOCK:
