@@ -356,4 +356,6 @@ def test_admission_respects_a_larger_selection_budget(lane):
     )))
     plan = graphbank.FixedM4CapacityPlan.for_request(32, runtime=rt)
     assert plan.rows(16_384, 4) == 16_640  # both allocation and admission keep k_eff
+    assert plan.bucket == 0
+    plan = graphbank.FixedM4CapacityPlan.for_request(32, runtime=rt)  # the next request
     assert plan.rows(32_768, 4) == 40_960

@@ -1984,10 +1984,12 @@ class FixedM4CapacityPlan:
     def rows(self, offset: int, ratio: int, kv_step: int = 256) -> int:
         from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
 
+        rows_gather = _qsa_gather_enabled() and offset >= _qsa_gather_min_context()
+        if rows_gather and offset < self.indexer_budget:
+            self.bucket = 0
         return TensorOffsetQSACache._bank_capacity(
             offset + self.reserve_tokens, ratio, kv_step,
-            rows_gather=_qsa_gather_enabled() and offset >= _qsa_gather_min_context(),
-            bucket=self.bucket if offset >= self.indexer_budget else 0,
+            rows_gather=rows_gather, bucket=self.bucket,
         )
 
 
