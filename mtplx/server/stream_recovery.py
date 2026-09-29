@@ -70,6 +70,9 @@ def _run_stream_recovery_chain(
         result = step(generated)
         if result is not generated:
             attempts.append(_attempt_receipt(result))
+            # The worker still holds its initial result until this chain
+            # returns. Once replaced, that pass cannot be postcommitted.
+            generated.pop("_final_state", None)
         generated = result
     if len(attempts) == 1:
         return generated
@@ -83,4 +86,3 @@ def _run_stream_recovery_chain(
     if state.last_metrics:
         state.last_metrics[-1].update(totals)
     return generated
-

@@ -81,7 +81,7 @@ def _pass_kind(observability: dict) -> str:
     return "first"
 
 
-def _run_chain(monkeypatch, texts):
+def _run_chain(monkeypatch, texts, *, session_id=None):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     state.args.stats_footer = False
@@ -117,10 +117,15 @@ def _run_chain(monkeypatch, texts):
         }
 
     monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    headers = {"x-mtplx-client": "pi"}
+    if session_id is None:
+        headers["x-mtplx-cache-mode"] = "bypass"
+    else:
+        headers["x-mtplx-session-id"] = session_id
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "pi"},
+        headers=headers,
         json=_tool_fed_request(),
     ) as response:
         body = "".join(response.iter_text())
@@ -149,6 +154,18 @@ def test_reasoning_repair_after_retry_continues_the_retry_prompt(monkeypatch):
     # Repair = retry prompt + pass-2 tokens + closing suffix.
     assert _is_prefix(retry + [ord(c) for c in THINKING_ONLY], repair)
     assert not _is_prefix(original + [ord(c) for c in THINKING_ONLY], repair)
+
+
+def test_named_session_recovery_keeps_the_retry_context_and_totals(monkeypatch):
+    prompts, kinds, stats = _run_chain(
+        monkeypatch,
+        [ORPHAN_TAIL, THINKING_ONLY, ANSWER],
+        session_id="recovery-regression",
+    )
+    assert kinds == ["first", "tool_fed_empty_retry", "reasoning_completion_repair"]
+    assert _is_prefix(prompts[1] + [ord(c) for c in THINKING_ONLY], prompts[2])
+    assert stats["stream_attempts"] == 3
+    assert stats["stream_attempts_new_prefill_tokens"] == 1351
 
 
 def test_reasoning_repair_always_uses_the_prompt_that_produced_its_tokens(monkeypatch):
@@ -255,9 +272,12 @@ def test_recovery_chain_releases_discarded_generation_state():
         assert old_ref() is None, "discarded pass retains its model cache"
         return {"completion_tokens": 5, "stats": {}}
 
+    # Match the worker: its local still references the initial result while
+    # the helper runs all recovery steps.
+    first = first_result()
     result = _run_stream_recovery_chain(
         SimpleNamespace(last_metrics=[]),
-        first_result(),
+        first,
         [lambda first: {"completion_tokens": 4, "stats": {}}, third_pass],
     )
     assert result["stats"]["stream_attempts_completion_tokens"] == 12
