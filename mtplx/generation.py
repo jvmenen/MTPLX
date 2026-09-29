@@ -15731,6 +15731,11 @@ def generate_mtpk(
         a3b_target_prefix_route.demote()
     elif compiled_verify_bank is not None:
         compiled_verify_report = compiled_verify_bank.to_dict()
+        # Demotion is after the decode timing window. Report its complete
+        # cost, including evaluated publication copies, in the request stats.
+        demote_started = time.perf_counter()
+        compiled_verify_bank.demote(cache, compact=capture_final_state and pending_primary is None and repetition_result is None)
+        compiled_verify_report["demote_time_s"] = time.perf_counter() - demote_started
         if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
             try:
                 print(
@@ -15741,10 +15746,6 @@ def generate_mtpk(
                 )
             except Exception:
                 pass
-        # Mandatory before the final-state capture: postcommit and every
-        # other downstream cache consumer must never see promoted
-        # tensor-offset adapters.
-        compiled_verify_bank.demote(cache)
     # Disarm the FR-Spec head's compact-row stash.  The head is model-scoped,
     # not request-scoped, so leaving it armed would keep one unevaluated
     # scatter graph alive between requests.  A raise before this point leaves
