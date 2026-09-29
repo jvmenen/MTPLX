@@ -26715,6 +26715,50 @@ _RESPONSE_TAIL_SNAPSHOT_MARKER: dict[str, Any] = {
 }
 
 
+async def _await_session_response_tail(session: Any) -> dict[str, Any] | None:
+    """Wait until the previous streamed turn's commit landed (its response
+    tail ended) before this request reads the session. None when no tail
+    was running.
+
+    The wait has no deadline: the parent held the previous turn's terminal
+    frame until that commit landed, however long it queued behind other
+    clients' work (the commit runs as foreground model work; the review of
+    4c9da1ba: another client's long prefill can hold it past 30 s), so the
+    client could not send this request before it. A request that stopped
+    waiting and read the session would plan its prompt against the older
+    frontier. Each round is bounded by ``STREAM_COMMIT_WAIT_MAX_S`` only so
+    the receipt counts them; a disconnected client cancels the wait with
+    its request."""
+
+    wait = getattr(session, "wait_for_response_tail", None)
+    if not callable(wait):
+        return None
+    round_s = STREAM_COMMIT_WAIT_MAX_S if STREAM_COMMIT_WAIT_MAX_S > 0 else 30.0
+    waited_s = 0.0
+    rounds = 0
+    last: dict[str, Any] | None = None
+    while True:
+        outcome = await asyncio.to_thread(wait, round_s)
+        if outcome is None:
+            break
+        rounds += 1
+        waited_s += float(outcome.get("waited_s") or 0.0)
+        last = outcome
+        if outcome.get("finished"):
+            break
+    if last is None:
+        return None
+    tail = last.get("tail") if last.get("finished") else None
+    if tail is None:
+        tail = dict(getattr(session, "last_response_tail", None) or {})
+    return {
+        "waited_s": round(waited_s, 6),
+        "finished": True,
+        "rounds": rounds,
+        "tail": tail,
+    }
+
+
 def _merge_response_tail_into_metrics(
     state: Any, response_id: str | None, fields: Mapping[str, Any]
 ) -> None:
@@ -36467,11 +36511,9 @@ def create_app(state: ServerState) -> FastAPI:
                     # The previous streamed turn's commit may still be
                     # running after its terminal frame: read the session
                     # only once it landed (and scheduled its postcommit).
-                    if hasattr(_pending_session, "wait_for_response_tail"):
-                        early_response_tail_wait = await asyncio.to_thread(
-                            _pending_session.wait_for_response_tail,
-                            STREAM_COMMIT_WAIT_MAX_S,
-                        )
+                    early_response_tail_wait = await _await_session_response_tail(
+                        _pending_session
+                    )
                     ttft_clock.mark("response_tail_wait")
                     early_postcommit_wait = await asyncio.to_thread(
                         _pending_session.resolve_pending_postcommit_for_request
@@ -37315,9 +37357,7 @@ def create_app(state: ServerState) -> FastAPI:
                             pass
         if not early_postcommit_handled and session is not None:
             if hasattr(session, "wait_for_response_tail"):
-                response_tail_wait = await asyncio.to_thread(
-                    session.wait_for_response_tail, STREAM_COMMIT_WAIT_MAX_S
-                )
+                response_tail_wait = await _await_session_response_tail(session)
                 ttft_clock.mark("response_tail_wait")
                 if response_tail_wait is not None:
                     request_observability["response_tail_wait"] = response_tail_wait

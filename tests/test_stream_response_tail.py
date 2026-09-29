@@ -300,6 +300,76 @@ def test_the_next_turn_reads_the_session_the_commit_left(monkeypatch, stored, ho
     assert snapshot["mode"] == ("generation_final_exact" if stored else "async_pending")
 
 
+@pytest.mark.parametrize("stored, hold", [(False, "schedule"), (True, "store")])
+def test_a_commit_longer_than_one_wait_round_is_still_waited_for(
+    monkeypatch, stored, hold
+):
+    """The review of 4c9da1ba: with the commit held past the wait's bound
+    (another client's long prefill ahead of it on the model thread), the
+    next turn stopped waiting and read the older frontier. It now waits
+    until the commit landed, in as many rounds as that takes."""
+
+    monkeypatch.setattr(openai, "STREAM_COMMIT_WAIT_MAX_S", 0.05)
+    engine = _Engine(stored=stored, hold=hold, held_session="tail-long")
+    engine.install(monkeypatch)
+    state = _fake_streaming_session_state()
+    tail_waiting = Event()
+    prologue_reads: list[dict] = []
+    landed: list[dict] = []
+
+    original_wait = EngineSession.wait_for_response_tail
+    original_resolve = EngineSession.resolve_pending_postcommit_for_request
+    original_end = EngineSession.end_response_tail
+
+    def observed_wait(self, timeout_s):
+        with self._postcommit_lock:
+            running = self._response_tail is not None
+        if running:
+            tail_waiting.set()
+        return original_wait(self, timeout_s)
+
+    def observed_resolve(self):
+        prologue_reads.append(_session_view(self, engine))
+        return original_resolve(self)
+
+    def observed_end(self, tail, outcome):
+        landed.append(_session_view(self, engine))
+        return original_end(self, tail, outcome)
+
+    monkeypatch.setattr(EngineSession, "wait_for_response_tail", observed_wait)
+    monkeypatch.setattr(
+        EngineSession, "resolve_pending_postcommit_for_request", observed_resolve
+    )
+    monkeypatch.setattr(EngineSession, "end_response_tail", observed_end)
+
+    def release_after_several_rounds() -> None:
+        if tail_waiting.wait(5.0):
+            time.sleep(0.5)
+        engine.gate.set()
+
+    with TestClient(create_app(state)) as client:
+        try:
+            first = _post(client, "tail-long", TURN1, stream=True)
+            assert engine.held.wait(5.0)
+            before = _session_view(state.sessions.peek("tail-long"), engine)
+            threading.Thread(target=release_after_several_rounds, daemon=True).start()
+            second = _post(client, "tail-long", TURN2, stream=False)
+        finally:
+            engine.gate.set()
+
+    assert first.status_code == 200
+    assert second.status_code == 200, second.text
+    # The next turn read the session once, after the commit landed.
+    assert prologue_reads[-1] == landed[0]
+    assert prologue_reads[-1] != before
+    wait = second.json()["mtplx_stats"]["response_tail_wait"]
+    assert wait["finished"] is True
+    assert wait["rounds"] >= 3
+    assert wait["waited_s"] >= 0.4
+    snapshot = wait["tail"]["session_postcommit_snapshot"]
+    assert snapshot["mode"] == ("generation_final_exact" if stored else "async_pending")
+
+
 def test_other_sessions_never_wait_for_the_commit(monkeypatch):
     engine = _Engine(held_session="tail-owner")
     engine.install(monkeypatch)
