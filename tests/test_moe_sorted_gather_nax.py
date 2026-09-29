@@ -611,3 +611,61 @@ def test_the_serving_prefill_loop_is_bit_identical_through_the_switch_glu_route(
     assert nax_gather.stats()["calls"] == calls
     assert (calls > 0) == installed
     assert_bit_equal(routed, stock)
+
+
+def test_the_warm_restored_suffix_loop_is_bit_identical_through_the_switch_glu_route(monkeypatch, tmp_path):
+    """A warm agent turn: a restored prefix, then the suffix through the
+    product's restored-suffix prefill loop, chunked so every full chunk routes
+    past the kernel's threshold, with and without the SwitchGLU route: the
+    logits, the last hidden and every trunk cache leaf carry the same bits."""
+
+    from types import SimpleNamespace
+
+    from mlx_lm.models import switch_layers
+
+    from mtplx import generation
+    from mtplx import moe_sorted_gather as entry
+    from tests.a3b_tiny_synth import assert_bit_equal, prompt, tiny_model_with_draft_head
+    from tests.test_mtp_history_cache_only import _LoopRuntime
+
+    model = tiny_model_with_draft_head(tmp_path).eval()
+    top_k, cached = 4, 300
+    chunk = -(-nax_gather.min_rows() // top_k) + 40
+    tokens = prompt(cached + 2 * chunk + 31, seed=13)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", str(chunk))
+    monkeypatch.setenv("MTPLX_SMALL_SUFFIX_FUSED_MAX", "0")
+    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", _original_switch_glu_call())
+    installed = entry.install_switch_glu_rows()
+
+    def warm():
+        rt = _LoopRuntime(model, tmp_path)
+        cache = rt.make_cache()
+        out = rt.forward_ar(mx.array([tokens[:cached]]), cache=cache, return_hidden=True, emit_logits=False)
+        mx.eval(out[1])
+        restored = SimpleNamespace(
+            cache=cache,
+            mtp_history_cache=rt.make_mtp_cache(),
+            hidden=None,
+            entry=SimpleNamespace(prefix_len=cached),
+        )
+        logits, hidden, _forward_s, _history_s = generation._prefill_restored_prompt_suffix(
+            rt,
+            restored,
+            list(tokens[cached:]),
+            base_hidden_variant="post_norm",
+            mtp_hidden_variant="post_norm",
+            mtp_history_policy="committed",
+            cached_tokens=cached,
+        )
+        mx.eval(logits, hidden)
+        leaves = [leaf for entry_ in cache for leaf in entry_.state if leaf is not None]
+        return [logits, hidden, *leaves]
+
+    routed = warm()
+    calls = nax_gather.stats()["calls"]
+    monkeypatch.setenv("MTPLX_MOE_SORTED_GATHER_KERNEL", "0")
+    stock = warm()
+    assert nax_gather.stats()["calls"] == calls
+    assert (calls > 0) == installed
+    assert_bit_equal(routed, stock)
