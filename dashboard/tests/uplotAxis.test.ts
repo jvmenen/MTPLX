@@ -67,9 +67,14 @@ describe("value-axis labels", () => {
     expect(actual).toBeGreaterThanOrEqual(10 + 5 + 108 / 2);
   });
 
-  test("measures pixel width, not character count, and restores the drawing font", () => {
+  test("measures pixel width, not character count", () => {
     const self = plot({ "1111": 24, "888": 36 });
     expect(autoAxisSize(self, ["1111", "888"], 0, 1)).toBe(33);
+  });
+
+  test("restores the drawing font after measuring", () => {
+    const self = plot({ "1111": 24 });
+    expect(autoAxisSize(self, ["1111"], 0, 1)).toBe(27);
     expect(self.ctx.font).toBe("16px serif");
   });
 
