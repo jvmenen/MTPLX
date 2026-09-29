@@ -329,3 +329,38 @@ def test_install_is_a_no_op_where_the_kernel_is_correct(monkeypatch):
     before = switch_layers.QuantizedSwitchLinear.__call__
     assert msg.install_switch_linear_guard() is False
     assert switch_layers.QuantizedSwitchLinear.__call__ is before
+
+
+def test_no_sorted_gather_in_mtplx_bypasses_the_entry_point():
+    """Every call site that serves a prefill (cold chunks, warm suffixes,
+    image embeddings, batched forwards) reaches MLX's sorted gather through
+    ``mtplx.moe_sorted_gather`` or mlx-lm's switch layers, which the loader
+    guards.  A direct ``mx.gather_qmm`` with sorted indices anywhere else in
+    the package would skip the row guard; only literal unsorted calls may
+    stay direct."""
+
+    import ast
+    from pathlib import Path
+
+    import mtplx
+
+    root = Path(mtplx.__file__).resolve().parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "moe_sorted_gather.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "gather_qmm"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "mx"
+            ):
+                continue
+            flag = next((kw.value for kw in node.keywords if kw.arg == "sorted_indices"), None)
+            if flag is None or (isinstance(flag, ast.Constant) and flag.value is False):
+                continue
+            offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert offenders == []

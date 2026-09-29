@@ -342,22 +342,22 @@ def test_canary_rejects_a_difference_only_in_the_sign_of_zero(monkeypatch):
 
 @needs_tensor_units
 def test_canary_checks_the_whole_first_call_including_its_tail(monkeypatch):
-    """A kernel wrong only in the last 64 of 40,950 rows (the highest experts)
-    must be caught on its first call."""
+    """A kernel wrong only for the highest experts' rows, the tail of the
+    sorted order (rows 38,000 and up of 40,950), must be caught on its first
+    call: a check that runs a strided sample of the call (at most 4,096 rows,
+    the last at 36,855) never sees them."""
 
     real_launch = nax_gather._launch
 
-    def bad_tail(*args, **kwargs):
-        y = real_launch(*args, **kwargs)
-        rows = y.shape[0]
-        bump = mx.concatenate(
-            [mx.zeros((rows - 64, *y.shape[1:]), y.dtype), mx.ones((64, *y.shape[1:]), y.dtype)]
-        )
-        return y + bump
+    def bad_top_experts(tokens, row_map, w, scales, biases, rhs_indices, **kwargs):
+        y = real_launch(tokens, row_map, w, scales, biases, rhs_indices, **kwargs)
+        return mx.where((rhs_indices >= 60).reshape(-1, 1, 1), y + 1, y)
 
-    monkeypatch.setattr(nax_gather, "_launch", bad_tail)
+    monkeypatch.setattr(nax_gather, "_launch", bad_top_experts)
     tok, row_map, idx = _routed(4095, 64, 10, 256, mx.bfloat16, seed=62)
     assert int(idx.shape[0]) == 40950
+    first_bad = int(np.argmax(np.array(idx) >= 60))
+    assert first_bad > 9 * 4095  # past the last row a strided 4,096-row sample reaches
     wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
     assert nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4) is None
     assert nax_gather.stats()["canary_failures"] == 1
@@ -420,6 +420,47 @@ def test_model_load_installs_the_row_guard_and_the_switch_glu_route(monkeypatch,
     with pytest.raises(RuntimeError, match="stopped after the install step"):
         runtime.load(tmp_path / "pack")
     assert installed == ["guard", "glu"]
+
+
+@pytest.mark.parametrize("combine", ["1", "0"])
+def test_flash_next_moe_block_is_bit_identical_with_and_without_the_kernel(monkeypatch, combine):
+    """Flash-Next's whole MoE block (router, routed experts, shared expert,
+    combine) at a 2,100-token prefill forward, through the fused prefill
+    combine (``combine=1``) and through the parent block's own tail
+    (``combine=0``): the same bits with the kernel as with the stock chain."""
+
+    from types import SimpleNamespace
+
+    from mtplx.attention_context import attention_phase
+    from mtplx.models import qwen4_exp
+
+    experts, hidden, inter, top_k = 64, 256, 64, 10
+    args = SimpleNamespace(
+        hidden_size=hidden, moe_intermediate_size=inter, shared_expert_intermediate_size=inter,
+        norm_topk_prob=True, num_experts=experts, num_experts_per_tok=top_k,
+    )
+    block = qwen4_exp.SparseMoeBlock(args)
+    mx.random.seed(71)
+    gu = (mx.random.normal((experts, 2 * inter, hidden)) * 0.05).astype(mx.bfloat16)
+    gu_w, gu_s, gu_b = mx.quantize(gu, group_size=32, bits=4)
+    down = QuantizedSwitchLinear(inter, hidden, experts, bias=False, group_size=32, bits=4)
+    down.set_dtype(mx.bfloat16)
+    block.switch_mlp = qwen4_exp._FusedGateUpSwitchGLU(down, gu_w, gu_s, gu_b, 32, 4, "affine")
+    block.set_dtype(mx.bfloat16)
+    x = (mx.random.normal((1, 2100, hidden)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setenv("MTPLX_QWEN4_MOE_PREFILL_COMBINE", combine)
+    with attention_phase("prefill"):
+        with_kernel = block(x)
+        mx.eval(with_kernel)
+        calls = nax_gather.stats()["calls"]
+        monkeypatch.setenv("MTPLX_MOE_SORTED_GATHER_KERNEL", "0")
+        stock = block(x)
+        mx.eval(stock)
+    assert nax_gather.stats()["calls"] == calls  # the second pass never reached the kernel
+    if nax_gather.available():
+        assert calls == 1
+    assert tuple(with_kernel.shape) == tuple(stock.shape) == (1, 2100, hidden)
+    assert np.array_equal(_bits(with_kernel), _bits(stock))
 
 
 # mlx-lm's SwitchGLU (separate gate and up weights; Qwen3.5 and 3.6 MoE).
@@ -527,3 +568,46 @@ def test_install_switch_glu_rows_is_idempotent_and_off_without_the_kernel(monkey
         wrapped = switch_layers.SwitchGLU.__call__
         assert entry.install_switch_glu_rows() is True
         assert switch_layers.SwitchGLU.__call__ is wrapped
+
+
+@pytest.mark.parametrize("split", [None, "stable-prefix"])
+def test_the_serving_prefill_loop_is_bit_identical_through_the_switch_glu_route(monkeypatch, tmp_path, split):
+    """The product's cold streaming prefill loop on a tiny quantized
+    Qwen3.5-MoE (the A3B layout, with its draft head), chunked so every
+    forward routes past the kernel's threshold, with and without the
+    SwitchGLU route: the logits, the last hidden, every trunk cache leaf and
+    the draft cache carry the same bits.  ``stable-prefix`` splits the body
+    at a stable-prefix edge (as an image or a cache boundary does)."""
+
+    from mlx_lm.models import switch_layers
+
+    from mtplx import generation
+    from mtplx import moe_sorted_gather as entry
+    from tests.a3b_tiny_synth import assert_bit_equal, prompt, tiny_model_with_draft_head
+    from tests.test_mtp_history_cache_only import _LoopRuntime
+
+    model = tiny_model_with_draft_head(tmp_path).eval()
+    top_k = 4
+    chunk = -(-nax_gather.min_rows() // top_k) + 40  # every full chunk routes past the threshold
+    tokens = prompt(2 * chunk + 31, seed=12)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", str(chunk))
+    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", _original_switch_glu_call())
+    installed = entry.install_switch_glu_rows()
+    stable = chunk + 17 if split else None
+
+    def cold():
+        rt = _LoopRuntime(model, tmp_path)
+        out = generation._prefill_committed_mtp_history_streaming(rt, list(tokens), stable_prefix_len=stable)
+        cache, logits, hidden, mtp_cache = out[:4]
+        mx.eval(logits, hidden)
+        leaves = [leaf for entry_ in cache for leaf in entry_.state if leaf is not None]
+        return [logits, hidden, *leaves, *mtp_cache[0].state]
+
+    routed = cold()
+    calls = nax_gather.stats()["calls"]
+    monkeypatch.setenv("MTPLX_MOE_SORTED_GATHER_KERNEL", "0")
+    stock = cold()
+    assert nax_gather.stats()["calls"] == calls
+    assert (calls > 0) == installed
+    assert_bit_equal(routed, stock)
