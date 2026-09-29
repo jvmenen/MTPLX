@@ -41,11 +41,14 @@ inner steps and the float accumulation of MLX's sorted kernel, so the result is
 bit-identical to ``mx.gather_qmm(tokens[row_map], ..., sorted_indices=True)``.
 Row positions are 32-bit throughout, so there is no 32,767-row bound
 (``mtplx.moe_sorted_gather``).  A first-use canary per compiled instantiation
-compares a sample of the real call against that stock result, bit for bit; a
-mismatch or a compile failure turns the kernel off for that instantiation for
-the rest of the process with a printed reason and a counter, and the caller
-runs the stock op (for ``swiglu=True``: the stock gather, split and
-``nn.silu(gate) * up``).
+and per MLX row regime (under and from 64 rows per expert) runs that whole
+first call both ways, the kernel and the stock chain behind the row guard, and
+compares the outputs bit for bit (so a sign of zero counts); a mismatch or a
+compile failure turns the kernel off for that instantiation and regime for the
+rest of the process with a printed reason and a counter, and the caller runs
+the stock op (for ``swiglu=True``: the stock gather, split and SwiGLU).  An
+install whose kernel headers are missing or unreadable keeps the stock path
+too, with the reason printed once.
 
 Only on tensor-unit GPUs (``nax_detect.nax_available()``: the M1 to M4
 rehearsal switch keeps the stock path), for affine weights, bf16 or fp16
@@ -86,7 +89,6 @@ _BITS = (4, 8)
 _GROUPS = (32, 64, 128)
 _DTYPES = (mx.bfloat16, mx.float16)
 _ENV = "MTPLX_MOE_SORTED_GATHER_KERNEL"
-_CANARY_ROWS = 4096
 
 # The set MLX's own JIT concatenates for its sorted tensor-unit gather.
 _KERNEL_HEADERS = (
@@ -99,7 +101,9 @@ _PREAMBLE_HEADER = "mlx/backend/metal/kernels/utils.h"
 _INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"\s*$')
 _PRAGMA_ONCE = re.compile(r"^\s*#\s*pragma\s+once\s*$")
 
-_STATS: dict[str, int] = {"calls": 0, "fallbacks": 0, "canaries": 0, "canary_failures": 0}
+_STATS: dict[str, int] = {
+    "calls": 0, "fallbacks": 0, "canaries": 0, "canary_failures": 0, "header_failures": 0,
+}
 _CANARY: dict[tuple, bool] = {}
 
 
@@ -152,23 +156,39 @@ def _functor(root: Path, rel: str, name: str) -> str | None:
     return None if end < 0 else text[start : end + 3]
 
 
+def _headers_unavailable(reason: str) -> None:
+    _STATS["header_failures"] += 1
+    print(
+        f"[moe-sorted-gather] MLX kernel headers unusable ({reason}); "
+        "the stock sorted gather runs instead",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 @lru_cache(maxsize=1)
 def _mlx_headers() -> str | None:
     """The installed MLX's tile, MMA and quantized-loader templates and its
-    Sigmoid and Multiply functors as one header string, or None when this MLX
-    install ships no kernel headers."""
+    Sigmoid and Multiply functors as one header string, or None (the stock
+    path runs) when this MLX install ships no kernel headers or any of them
+    cannot be read; the reason is printed once and counted."""
 
     root = _include_root()
     if root is None:
         return None
-    seen: set[str] = set()
-    _closure(root, _PREAMBLE_HEADER, seen)  # already in every custom kernel
-    out: list[str] = []
-    for rel in _KERNEL_HEADERS:
-        _inline(root, rel, seen, out)
-    sigmoid = _functor(root, "mlx/backend/metal/kernels/unary_ops.h", "Sigmoid")
-    multiply = _functor(root, "mlx/backend/metal/kernels/binary_ops.h", "Multiply")
+    try:
+        seen: set[str] = set()
+        _closure(root, _PREAMBLE_HEADER, seen)  # already in every custom kernel
+        out: list[str] = []
+        for rel in _KERNEL_HEADERS:
+            _inline(root, rel, seen, out)
+        sigmoid = _functor(root, "mlx/backend/metal/kernels/unary_ops.h", "Sigmoid")
+        multiply = _functor(root, "mlx/backend/metal/kernels/binary_ops.h", "Multiply")
+    except (OSError, UnicodeDecodeError) as exc:
+        _headers_unavailable(f"{type(exc).__name__}: {exc}")
+        return None
     if sigmoid is None or multiply is None:
+        _headers_unavailable("no Sigmoid or Multiply functor in unary_ops.h / binary_ops.h")
         return None
     out += [sigmoid, multiply]
     return "\n".join(out) + "\nusing namespace mlx::steel;\n"
@@ -524,14 +544,17 @@ def _fail(key: tuple, reason: str) -> None:
     )
 
 
-def _stock(tokens, rows, w, scales, biases, idx, *, group_size, bits, swiglu, up=None, act=None):
-    """What the kernel replaces: the copy and the stock sorted gather and, for
+def _stock(tokens, row_map, w, scales, biases, idx, *, group_size, bits, swiglu, up=None, act=None):
+    """What the kernel replaces: the row copy and the stock sorted gather
+    (behind the row guard, so it is correct at every width) and, for
     ``swiglu``, the gate and up halves (split from a fused weight, or ``up``'s
     own gather) through ``act(up, gate)`` (default ``nn.silu(gate) * up``)."""
 
+    from mtplx.moe_sorted_gather import gather_qmm as guarded_gather_qmm
+
     def gather(wq, sq, bq):
-        return mx.gather_qmm(
-            tokens[rows], wq, sq, bq, rhs_indices=idx, transpose=True,
+        return guarded_gather_qmm(
+            tokens[row_map], wq, sq, bq, rhs_indices=idx, transpose=True,
             group_size=group_size, bits=bits, sorted_indices=True,
         )
 
@@ -549,36 +572,47 @@ def _stock(tokens, rows, w, scales, biases, idx, *, group_size, bits, swiglu, up
     return nn.silu(gate) * upv
 
 
+def _same_bits(a: mx.array, b: mx.array) -> bool:
+    """Equal bit for bit (so +0.0 and -0.0, or two NaN payloads, differ)."""
+
+    if tuple(a.shape) != tuple(b.shape) or a.dtype != b.dtype:
+        return False
+    return bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
+
+
+def _regime(rows: int, experts: int) -> str:
+    """MLX picks its sorted kernel's row tile from rows per expert (32 rows
+    under 64 per expert, 64 from there); each regime gets its own check."""
+
+    return "wide" if rows >= 64 * experts else "narrow"
+
+
 def _canary(
     key, tokens, row_map, w, scales, biases, rhs_indices, *, group_size, bits, swiglu, up=None, act=None
-) -> bool:
-    """First use of an instantiation: the kernel against the stock chain on
-    the copied rows, bit for bit, over a sample of the real call's rows."""
+) -> tuple[bool, mx.array | None]:
+    """The first call of an instantiation in each row regime runs both ways:
+    the kernel and the stock chain on the whole call, compared bit for bit.
+    Returns whether the kernel may run and, on that first call, its checked
+    output."""
 
     passed = _CANARY.get(key)
     if passed is not None:
-        return passed
+        return passed, None
     _STATS["canaries"] += 1
-    # Every step-th sorted row: still sorted, and every expert is sampled.
-    total = int(rhs_indices.shape[0])
-    step = max(1, total // _CANARY_ROWS)
-    sample = mx.arange(0, total, step, dtype=mx.uint32)[:_CANARY_ROWS]
-    idx = rhs_indices[sample]
-    rows = row_map[sample]
     kw = dict(group_size=group_size, bits=bits, swiglu=swiglu, up=up)
     try:
-        ours = _launch(tokens, rows, w, scales, biases, idx, **kw)
-        stock = _stock(tokens, rows, w, scales, biases, idx, act=act, **kw)
+        ours = _launch(tokens, row_map, w, scales, biases, rhs_indices, **kw)
+        stock = _stock(tokens, row_map, w, scales, biases, rhs_indices, act=act, **kw)
         mx.eval(ours, stock)
-        same = bool(mx.array_equal(ours, stock).item())
+        same = _same_bits(ours, stock)
     except Exception as exc:  # a compile or dispatch failure on this GPU
         _fail(key, f"{type(exc).__name__}: {exc}")
-        return False
+        return False, None
     if not same:
-        _fail(key, "output differs from the stock sorted gather on the canary rows")
-        return False
+        _fail(key, "output differs from the stock sorted gather, bit for bit, on its first call")
+        return False, None
     _CANARY[key] = True
-    return True
+    return True, ours
 
 
 def gather_rows_qmm(
@@ -605,13 +639,16 @@ def gather_rows_qmm(
 
     key = (
         tokens.dtype, int(group_size), int(bits), tuple(w.shape), bool(swiglu),
-        up is not None, type(act).__name__,
+        up is not None, type(act).__name__, _regime(int(rhs_indices.shape[0]), int(w.shape[0])),
     )
     kw = dict(group_size=int(group_size), bits=int(bits), swiglu=bool(swiglu), up=up)
-    if not _canary(key, tokens, row_map, w, scales, biases, rhs_indices, act=act, **kw):
+    passed, checked = _canary(key, tokens, row_map, w, scales, biases, rhs_indices, act=act, **kw)
+    if not passed:
         _STATS["fallbacks"] += 1
         return None
     _STATS["calls"] += 1
+    if checked is not None:
+        return checked
     return _launch(tokens, row_map, w, scales, biases, rhs_indices, **kw)
 
 

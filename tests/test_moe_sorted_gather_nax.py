@@ -11,6 +11,8 @@ everywhere else these tests check that the stock path runs.
 
 from __future__ import annotations
 
+import shutil
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -69,13 +71,15 @@ def _stock_swiglu(tokens, row_map, wq, s, b, idx, group_size, bits):
 def _fresh_canaries(monkeypatch):
     monkeypatch.setattr(nax_gather, "_CANARY", {})
     monkeypatch.setattr(
-        nax_gather, "_STATS", {"calls": 0, "fallbacks": 0, "canaries": 0, "canary_failures": 0}
+        nax_gather,
+        "_STATS",
+        {"calls": 0, "fallbacks": 0, "canaries": 0, "canary_failures": 0, "header_failures": 0},
     )
 
 
 @needs_tensor_units
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("group_size,bits", [(32, 4), (64, 4), (64, 8)])
+@pytest.mark.parametrize("group_size,bits", [(32, 4), (64, 4), (64, 8), (128, 4)])
 @pytest.mark.parametrize("n,k", [(128, 256), (256, 128)])
 def test_bit_identical_to_copy_plus_stock_gather(dtype, group_size, bits, n, k):
     tok, row_map, idx = _routed(500, 64, 10, k, dtype, seed=3)
@@ -128,7 +132,7 @@ def test_no_row_bound(tokens):
 
 @needs_tensor_units
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("group_size,bits", [(32, 4), (64, 4), (64, 8)])
+@pytest.mark.parametrize("group_size,bits", [(32, 4), (64, 4), (64, 8), (128, 4)])
 @pytest.mark.parametrize("n,k", [(128, 256), (256, 128)])
 def test_swiglu_bit_identical_to_the_stock_chain(dtype, group_size, bits, n, k):
     tok, row_map, idx = _routed(500, 64, 10, k, dtype, seed=4)
@@ -255,7 +259,8 @@ def test_a_failed_swiglu_canary_falls_back_to_the_stock_chain(monkeypatch):
     assert nax_gather.stats()["calls"] == 0
 
 
-def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
+@pytest.mark.parametrize("batch,tokens", [(1, 4096), (2, 1100)])
+def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch, batch, tokens):
     """Flash-Next's own gate/up + down module at a 4,096-token chunk against
     the code it ran before (mlx-lm's gather-sort copy, the stock gate/up gather,
     split, ``nn.silu(gate) * up``, the down gather, the unsort), bit for bit, in
@@ -267,7 +272,7 @@ def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
 
     from mtplx.models import qwen4_exp
 
-    experts, hidden, inter, top_k, tokens = 64, 256, 128, 10, 4096
+    experts, hidden, inter, top_k = 64, 256, 128, 10
     mx.random.seed(14)
     gu = (mx.random.normal((experts, 2 * inter, hidden)) * 0.05).astype(mx.bfloat16)
     gu_w, gu_s, gu_b = mx.quantize(gu, group_size=32, bits=4)
@@ -275,9 +280,9 @@ def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
     dn = (mx.random.normal((experts, hidden, inter)) * 0.05).astype(mx.bfloat16)
     down.weight, down.scales, down.biases = mx.quantize(dn, group_size=32, bits=4)
     switch = qwen4_exp._FusedGateUpSwitchGLU(down, gu_w, gu_s, gu_b, 32, 4, "affine")
-    x = (mx.random.normal((1, tokens, hidden)) * 0.5).astype(mx.bfloat16)
-    inds = mx.argsort(mx.random.uniform(shape=(tokens, experts)), axis=-1)[:, :top_k]
-    inds = inds.astype(mx.uint32).reshape(1, tokens, top_k)
+    x = (mx.random.normal((batch, tokens, hidden)) * 0.5).astype(mx.bfloat16)
+    inds = mx.argsort(mx.random.uniform(shape=(batch * tokens, experts)), axis=-1)[:, :top_k]
+    inds = inds.astype(mx.uint32).reshape(batch, tokens, top_k)
 
     xs, idx, inv_ref = _gather_sort(mx.expand_dims(x, (-2, -3)), inds)
     gate, up = mx.split(
@@ -291,7 +296,7 @@ def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
     y_ref = down(nn.silu(gate) * up, idx, sorted_indices=True)
     block_ref = _scatter_unsort(y_ref, inv_ref, inds.shape).squeeze(-2)
 
-    rows = mx.zeros((tokens * top_k,), dtype=mx.uint32)
+    rows = mx.zeros((batch * tokens * top_k,), dtype=mx.uint32)
     on_tensor_units = nax_gather.applies(
         x.reshape(-1, 1, hidden), rows, gu_w, gu_s, gu_b, rows,
         group_size=32, bits=4, mode="affine",
@@ -308,6 +313,113 @@ def test_flash_next_expert_module_equals_the_code_it_replaced(monkeypatch):
         assert np.array_equal(np.array(inv), np.array(inv_ref)), label
         assert np.array_equal(_bits(y), _bits(y_ref.reshape(y_ref.shape[0], -1))), label
         assert np.array_equal(_bits(block), _bits(block_ref)), label
+
+
+@needs_tensor_units
+def test_canary_rejects_a_difference_only_in_the_sign_of_zero(monkeypatch):
+    """A first call whose output differs from the stock chain only by -0.0
+    where the stock wrote +0.0 is value-equal but not bit-identical: the
+    canary must refuse it (a float comparison would not)."""
+
+    real_launch = nax_gather._launch
+
+    def negative_zeros(*args, **kwargs):
+        y = real_launch(*args, **kwargs)
+        return mx.where(y == 0, mx.zeros_like(y) * -1.0, y)
+
+    monkeypatch.setattr(nax_gather, "_launch", negative_zeros)
+    tok, row_map, idx = _routed(500, 64, 10, 256, mx.bfloat16, seed=61)
+    tok = mx.concatenate([mx.zeros((50, 1, 256), dtype=tok.dtype), tok[50:]])  # rows of exact zeros
+    wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
+    stock = _stock_swiglu(tok, row_map, wq, s, b, idx, 32, 4)
+    faked = negative_zeros(tok, row_map, wq, s, b, idx, group_size=32, bits=4, swiglu=True)
+    assert bool(mx.array_equal(faked, stock).item())  # equal as floats ...
+    assert not np.array_equal(_bits(faked), _bits(stock))  # ... not as bits
+    ours = nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4, swiglu=True)
+    assert ours is None
+    assert nax_gather.stats()["canary_failures"] == 1
+
+
+@needs_tensor_units
+def test_canary_checks_the_whole_first_call_including_its_tail(monkeypatch):
+    """A kernel wrong only in the last 64 of 40,950 rows (the highest experts)
+    must be caught on its first call."""
+
+    real_launch = nax_gather._launch
+
+    def bad_tail(*args, **kwargs):
+        y = real_launch(*args, **kwargs)
+        rows = y.shape[0]
+        bump = mx.concatenate(
+            [mx.zeros((rows - 64, *y.shape[1:]), y.dtype), mx.ones((64, *y.shape[1:]), y.dtype)]
+        )
+        return y + bump
+
+    monkeypatch.setattr(nax_gather, "_launch", bad_tail)
+    tok, row_map, idx = _routed(4095, 64, 10, 256, mx.bfloat16, seed=62)
+    assert int(idx.shape[0]) == 40950
+    wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
+    assert nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4) is None
+    assert nax_gather.stats()["canary_failures"] == 1
+
+
+@needs_tensor_units
+def test_each_row_regime_gets_its_own_first_call_check():
+    """MLX tiles narrow calls (under 64 rows per expert) and wide ones
+    differently; the first call of each runs the check."""
+
+    wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
+    narrow = _routed(300, 64, 10, 256, mx.bfloat16, seed=63)  # 3,000 rows, 47 per expert
+    wide = _routed(500, 64, 10, 256, mx.bfloat16, seed=64)  # 5,000 rows, 78 per expert
+    for tok, row_map, idx in (narrow, wide, narrow, wide):
+        ours = nax_gather.gather_rows_qmm(tok, row_map, wq, s, b, idx, group_size=32, bits=4)
+        assert np.array_equal(_bits(ours), _bits(_stock(tok, row_map, wq, s, b, idx, 32, 4)))
+    assert nax_gather.stats()["canaries"] == 2
+    assert nax_gather.stats()["calls"] == 4
+
+
+def test_unreadable_headers_keep_the_stock_path(tmp_path, monkeypatch):
+    """An install with the four checked headers but without unary_ops.h: no
+    exception reaches the prefill, the reason is counted once, the kernel
+    reports itself unavailable."""
+
+    root = nax_gather._include_root()
+    if root is None:
+        pytest.skip("this MLX install ships no kernel headers")
+    kernels = "mlx/backend/metal/kernels"
+    copy = tmp_path / "include"
+    shutil.copytree(root / kernels, copy / kernels, ignore=shutil.ignore_patterns("unary_ops.h"))
+    monkeypatch.setattr(nax_gather, "_include_root", lambda: copy)
+    nax_gather._mlx_headers.cache_clear()
+    try:
+        assert nax_gather._mlx_headers() is None
+        assert nax_gather._mlx_headers() is None
+        assert nax_gather.stats()["header_failures"] == 1
+        assert not nax_gather.available()
+        rows = nax_gather.min_rows()
+        tok = mx.zeros((rows, 1, 256), dtype=mx.bfloat16)
+        idx = mx.zeros((rows,), dtype=mx.uint32)
+        wq, s, b = _weights(64, 128, 256, 32, 4, mx.bfloat16)
+        assert not nax_gather.applies(tok, idx, wq, s, b, idx, group_size=32, bits=4, mode="affine")
+    finally:
+        nax_gather._mlx_headers.cache_clear()
+
+
+def test_model_load_installs_the_row_guard_and_the_switch_glu_route(monkeypatch, tmp_path):
+    from mtplx import moe_sorted_gather as entry
+    from mtplx import runtime
+
+    installed = []
+    monkeypatch.setattr(entry, "install_switch_linear_guard", lambda: installed.append("guard") or True)
+    monkeypatch.setattr(entry, "install_switch_glu_rows", lambda: installed.append("glu") or True)
+
+    def stop(_metadata):
+        raise RuntimeError("stopped after the install step")
+
+    monkeypatch.setattr(runtime, "engine_version_blocker", stop)
+    with pytest.raises(RuntimeError, match="stopped after the install step"):
+        runtime.load(tmp_path / "pack")
+    assert installed == ["guard", "glu"]
 
 
 # mlx-lm's SwitchGLU (separate gate and up weights; Qwen3.5 and 3.6 MoE).
@@ -333,7 +445,7 @@ def _original_switch_glu_call():
 
 @needs_tensor_units
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("group_size,bits", [(64, 4), (32, 4), (64, 8)])
+@pytest.mark.parametrize("group_size,bits", [(64, 4), (32, 4), (64, 8), (128, 4)])
 def test_split_gate_up_bit_identical_to_the_stock_chain(dtype, group_size, bits):
     from mlx_lm.models.switch_layers import SwiGLU
 
