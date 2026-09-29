@@ -26866,6 +26866,11 @@ async def _await_session_response_tail(session: Any) -> dict[str, Any] | None:
     if not callable(wait):
         return None
     round_s = STREAM_COMMIT_WAIT_MAX_S if STREAM_COMMIT_WAIT_MAX_S > 0 else 30.0
+    # A wedged model owner never lands the commit: the stream's stall
+    # watchdog (#86) bounded that wait when the frame waited for the commit,
+    # and it bounds it here, as a refusal, never as a read of the older
+    # frontier.
+    owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
     waited_s = 0.0
     rounds = 0
     last: dict[str, Any] | None = None
@@ -26878,6 +26883,22 @@ async def _await_session_response_tail(session: Any) -> dict[str, Any] | None:
         last = outcome
         if outcome.get("finished"):
             break
+        frozen_for_s = owner_stall_probe.observe()
+        if frozen_for_s is not None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": (
+                        "this session's previous turn is still committing and "
+                        f"the model owner made no progress for {frozen_for_s:.0f}s "
+                        "(MTPLX_STREAM_STALL_DEADLINE_S); the request was not "
+                        "started, so it cannot read the session before that "
+                        "commit lands"
+                    ),
+                    "code": "session_commit_stalled",
+                    "waited_s": round(waited_s, 3),
+                },
+            )
     if last is None:
         return None
     tail = last.get("tail") if last.get("finished") else None
@@ -40771,6 +40792,8 @@ def create_app(state: ServerState) -> FastAPI:
                 },
             )
             stop_generated = attach_response_observability(stop_generated)
+            # The stop path builds its own result: publish its spans too.
+            request_spans.refresh(ttft_clock, stop_generated["stats"])
             _merge_final_bridge_stats_into_latest_metrics(
                 state, stop_generated["stats"]
             )
