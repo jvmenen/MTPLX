@@ -23,7 +23,10 @@ image rows included), for both prefill loops:
 * the next turn, changed after the image, restores at the pre-image anchor
   and its logits equal a cold prefill's (fails on the old code: cold);
 * a turn changed before the image restores at the newest anchor at or below
-  its match, never past it.
+  its match, never past it;
+* a turn that extends the image prompt restores it exactly through the image
+  and banks an entry that still carries the pre-image anchors (fails on the
+  old code: none).
 
 CPU-sized: 16-id vocabulary, no model pack, no tower.
 """
@@ -246,3 +249,22 @@ def test_a_turn_changed_before_the_image_never_restores_past_its_match(policy):
     assert warm.cached_tokens == 16
     cold = _state(_runtime(), second, policy=policy)
     assert warm.logits.tolist() == cold.logits.tolist()
+
+
+def test_a_turn_that_extends_the_image_prompt_carries_its_anchors(policy):
+    """The next turn of an agent session extends the stored prompt, image
+    included: the exact restore serves it through the image, and the entry
+    it banks must still carry the pre-image anchors, or the turn after it
+    has nothing to fall back to."""
+
+    bank = SessionBank()
+    first = _prompt(TEXT_BEFORE, AFTER_ONE)
+    _state(_runtime(), first, policy=policy, bank=bank)
+    extended = [*first, *AFTER_TWO]
+    warm = _state(_runtime(), extended, policy=policy, bank=bank)
+    assert warm.cached_tokens == len(first)
+    assert _positions(warm.gdn_boundaries) == [8, 16, 24, 32, 40]
+    cold = _state(_runtime(), extended, policy=policy)
+    assert warm.logits.tolist() == cold.logits.tolist()
+    keyed = vision_bank_key_ids(extended, _splice(IMAGE))
+    assert _positions(bank.longest_prefix(keyed).gdn_boundaries) == [8, 16, 24, 32, 40]
