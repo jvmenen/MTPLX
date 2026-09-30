@@ -83,10 +83,10 @@ def test_the_16371_match_restores_at_8192_not_4096():
 
     Eight checkpoints over 47K tokens only guarantee the 16K grid: 8,192
     survives here because the inherited set held one checkpoint. Had it also
-    held 2,048, the first checkpoint and the restore point would share the
-    first 8K cell and the last slot would go to a newer cell, and this match
-    would restore at 4,096 again (ten checkpoints restore it at 8,192). The
-    general bound is pinned in tests/test_checkpoint_anchors.py."""
+    held 2,048, a production sink (which protects its restore point) would
+    keep both in the first 8K cell and give the last slot to a newer cell, so
+    this match would restore at 4,096 again; ten checkpoints restore it at
+    8,192. The general bound is pinned in tests/test_checkpoint_anchors.py."""
 
     previous = SimpleNamespace(gdn_boundaries=[_rec(4096)])
     sink = list(_inherited_gdn_boundaries(previous, 4096))
