@@ -192,21 +192,25 @@ class TestWhenBothCannotFit:
         assert manager.bank.eviction_log[-1]["reason"] == "prefill_admission_moved_to_ssd"
         assert manager.bank.eviction_log[-1]["persistence_cancelled"] == 0
 
-    def test_without_an_ssd_copy_the_refusal_says_the_retry_cannot_succeed(self, monkeypatch):
+    def test_without_an_ssd_copy_the_entry_gives_way_and_the_request_runs(self, monkeypatch):
+        """Nothing will put the entry on disk (the SSD cache is off), so
+        keeping it would refuse this conversation on every turn that does not
+        fit beside it. It is released instead and the request re-reads what
+        it held; the receipt says why."""
+
         manager, lane = _world(ssd=False)
         entry = _flash_next_entry(manager.bank, CONV)
 
-        receipt, state = _admit(
+        receipt, _state = _admit(
             monkeypatch, manager, lane, TEXT_PROMPT,
             base_gib=_base_for(1.0, entry.nbytes),
         )
 
-        assert receipt["refused"] is True
-        assert receipt["retry_can_succeed"] is False
-        assert receipt["retry_when"] == "not_while_the_conversation_stays_in_memory"
-        assert manager.bank._entries.get(entry.token_ids) is entry
-        message = srv._prefill_admission_refusal(state, receipt).detail["message"]
-        assert "Free disk space for the SSD cache" in message
+        assert "refused" not in receipt
+        assert receipt["kept_session_entries_released_no_ssd"]["entries"] == 1
+        assert "same_conversation_released_no_ssd" in receipt["reclamation_steps"]
+        assert entry.token_ids not in manager.bank._entries
+        assert manager.bank.eviction_log[-1]["reason"] == "prefill_admission_released_no_ssd"
 
 
 class TestStillReclaimable:

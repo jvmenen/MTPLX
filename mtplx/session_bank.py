@@ -4230,6 +4230,32 @@ class SessionBank:
             moved += 1
         return {"entries": moved, "held_bytes": held, "longest_prefix_tokens": longest}
 
+    def release_entries_no_disk_can_take(
+        self, keys: Any, *, reason: str = "released_no_ssd"
+    ) -> dict[str, Any]:
+        """Let RAM go of each of these entries that nothing will put on disk.
+
+        An entry the cold tier has not published and holds no queued write
+        for (the SSD cache is off, full, or refused it) can never leave RAM
+        any other way; kept, it would refuse every request of its
+        conversation that does not fit beside it. Returns what was released.
+        """
+
+        released = 0
+        held = 0
+        longest = 0
+        for key in keys or ():
+            entry = self._entries.get(tuple(key))
+            if entry is None or self.entry_is_durable(entry):
+                continue
+            if self._persistence_pending_for(entry):
+                continue
+            held += int(entry.held_nbytes)
+            longest = max(longest, len(entry.token_ids))
+            self._evict_entry(entry, reason=reason, cancel_queued_persistence=False)
+            released += 1
+        return {"entries": released, "held_bytes": held, "longest_prefix_tokens": longest}
+
     def held_by_session(self) -> list[dict[str, Any]]:
         """What each session's RAM entries hold, largest first (the 507's
         holder list and the admission receipt read it)."""

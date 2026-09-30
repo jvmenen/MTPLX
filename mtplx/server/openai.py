@@ -21287,7 +21287,8 @@ def _answer_room(
     prompt_tokens = len(prompt_ids)
     depth = max(0, int(mtp_depth or 0))
     requested = max(0, int(max_new_tokens))
-    window = int(getattr(state, "context_window", 0) or 0)
+    # The window this server executes (the one Pi and OpenCode are told).
+    window = int(served_execution_window(state).get("tokens") or 0)
     answer_rows = requested + depth
     if window > 0:
         answer_rows = min(answer_rows, max(0, window - prompt_tokens))
@@ -22991,6 +22992,29 @@ def _run_prefill_admission(
                 replan("same_conversation_to_ssd", moved.get("entries"))
         except Exception as exc:
             receipt["kept_session_entries_move_error"] = repr(exc)
+            step_errors.append(exc)
+
+    # 9. Still refused: a same-conversation entry that nothing will put on
+    # disk (the SSD cache is off, full, or refused it) would refuse every
+    # request of its conversation that does not fit beside it. It is let go
+    # instead, and the request re-reads what it held.
+    release_fn = getattr(session_bank, "release_entries_no_disk_can_take", None)
+    if (
+        chosen is _ADMISSION_NO_FIT
+        and kept_keys
+        and callable(release_fn)
+        and refusal_deficit(now, current) > 0
+    ):
+        try:
+            released = release_fn(kept_keys, reason="prefill_admission_released_no_ssd")
+            receipt["kept_session_entries_released_no_ssd"] = released
+            if int((released or {}).get("entries") or 0) > 0:
+                clear_pool()
+                now = measure()
+                steps.append("same_conversation_released_no_ssd")
+                replan("same_conversation_released_no_ssd", released.get("entries"))
+        except Exception as exc:
+            receipt["kept_session_entries_release_error"] = repr(exc)
             step_errors.append(exc)
 
     if chosen is _ADMISSION_NO_FIT:
