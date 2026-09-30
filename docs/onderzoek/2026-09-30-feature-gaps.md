@@ -20,6 +20,26 @@ Scale: effort S (under a day of agent work plus one measurement), M (a few days,
 | 10 | Forge has no "keep an existing body, swap only the MTP head" mode | | anyone improving a published pack's head | M | reproducibility of the combo packs (label scoring identical to the original) | [building-mtp-packs](2026-09-30-building-mtp-packs.md), step 5 | low priority; the manual recipe works |
 | 11 | `MTPLX_FUSE_GDN_POST_CONV` hard-coded to the A3B contract (40 layers, 16 heads) | 35B-A3B | dense 3.8-27B (48 GDN layers) | M-L | small at best: 3.8-27B verify is bandwidth-bound (matmuls 250-280 GB/s), GDN non-matmul work ~0.14 ms per layer and mostly overlapped | Q6 analysis | do not pursue |
 
+## By model type
+
+Where each gap matters. ✓ = relevant (measured), (✓) = likely relevant (estimate), – = not relevant or already covered, ? = unknown. Model types: MoE = Qwen3.6-35B-A3B (3B active, bandwidth-light decode); dense hybrid = Qwen3.8-27B (64 layers, 48 GDN, bandwidth-bound decode, compute-bound prefill); small dense = Qwen3.5-9B; Gemma 4 = assistant-pair drafter instead of a native MTP head; Flash-Next = Qwen3.8 Flash-Next (MoE, too large for 64 GB).
+
+| Rank | Gap | MoE (3.6-35B-A3B) | Dense hybrid (3.8-27B) | Small dense (3.5-9B) | Gemma 4 | Flash-Next |
+|---|---|---|---|---|---|---|
+| 1 | Forge: best depth and served id not stamped | ✓ (our packs) | (✓) | (✓) | ? (Forge path differs) | – (first-party) |
+| 2 | `repetition_penalty` ignored | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 3 | Queue wait missing in request log | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 4 | FR-Spec not bound outside Flash-Next | – (no vocab yet) | ✓ +7-8% | ? (same tokenizer family, no vocab) | – (different drafter) | – (has it) |
+| 5 | Fused MTP experts dropped (#574) | ✓ +32% D2 | – (dense MLP) | – (dense MLP) | – | – (own Forge path) |
+| 6 | FR-Spec vocab only for 3.8 | (✓) few % | – (has it) | ? | – | – |
+| 7 | Sampled draft chain / prescatter | ? | ✓ but <1% | ? | – | – (has it) |
+| 8 | Compiled verify off with KV quantization | (✓) KV is 20 KB/token, less pressure | ✓ KV 64 KB/token | – (small KV) | ? | – |
+| 9 | `mtp_batch` tied to one A3B layout | ✓ only under parallel load | – (no batch route for dense) | – | – | ? |
+| 10 | Forge "swap only the head" | ✓ (combo packs) | – (head already BF16) | ? | – | – |
+| 11 | GDN postconv fusion A3B-only | – (has it) | – (measured: little to gain) | – | – | – |
+
+Reading the matrix: the MoE model gains most from MTP-head work (ranks 5, 10) and batching (9); the dense hybrid gains from draft-side byte savings (4) and memory (8), not from verify tuning; general items (1-3) help every type.
+
 Not gaps (checked and deliberate): the batch-invariant prefill lane and the A3B MoE prefill combine are MoE-only by nature; the long-context depth policy is correctly off for 3.8-27B (D3 beats D2 at 20K-60K, Q7); the tune cap at D3 for Qwen3.8 follows the maker's measurement (D6 -27% against D3).
 
 ## Suggested order
