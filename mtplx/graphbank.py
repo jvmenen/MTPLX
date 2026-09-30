@@ -2142,6 +2142,26 @@ def _fixed_m4_capacity_growth(
     return next_capacity, _next_fixed_m4_growth_tokens(growth_tokens)
 
 
+class FixedM4GrowthRefused(MemoryError):
+    """An installed fixed-M4 bank could not grow for the next write.
+
+    Raised by ``reserve_fixed_m4_window`` when the memory admission refuses
+    the growth at both the bucketed and the unbucketed width, after the
+    session bank gave way (generation._qwen4_fixed_m4_growth_fits). No cache
+    leaf has changed, so the committed state is whole: a caller between
+    rounds can end the answer there instead of failing it.
+    """
+
+    def __init__(self, *, capacity: int, required_end: int, rows: int) -> None:
+        super().__init__("fixed-M4 bank growth exceeds memory admission")
+        self.receipt = {
+            "reason": "fixed_m4_growth_refused",
+            "capacity_tokens": int(capacity),
+            "required_tokens": int(required_end),
+            "requested_rows": int(rows),
+        }
+
+
 def _post_restore_eager_rounds() -> int:
     """Verify rounds routed eager after a large session-bank restore (opt-in).
 
@@ -2951,6 +2971,35 @@ class CompiledVerifyBank:
         )
         return fetched
 
+    def reserve_fixed_m4_round(
+        self,
+        cache: Any,
+        *,
+        committed_count: int,
+        copy_window: int = 0,
+    ) -> None:
+        """Grow an installed fixed-M4 bank for the round about to run, first.
+
+        The verify's own reservation (a four-row window at the same committed
+        count) is made here, before the round samples, drafts or writes, so
+        every forward sees the capacity it saw before. On the rows-gather
+        lane, where the bank's capacity changes no value, the widest copy
+        window is reserved too. A refusal (``FixedM4GrowthRefused``) then
+        comes between rounds, with the committed state untouched.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return
+        window = 4
+        if int(copy_window) > window and all(
+            entry.fixed_rows_gather for entry in dispatch["qsa_entries"]
+        ):
+            window = int(copy_window)
+        self.reserve_fixed_m4_window(
+            cache, committed_count=committed_count, window_tokens=window
+        )
+
     def reserve_fixed_m4_window(
         self,
         cache: Any,
@@ -3031,7 +3080,11 @@ class CompiledVerifyBank:
                         for entry in qsa_entries
                     ]
                     if not admit(max(planned)):
-                        raise MemoryError("fixed-M4 bank growth exceeds memory admission")
+                        raise FixedM4GrowthRefused(
+                            capacity=int(dispatch["dense_capacity"]),
+                            required_end=required_end,
+                            rows=max(planned),
+                        )
                     for entry in qsa_entries:
                         entry.capacity_bucket = 0
                     self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0

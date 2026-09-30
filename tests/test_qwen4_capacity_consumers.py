@@ -529,8 +529,11 @@ def _lazy_bonus_boundary_session(pack, patch, bucket):
                    mtp_history_policy="committed", verify_strategy="batched",
                    stop_token_ids=set(), capture_final_state=True, session_bank=session)
     first = generation.generate_mtpk(rt, prompt, **options)
+    # The second round grows the bank at its top (reserve_fixed_m4_round),
+    # with the reservation its one-row verify used to make on entry, so the
+    # verify is called with the grown bank; every write sees what it saw.
     assert windows[:2] == [(3, 17_403, 17_408, 24_576 if bucket else 17_408),
-                           (1, 17_407, 17_408, 24_576 if bucket else 17_408)]
+                           (1, 17_407, 17_664, 24_576 if bucket else 17_664)]
     assert (17_408, 17_664) in writes
     assert first.stats.events[1]["lazy_bonus_verify"]["enabled"]
     final = first.final_state

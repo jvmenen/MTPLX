@@ -82,6 +82,7 @@ from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import (
     CompiledVerifyBank,
     FixedM4CapacityPlan,
+    FixedM4GrowthRefused,
     SpecDecodeGraphBank,
     TensorOffsetQSACache,
     _float32_gdn_key_scale_head_dim,
@@ -3681,6 +3682,9 @@ class GenerationStats:
     owned_attn_kv: dict[str, object] = field(default_factory=dict)
     repetition_stop_triggered: bool = False
     repetition_stop_reason: str | None = None
+    # The answer ended between rounds because the fast path's bank could not
+    # grow (graphbank.FixedM4GrowthRefused): what was asked and refused.
+    memory_stop: dict[str, Any] | None = None
     repetition_stop_block_tokens: int = 0
     repetition_stop_repeats: int = 0
     repetition_stop_trimmed_tokens: int = 0
@@ -6387,6 +6391,7 @@ def restore_or_prefill_prompt_state(
                     hidden=state.hidden,
                     prompt_len=len(prompt_ids),
                     boundaries=boundaries,
+                    runtime=rt,
                 )
                 has_mtp = state.committed_mtp_cache is not None
             else:
@@ -10515,6 +10520,7 @@ def generate_mtpk(
     repetition_config = _repetition_stop_config(bool(repetition_stop))
     repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result: RepetitionStopResult | None = None
+    memory_stop: dict[str, Any] | None = None
     # F35 → 2.8.3: armed uncapped streams hold a detector-window tail off
     # the wire ONLY while the tail shows a forming loop (candidate-gated —
     # see _RepetitionStreamGate; the 2.8.0-2.8.2 unconditional holdback
@@ -10626,6 +10632,7 @@ def generate_mtpk(
                     hidden=prompt_state.hidden,
                     prompt_len=len(prompt_ids),
                     boundaries=prompt_boundaries,
+                    runtime=rt,
                 )
             else:
                 # This prompt cache is committed before decode continues and
@@ -12436,6 +12443,21 @@ def generate_mtpk(
                 and not _is_stop(tokens[-1], stop_token_ids)
             ):
                 append_event({"step": len(tokens), "constraint_stop": True})
+                break
+        if compiled_verify_bank is not None:
+            # Grow the fast path's bank for this round before anything of it
+            # runs. When the memory is not there even after the session bank
+            # gave way, the answer ends here with every committed token whole
+            # (finish_reason "length"), instead of failing mid-stream.
+            try:
+                compiled_verify_bank.reserve_fixed_m4_round(
+                    cache,
+                    committed_count=len(tokens) - (1 if pending_primary is not None else 0),
+                    copy_window=(1 + max(4, int(ccopy_k))) if ccopy_active else 0,
+                )
+            except FixedM4GrowthRefused as exc:
+                memory_stop = {**exc.receipt, "completion_tokens": len(tokens)}
+                append_event({"step": step, "memory_stop": memory_stop})
                 break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
@@ -16319,6 +16341,7 @@ def generate_mtpk(
             if repetition_result is None
             else len(tokens) + repetition_result.repeated_tokens
         ),
+        memory_stop=memory_stop,
         loop_guard=(_loop_guard.summary() if _loop_guard is not None else {}),
         thinking_guard=(
             _thinking_guard.summary() if _thinking_guard is not None else {}

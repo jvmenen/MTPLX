@@ -82,7 +82,11 @@ from mtplx.a3b_mtp_batch import (
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
-from mtplx.one_copy import one_copy_runtime
+from mtplx.one_copy import (
+    anchor_nbytes as one_copy_anchor_nbytes,
+    one_copy_runtime,
+    prefill_slack_rows as one_copy_prefill_slack_rows,
+)
 from mtplx.mtp_patch import MTPContract
 from mtplx.mtp_batch_numerics import (
     MTP_BATCH_NUMERICS_CHOICES,
@@ -17611,6 +17615,7 @@ def _metrics_envelope(
             stats.get("repetition_stop_trimmed_tokens") or 0
         ),
         "repetition_stop_raw_tokens": int(stats.get("repetition_stop_raw_tokens") or 0),
+        "memory_stop": stats.get("memory_stop"),
         # #414: which speculative branch emitted the stop token. Null on
         # length/aborted finishes; stamped unconditionally here because
         # the JSONL is the forensics surface the release note names.
@@ -21098,7 +21103,9 @@ def _admission_context_transient_per_token(
     )
 
 
-def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
+def _admission_restore_copies_prefix(
+    entry: Any, restore_mode: str, session_id: str | None = None
+) -> bool:
     """Whether restoring from ``entry`` puts a second copy of its prefix in memory.
 
     A clone restore installs views of the banked arrays (or copies them
@@ -21112,6 +21119,10 @@ def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
     generation-final commit of a coding-agent turn leaves, copies on the
     first write like a clone. (#499, 48 GB: 38.5 GiB active = 19.85 GiB of
     weights + three copies of a 96K conversation at 64 KiB a token.)
+    A lease-only entry is its conversation's only copy: its own session
+    takes it in place, and a request of another session (a subagent sharing
+    the prefix) is served a copy while the owner keeps its lease
+    (``session_bank._lease_owned_by``).
     """
 
     if entry is None:
@@ -21122,10 +21133,142 @@ def _admission_restore_copies_prefix(entry: Any, restore_mode: str) -> bool:
         # Nothing to lease: the restore clones the snapshot, or misses.
         return True
     if getattr(entry, "live_ref_only", False):
-        return False
+        from mtplx.session_bank import _lease_owned_by
+
+        return not _lease_owned_by(entry, session_id)
     if not getattr(entry, "lazy_kv", False):
         return False
     return getattr(entry, "snapshot_settled_at", None) is None
+
+
+# The shortest answer a request is still worth running for: below it the
+# request is refused before its prefill instead of capped.
+_ANSWER_ROOM_FLOOR_TOKENS = 1024
+
+
+def _answer_room(
+    state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    max_new_tokens: int,
+    mtp_depth: int,
+    session_bank: Any | None,
+    session_id: str | None,
+    growth: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Room for the whole answer, checked before the prefill.
+
+    The one-copy store (Flash-Next's fixed-M4 lane) grows the conversation's
+    buffers while the answer decodes, and the prefill admission prices only
+    the prefill and the start of decode (``growth``, what it settled on).
+    Here the longest answer the request may write (its max_tokens, inside
+    the served window) is priced against what the engine line leaves after
+    the prefill, counting what the session bank would give back: the bank's
+    other conversations are released only if the answer grows into their
+    room (generation._qwen4_fixed_m4_growth_fits), so an answer that stays
+    short evicts nothing.
+
+    None when the answer fits. Otherwise a receipt with ``answer_token_cap``
+    when a shorter answer fits (the request runs with that limit and says so
+    if it reaches it), or ``refused`` when not even
+    ``_ANSWER_ROOM_FLOOR_TOKENS`` do, before any prefill.
+    """
+
+    runtime = getattr(state, "runtime", None)
+    if not one_copy_runtime(runtime) or not isinstance(growth, Mapping):
+        return None
+    if bool(getattr(state, "allow_swap", False)):
+        return None
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = int(caps.get("memory_limit_bytes") or 0) if isinstance(caps, dict) else 0
+    live_w = int(_admission_geometry(state).live_bytes_per_token)
+    if limit <= 0 or live_w <= 0:
+        return None
+    from mtplx.generation import (
+        _qwen4_fixed_m4_promotion_bytes_per_token,
+        _qwen4_qsa_layer_count,
+    )
+
+    prompt_tokens = len(prompt_ids)
+    depth = max(0, int(mtp_depth or 0))
+    requested = max(0, int(max_new_tokens))
+    window = int(getattr(state, "context_window", 0) or 0)
+    answer_rows = requested + depth
+    if window > 0:
+        answer_rows = min(answer_rows, max(0, window - prompt_tokens))
+    slack_rows = int(growth.get("slack_bytes") or 0) // live_w
+    extra_rows = max(0, answer_rows - slack_rows)
+    if extra_rows <= 0:
+        return None
+    # The bank grows one layer at a time: the last growth holds one layer's
+    # new banks beside the old ones.
+    layers = max(1, _qwen4_qsa_layer_count(runtime))
+    transient = (
+        (prompt_tokens + answer_rows)
+        * _qwen4_fixed_m4_promotion_bytes_per_token(runtime)
+        // layers
+    )
+    need = extra_rows * live_w + transient
+    stats = _mlx_memory_stats_live()
+    if _allocator_reading_failure(stats) is not None:
+        return None
+    engine = int(stats.get("active_memory_bytes") or 0)
+    line = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
+    after_prefill = engine + int(growth.get("decode_start_bytes") or 0)
+    reclaimable = 0
+    reclaim_fn = getattr(session_bank, "reclaimable_nbytes", None)
+    if callable(reclaim_fn):
+        keep = set(_in_flight_session_ids(state))
+        if session_id:
+            keep.add(str(session_id))
+        reclaimable = int(reclaim_fn(keep_session_ids=keep, protect_tokens=list(prompt_ids)))
+    room = line - after_prefill + reclaimable
+    if need <= room:
+        return None
+    receipt: dict[str, Any] = {
+        "action": "answer_room",
+        "prompt_tokens": int(prompt_tokens),
+        "requested_answer_tokens": int(requested),
+        "window_tokens": int(window) if window > 0 else None,
+        "answer_rows": int(answer_rows),
+        "slack_rows": int(slack_rows),
+        "need_bytes": int(need),
+        "room_bytes": int(room),
+        "reclaimable_bytes": int(reclaimable),
+        "engine_bytes": int(engine),
+        "after_prefill_bytes": int(after_prefill),
+        "line_bytes": int(line),
+        "limit_bytes": int(limit),
+    }
+    cap = slack_rows + max(0, (room - transient) // live_w) - depth
+    if cap >= min(requested, _ANSWER_ROOM_FLOOR_TOKENS):
+        receipt["answer_token_cap"] = int(min(cap, requested))
+        return receipt
+    receipt["refused"] = True
+    return receipt
+
+
+def _answer_room_refusal(receipt: Mapping[str, Any]) -> HTTPException:
+    """The 507 for a prompt that leaves no room for even a short answer."""
+
+    gib = float(1024**3)
+    short = max(0, int(receipt.get("need_bytes") or 0) - int(receipt.get("room_bytes") or 0))
+    message = (
+        "insufficient memory: this conversation "
+        f"({int(receipt.get('prompt_tokens') or 0):,} tokens) leaves no room "
+        f"for an answer; it needs about {short / gib:.1f} GiB more than the "
+        "engine can give it after releasing the other conversations' caches. "
+        "The request was refused before prefill. Start a new conversation, or "
+        "close other apps and try again."
+    )
+    return HTTPException(
+        status_code=507,
+        detail={
+            "message": message,
+            "code": "insufficient_memory",
+            "memory": _json_safe(dict(receipt)),
+        },
+    )
 
 
 def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
@@ -21298,6 +21441,8 @@ def _admission_growth(
     prefill_chunk_tokens: int | None = None,
     verify_tokens: int = 1,
     restore_fixed_bytes: int | None = None,
+    publish_bytes: int | None = None,
+    slack_rows: int = 0,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -21334,6 +21479,14 @@ def _admission_growth(
     of 9c96dd9c: a 196,608-token capacity grows to 262,144 for a
     196,609-token prompt, 4 GiB on the 27B, where the old model charged three
     rows, and a lease with room was charged its reservation again).
+
+    The one-copy store (``mtplx/one_copy.py``) changes two terms. Its prefill
+    writes the attention buffers at the verifier bank's rows, the answer's
+    reserve rounded up to the capacity bucket (``slack_rows`` past the
+    prompt), so those rows are allocated with the prompt. And it publishes a
+    prompt as a lease on the live cache plus one recurrent anchor
+    (``publish_bytes``): no snapshot aliases the buffers decode writes, so
+    nothing is copied at decode's first write.
     """
 
     P = max(0, int(prompt_tokens))
@@ -21412,6 +21565,8 @@ def _admission_growth(
         row_width = paged_w
         restore_fixed = 0
         live_prefill = (new_rows + out_rows) * paged_w
+    slack = max(0, int(slack_rows)) * live_w if M > 0 else 0
+    live_prefill += slack
     transient_per_token = (
         geometry.context_transient_bytes_per_token
         if context_transient_bytes_per_token is None
@@ -21472,7 +21627,12 @@ def _admission_growth(
         # The snapshot holds the prompt dequantized (q4), or views of the q8
         # mirror that decode's first write copies: full width either way.
         live_total = P * live_w
-    publish_copy = live_total if publish else 0
+    if not publish:
+        publish_copy = 0
+    elif publish_bytes is not None:
+        publish_copy = max(0, int(publish_bytes))
+    else:
+        publish_copy = live_total
     decode_start = live_decode + publish_copy
     return {
         "layout": layout,
@@ -21487,6 +21647,7 @@ def _admission_growth(
         "quant_working_bytes": int(quant_working),
         "quant_working": quant_detail or None,
         "publish_copy_bytes": int(publish_copy),
+        "slack_bytes": int(slack),
         "lease_capacity_tokens": (
             int(lease["capacity_tokens"])
             if lease is not None and lease.get("capacity_tokens") is not None
@@ -21955,6 +22116,16 @@ def _run_prefill_admission(
     flags = {"skip_publish": False}
 
     own_snapshot = bool(getattr(runtime, "keeps_prompt_snapshot_with_bank", False))
+    # The one-copy store publishes a prompt as a lease plus one recurrent
+    # anchor and sizes the prefill's buffers to the verifier bank's rows
+    # (mtplx/one_copy.py).
+    one_copy = one_copy_runtime(runtime)
+    anchor_bytes = one_copy_anchor_nbytes(runtime) if one_copy else None
+    slack_rows = (
+        one_copy_prefill_slack_rows(runtime, prompt_tokens, max_new_tokens)
+        if one_copy
+        else 0
+    )
 
     def publishes(miss: int) -> bool:
         if own_snapshot:
@@ -21969,6 +22140,10 @@ def _run_prefill_admission(
         committed = bool(commit_prompt_prefix and session_id) and miss > 0
         if not (stored or committed):
             return False
+        if one_copy:
+            # A lease holds no snapshot, so the per-session cap never
+            # refuses it.
+            return True
         if isinstance(per_session_cap, int) and per_session_cap > 0:
             # The snapshot's width: a dense decode cache, or a quantized one
             # read back dequantized, is full width; plain pages are paged.
@@ -22032,6 +22207,8 @@ def _run_prefill_admission(
             restore_fixed_bytes=(
                 int(source_windows) if source_windows is not None and int(reused) > 0 else None
             ),
+            publish_bytes=anchor_bytes,
+            slack_rows=slack_rows,
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
@@ -22157,6 +22334,7 @@ def _run_prefill_admission(
                 # The near-prefix lane tries a lease first whenever the entry
                 # still owns its live cache.
                 restore_mode if reused_mode == "exact" else "reference",
+                session_id,
             )
             if reused_mode in {"exact", "near_prefix"}
             else True
@@ -22358,7 +22536,10 @@ def _run_prefill_admission(
             )
 
         # 2. The banked copy of this prompt, when it is what crosses the line.
-        if deficit(now) > 0 and current["publish_copy_bytes"] > 0:
+        # Not the one-copy store's anchor: it is what lets a cancelled or
+        # edited answer restore at the prompt instead of prefilling it cold,
+        # and it is a fixed 115 MB.
+        if not one_copy and deficit(now) > 0 and current["publish_copy_bytes"] > 0:
             flags["skip_publish"] = True
             unpublished = price()
             if unpublished[narrow]["growth_bytes"] < current["growth_bytes"]:
@@ -24573,6 +24754,18 @@ PUBLIC_POSTCOMMIT_KEYS = (
 )
 
 
+def _memory_stop_message(memory_stop: Mapping[str, Any]) -> str:
+    """What an answer the memory ended says to the person reading it."""
+
+    tokens = int(memory_stop.get("completion_tokens") or 0)
+    return (
+        f"The answer stopped after {tokens:,} tokens because the Mac ran out "
+        "of memory for this conversation to grow. Everything written so far "
+        "is kept. Close other apps or start a new conversation, then ask it "
+        "to continue."
+    )
+
+
 def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     stats = generated.get("stats") or {}
     public = {key: stats[key] for key in PUBLIC_MTPLX_STATS_KEYS if key in stats}
@@ -24585,6 +24778,14 @@ def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
         reason = stats.get("repetition_stop_reason")
         if reason is not None:
             public["repetition_stop_reason"] = str(reason)
+    memory_stop = stats.get("memory_stop")
+    if isinstance(memory_stop, dict):
+        # Same quiet-envelope rule: a "length" finish the memory ended must
+        # be told apart from the client's own max_tokens, in plain words.
+        public["memory_stop"] = {
+            **memory_stop,
+            "message": _memory_stop_message(memory_stop),
+        }
     # #414 telemetry: same quiet-envelope rule. finish_stop_origin is None
     # on every length/aborted finish, so it joins the envelope only when a
     # stop actually named its commit path; without this the origin exists
@@ -30512,6 +30713,24 @@ def _run_generation(
             # max_tokens truncation into "stop".
             else (getattr(out, "finish_reason", None) or "stop")
         )
+        memory_stop = stats.get("memory_stop")
+        if isinstance(memory_stop, dict):
+            # The answer ended between rounds, whole, because the fast path's
+            # bank could not grow (generation, FixedM4GrowthRefused): the
+            # app's guard feed and the log say so.
+            _record_guard_event(
+                state,
+                {
+                    "action": "answer_memory_stop",
+                    "request_id": str((request_observability or {}).get("request_id") or ""),
+                    **memory_stop,
+                },
+            )
+            logging.getLogger("mtplx.server").warning(
+                "answer ended by memory after %s tokens: %s",
+                memory_stop.get("completion_tokens"),
+                memory_stop,
+            )
         _record_request_metrics(state, dict(envelope))
         if not bool(envelope.get("warmup")):
             # Same contract as the batch lanes: warm rungs never stamp the

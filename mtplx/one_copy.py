@@ -111,6 +111,7 @@ def prompt_lease_fields(
     hidden: Any,
     prompt_len: int,
     boundaries: Any,
+    runtime: Any = None,
 ) -> dict[str, Any]:
     """``SessionBank.put`` arguments that bank a finished prompt as a lease.
 
@@ -121,7 +122,9 @@ def prompt_lease_fields(
     its entry replaces this lease and inherits the anchor; if it is not
     (cancelled, refused), a restore rewinds the lease to the anchor. The
     anchor is evaluated now, so it holds its own 115 MB and never pins the
-    live recurrent buffers the verifier writes in place.
+    live recurrent buffers the verifier writes in place. Its size is recorded
+    on ``runtime`` (``anchor_nbytes``): it is what the server's admission
+    charges for publishing a prompt.
     """
 
     import mlx.core as mx
@@ -139,6 +142,8 @@ def prompt_lease_fields(
     ]
     if leaves:
         mx.eval(*leaves)
+    if runtime is not None:
+        _record_anchor_nbytes(runtime, sum(int(leaf.nbytes) for leaf in leaves))
     kept = [
         record for record in (boundaries or ())
         if int(record[0]) != prompt_len
@@ -149,6 +154,47 @@ def prompt_lease_fields(
         "mtp_history_cache_ref": committed_mtp_cache,
         "gdn_boundaries": [*kept, (prompt_len, snapshot, hidden)],
     }
+
+
+def anchor_nbytes(rt: Any) -> int | None:
+    """Bytes one prompt anchor holds on this runtime, once one was taken.
+
+    The recurrent state is fixed-size (115,642,384 bytes on Flash-Next), so
+    the first prompt lease measures it for every later admission. None before
+    that: the admission then prices the publication as the copy it used to
+    be, which only ever over-charges.
+    """
+
+    value = getattr(rt, "one_copy_anchor_nbytes", None)
+    return int(value) if isinstance(value, int) and value > 0 else None
+
+
+def prefill_slack_rows(rt: Any, prompt_tokens: int, max_tokens: int) -> int:
+    """Rows a one-copy prefill allocates past the prompt, or 0.
+
+    The prefill sizes its QSA buffers once to the verifier bank's rows
+    (``prefill_rows_target``): the answer's reserve rounded up to the
+    capacity bucket, allocated when the prompt is written instead of when
+    the bank is built.
+    """
+
+    if not one_copy_runtime(rt):
+        return 0
+    from .graphbank import FixedM4CapacityPlan
+
+    plan = FixedM4CapacityPlan.for_request(max(1, int(max_tokens)), runtime=rt)
+    target = prefill_rows_target(rt, prompt_tokens, plan)
+    return max(0, int(target) - max(0, int(prompt_tokens)))
+
+
+def _record_anchor_nbytes(rt: Any, nbytes: int) -> None:
+    if int(nbytes) <= 0:
+        return
+    try:
+        rt.one_copy_anchor_nbytes = int(nbytes)
+    except Exception:
+        # A runtime that takes no attributes keeps the copy price.
+        pass
 
 
 def prefill_rows_scope(rows: int):

@@ -3967,6 +3967,30 @@ class SessionBank:
         source = self.restore_plan(protect_tokens, **identity)["source"]
         return None if source is None else source.token_ids
 
+    def reclaimable_nbytes(
+        self,
+        *,
+        keep_session_ids: Any = (),
+        protect_tokens: list[int] | tuple[int, ...] | None = None,
+    ) -> int:
+        """Bytes the bank can give back to one request, at most.
+
+        Every entry's held bytes except the sessions named (the request's
+        own, and any that are generating) and the entries the request's
+        prompt restores from: what ``shrink_for_admission`` may take for it.
+        """
+
+        keep = {str(sid) for sid in (keep_session_ids or ()) if sid}
+        protected = set(self.restore_source_keys(protect_tokens)) if protect_tokens else set()
+        total = 0
+        for key, entry in list(self._entries.items()):
+            if entry.session_id and str(entry.session_id) in keep:
+                continue
+            if key in protected:
+                continue
+            total += int(entry.held_nbytes)
+        return total
+
     def has_session_entries(self, session_id: str | None) -> bool:
         """Whether any RAM entry belongs to ``session_id``."""
 
