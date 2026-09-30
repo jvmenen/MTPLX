@@ -2980,6 +2980,22 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             mask = mask & (linds[:, None] < rinds[None, :] + window_size)
         return mask
 
+    def _is_own_tail_mask(self, mask: Any, queries: Any) -> bool:
+        """True for the capacity-wide tail-causal bool mask ``make_mask`` emits.
+
+        Shape and dtype only (static under ``mx.compile``): row j sees keys
+        <= offset + j, which is exactly the built-in visibility of the
+        paged tail kernels, so callers may drop it.
+        """
+        import mlx.core as mx
+
+        return (
+            isinstance(mask, mx.array)
+            and mask.dtype == mx.bool_
+            and int(mask.shape[-2]) == int(queries.shape[2])
+            and int(mask.shape[-1]) == int(self.capacity)
+        )
+
     def paged_attention(
         self,
         queries: Any,
@@ -2990,18 +3006,12 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         impl_override: str | None = None,
     ):
         del impl_override
-        import mlx.core as mx
-
         if int(sliding_window) > 0:
             return None
         if int(queries.shape[0]) != 1:
             return None
-        if (
-            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
-            and isinstance(mask, mx.array)
-            and mask.dtype == mx.bool_
-            and int(mask.shape[-2]) == int(queries.shape[2])
-            and int(mask.shape[-1]) == int(self.capacity)
+        if _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE") and self._is_own_tail_mask(
+            mask, queries
         ):
             # The capacity-wide tail-causal bool mask this class's make_mask
             # emits (row j sees keys <= offset+j) is exactly the dynamic-
@@ -3366,6 +3376,15 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         del impl_override
         if int(sliding_window) > 0:
             return None
+        if _env_truthy("MTPLX_KV_QUANT_TAILMASK_ELIDE") and self._is_own_tail_mask(
+            mask, queries
+        ):
+            # make_mask (inherited) always emits the capacity-wide tail mask,
+            # so without this every verify round declined the packed-quant
+            # kernel and attention fell back to cache.state: a full-capacity
+            # dequantization per layer per round. The kernel's built-in
+            # visibility equals that mask (tests/test_kv_quant_tailmask_elide.py).
+            mask = None
         if mask is not None and not (isinstance(mask, str) and mask == "causal"):
             return None
         if int(queries.shape[0]) != 1:
