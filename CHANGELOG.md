@@ -74,6 +74,13 @@ Carried on the `perf/definitief-2122` integration branch (v2.12.2 plus the chang
 - **Scoped reasoning history keeps the in-round postcommit** and client bookkeeping no longer closes the round (#570).
 - **A thinking model's answer after a tool result is no longer returned as empty content when the request declares tools** (#583). A turn that stops naturally inside the template-opened think block, without `</think>`, was filed entirely as reasoning, and the recovery that surfaces it as content only ran for requests without tools, so no agent turn got it. The recovery now also runs with tools declared when the turn ended at `stop` and holds no tool markup, on `/v1/chat/completions` and `/v1/messages`, streaming and not. On an M5 Max 64 GB with Qwen3.6-35B-A3B Optimized-Speed (v2.12.2, 2026-10-04), 6 growing agent turns x 3 runs x 2 protocols went from 1 to 2 empty replies per 36 turns to 0 of 108 over three repeats.
 
+- **Claude Code requests resolve to their own session.** Claude Code (CLI and Agent SDK) sends `X-Claude-Code-Session-Id` on every `/v1/messages` request; MTPLX now takes it as the session id, next to the OpenCode and Open WebUI headers, instead of inferring the session from the prompt prefix. An explicit `x-mtplx-session-id` still comes first.
+- **Forge stamps the verified depth and a served id.** `mtplx forge build` and `mtplx forge verify --stamp` now write the depth that won verification as `mtp_depth_default` (marked `mtp_depth_default_status: forge_verified`), so `serve` launches the pack at that depth instead of the `mtp_depth_max` ceiling. A depth the source declares is kept; one an earlier Forge verify stamped is replaced, or dropped when AR wins. A pack whose name is not first-party and that has no id claim gets `public_model_id` set to its sanitized branded name, so its served id no longer changes with the directory name. Seen on a Forge build of Apodex-1.1-mini Balance (6-bit g64 body, BF16 MTP head; M5 Pro 64 GB, turbo, 30 September 2026): verify picked D2 (1.72x AR), but the stamped runtime json left the launch depth at the D3 ceiling and needed a hand edit. Unit tests only; no change to the generation path.
+
+### Changed
+
+- **The dashboard's request log shows a refused request as a refusal.** A request the server refuses before prefill (a 507 memory refusal, a 503, a 429) used to render as an ordinary row with a "MISS" cache badge and zeros for tokens and speed. It now carries a "507 memory" badge, dashes for the generation columns, and the refusal reason and when a retry can succeed in its details. The request log row gained `refusal_reason`, `retry_when` and `retry_can_succeed` for memory refusals.
+
 
 ## [2.12.2] - 2026-10-03
 
