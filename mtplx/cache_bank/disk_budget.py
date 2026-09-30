@@ -73,10 +73,10 @@ class DiskBudget:
 
         if self.state == DISK_FULL:
             return (
-                f"Free disk space is {_gib(self.free_bytes)}, below the "
-                f"{_gib(self.floor_bytes)} the SSD cache always leaves free, so "
-                "it has stopped saving conversations. Free up disk space to "
-                "turn it back on."
+                f"Only {_gib(self.free_bytes)} of disk space is free, and the "
+                f"SSD cache always leaves {_gib(self.floor_bytes)} free, so it "
+                "has stopped saving conversations. Free up disk space to turn "
+                "it back on."
             )
         if self.state == DISK_LOW:
             return (
