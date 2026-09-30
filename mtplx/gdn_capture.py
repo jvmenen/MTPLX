@@ -461,8 +461,8 @@ def _verify_async_chunk_layers() -> int:
     Same kernels, same inputs, only the submit points move: the output is
     bit-identical. Measured on Qwen3.6-35B-A3B (6-bit, eager verify) at depth
     2: the host spends ~2 ms per round building the verify graph with the GPU
-    idle; N=8 cut the round from ~26 to ~23 ms (2026-09-30 host-overhead
-    report). Default off.
+    idle; N=8 cut the round from ~26 to ~23.7 ms (M5 Pro, 2026-09-30).
+    Default off.
     """
 
     raw = os.environ.get("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "").strip().lower()
