@@ -20,12 +20,6 @@ Env contract (all default-off):
 - ``MTPLX_FRSPEC_N`` optional cap for external ranked files. The built-in 64K
   artifact is row-sorted for efficient gathering and therefore only accepts
   its full size.
-
-Tables built with ``mtplx frspec build`` carry a ``<name>.meta.json`` sidecar
-with the fingerprint of the tokenizer they were ranked with and their row
-order. When it is present, installation refuses a model whose tokenizer maps
-ids to different tokens, and ``MTPLX_FRSPEC_N`` refuses to truncate a
-row-sorted table.
 """
 
 from __future__ import annotations
@@ -127,7 +121,13 @@ def _vocab_path() -> Path | None:
 
 
 def vocab_sidecar_path(vocab_path: Path) -> Path:
-    """Metadata written next to a built table: ``bink-64k.npy`` -> ``bink-64k.meta.json``."""
+    """Metadata next to a table built by ``mtplx frspec build``: ``mine.npy`` -> ``mine.meta.json``.
+
+    It records the fingerprint of the tokenizer the table was ranked with and
+    its row order. When present, installation refuses a model whose tokenizer
+    maps ids to other tokens, and ``MTPLX_FRSPEC_N`` refuses to cut a
+    row-sorted table.
+    """
 
     return vocab_path.with_name(vocab_path.stem + ".meta.json")
 
