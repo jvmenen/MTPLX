@@ -97,6 +97,7 @@ from .graphbank import (
     cache_array_tree,
     compiled_verify_mode,
     ensure_eager_window_capacity,
+    fixed_m4_copy_windows_enabled,
     fixed_m4_lane_retired_reason as _fixed_m4_lane_retired_reason,
     paged_offsets_context_ok as _paged_offsets_context_ok,
     promote_kv_cache_offsets,
@@ -1210,8 +1211,10 @@ _FIXED_M4_RETIRED_SKIP_REASON = (
     "process and was retired; see the fixed_m4_dispatch_retired reason"
 )
 _COPY_ROUND_EAGER_REASON = (
-    "copy-block rounds on the batched lane run the eager forward (width 9 to "
-    "25 has no compiled route)"
+    "copy-block rounds on the batched lane run the eager forward unless "
+    "MTPLX_FIXED_M4_COPY_WINDOWS=1 compiles them (full-length blocks on a "
+    "bucketed rows-gather fixed-M4 bank; the request log's "
+    "compiled_verify.fixed_m4_copy_windows says why a round ran eager)"
 )
 
 
@@ -12344,6 +12347,7 @@ def generate_mtpk(
                                context_copy_enabled, context_copy_min_ext,
                                context_copy_ng_max, context_copy_ng_min,
                                context_copy_probation_k,
+                               ladder_widths as _ccopy_ladder_widths,
                                context_copy_target_prefix_enabled)
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
@@ -12539,6 +12543,24 @@ def generate_mtpk(
         _family_capture_commit_enabled()
         and callable(getattr(rt.model, "commit_verified_window", None))
         and callable(getattr(rt.model, "verify_capture_scope", None))
+    )
+    # Compiled copy windows (MTPLX_FIXED_M4_COPY_WINDOWS=1, opt-in): the batched
+    # lane's full-length copy widths, replayed on the installed fixed-M4 bank
+    # instead of the eager forward (graphbank.replay_fixed_m4_copy_window).
+    # A partial accept must commit through the family capture-commit, which
+    # reads the captures the replay installs. Empty otherwise, and then every
+    # copy round runs the eager forward exactly as before.
+    _cb_compiled_widths = (
+        _ccopy_ladder_widths((ccopy_k, ccopy_probation_k))
+        if (
+            ccopy_active
+            and _ccopy_batched_lane
+            and family_capture_commit_active
+            and qwen4_fixed_m4_compiled_verify
+            and compiled_verify_bank is not None
+            and fixed_m4_copy_windows_enabled()
+        )
+        else frozenset()
     )
     # Phase-3 QSA/MTP staging stays explicitly dark until the fused selector
     # and compiled indexer pass their deferred model/MTP gates.  The disabled
@@ -13421,18 +13443,36 @@ def generate_mtpk(
                     ccopy_capacity_growths += 1
                     event["ccopy_capacity_growth"] = int(_cb_grown)
                 started_forward = time.perf_counter()
+                _cb_ids = mx.array([[int(primary), *_cb_block]])
                 with (
                     _decode_trunk_scope(vision_splice),
                     model_forward_kind("target_verify"),
                     _cb_scope,
                 ):
-                    _cb_logits, _cb_hidden = rt.forward_ar(
-                        mx.array([[int(primary), *_cb_block]]),
-                        cache=cache,
-                        return_hidden=True,
-                        hidden_variant=base_hidden_variant,
+                    # A full-length block replays on the fixed-M4 bank when
+                    # compiled copy windows are on; None is the eager forward.
+                    _cb_compiled = (
+                        compiled_verify_bank.replay_fixed_m4_copy_window(
+                            _cb_ids,
+                            widths=_cb_compiled_widths,
+                            host_input_ids=[int(primary), *_cb_block],
+                            completion_tokens=tokens,
+                            committed_count=len(tokens) - 1,
+                            cache=cache,
+                        )
+                        if _cb_compiled_widths
+                        else None
                     )
-                _note_demotion("copy_round_eager", _COPY_ROUND_EAGER_REASON)
+                    if _cb_compiled is not None:
+                        _cb_logits, _cb_hidden = _cb_compiled
+                    else:
+                        _cb_logits, _cb_hidden = rt.forward_ar(
+                            _cb_ids,
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
+                        _note_demotion("copy_round_eager", _COPY_ROUND_EAGER_REASON)
                 # Masked copy for acceptance only; the raw rows stay in
                 # _cb_logits for the row kept below (see accept_logits in the
                 # MTP verify window).
@@ -13448,7 +13488,12 @@ def generate_mtpk(
                 elapsed_verify = time.perf_counter() - started_forward
                 # Route Tape: the batched-lane copy block is a verify round like any other;
                 # it carries the block width so the census reads the copy lane's rounds.
-                event["verify_route"] = "ccopy_block"
+                # A compiled copy window reports the bank's compiled block route.
+                event["verify_route"] = (
+                    compiled_verify_bank.last_dispatch_route("ccopy_bank")
+                    if _cb_compiled is not None
+                    else "ccopy_block"
+                )
                 event["verify_width"] = int(_cb_T)
                 _add_timing(event, "verify_forward", elapsed_verify)
                 verify_forward_time += elapsed_verify

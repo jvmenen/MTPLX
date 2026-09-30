@@ -157,7 +157,11 @@ class _FixedM4SidecarAux:
         )
         prev_np = np.asarray((previous,), dtype=np.int64)
         rows, _new_history = self._rows(ids_np, prev_np)
-        return self._gather(rows.reshape(-1)).reshape(1, 4, self._output_dim)
+        # One embedding row per window token: four for a verify round, the
+        # block's width for a copy window (graphbank's copy-window replay).
+        return self._gather(rows.reshape(-1)).reshape(
+            1, int(ids_np.shape[1]), self._output_dim
+        )
 
 
 def _fixed_m4_previous_tokens(

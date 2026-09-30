@@ -62,6 +62,47 @@ def retire_fixed_m4_lane(reason: str) -> None:
         pass
 
 
+# Process-wide state of compiled copy windows on the same lane
+# (MTPLX_FIXED_M4_COPY_WINDOWS=1): the widths whose program traced cleanly in
+# this process, and, after a trace failure, the one-line reason every copy
+# window runs the eager forward for the rest of the process. The four-row lane
+# is not touched by it.
+_FIXED_M4_COPY_WINDOWS: dict[str, Any] = {"proven": set(), "retired": None}
+
+
+def fixed_m4_copy_windows_enabled() -> bool:
+    """Compiled copy windows on the fixed-M4 lane (opt-in, MTPLX_FIXED_M4_COPY_WINDOWS=1)."""
+
+    return _env_enabled("MTPLX_FIXED_M4_COPY_WINDOWS")
+
+
+def fixed_m4_copy_windows_retired_reason() -> str | None:
+    """Why compiled copy windows are retired for this process, or None."""
+
+    return _FIXED_M4_COPY_WINDOWS["retired"]
+
+
+def retire_fixed_m4_copy_windows(reason: str) -> None:
+    """Retire compiled copy windows for the process: one printed line, one ledger entry."""
+
+    first = _FIXED_M4_COPY_WINDOWS["retired"] is None
+    text = " ".join(str(reason).split())[:400]
+    if first:
+        _FIXED_M4_COPY_WINDOWS["retired"] = text
+    _note_demotion("fixed_m4_copy_windows_retired", _FIXED_M4_COPY_WINDOWS["retired"])
+    if not first:
+        return
+    try:
+        print(
+            "[mtplx] Flash-Next compiled copy windows could not dispatch on this "
+            f"GPU ({text}). Copy rounds run the eager forward for the rest of "
+            "this process; output is unchanged.",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 # Demotion ledger reasons for the per-round sites: constants, so the verify
 # path formats nothing (mtplx/demotions.py cost contract).
 _FIXED_M4_OTHER_WIDTH_REASON = (
@@ -3157,6 +3198,25 @@ class CompiledVerifyBank:
             )
             self.stats["fixed_m4_route_transitions"] += 1
 
+    def _fixed_m4_program(self, width: int):
+        """The installed replay's compiled step for ``width`` rows, and its trace host.
+
+        Four rows is the verify round's program, bound at install and at every
+        capacity or route transition. Any other width (a copy window) is the
+        same verify step traced at that width: the same state plan, capture
+        layout, auxiliary and rotary inputs, keyed like the four-row program
+        on the route, so it is shared by every bank of the process and MLX
+        keeps one trace per bank capacity.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if width == 4:
+            return dispatch["fn"], dispatch["host"]
+        route_key = int(all(entry.fixed_rows_gather for entry in dispatch["qsa_entries"]))
+        key = self._verify_key(width, dispatch["hidden_variant"], route_key)
+        fn = self._verify_program(key, width, dispatch["hidden_variant"])
+        return fn, self._program_hosts.get(key)
+
     def _forward_installed_fixed_m4(
         self,
         input_ids,
@@ -3167,16 +3227,27 @@ class CompiledVerifyBank:
     ):
         dispatch = self._fixed_m4_dispatch
         assert dispatch is not None
+        # A verify round replays four rows (its reservation keeps the lazy
+        # bonus row too); a copy window replays its own width.
+        width = _decode_length(input_ids)
         self.reserve_fixed_m4_window(
             cache,
             committed_count=committed_count,
+            window_tokens=width,
         )
+        # After the reservation: a capacity or route transition there binds
+        # the programs of the grown bank.
+        fn, host = self._fixed_m4_program(width)
         boundary = dispatch["boundary"]
         donate = dispatch["donate"]
         if donate:
             self._clear_shadow_leaf_refs()
 
         state_in: list[Any] = []
+        # Every input but the QSA bank buffers: the ones the pre-dispatch
+        # evaluation below may have to run (a commit after a rejection leaves
+        # the recurrent state and the offsets pending).
+        pending: list[Any] = []
         for kind, entry, n_leaves in dispatch["state_plan"]:
             if kind == VERIFY_SPEC_KIND_QSA:
                 state_in.extend(
@@ -3188,16 +3259,19 @@ class CompiledVerifyBank:
                         entry.pooled,
                     )
                 )
+                pending.append(entry.kv.cache[2])
             else:
                 state_in.extend(entry.cache[:n_leaves])
+                pending.extend(entry.cache[:n_leaves])
 
         # Host split of the replay (four clock reads per round): the n-gram row
         # gather, the input eval, the graph replay and the encode. The verify
         # forward is most of a decode round and it is one opaque host call
         # otherwise; the request log carries these as compiled_verify
-        # fixed_m4_host_s so a slow round can be read, not guessed.
+        # fixed_m4_host_s (copy windows: fixed_m4_copy_window_host_s) so a
+        # slow round can be read, not guessed.
         host_split = self.stats.setdefault(
-            "fixed_m4_host_s",
+            "fixed_m4_host_s" if width == 4 else "fixed_m4_copy_window_host_s",
             {"aux": 0.0, "input_eval": 0.0, "replay": 0.0, "encode": 0.0},
         )
         clock = time.perf_counter
@@ -3210,16 +3284,22 @@ class CompiledVerifyBank:
         )
         t1 = clock()
         if boundary in ("both", "pre"):
-            mx.async_eval(compiled_aux, *state_in)
+            # A pending evaluation holds every array it is handed until it
+            # completes, and the compiled step's bank writes are encoded right
+            # after: a K, V or raw bank held then is copied, not written in
+            # place (MLX donates a buffer only to its sole holder). A copy
+            # window therefore hands over only what can be pending; the banks
+            # are materialized or, if not, run by their own kernels as inputs
+            # of the step, so no value changes. A verify round keeps the call
+            # it shipped with.
+            mx.async_eval(compiled_aux, *(state_in if width == 4 else pending))
         t2 = clock()
-        self._bind_program(dispatch["host"])
+        self._bind_program(host)
         # Argument order is the trace's contract (``_make_verify_step``):
         # ids, the auxiliary, the rotary delta of an image request, the state.
-        identity = (id(dispatch["fn"]), tuple(getattr(input_ids, "shape", ())))
+        identity = (id(fn), tuple(getattr(input_ids, "shape", ())))
         with compiled_dispatch(identity):
-            outputs = dispatch["fn"](
-                input_ids, compiled_aux, *dispatch["rope_args"], *state_in
-            )
+            outputs = fn(input_ids, compiled_aux, *dispatch["rope_args"], *state_in)
         t3 = clock()
         host_split["aux"] += t1 - t0
         host_split["input_eval"] += t2 - t1
@@ -3436,6 +3516,156 @@ class CompiledVerifyBank:
             cache,
             hidden_variant=hidden_variant,
         )
+
+    # -- copy windows on the installed bank (MTPLX_FIXED_M4_COPY_WINDOWS=1) -----
+    #
+    # A context-copy block round forwards the primary and a block of prompt
+    # tokens (9, 13, 17 or 25 rows by default) over the conversation. The
+    # four-row replay was this lane's only compiled forward, so every block
+    # round built the eager graph of the whole model and paid the eager bank
+    # write's two syncs per QSA layer (the offset read and the rollback copy):
+    # 116 to 146 ms per round at 125K+ in the 2026-09-29 Pi session, the
+    # stutter of a file rewrite. Here the same verify step replays at the
+    # block's width, with the same inputs, captures and in-place state.
+
+    def fixed_m4_copy_window_refusal(self, width: int) -> str | None:
+        """Why a copy window of ``width`` rows would run eager now, or None.
+
+        A window replays the four-row lane's verify step traced at its width,
+        so it needs that lane installed, proven on this GPU and not retired.
+        It needs a bank whose capacity is bucketed on the rows-gather lane:
+        there one trace per width serves every round and turn up to the next
+        bucket edge, where the dense lane's exact per-request capacity would
+        trace every width once per request. And it needs a width the verify
+        routes serve in every layer (``qwen4_exp.verify_route_max_rows``),
+        where the compiled trace is the eager forward bit for bit.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return "not_installed"
+        if _FIXED_M4_LANE["retired"] is not None:
+            return "lane_retired"
+        if not _FIXED_M4_LANE["proven"]:
+            return "lane_not_proven"
+        if _FIXED_M4_COPY_WINDOWS["retired"] is not None:
+            return "copy_windows_retired"
+        if int(dispatch["capacity_bucket"]) <= 0 or not all(
+            entry.fixed_rows_gather for entry in dispatch["qsa_entries"]
+        ):
+            return "capacity_not_bucketed"
+        from .models.qwen4_exp import verify_route_max_rows
+
+        if not 2 <= int(width) <= verify_route_max_rows():
+            return "width_past_verify_routes"
+        return None
+
+    def replay_fixed_m4_copy_window(
+        self,
+        input_ids,
+        *,
+        widths,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+    ):
+        """Replay a copy window on the installed bank: ``(logits, hidden)``, or None.
+
+        ``widths`` are the request's full-length copy widths
+        (``context_copy.ladder_widths``); a cut-short block keeps the eager
+        forward, so the ladder bounds the traces to one per width and bucket.
+        None means the caller runs its eager forward over an untouched cache;
+        the reason is counted in ``fixed_m4_copy_windows["eager"]``. Otherwise
+        the window ran like a verify round: the captures the family commit
+        reads are on the cache entries and the state was written in place.
+        """
+
+        width = _decode_length(input_ids)
+        receipt = self.stats.setdefault(
+            "fixed_m4_copy_windows", {"compiled": {}, "traces": {}, "eager": {}}
+        )
+        traces_before = int(self.stats.get("traces", 0))
+        refusal = (
+            self.fixed_m4_copy_window_refusal(width)
+            if width in widths
+            else "width_off_the_ladder"
+        )
+        if refusal is None and width not in _FIXED_M4_COPY_WINDOWS["proven"]:
+            refusal = self._prove_fixed_m4_copy_window(
+                input_ids, host_input_ids, completion_tokens, committed_count, cache
+            )
+        if refusal is not None:
+            receipt["eager"][refusal] = receipt["eager"].get(refusal, 0) + 1
+            return None
+        self.stats["calls"] += 1
+        logits, hidden, _captures = self._forward_installed_fixed_m4(
+            input_ids, host_input_ids, completion_tokens, committed_count, cache
+        )
+        key = str(width)
+        receipt["compiled"][key] = receipt["compiled"].get(key, 0) + 1
+        traced = int(self.stats.get("traces", 0)) - traces_before
+        if traced:
+            receipt["traces"][key] = receipt["traces"].get(key, 0) + traced
+        return logits, hidden
+
+    def _prove_fixed_m4_copy_window(
+        self, input_ids, host_input_ids, completion_tokens, committed_count, cache
+    ) -> str | None:
+        """First window of a width in this process: trace it, or retire copy windows.
+
+        The four-row lane's guard evaluates its first replay with the input
+        leaves held, which blocks their donation: the bank is copied once.
+        That is the warmup's small bank for the four-row lane, but a width's
+        first copy window can come at 128K, where one copy of the QSA state
+        is about 3.7 GB. So this guard traces the width's program alone
+        (``_trace_fixed_m4_copy_window``: nothing evaluated, nothing rebound)
+        and the replay that follows donates as every round does. A trace that
+        raises (a host read at this width, a route the tiny test pack never
+        reaches) retires compiled copy windows for the process, with one
+        printed line and a ledger entry, and this window runs the eager
+        forward on the state it found. A failure after the trace, when the
+        graph runs, is the same failure a proven four-row round would raise.
+        """
+
+        width = _decode_length(input_ids)
+        self.reserve_fixed_m4_window(
+            cache, committed_count=committed_count, window_tokens=width
+        )
+        try:
+            self._trace_fixed_m4_copy_window(
+                input_ids, host_input_ids, completion_tokens, committed_count
+            )
+        except Exception as exc:  # noqa: BLE001 - retired, printed and counted; the round runs eager
+            retire_fixed_m4_copy_windows(f"{type(exc).__name__}: {exc}")
+            return "copy_windows_retired"
+        _FIXED_M4_COPY_WINDOWS["proven"].add(width)
+        return None
+
+    def _trace_fixed_m4_copy_window(
+        self, input_ids, host_input_ids, completion_tokens, committed_count
+    ) -> None:
+        """Call this width's program on the live inputs and drop its outputs.
+
+        A compiled step traces on its first call at a shape. Made here, the
+        call evaluates nothing (no GPU work, no allocation) and rebinds
+        nothing, so a trace that raises leaves the round as it was; the
+        replay that follows reuses the trace.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        fn, host = self._fixed_m4_program(_decode_length(input_ids))
+        compiled_aux = dispatch["prepare_aux"](
+            input_ids, host_input_ids, completion_tokens, committed_count
+        )
+        self._bind_program(host)
+        with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+            fn(
+                input_ids,
+                compiled_aux,
+                *dispatch["rope_args"],
+                *self._fixed_m4_state_leaves(),
+            )
 
     def _fixed_m4_state_refs(self) -> list[tuple[Any, str, tuple, tuple, tuple]]:
         """References (never copies) to every leaf the replay rebinds.
@@ -4680,6 +4910,14 @@ class CompiledVerifyBank:
             data["parity2"] = {
                 key: (dict(value) if isinstance(value, dict) else value)
                 for key, value in parity2.items()
+            }
+        copy_windows = self.stats.get("fixed_m4_copy_windows")
+        if isinstance(copy_windows, dict):
+            # Compiled copy windows (MTPLX_FIXED_M4_COPY_WINDOWS=1): replays
+            # and traces by width, and the copy rounds that ran eager, by why.
+            data["fixed_m4_copy_windows"] = {
+                **{key: dict(value) for key, value in copy_windows.items()},
+                "retired": _FIXED_M4_COPY_WINDOWS["retired"],
             }
         dispatch = self._fixed_m4_dispatch
         if dispatch is not None:

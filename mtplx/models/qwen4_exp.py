@@ -2134,6 +2134,32 @@ def _qsa_dense_band_sdpa_applies(q: mx.array, k: mx.array, mask) -> bool:
     return dense_band_eligible(q, k, mask)
 
 
+def verify_route_max_rows() -> int:
+    """The widest forward that takes a verify window's routes in every layer.
+
+    Below every prefill-width threshold a forward keeps the per-row routes of
+    a verify window, whose eager spelling is the compiled verifier's (the
+    shared-expert, attention output and inject gates under the verify gate
+    contract of mtplx/attention_math.py). From the narrowest threshold up it
+    takes prefill routes instead: the fused MoE combine (its shared-expert
+    sigmoid is the stock one), the hyper-connection prefill read and compiled
+    write, the GDN prefill kernels and the dense-band SDPA. None of those was
+    proven equal to a compiled trace, so a compiled replay of a wider window
+    would not be the eager forward it replaces.
+    """
+
+    return (
+        min(
+            _HC_COMPILE_MIN_ROWS,
+            _GDN_GATED_NORM_MIN_ROWS,
+            _GDN_PREFILL_PREWORK_MIN_ROWS,
+            _MOE_PREFILL_COMBINE_MIN_ROWS,
+            _QSA_DENSE_BAND_SDPA_MIN_ROWS,
+        )
+        - 1
+    )
+
+
 def _verify_sdpa(q, k, v, *, scale, mask):
     """SDPA that stays on the fused kernel across the small-q_len verify band.
 
