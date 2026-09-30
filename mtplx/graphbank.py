@@ -3244,6 +3244,10 @@ class CompiledVerifyBank:
             self._clear_shadow_leaf_refs()
 
         state_in: list[Any] = []
+        # Every input but the QSA bank buffers: the ones the pre-dispatch
+        # evaluation below may have to run (a commit after a rejection leaves
+        # the recurrent state and the offsets pending).
+        pending: list[Any] = []
         for kind, entry, n_leaves in dispatch["state_plan"]:
             if kind == VERIFY_SPEC_KIND_QSA:
                 state_in.extend(
@@ -3255,8 +3259,10 @@ class CompiledVerifyBank:
                         entry.pooled,
                     )
                 )
+                pending.append(entry.kv.cache[2])
             else:
                 state_in.extend(entry.cache[:n_leaves])
+                pending.extend(entry.cache[:n_leaves])
 
         # Host split of the replay (four clock reads per round): the n-gram row
         # gather, the input eval, the graph replay and the encode. The verify
@@ -3278,7 +3284,15 @@ class CompiledVerifyBank:
         )
         t1 = clock()
         if boundary in ("both", "pre"):
-            mx.async_eval(compiled_aux, *state_in)
+            # A pending evaluation holds every array it is handed until it
+            # completes, and the compiled step's bank writes are encoded right
+            # after: a K, V or raw bank held then is copied, not written in
+            # place (MLX donates a buffer only to its sole holder). A copy
+            # window therefore hands over only what can be pending; the banks
+            # are materialized or, if not, run by their own kernels as inputs
+            # of the step, so no value changes. A verify round keeps the call
+            # it shipped with.
+            mx.async_eval(compiled_aux, *(state_in if width == 4 else pending))
         t2 = clock()
         self._bind_program(host)
         # Argument order is the trace's contract (``_make_verify_step``):

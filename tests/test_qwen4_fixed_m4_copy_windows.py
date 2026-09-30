@@ -15,7 +15,9 @@ the GPU) this file pins:
   on the rows-gather lane through the product entry and on the dense lane
   through the replay itself; with the serve lane's op diet and verify glue;
   and with gate values planted where MLX's compiled and eager sigmoids differ;
-* one copy: the replay writes the conversation's QSA buffers in place;
+* one copy: after a rejection the replay writes the conversation's K, V and
+  raw banks in place, because its pre-dispatch evaluation is handed only the
+  leaves a commit can leave pending, never a bank;
 * compile cost: one trace per width per bank capacity;
 * the policy: full-length blocks on a bucketed rows-gather bank below the first
   prefill-width route, with every refusal counted;
@@ -146,12 +148,17 @@ def _qsa(cache):
     return [entry for entry in cache if isinstance(entry, graphbank.TensorOffsetQSACache)]
 
 
-def _qsa_addresses(cache) -> list[int]:
-    return [
-        _address(leaf)
-        for entry in _qsa(cache)
-        for leaf in (entry.kv.keys, entry.kv.values, entry.raw_keys, entry.pooled)
-    ]
+def _qsa_addresses(cache) -> dict[str, int]:
+    return {
+        f"{name}[{layer}]": _address(leaf)
+        for layer, entry in enumerate(_qsa(cache))
+        for name, leaf in (
+            ("keys", entry.kv.keys),
+            ("values", entry.kv.values),
+            ("raw", entry.raw_keys),
+            ("pooled", entry.pooled),
+        )
+    }
 
 
 def _captures(cache) -> dict[str, np.ndarray]:
@@ -180,8 +187,8 @@ def _state(cache) -> dict[str, np.ndarray]:
     return out
 
 
-def _session(rt, *, route):
-    """PLAN on one fresh request: every round's outputs as raw bits.
+def _session(rt, *, route, plan=PLAN, read_state=True):
+    """``plan`` on one fresh request: every round's outputs as raw bits.
 
     Four-row rounds replay through ``forward_fixed_m4`` in every session. A
     copy window runs ``route``: "compiled" (the product entry), "replay" (the
@@ -189,7 +196,12 @@ def _session(rt, *, route):
     round's eager forward, the reference). Each round is taken under the copy
     round's scopes and committed through the family capture-commit, as the
     batched lane commits it. Also returns the bank and, for every compiled
-    window, whether any QSA buffer moved (a copy of the conversation).
+    window, the QSA buffers that moved to a new allocation (a copy).
+
+    ``read_state=False`` reads only what the decode loop reads between rounds
+    (each round's logits, for sampling): reading the state after a commit
+    would evaluate the recurrent state the commit left pending, which the
+    decode loop never does and which hides the copy the in-place test is for.
     """
 
     model = rt.model
@@ -200,7 +212,7 @@ def _session(rt, *, route):
     bank.install_fixed_m4(cache, prompt_ids=PROMPT, hidden_variant=hidden_variant)
     completion: list[int] = []
     rounds, moved = [], []
-    for step, (width, keep) in enumerate(PLAN):
+    for step, (width, keep) in enumerate(plan):
         ids = [(step * 13 + j * 7 + 1) % 128 for j in range(width)]
         before = snapshot_untrimmable_cache_lazy(cache)
         bank.reserve_fixed_m4_window(cache, committed_count=len(completion), window_tokens=width)
@@ -235,22 +247,23 @@ def _session(rt, *, route):
             "width": width,
             "capacity": _qsa(cache)[0].capacity,
             "logits": _bits(logits),
-            "hidden": _bits(hidden),
-            **_captures(cache),
+            **({"hidden": _bits(hidden), **_captures(cache)} if read_state else {}),
         }
         if width != 4 and route != "eager":
-            moved.append(_qsa_addresses(cache) != addresses)
+            after = _qsa_addresses(cache)
+            moved.append({name for name, address in addresses.items() if after[name] != address})
         assert model.language_model.model.commit_verified_window(
             cache, before.states, keep_tokens=keep, verified_tokens=width,
         )
         completion.extend(ids[:keep])
-        record.update(_state(cache))
+        if read_state:
+            record.update(_state(cache))
         rounds.append(record)
     return rounds, bank, moved
 
 
 def _assert_same_rounds(candidate: list[dict], reference: list[dict]) -> None:
-    assert len(candidate) == len(reference) == len(PLAN)
+    assert len(candidate) == len(reference) > 0
     for index, (got, want) in enumerate(zip(candidate, reference)):
         assert got.keys() == want.keys(), index
         for name, value in want.items():
@@ -329,6 +342,69 @@ def test_the_replay_is_exact_on_the_dense_lane_which_the_product_keeps_eager(lan
     # every width: the product keeps this lane's copy rounds eager.
     assert len({record["capacity"] for record in replayed}) > 2
     assert bank.fixed_m4_copy_window_refusal(9) == "capacity_not_bucketed"
+
+
+# -- one copy ------------------------------------------------------------------------
+
+# Every copy window follows a rejection, whose commit leaves the recurrent state
+# pending: the case in which the replay's pre-dispatch evaluation used to hold
+# the banks and the window copied K and V instead of writing them in place.
+AFTER_REJECTIONS = (
+    (4, 2), (9, 3), (4, 1), (13, 2), (4, 3), (17, 5), (4, 1), (25, 3),
+    (9, 1), (13, 4), (17, 2), (25, 7), (4, 2), (25, 11), (9, 2), (4, 4),
+)
+
+
+@gpu
+def test_copy_windows_write_the_conversation_in_place(lane):
+    """At Flash-Next's QSA buffer geometry (K and V [1, 2, capacity, 256],
+    index keys 128 wide), where the capacity rule keeps every bank donatable,
+    no window moves a K, V or raw bank. (The pooled bank's per-round copy is
+    the four-row lane's too and is not asserted either way here.)
+    """
+
+    _rows_gather(lane)
+    rt = _runtime(head_dim=256, indexer_head_dim=128)
+    _rounds, bank, moved = _session(rt, route="compiled", plan=AFTER_REJECTIONS, read_state=False)
+    assert len(moved) == sum(width != 4 for width, _keep in AFTER_REJECTIONS)
+    copies = [
+        (window, sorted(name for name in names if not name.startswith("pooled")))
+        for window, names in enumerate(moved)
+    ]
+    assert all(not names for _window, names in copies), copies
+    assert bank.to_dict()["fixed_m4_copy_windows"]["eager"] == {}
+
+
+def test_a_window_hands_its_pending_evaluation_no_bank(lane):
+    """Why the windows above write in place, without the GPU's timing.
+
+    Whether a held bank is copied depends on whether the pending evaluation
+    has completed by the time the step's writes are encoded, so the test
+    above can pass on a lucky run with the old call. What the evaluation is
+    handed does not depend on timing: a copy window hands over the auxiliary
+    and the leaves a commit can leave pending (the QSA offset and the
+    recurrent state), never a K, V, raw or pooled bank. A verify round keeps
+    the call it shipped with.
+    """
+
+    handed = []
+    lane.setattr(graphbank.mx, "async_eval", lambda *arrays: handed.append(arrays))
+    lane.setattr(graphbank.mx, "eval", lambda *_a, **_k: None)
+    lane.setitem(graphbank._FIXED_M4_LANE, "proven", True)
+    first_call = {}
+    for width in (4, 9):
+        bank, _qsa, _gdn = _copy_stub()
+        bank._fixed_m4_dispatch["boundary"] = "both"
+        handed.clear()
+        bank._forward_installed_fixed_m4(
+            SimpleNamespace(shape=(1, width)), list(range(width)), [1, 2], 2, []
+        )
+        first_call[width] = [getattr(leaf, "name", leaf) for leaf in handed[0]]
+    assert first_call[9] == ["aux", "qsa0.offset", "gdn0.conv", "gdn0.state"]
+    assert first_call[4] == [
+        "aux", "qsa0.k", "qsa0.v", "qsa0.offset", "qsa0.raw", "qsa0.pooled",
+        "gdn0.conv", "gdn0.state",
+    ]
 
 
 # -- compile cost ------------------------------------------------------------------
