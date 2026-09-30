@@ -121,6 +121,7 @@ from mtplx.server.stream_recovery import (
     _update_recovery_metrics,
 )
 from mtplx.server.prefill_safety import make_prefill_system_guard, score_prompt_with_memory_policy
+from mtplx.server.retry_prompt import served_prompt_with_appended_turn
 from mtplx.constrained import (
     ResponseFormatError,
     constraint_spec_from_response_format,
@@ -24405,6 +24406,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_fed_empty_retry_prompt_tokens",
     "tool_fed_empty_retry_completion_tokens",
     "tool_fed_empty_retry_finish_reason",
+    "tool_fed_empty_retry_reused_prompt_tokens",
+    "tool_fed_empty_retry_skipped",
     "stream_attempts",
     "stream_attempts_first_ttft_s",
     "stream_attempts_prompt_eval_time_s",
@@ -37707,6 +37710,65 @@ def create_app(state: ServerState) -> FastAPI:
                         payload=progress,
                     )
 
+                def served_retry_prompt_ids(
+                    repair_messages: list[ChatMessage],
+                    template_observability: dict[str, Any],
+                ) -> tuple[list[int] | None, dict[str, Any]]:
+                    """A recovery pass's prompt on the ids this request was
+                    served, with the repair turn in place of the generation
+                    prompt (mtplx/server/retry_prompt.py). None when no exact
+                    prompt exists; the caller then keeps its first pass.
+
+                    Both renders take the served encode's arguments, so the
+                    template's own tail is compared like for like. Repair
+                    re-encodes run on the gate's canonical messages: without
+                    allow_committed_reasoning the substituted think interiors
+                    are dropped (audit F11 #5). Everything before the repair
+                    turn comes from the served ids, never from these renders.
+                    """
+
+                    encode_kwargs: dict[str, Any] = {
+                        "enable_thinking": thinking_enabled,
+                        "reasoning_effort": reasoning_effort,
+                        "strip_assistant_reasoning_history": (
+                            state.args.strip_assistant_reasoning_history
+                        ),
+                        "scoped_reasoning_history": _reasoning_history_scoped_active(
+                            state
+                        ),
+                        "preserve_reasoning_history": (
+                            _reasoning_history_preserve_echo_active(state)
+                        ),
+                        "tools": prompt_tool_specs,
+                        "tool_choice": request.tool_choice,
+                        "tool_prompt_mode": template_tool_prompt_mode,
+                    }
+                    plain_ids = _encode_messages(
+                        state.runtime.tokenizer,
+                        messages_for_generation,
+                        allow_committed_reasoning=True,
+                        **encode_kwargs,
+                    )
+                    appended_ids = _encode_messages(
+                        state.runtime.tokenizer,
+                        repair_messages,
+                        template_observability=template_observability,
+                        allow_committed_reasoning=True,
+                        **encode_kwargs,
+                    )
+                    return served_prompt_with_appended_turn(
+                        prompt_ids,
+                        plain_ids,
+                        appended_ids,
+                        served_suffix_ids=(
+                            _encode_rendered_chat_text(
+                                state.runtime.tokenizer, f"{THINK_CLOSE}\n"
+                            )
+                            if aime_visible_working
+                            else ()
+                        ),
+                    )
+
                 def maybe_retry_degenerate_read_only_inspection(
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
@@ -37832,28 +37894,19 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     )
                     repair_observability: dict[str, Any] = {}
-                    repair_prompt_ids = _encode_messages(
-                        state.runtime.tokenizer,
-                        repair_messages,
-                        enable_thinking=thinking_enabled,
-                        reasoning_effort=reasoning_effort,
-                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-                        scoped_reasoning_history=_reasoning_history_scoped_active(
-                            state
-                        ),
-                        preserve_reasoning_history=(
-                            _reasoning_history_preserve_echo_active(state)
-                        ),
-                        tools=tool_specs,
-                        tool_prompt_mode=tool_prompt_mode,
-                        template_observability=repair_observability,
-                        # Repair re-encodes run on the gate's canonical
-                        # messages: without this flag the substituted think
-                        # interiors are dropped and the repair prompt
-                        # re-poisons what canonicalization just fixed
-                        # (audit F11 #5).
-                        allow_committed_reasoning=True,
+                    repair_prompt_ids, retry_prompt = served_retry_prompt_ids(
+                        repair_messages, repair_observability
                     )
+                    if repair_prompt_ids is None:
+                        # A fresh render would drop the committed-token
+                        # repair and re-prefill the conversation from its
+                        # first seam; the first pass stands, and says why.
+                        skipped_stats = generated.setdefault("stats", {})
+                        skipped_stats["tool_fed_empty_retry_skipped"] = str(
+                            retry_prompt.get("reason")
+                        )
+                        _update_recovery_metrics(state, skipped_stats)
+                        return generated
                     retry_observability = dict(request_observability)
                     retry_observability.update(
                         {
@@ -37867,6 +37920,9 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                             "tool_fed_empty_retry_prompt_tokens": len(
                                 repair_prompt_ids
+                            ),
+                            "tool_fed_empty_retry_reused_prompt_tokens": int(
+                                retry_prompt.get("reused_served_tokens") or 0
                             ),
                         }
                     )
@@ -38176,25 +38232,22 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     )
                     repair_observability: dict[str, Any] = {}
-                    repair_prompt_ids = _encode_messages(
-                        state.runtime.tokenizer,
-                        repair_messages,
-                        enable_thinking=thinking_enabled,
-                        reasoning_effort=reasoning_effort,
-                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-                        scoped_reasoning_history=_reasoning_history_scoped_active(
-                            state
-                        ),
-                        preserve_reasoning_history=(
-                            _reasoning_history_preserve_echo_active(state)
-                        ),
-                        tools=None,
-                        tool_prompt_mode=tool_prompt_mode,
-                        template_observability=repair_observability,
-                        # Same committed-reasoning preservation as the other
-                        # repair encodes (audit F11 #5).
-                        allow_committed_reasoning=True,
+                    # The served tool contract stays in the prompt: this turn
+                    # was prefilled with it, and the repair turn is a pure
+                    # suffix that closes the tools in words (the policy's own
+                    # prefix-stable rule for forced answers). Rendering it
+                    # without tools re-read the whole conversation from the
+                    # system prompt on.
+                    repair_prompt_ids, retry_prompt = served_retry_prompt_ids(
+                        repair_messages, repair_observability
                     )
+                    if repair_prompt_ids is None:
+                        skipped_stats = generated.setdefault("stats", {})
+                        skipped_stats["read_only_force_answer_retry_skipped"] = str(
+                            retry_prompt.get("reason")
+                        )
+                        _update_recovery_metrics(state, skipped_stats)
+                        return generated
                     first_stats = dict(generated.get("stats") or {})
                     retry_observability = dict(request_observability)
                     retry_observability.update(
@@ -38211,6 +38264,9 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                             "read_only_force_answer_retry_prompt_tokens": len(
                                 repair_prompt_ids
+                            ),
+                            "read_only_force_answer_retry_reused_prompt_tokens": int(
+                                retry_prompt.get("reused_served_tokens") or 0
                             ),
                         }
                     )
