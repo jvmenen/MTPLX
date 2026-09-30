@@ -29991,19 +29991,23 @@ def _run_generation(
             # The admission may have dropped this request's banked copy of
             # its prompt (the copy decode's first write makes is what crossed
             # the line): no store-on-prefill snapshot, no prompt-prefix
-            # commit. The generation-final commit still banks the turn.
+            # commit. The generation-final commit still banks the turn. The
+            # decision travels to generation as this request's own argument:
+            # it used to ride MTPLX_SESSION_STORE_ON_PREFILL=0 in the process
+            # environment for the length of the generation, where every
+            # other reader of that switch (a postcommit, the next admission's
+            # pricing) saw it too.
             prompt_publish_skipped = bool(
                 admission_shed is not None
                 and admission_shed.get("prompt_publish_skipped")
             )
+            store_prefix_snapshot = False if prompt_publish_skipped else None
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
             request_env = dict(dynamic_kv_reservation["env"])
-            if prompt_publish_skipped:
-                request_env["MTPLX_SESSION_STORE_ON_PREFILL"] = "0"
             prefill_system_guard = make_prefill_system_guard(
                 state, prompt_tokens=len(prompt_ids), chunk_tokens=prefill_chunk_tokens,
                 priced=admission_pricing.get("growth"),
@@ -30104,6 +30108,7 @@ def _run_generation(
                         session_policy_fingerprint=session_policy_fingerprint,
                         capture_final_state=session_bank is not None,
                         abort_check=_prefill_abort_check,
+                        store_prefix_snapshot=store_prefix_snapshot,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -30190,6 +30195,7 @@ def _run_generation(
                         online_hidden_corrector_key=str(
                             state.args.online_hidden_corrector_key
                         ),
+                        store_prefix_snapshot=store_prefix_snapshot,
                     )
         except PostcommitAbort:
             # abort_check tripped inside the prefill. Three arms share it: a
