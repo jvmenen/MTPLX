@@ -42504,8 +42504,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("MTPLX_SSD_SESSION_CACHE", "on"),
         help=(
             "Persistent SessionBank cold tier (default on; kvcache-v2). "
-            "Budgeted by min(configured cap, free_disk/4), disabled below "
-            "10 GiB free."
+            "Budgeted by the configured cap and free disk: normally a quarter of "
+            "the space it can use, raised to hold two copies of the largest "
+            "conversation, never taking free disk below 10 GiB."
         ),
     )
     parser.add_argument(

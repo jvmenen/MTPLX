@@ -30,6 +30,7 @@ from .codec import (
     payload_supports_prefix_decode,
     snapshot_supports_prefix_decode,
 )
+from .disk_budget import DISK_FLOOR_BYTES, DISK_FULL, DiskBudget, disk_budget
 from .reconcile import (
     DEFAULT_COLD_TIER_DIR,
     ReconcileReport,
@@ -180,7 +181,13 @@ class ColdPrefixRestoreRecord:
 
 
 GIB = 1024**3
-LOW_DISK_FLOOR_BYTES = 10 * GIB
+# Free disk the tier never writes into (the policy lives in .disk_budget).
+LOW_DISK_FLOOR_BYTES = DISK_FLOOR_BYTES
+
+# _install_entry outcomes.
+_INSTALL_INSTALLED = "installed"
+_INSTALL_PRESENT = "present"  # the same entry was already in the manifest
+_INSTALL_FAILED = "failed"
 
 
 def detect_total_ram_bytes() -> int | None:
@@ -473,6 +480,12 @@ class SessionBankColdTier:
         # the orphan cleanup consults these before deleting anything.
         self._inflight_entry_dirs: Counter[str] = Counter()
         self._inflight_blob_hashes: Counter[str] = Counter()
+        # Disk bytes that admitted writes may still add, guarded by
+        # _base_lock. A write reserves before its first blob and releases
+        # once its manifest row is installed or it gives up, so two writers
+        # (the owner-thread spill and the writer thread) cannot both spend
+        # the same free space above the floor.
+        self._reserved_bytes = 0
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int | float | str | bool | None] = {
             "format_version": COLD_TIER_FORMAT_VERSION,
@@ -488,6 +501,9 @@ class SessionBankColdTier:
             "skipped_too_short": 0,
             "skipped_queue_full": 0,
             "skipped_size_cap": 0,
+            # The disk above the floor had no room for this write; the copy
+            # already saved was kept.
+            "skipped_no_disk_room": 0,
             "skipped_serialize_error": 0,
             "deduped_blob_hits": 0,
             "entries_evicted": 0,
@@ -501,6 +517,12 @@ class SessionBankColdTier:
             "orphan_cleanup_disk_bytes_deleted": 0,
             "orphan_cleanup_last_s": 0.0,
             "last_write_s": None,
+            # The newest write that did not land: {"reason", "message",
+            # "prefix_len", "at_s"}, the message in plain words.
+            "last_write_skip": None,
+            # Post-install evictions put off because a request arrived; the
+            # next write settles the store back under its cap.
+            "settle_deferred": 0,
             "last_restore_s": None,
             "last_miss_reason": None,
             "last_archive_path": None,
@@ -708,7 +730,7 @@ class SessionBankColdTier:
         """One console line per session when a spill is refused for size.
 
         skipped_size_cap was a silent in-memory counter — a session bigger
-        than min(cap, free_disk/4) lost durability with no trace, and the
+        than the effective cap lost durability with no trace, and the
         user's next restart paid a full re-prefill with nothing to explain
         it (the 2026-08-27 48G-sim finding: a 4 TB disk at 28 GiB free
         capped the lane at ~7 GiB and every 100k+ session skipped mutely,
@@ -731,13 +753,15 @@ class SessionBankColdTier:
             free_gib = -1.0
         logger.warning(
             "SessionBank SSD spill skipped for session %s: entry ~%.1f GiB "
-            "exceeds the effective cap %.1f GiB (min of configured cap and "
-            "free_disk/4; free disk %.1f GiB). The session stays warm in RAM "
-            "but will re-prefill after a restart. Free disk space to restore "
-            "durability for sessions this large.",
+            "exceeds the effective cap %.1f GiB (the configured cap, or what "
+            "free disk above the %d GiB floor allows; free disk %.1f GiB). "
+            "The session stays warm in RAM but will re-prefill after a "
+            "restart. Free disk space or raise the cap to restore durability "
+            "for sessions this large.",
             session_id or "<anon>",
             estimated / GIB,
             effective_cap / GIB,
+            LOW_DISK_FLOOR_BYTES // GIB,
             free_gib,
         )
 
@@ -765,6 +789,14 @@ class SessionBankColdTier:
         The on-disk result is byte-compatible with put_entry — same
         content-addressed blobs, same payload.json shape, same manifest
         row — so lookups and restores cannot tell the paths apart.
+
+        Replacement is a transaction, in this order: reserve the disk the
+        new copy may need, write its blobs, install its manifest row, and
+        only then retire older entries for the cap. The copy a restore
+        would use today stays whole until its successor is installed, so a
+        failed or interrupted write, a full disk or a killed process leaves
+        one restorable copy (2026-09-29: evicting first left none between
+        20:55 and 20:56, and a 138K request had nothing to restore).
         """
         if self.mode == "off":
             return False
@@ -789,35 +821,11 @@ class SessionBankColdTier:
         # Orphans that price it over the cap are reclaimed in the background
         # and are not charged to this spill meanwhile.
         self._reclaim_orphans_if_over_cap(estimated, inline=False)
-        with self._base_lock:
-            self._ensure_store()
-            if final_dir.exists():
-                if self._entry_in_manifest(entry_id):
-                    self._touch_entry(entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, entry_id)
-            effective_cap, budget_block = self._effective_write_budget()
-            if budget_block is not None:
-                self._inc("skipped_low_disk")
-                with self._stats_lock:
-                    self._stats["low_disk_writes_disabled"] = True
-                logger.warning(
-                    "SessionBank SSD spill disabled (%s): free disk below %d GiB",
-                    budget_block,
-                    LOW_DISK_FLOOR_BYTES // GIB,
-                )
-                return False
-            with self._stats_lock:
-                self._stats["low_disk_writes_disabled"] = False
-                self._stats["effective_max_bytes"] = int(effective_cap)
-            if estimated > effective_cap:
-                self._inc("skipped_size_cap")
-                self._warn_spill_size_capped(entry, estimated, effective_cap)
-                return False
+
         # The owner thread yields back to the scheduler rather than waiting
         # behind foreground work. In particular, never pause with _base_lock
         # held: a foreground restore may need that same lock.
-        def yield_eviction() -> None:
+        def yield_to_foreground() -> None:
             if self._stop.is_set() or (
                 self._encode_yield_enabled
                 and self.foreground_busy is not None
@@ -826,23 +834,39 @@ class SessionBankColdTier:
                 raise ColdEncodeInterrupted()
 
         try:
-            room = self._evict_until_room(
-                estimated, cap_bytes=effective_cap, on_yield=yield_eviction
-            )
+            # Before anything is reserved or claimed: a spill that would
+            # yield at its first tensor should not hold disk it never uses.
+            yield_to_foreground()
         except ColdEncodeInterrupted:
             self._inc("encode_yields_foreground")
             if raise_on_yield:
                 raise
             return False
-        if not room:
-            self._inc("skipped_size_cap")
-            self._warn_spill_size_capped(entry, estimated, effective_cap)
-            return False
         with self._base_lock:
+            self._ensure_store()
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return True
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            # A streamed payload's physical size is known only once it is
+            # encoded, so the whole logical size is reserved: an upper
+            # bound, because blobs the store already holds (the entry this
+            # one replaces, kept until it is installed) are deduplicated.
+            budget = self._admit_write_room(
+                estimated,
+                entry_nbytes=estimated,
+                prefix_len=len(token_ids),
+                warn_size_cap=lambda cap: self._warn_spill_size_capped(
+                    entry, estimated, cap
+                ),
+            )
+            if budget is None:
+                return False
             self._claim_inflight(entry_dirs=(entry_dir_rel,))
         claimed_digests: set[str] = set()
         try:
-            return self._spill_entry_admitted(
+            stored = self._spill_entry_admitted(
                 entry,
                 metadata=metadata,
                 entry_id=entry_id,
@@ -854,6 +878,12 @@ class SessionBankColdTier:
             )
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=claimed_digests)
+            self._release_reserved(estimated)
+        if stored:
+            # Only now, with the new entry installed, may anything older
+            # (the entry it replaces included) be retired for the cap.
+            self._settle_to_cap(keep=entry_id, on_yield=yield_to_foreground)
+        return stored
 
     def _claim_inflight(
         self, *, entry_dirs: tuple[str, ...] = (), digests: set[str] | None = None
@@ -966,6 +996,12 @@ class SessionBankColdTier:
             if raise_on_yield:
                 raise
             return False
+        except OSError as exc:
+            # A blob write the disk refused (ENOSPC, EIO). Nothing of this
+            # entry is restorable yet; its blobs are orphans for the
+            # cleanup, and the copy it was replacing is untouched.
+            self._record_write_failure(entry_id, len(token_ids), exc)
+            return False
         except Exception as exc:
             self._inc("skipped_serialize_error")
             logger.warning(
@@ -997,25 +1033,18 @@ class SessionBankColdTier:
             "tensor_names": sorted(tensor_blobs),
             "tensor_blobs": tensor_blobs,
         }
-        with self._base_lock:
-            if final_dir.exists():
-                if self._entry_in_manifest(entry_id):
-                    self._touch_entry(entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, entry_id)
-            temp_parent = self.base_dir / "entries" / entry_hash_prefix
-            temp_parent.mkdir(parents=True, exist_ok=True)
-            temp_dir = Path(
-                tempfile.mkdtemp(prefix=f".{entry_id}.tmp-", dir=temp_parent)
-            )
-            (temp_dir / "payload.json").write_text(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temp_dir.rename(final_dir)
-            metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
-            self._insert_manifest(metadata)
-            self._invalidate_disk_usage_cache()
+        outcome = self._install_entry(
+            entry_id=entry_id,
+            entry_hash_prefix=entry_hash_prefix,
+            final_dir=final_dir,
+            payload_text=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            metadata=metadata,
+            prefix_len=len(token_ids),
+        )
+        if outcome == _INSTALL_FAILED:
+            return False
+        if outcome == _INSTALL_PRESENT:
+            return True
         self._inc("writes_completed")
         self._inc("spill_writes_completed")
         with self._stats_lock:
@@ -1240,7 +1269,7 @@ class SessionBankColdTier:
             logger.warning("SessionBank SSD prefix-boundary restore failed: %s: %s", type(exc).__name__, exc)
             return None
 
-    def _manifest_stats_row(self) -> tuple[int, int, int, int]:
+    def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
         """The stats() aggregate, opening the manifest only when it changed.
 
         Before 2.8.2 every stats() call — i.e. every /health and dashboard
@@ -1269,9 +1298,16 @@ class SessionBankColdTier:
                 "THEN logical_nbytes ELSE nbytes END), 0), "
                 "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
                 "THEN physical_nbytes ELSE nbytes END), 0), "
-                "COALESCE(SUM(deduped_nbytes), 0) FROM entries"
+                "COALESCE(SUM(deduped_nbytes), 0), "
+                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
             ).fetchone()
-        row = (int(fetched[0]), int(fetched[1]), int(fetched[2]), int(fetched[3]))
+        row = (
+            int(fetched[0]),
+            int(fetched[1]),
+            int(fetched[2]),
+            int(fetched[3]),
+            int(fetched[4]),
+        )
         with self._manifest_stats_lock:
             self._manifest_stats_cache = {
                 "generation": generation,
@@ -1336,6 +1372,31 @@ class SessionBankColdTier:
                 managed_disk_bytes - database_disk_bytes - manifest_bytes_at_scan,
             )
             stats["orphan_cleanup_running"] = self._orphan_cleanup_is_running()
+            # The disk as the next write will see it, live on every read (a
+            # statvfs; the manifest figures are the cached aggregate above):
+            # whether the cache can still hold two copies of the largest
+            # conversation above the free-disk floor, in plain words for the
+            # app. Field names added here are new; existing ones keep their
+            # meaning (low_disk_writes_disabled is the last write's verdict).
+            # One int read, no lock: /health must never wait behind a writer.
+            reserved = int(self._reserved_bytes)
+            budget = disk_budget(
+                configured_max_bytes=self.max_bytes,
+                free_bytes=self._free_disk_bytes(),
+                store_bytes=int(row[2]) + self._untracked_bytes_estimate(),
+                largest_session_bytes=int(row[4]),
+                reserved_bytes=reserved,
+                floor_bytes=LOW_DISK_FLOOR_BYTES,
+            )
+            stats["effective_max_bytes"] = int(budget.cap_bytes)
+            stats["disk_state"] = budget.state
+            stats["low_disk"] = bool(budget.low)
+            stats["disk_message"] = budget.message()
+            stats["disk_free_bytes"] = int(budget.free_bytes)
+            stats["disk_floor_bytes"] = int(budget.floor_bytes)
+            stats["disk_room_bytes"] = int(budget.room_bytes)
+            stats["largest_session_bytes"] = int(budget.largest_session_bytes)
+            stats["reserved_write_bytes"] = reserved
             # Reclaimable garbage is the part of untracked_* a cleanup can
             # free; the rest is live blobs booked under evicted entries.
             if (
@@ -1760,71 +1821,62 @@ class SessionBankColdTier:
         final_dir: Path,
         entry_hash_prefix: str,
     ) -> bool:
-        # Phase 1 (under lock): admission gates — no bulk IO, no hashing.
+        logical_bytes = sum(int(item["nbytes"]) for item in tensor_blobs.values())
+        entry_nbytes = max(int(pending.metadata.get("nbytes") or 0), int(logical_bytes))
+        prefix_len = int(pending.metadata["prefix_len"])
+        # Phase 1 (under lock): admission and reservation — no bulk IO, no
+        # hashing, and nothing evicted. pending_bytes is exact here: the
+        # blobs this payload does not share with the store (the entry it
+        # replaces stays, so its blobs stay deduplicated) plus payload.json.
         with self._base_lock:
-            effective_cap, budget_block = self._effective_write_budget()
-            if budget_block is not None:
-                self._inc("skipped_low_disk")
-                with self._stats_lock:
-                    self._stats["low_disk_writes_disabled"] = True
-                logger.warning(
-                    "SessionBank SSD writes disabled (%s): free disk below %d GiB",
-                    budget_block,
-                    LOW_DISK_FLOOR_BYTES // GIB,
-                )
+            budget = self._admit_write_room(
+                pending_bytes, entry_nbytes=entry_nbytes, prefix_len=prefix_len
+            )
+            if budget is None:
                 return False
-            with self._stats_lock:
-                self._stats["low_disk_writes_disabled"] = False
-                self._stats["effective_max_bytes"] = int(effective_cap)
-            logical_bytes = sum(int(item["nbytes"]) for item in tensor_blobs.values())
-            if pending_bytes > effective_cap:
-                self._inc("skipped_size_cap")
-                logger.warning(
-                    "SessionBank SSD size cap skipped entry_id=%s prefix_len=%d pending=%d max=%d",
-                    pending.entry_id,
-                    int(pending.metadata["prefix_len"]),
-                    pending_bytes,
-                    self.max_bytes,
-                )
-                return False
-        if not self._evict_until_room(pending_bytes, cap_bytes=effective_cap):
-            self._inc("skipped_size_cap")
-            return False
-        # Phase 2 (no lock): pause-aware bulk blob writes. Blobs are
-        # content-addressed, atomic (tmp+rename), idempotent, and invisible
-        # to restores until the manifest row lands in phase 3 — a crash or a
-        # skip here leaves only orphan blobs, which the existing orphan
-        # cleanup already handles. Pausing per blob bounds the
-        # bandwidth-contention window to one blob write (gate254-c4s: an
-        # entry-granular pause left the 2.5 GB write straddling the arrival).
-        for name, raw in pending.tensors.items():
-            self._pause_for_foreground()
-            if self._stop.is_set():
-                return False
-            blob = tensor_blobs[name]
-            if self._write_blob(blob["sha256"], raw):
-                continue
-            self._inc("deduped_blob_hits")
-        # Phase 3 (under lock): entry payload + manifest finalize.
-        with self._base_lock:
-            if final_dir.exists():
-                if self._entry_in_manifest(pending.entry_id):
-                    self._touch_entry(pending.entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, pending.entry_id)
-            temp_parent = self.base_dir / "entries" / entry_hash_prefix
-            temp_parent.mkdir(parents=True, exist_ok=True)
-            temp_dir = Path(tempfile.mkdtemp(prefix=f".{pending.entry_id}.tmp-", dir=temp_parent))
-            (temp_dir / "payload.json").write_text(payload_text, encoding="utf-8")
-            temp_dir.rename(final_dir)
+        try:
+            # Phase 2 (no lock): pause-aware bulk blob writes. Blobs are
+            # content-addressed, atomic (tmp+rename), idempotent, and
+            # invisible to restores until the manifest row lands in phase 3
+            # — a crash or a skip here leaves only orphan blobs, which the
+            # existing orphan cleanup already handles. Pausing per blob
+            # bounds the bandwidth-contention window to one blob write
+            # (gate254-c4s: an entry-granular pause left the 2.5 GB write
+            # straddling the arrival).
+            for name, raw in pending.tensors.items():
+                self._pause_for_foreground()
+                if self._stop.is_set():
+                    return False
+                blob = tensor_blobs[name]
+                try:
+                    wrote = self._write_blob(blob["sha256"], raw)
+                except OSError as exc:
+                    self._record_write_failure(pending.entry_id, prefix_len, exc)
+                    return False
+                if not wrote:
+                    self._inc("deduped_blob_hits")
             metadata = dict(pending.metadata)
-            metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
             metadata["logical_nbytes"] = int(logical_bytes)
             metadata["physical_nbytes"] = int(pending_bytes)
             metadata["deduped_nbytes"] = max(0, int(logical_bytes) - int(pending_bytes))
-            self._insert_manifest(metadata)
-            self._invalidate_disk_usage_cache()
-            return True
+            # Phase 3 (under lock): payload directory, then the manifest
+            # row, the commit point.
+            outcome = self._install_entry(
+                entry_id=pending.entry_id,
+                entry_hash_prefix=entry_hash_prefix,
+                final_dir=final_dir,
+                payload_text=payload_text,
+                metadata=metadata,
+                prefix_len=prefix_len,
+            )
+        finally:
+            self._release_reserved(pending_bytes)
+        if outcome == _INSTALL_FAILED:
+            return False
+        # Phase 4 (no lock): only with this entry installed may older ones,
+        # the entry it replaces included, be retired for the cap.
+        self._settle_to_cap(keep=pending.entry_id)
+        return True
 
     def _block_memo(self, memo_key: str | None) -> dict[tuple, dict[str, Any]]:
         if memo_key is None:
@@ -1896,16 +1948,29 @@ class SessionBankColdTier:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
         try:
-            temp_path.write_bytes(raw)
-        except FileNotFoundError:
-            # An orphan cleanup pruned the now-empty prefix directory between
-            # the mkdir above and this write; the directory is ours to remake.
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path.write_bytes(raw)
-        try:
-            temp_path.rename(path)
-        except FileExistsError:
-            return False
+            try:
+                temp_path.write_bytes(raw)
+            except FileNotFoundError:
+                # An orphan cleanup pruned the now-empty prefix directory
+                # between the mkdir above and this write; the directory is
+                # ours to remake.
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path.write_bytes(raw)
+            try:
+                temp_path.rename(path)
+            except FileExistsError:
+                temp_path.unlink(missing_ok=True)
+                return False
+        except OSError:
+            # A write the disk refused (ENOSPC) leaves a partial temp file
+            # that would hold its bytes for the reconcile's hour-long temp
+            # grace, on exactly the disk that just ran out. It is ours and
+            # unreferenced: remove it, then report the failure.
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return True
 
     def _evict_until_room(
@@ -1914,6 +1979,7 @@ class SessionBankColdTier:
         *,
         cap_bytes: int | None = None,
         on_yield: Callable[[], None] | None = None,
+        protect: frozenset[str] = frozenset(),
     ) -> bool:
         """Retire LRU entries, then reclaim their blobs in one paced pass.
 
@@ -1921,6 +1987,8 @@ class SessionBankColdTier:
         turn; owner-thread spills instead raise ColdEncodeInterrupted.
         Re-reading every surviving payload for every victim made a 66-entry
         eviction run for 89 seconds alongside the next two app replies.
+        ``protect`` names entries that must survive this pass (the entry a
+        write has just installed).
         """
         required = max(0, int(required_bytes))
         cap = int(self.max_bytes if cap_bytes is None else cap_bytes)
@@ -1943,6 +2011,8 @@ class SessionBankColdTier:
                 if self._stop.is_set():
                     return False
                 with self._base_lock:
+                    if str(row["entry_id"]) in protect:
+                        continue
                     # A concurrent spill may be reusing this entry. Its
                     # manifest and blobs remain protected until it commits.
                     if str(row["entry_dir"]) in self._inflight_entry_dirs:
@@ -1970,18 +2040,243 @@ class SessionBankColdTier:
                 # existing foreground-aware orphan worker after a stop.
                 self._start_orphan_cleanup()
 
-    def _effective_write_budget(self) -> tuple[int, str | None]:
-        """min(configured cap, free_disk/4), writes disabled under 10 GiB free.
-
-        Re-checked on every write (cheap statvfs); guards strangers' Macs where
-        a flat configured cap could fill the disk (kvcache-v2 P2.3)."""
+    def _free_disk_bytes(self) -> int | None:
         try:
-            free = shutil.disk_usage(self.base_dir).free
+            return int(shutil.disk_usage(self.base_dir).free)
         except Exception:
-            return self.max_bytes, None
-        if free < LOW_DISK_FLOOR_BYTES:
-            return 0, "low_disk"
-        return min(int(self.max_bytes), int(free // 4)), None
+            return None
+
+    def _largest_entry_bytes(self) -> int:
+        """Logical size of the largest entry the manifest holds."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def _disk_budget(self, *, incoming_bytes: int = 0) -> DiskBudget:
+        """What the disk allows now (the policy is in .disk_budget).
+
+        Re-read on every write (one statvfs and two manifest queries), so a
+        disk that fills or empties between turns is seen at once; it guards
+        strangers' Macs where a flat configured cap could fill the disk
+        (kvcache-v2 P2.3). ``incoming_bytes`` is the logical size of the
+        entry being written, which may be the largest conversation yet.
+        Writers call it under _base_lock, so the reservation read is exact.
+        """
+        return disk_budget(
+            configured_max_bytes=self.max_bytes,
+            free_bytes=self._free_disk_bytes(),
+            store_bytes=self._current_bytes_for_cap(),
+            largest_session_bytes=max(
+                int(incoming_bytes), self._largest_entry_bytes()
+            ),
+            reserved_bytes=self._reserved_bytes,
+            floor_bytes=LOW_DISK_FLOOR_BYTES,
+        )
+
+    def _admit_write_room(
+        self,
+        need_bytes: int,
+        *,
+        entry_nbytes: int,
+        prefix_len: int,
+        warn_size_cap: Callable[[int], None] | None = None,
+    ) -> DiskBudget | None:
+        """Admit one write and reserve the disk it may add; None skips it.
+
+        Called under _base_lock before the write's first blob. Nothing is
+        evicted here: the entries on disk, the one this write replaces
+        included, stay whole until the new entry is installed. A write that
+        does not fit is skipped with its reason recorded, keeping the copy
+        that exists instead of destroying it for one that may never land.
+        """
+        budget = self._disk_budget(incoming_bytes=entry_nbytes)
+        if budget.state == DISK_FULL:
+            self._inc("skipped_low_disk")
+            with self._stats_lock:
+                self._stats["low_disk_writes_disabled"] = True
+            self._record_write_skip("low_disk", budget.message() or "", prefix_len)
+            logger.warning(
+                "SessionBank SSD writes disabled: free disk %.1f GiB is at or "
+                "below the %d GiB floor",
+                budget.free_bytes / GIB,
+                LOW_DISK_FLOOR_BYTES // GIB,
+            )
+            return None
+        with self._stats_lock:
+            self._stats["low_disk_writes_disabled"] = False
+            self._stats["effective_max_bytes"] = int(budget.cap_bytes)
+        need = max(0, int(need_bytes))
+        entry_nbytes = max(0, int(entry_nbytes))
+        if entry_nbytes > budget.cap_bytes and not budget.cap_limited_by_disk:
+            # The configured cap cannot hold this entry even alone.
+            self._inc("skipped_size_cap")
+            self._record_write_skip(
+                "size_cap",
+                f"Not saved to the SSD cache: this conversation needs "
+                f"{entry_nbytes / GIB:.1f} GiB and the cache limit is "
+                f"{budget.cap_bytes / GIB:.1f} GiB.",
+                prefix_len,
+            )
+            if warn_size_cap is not None:
+                warn_size_cap(int(budget.cap_bytes))
+            else:
+                logger.warning(
+                    "SessionBank SSD size cap skipped prefix_len=%d nbytes=%d max=%d",
+                    int(prefix_len),
+                    entry_nbytes,
+                    int(budget.cap_bytes),
+                )
+            return None
+        if need > budget.room_bytes or entry_nbytes > budget.cap_bytes:
+            self._inc("skipped_no_disk_room")
+            self._record_write_skip(
+                "no_disk_room",
+                f"Not saved to the SSD cache: the disk has "
+                f"{budget.room_bytes / GIB:.1f} GiB it can use above the "
+                f"{budget.floor_bytes / GIB:.0f} GiB it always leaves free, "
+                f"and this save needs {max(need, entry_nbytes) / GIB:.1f} GiB. "
+                "The copy saved before it was kept.",
+                prefix_len,
+            )
+            logger.warning(
+                "SessionBank SSD write skipped, no disk room: prefix_len=%d "
+                "need=%d nbytes=%d room=%d cap=%d free=%d",
+                int(prefix_len),
+                need,
+                entry_nbytes,
+                int(budget.room_bytes),
+                int(budget.cap_bytes),
+                int(budget.free_bytes),
+            )
+            return None
+        self._reserved_bytes += need
+        return budget
+
+    def _release_reserved(self, nbytes: int) -> None:
+        with self._base_lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - max(0, int(nbytes)))
+
+    def _install_entry(
+        self,
+        *,
+        entry_id: str,
+        entry_hash_prefix: str,
+        final_dir: Path,
+        payload_text: str,
+        metadata: dict[str, Any],
+        prefix_len: int,
+    ) -> str:
+        """Install a written entry: its payload directory, then its manifest row.
+
+        The row is the commit point. A restore sees an entry only once its
+        row exists, and a row always names a directory whose payload and
+        blobs are complete. When the disk refuses the payload, the rename or
+        the SQLite write, what this call created is set aside and the store
+        is as it was before the entry was written.
+        """
+        with self._base_lock:
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return _INSTALL_PRESENT
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            temp_parent = self.base_dir / "entries" / entry_hash_prefix
+            temp_dir: Path | None = None
+            renamed = False
+            try:
+                temp_parent.mkdir(parents=True, exist_ok=True)
+                temp_dir = Path(
+                    tempfile.mkdtemp(prefix=f".{entry_id}.tmp-", dir=temp_parent)
+                )
+                (temp_dir / "payload.json").write_text(payload_text, encoding="utf-8")
+                temp_dir.rename(final_dir)
+                renamed = True
+                metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
+                self._insert_manifest(metadata)
+            except (OSError, sqlite3.Error) as exc:
+                try:
+                    if renamed:
+                        # The directory landed without its row: set it aside
+                        # so the next write of this entry starts clean.
+                        self._archive_orphan_entry_dir(final_dir, entry_id)
+                    elif temp_dir is not None:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                except OSError as cleanup_exc:
+                    # Left for the reconcile, which removes directories no
+                    # manifest row names.
+                    logger.warning(
+                        "SessionBank SSD could not set aside the partial entry "
+                        "entry_id=%s: %s: %s",
+                        entry_id,
+                        type(cleanup_exc).__name__,
+                        cleanup_exc,
+                    )
+                self._record_write_failure(entry_id, prefix_len, exc)
+                return _INSTALL_FAILED
+            finally:
+                self._invalidate_disk_usage_cache()
+        return _INSTALL_INSTALLED
+
+    def _settle_to_cap(
+        self,
+        *,
+        keep: str,
+        on_yield: Callable[[], None] | None = None,
+    ) -> None:
+        """Retire LRU entries until the store is back under its cap.
+
+        Runs only after a write's manifest row is installed and never takes
+        that entry. The cap is re-read, since the write changed both the
+        store and the free space. A request arriving mid-pass (owner-thread
+        spills) or a failing removal leaves the store over its cap until the
+        next write settles it; the new entry is installed and restorable
+        either way.
+        """
+        with self._base_lock:
+            cap = self._disk_budget().cap_bytes
+        try:
+            self._evict_until_room(
+                0, cap_bytes=cap, on_yield=on_yield, protect=frozenset({keep})
+            )
+        except ColdEncodeInterrupted:
+            self._inc("settle_deferred")
+        except (OSError, sqlite3.Error) as exc:
+            self._inc("settle_deferred")
+            logger.warning(
+                "SessionBank SSD could not retire older entries after writing "
+                "entry_id=%s: %s: %s",
+                keep,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _record_write_skip(self, reason: str, message: str, prefix_len: int) -> None:
+        with self._stats_lock:
+            self._stats["last_write_skip"] = {
+                "reason": str(reason),
+                "message": str(message),
+                "prefix_len": int(prefix_len),
+                "at_s": time.time(),
+            }
+
+    def _record_write_failure(
+        self, entry_id: str, prefix_len: int, exc: BaseException
+    ) -> None:
+        self._inc("write_failures")
+        self._record_write_skip(
+            "write_failed",
+            f"Not saved to the SSD cache: the disk refused the write "
+            f"({type(exc).__name__}: {exc}). The copy saved before it was kept.",
+            prefix_len,
+        )
+        logger.warning(
+            "SessionBank SSD write failed entry_id=%s: %s: %s",
+            entry_id,
+            type(exc).__name__,
+            exc,
+        )
 
     def _current_bytes_for_cap(self, required_bytes: int = 0) -> int:
         """Bytes the cap gate prices: the whole managed directory.
@@ -2036,9 +2331,8 @@ class SessionBankColdTier:
         reclaimable = self._reclaimable_bytes_estimate()
         if reclaimable <= 0 or self._orphan_cleanup_is_running():
             return
-        cap, budget_block = self._effective_write_budget()
-        if budget_block is not None:
-            cap = 0
+        budget = self._disk_budget()
+        cap = 0 if budget.state == DISK_FULL else budget.cap_bytes
         current = self._current_bytes() + self._untracked_bytes_estimate()
         if current + max(0, int(required_bytes)) <= cap:
             return
@@ -2061,15 +2355,23 @@ class SessionBankColdTier:
         self._delete_unreferenced_blobs(blob_hashes)
 
     def _retire_entry_row(self, row: sqlite3.Row) -> set[str]:
-        """Remove the small entry record under _base_lock, retaining blobs."""
+        """Remove the small entry record under _base_lock, retaining blobs.
+
+        The manifest row goes first. A row must never name a directory that
+        is gone (a restore would find the row and fail on the missing
+        payload), while a directory no row names is garbage the reconcile
+        already removes; a process killed between the two leaves only that.
+        """
         entry_id = str(row["entry_id"])
         entry_dir = self.base_dir / str(row["entry_dir"])
         blob_hashes = self._entry_blob_hashes(entry_dir)
-        if entry_dir.exists():
-            shutil.rmtree(entry_dir)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
-        self._invalidate_disk_usage_cache()
+        try:
+            if entry_dir.exists():
+                shutil.rmtree(entry_dir)
+        finally:
+            self._invalidate_disk_usage_cache()
         return blob_hashes
 
     def _archive_entry_row(self, row: sqlite3.Row) -> None:
