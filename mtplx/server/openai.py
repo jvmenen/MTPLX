@@ -1148,6 +1148,19 @@ def _server_runtime_env_overrides(
             # env gate above, and runtime_env_overrides are applied AFTER
             # the profile env (apply_profile_env), so this beats turbo's 1.
             overrides["MTPLX_NAX_VERIFY"] = "0"
+    elif generation_mode == "mtp" and _served_model_is_qwen38_dense_frspec_pack(args):
+        # FR-Spec on the dense Qwen3.8 packs: the builtin 64K table prunes
+        # the configured draft head, bound on the generic mtp_patch draft
+        # route (frspec_draft._bind_full_head). Output stays exact (the
+        # target verifies the full vocabulary). An explicit
+        # MTPLX_FRSPEC_DRAFT=0 export turns it off.
+        if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
+            overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
+        if (
+            _qwen4_port_opt_in(overrides, "MTPLX_FRSPEC_DRAFT")
+            and os.environ.get("MTPLX_FRSPEC_VOCAB") is None
+        ):
+            overrides.setdefault("MTPLX_FRSPEC_VOCAB", "builtin:qwen38-code-64k")
     # Model-tuned settings the served family owns (PX.0): prefill chunk and
     # compiled width, score workspace, cleanup and clear cadences, copy-lane
     # parameters, first verify reserve. The stamp carries only values that
@@ -1374,6 +1387,39 @@ def _served_model_lm_head_is_q8_g64(args: argparse.Namespace) -> bool:
         64,
         "affine",
     )
+
+
+_QWEN38_FRSPEC_VOCAB_ROWS = 248_320
+
+
+def _served_model_is_qwen38_dense_frspec_pack(args: argparse.Namespace) -> bool:
+    """Dense Qwen3.8 pack whose configured draft head FR-Spec can prune.
+
+    The builtin table is ranked over the Qwen3.8 tokenizer (248,320 rows).
+    The pruned head is gathered from the configured affine draft head
+    (--draft-lm-head-*), so the pack must be the plain qwen3_5 layout (not a
+    rotated derivative such as Bonsai, whose draft head is the packed target
+    head), untied, with an affine or unquantized lm_head.
+    """
+    if str(getattr(args, "draft_lm_head_mode", "affine") or "affine") != "affine":
+        return False
+    if int(getattr(args, "draft_lm_head_bits", 0) or 0) <= 0:
+        return False
+    config = _served_model_config(args)
+    if config is None:
+        return False
+    text = config.get("text_config")
+    text = text if isinstance(text, Mapping) else config
+    if str(config.get("model_type") or "") != "qwen3_5":
+        return False
+    if text.get("tie_word_embeddings") or config.get("tie_word_embeddings"):
+        return False
+    if text.get("vocab_size") != _QWEN38_FRSPEC_VOCAB_ROWS:
+        return False
+    head = _served_module_quantization(config, "language_model.lm_head")
+    if head is not None and head[2] != "affine":
+        return False
+    return _served_model_family(args) == "qwen3_8"
 
 
 # Per-module quantization the M=4 stage-3 combine tail pins for every MoE

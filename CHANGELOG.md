@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **FR-Spec drafts from the pruned 64K head on dense Qwen3.8 packs, on by default.** The pruned draft head was only bound on Flash-Next's native MTP route; on the dense 27B it was built and never used unless `MTPLX_FRSPEC_LEGACY=1` was set. It is now bound on the configured draft-head route, and the server turns it on (builtin `qwen38-code-64k`) for dense Qwen3.8 packs with an affine configured draft head; `MTPLX_FRSPEC_DRAFT=0` turns it off. Output stays exact: the target verifies the full vocabulary. M5 Pro 64 GB, Qwen3.8-27B Optimized Speed, turbo, depth 3, draft temperature 0.6, fans default, 2026-09-30, commit bc4618c4, two alternating boots per arm: reasoning workload (8 prompts, 1,200 tokens) 31.9 -> 33.7 tok/s (+5.4%; pairs +5.1% and +5.7%), acceptance 0.864 / 0.704 / 0.574 -> 0.859 / 0.710 / 0.571. By text type (800 tokens, same boots): code +8.6% (29.2 -> 31.7), English prose +7.5% (26.5 -> 28.5), Dutch summaries with reasoning -3.5% (27.0 -> 26.1, acceptance 0.81 / 0.58 / 0.39 -> 0.70 / 0.46 / 0.31), Dutch without thinking -12.4% (24.4 -> 21.4, acceptance 0.72 / 0.48 / 0.27 -> 0.60 / 0.29 / 0.13): the table is ranked on code, so text in a language it covers poorly drafts worse.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
