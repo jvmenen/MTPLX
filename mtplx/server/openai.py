@@ -208,6 +208,7 @@ from mtplx.reasoning_codecs import (
 from mtplx.server.dashboard_state import DashboardState, InFlightHandle
 from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
+from mtplx import thermal_pressure as _thermal_pressure
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
 # of AttributeError; real ServerState installs its own in __init__.
@@ -16413,6 +16414,13 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     # request finished instead of rendering a dash. setdefault so a producer
     # that already knows a more precise instant keeps it.
     record.setdefault("completed_at_s", time.time())
+    # Thermal pressure (the kernel's throttle verdict, not the fan state):
+    # the level at completion and the worst level in effect since the request
+    # arrived, from the background sampler's cache. No OS call here.
+    for key, value in _thermal_pressure.receipt_fields(
+        record.get("request_received_monotonic_s")
+    ).items():
+        record.setdefault(key, value)
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -34676,6 +34684,9 @@ def create_app(state: ServerState) -> FastAPI:
         if dashboard is not None:
             dashboard.bus.attach_loop(asyncio.get_running_loop())
         bg_tasks: list[asyncio.Task[Any]] = []
+        # Thermal pressure for flight samples and receipts: a background
+        # thread keeps the level cached; readers never call the OS.
+        thermal_pressure_sampler = _thermal_pressure.start_process_sampler()
         if dashboard is not None and bool(
             getattr(state.args, "enable_thermal_poll", False)
         ):
@@ -34706,6 +34717,7 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            thermal_pressure_sampler.stop()
             # Issue #290: BEFORE the scheduler shutdown cancels queued
             # futures, give pending SSD session-cache writes a bounded
             # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
@@ -34971,6 +34983,7 @@ def create_app(state: ServerState) -> FastAPI:
                 fan_mode=fan_mode,
                 smart_status=smart_status,
             ),
+            "thermal_pressure": _thermal_pressure.process_sampler().health_payload(),
             "available_generation_modes": ["mtp", "ar"],
             "load_mtp": bool(state.args.load_mtp),
             "mtp_enabled": bool(
