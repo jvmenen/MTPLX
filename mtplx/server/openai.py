@@ -5722,98 +5722,173 @@ _VISION_LINEAGE_OVERRIDE_SOURCES = frozenset(
 )
 
 
-def _vision_text_canonicalization_refusal(
-    raw_ids: Sequence[int],
-    canonical_ids: Sequence[int],
+def _image_prompt_view(splice: Any) -> Callable[[Sequence[int]], list[int] | None] | None:
+    """The view the committed-token repair compares an image request in.
+
+    An image session commits the content-keyed view of what it was served
+    (``vision.splice.vision_bank_key_ids``, the view the session bank keys
+    it by): every image row becomes a stand-in for its image's bytes, row,
+    grid and position scheme, so rows of other pixels can never match. The
+    repair encodes messages to TEXT ids, one placeholder per image; the view
+    expands each placeholder to this request's rows and keys them, and
+    returns None for ids whose placeholders are not this request's images.
+    None as a whole when the splice carries no content identity (such a
+    request bypasses the session anyway, see ``vision_cache_keying``).
+    """
+
+    if (
+        splice is None
+        or not getattr(splice, "image_digests", None)
+        or not getattr(splice, "pad_counts", None)
+    ):
+        return None
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    pad_id = int(splice.image_pad_token_id)
+    pad_counts = [int(count) for count in splice.pad_counts]
+
+    def keyed(text_ids: Sequence[int]) -> list[int] | None:
+        try:
+            expanded = _expand_image_pads(
+                [int(token) for token in text_ids],
+                image_pad_id=pad_id,
+                pad_counts=pad_counts,
+            )
+        except ValueError:
+            return None
+        return vision_bank_key_ids(expanded, splice)
+
+    return keyed
+
+
+def _decodable_ids(state: Any, token_ids: Sequence[int]) -> list[int]:
+    """Ids a tokenizer can decode. An image session's committed stream holds
+    its image rows as content-keyed stand-ins, which decode as the image pad
+    they stand for."""
+
+    from mtplx.vision.splice import is_image_key, unkeyed_ids
+
+    pad_id = getattr(_server_vision_spec(state), "image_token_id", None)
+    if pad_id is None:
+        return [int(token) for token in token_ids if not is_image_key(token)]
+    return unkeyed_ids(token_ids, int(pad_id))
+
+
+def _vision_canonicalization_refusal(
+    raw_keyed: Sequence[int],
+    canonical_keyed: Sequence[int],
+    committed: Sequence[int],
     image_pad_token_id: int | None,
 ) -> str | None:
-    """Why canonicalized TEXT ids may not be served for an image request
-    (None: they may).
+    """Why a repaired image prompt may not be served (None: it may).
 
-    The committed-think substitution and the committed-id splice re-express
-    the text history in the session's own ids. For an image request that is
-    legal only BEFORE the first image placeholder: those positions carry no
-    pixel influence (causal attention). From the first placeholder on, the
-    ids must be the raw encode's, token for token, so every image keeps its
-    placeholder, its order and the text around it, and the pad layout that
-    _materialize_vision_splice expands is the raw one by construction. This
-    is a guard on the input ids only: what may be RESTORED is still decided
-    by the pixel-keyed bank view and the image-span clamp in generation.
+    All three sequences are content-keyed views: the raw encode, the repaired
+    one and the session's committed stream. The repair (the committed think
+    and body substitution, the committed-id splice) may re-express any stretch
+    before the first image the committed stream does not hold, where the
+    session's turns were generated from these very pixels. That image and
+    everything after it stay the raw encode's, token for token (a stream that
+    holds no image makes this the first image, the rule of 2026-09-18), and
+    every image before it comes back byte-identical: the same rows, in order,
+    each as one run. The splice only copies an image row that both sides
+    hold, so this is what it produces; the check keeps the substitution, which
+    re-renders whole turns, to the same.
     """
 
     if image_pad_token_id is None:
         return "image_pad_token_unknown"
-    pad_id = int(image_pad_token_id)
-    first_pad = next(
-        (pos for pos, token in enumerate(raw_ids) if int(token) == pad_id), None
-    )
-    if first_pad is None:
+    from mtplx.vision.splice import image_key_runs
+
+    raw_runs = image_key_runs(raw_keyed)
+    if not raw_runs:
         return "image_placeholder_missing"
-    tail = [int(token) for token in raw_ids[first_pad:]]
-    canonical = [int(token) for token in canonical_ids]
-    head_len = len(canonical) - len(tail)
-    if head_len < 0 or canonical[head_len:] != tail:
-        return "canonicalization_crossed_first_image"
-    if pad_id in canonical[:head_len]:
+    if int(image_pad_token_id) in canonical_keyed:
         return "canonicalization_added_image_placeholder"
+    held = [tuple(committed[start:end]) for start, end in image_key_runs(committed)]
+    shared = 0
+    for (start, end), image in zip(raw_runs, held):
+        if tuple(raw_keyed[start:end]) != image:
+            break
+        shared += 1
+    limit = raw_runs[shared][0] if shared < len(raw_runs) else len(raw_keyed)
+    tail = [int(token) for token in raw_keyed[limit:]]
+    head_len = len(canonical_keyed) - len(tail)
+    if head_len < 0 or [int(t) for t in canonical_keyed[head_len:]] != tail:
+        return "canonicalization_crossed_an_image_not_in_the_session"
+    head = canonical_keyed[:head_len]
+    if [tuple(head[start:end]) for start, end in image_key_runs(head)] != [
+        tuple(raw_keyed[start:end]) for start, end in raw_runs[:shared]
+    ]:
+        return "canonicalization_changed_an_image"
     return None
 
 
-def _vision_gate_text_canonicalization(
+def _vision_gate_canonicalization(
     state: Any,
     *,
-    raw_ids: Sequence[int],
+    raw_keyed: Sequence[int],
     canonicalized: tuple[list[Any], list[int]] | None,
+    splice: Any,
     canon_observability: dict[str, Any],
     template_observability: dict[str, Any],
     receipt: dict[str, Any],
     session_id: str | None,
-) -> tuple[list[Any], list[int]] | None:
-    """Serve or refuse an image request's canonicalized TEXT ids, and fill
-    its ``request_vision_session_restore`` receipt.
+) -> tuple[list[Any], list[int], Any] | None:
+    """Serve or refuse an image request's repaired prompt, and fill its
+    ``request_vision_session_restore`` receipt.
 
+    ``canonicalized`` is what ``_maybe_canonicalize_committed_reasoning``
+    returned in the keyed view. When it is served this returns the messages,
+    the ids the model reads (the keyed rows back to the pad) and the splice
+    positioned for those ids; None leaves the raw encode standing.
     ``canon_observability`` is the copy of ``template_observability`` the
-    committed-reasoning gate wrote into. It is adopted when the canonical
-    encode is served (or the gate stood aside by itself); on a refusal the
-    raw encode's observability stands and only the gate's record is kept,
-    marked not applied. The receipt also says what the session holds and how
-    far the served TEXT ids run along it, so with first_image_pad_position
-    and cached_tokens one request line reads "held N, shares M, restored K".
+    committed-reasoning gate wrote into. It is adopted when the repaired
+    encode is served (or the gate stood aside by itself); on a refusal the raw
+    encode's observability stands and only the gate's record is kept, marked
+    not applied. The receipt also says what the session holds and how far the
+    served ids run along it, so with first_image_pad_position and
+    cached_tokens one request line reads "held N, shares M, restored K".
     """
 
-    refusal = (
-        _vision_text_canonicalization_refusal(
-            raw_ids,
-            canonicalized[1],
-            getattr(_server_vision_spec(state), "image_token_id", None),
-        )
-        if canonicalized is not None
-        else None
-    )
+    from mtplx.vision.splice import unkeyed_ids, vision_bank_key_ids
+
+    committed: Sequence[int] = ()
+    peek = getattr(getattr(state, "sessions", None), "peek", None)
+    if session_id is not None and callable(peek):
+        committed = tuple(getattr(peek(session_id), "committed_token_ids", ()) or ())
+    pad_id = getattr(_server_vision_spec(state), "image_token_id", None)
+    served: tuple[list[Any], list[int], Any] | None = None
+    refusal: str | None = None
+    if canonicalized is not None:
+        messages, keyed = canonicalized
+        refusal = _vision_canonicalization_refusal(raw_keyed, keyed, committed, pad_id)
+        if refusal is None:
+            served_ids = unkeyed_ids(keyed, int(pad_id))
+            served_splice = _vision_splice_for_ids(state, splice, served_ids)
+            # The ids the model reads, keyed with their own positions, must be
+            # exactly the view the repair was judged in.
+            if vision_bank_key_ids(served_ids, served_splice) != [int(t) for t in keyed]:
+                refusal = "image_positions_changed"
+            else:
+                served = (messages, served_ids, served_splice)
     if refusal is None:
         template_observability.clear()
         template_observability.update(canon_observability)
     else:
-        # Guard, fail-closed: the raw encode stands, exactly as it did
-        # before image requests reached this gate.
-        canonicalized = None
+        # Guard, fail-closed: the raw encode stands.
         template_observability["committed_reasoning_canonicalization"] = {
             **(canon_observability.get("committed_reasoning_canonicalization") or {}),
             "applied": False,
             "refused_reason": refusal,
         }
         receipt["refused"] = refusal
-    receipt["canonicalized"] = canonicalized is not None
-    committed: Sequence[int] = ()
-    peek = getattr(getattr(state, "sessions", None), "peek", None)
-    if session_id is not None and callable(peek):
-        committed = tuple(getattr(peek(session_id), "committed_token_ids", ()) or ())
-    served_ids = canonicalized[1] if canonicalized is not None else raw_ids
+    receipt["canonicalized"] = served is not None
+    served_keyed = canonicalized[1] if served is not None else raw_keyed
     receipt["session_committed_tokens"] = len(committed)
-    receipt["committed_prefix_tokens"] = int(_common_prefix_len(served_ids, committed))
+    receipt["committed_prefix_tokens"] = int(_common_prefix_len(served_keyed, committed))
     if not committed and receipt.get("refused") is None:
         receipt["refused"] = "no_committed_stream"
-    return canonicalized
+    return served
 
 
 def _image_content_digest(raw: bytes) -> int:
@@ -5935,6 +6010,30 @@ def _materialize_vision_splice(
     # different thread, and a pending lazy graph must not cross it.
     _mx.eval(embeddings)
 
+    mrope_table, mrope_delta, dense_mrope = _vision_positions(
+        state, spec, expanded_ids, grids
+    )
+    return expanded_ids, VisionSplice(
+        image_pad_token_id=int(spec.image_token_id),
+        embeddings=embeddings,
+        image_digests=tuple(digests),
+        pad_counts=tuple(pad_counts),
+        image_grids=tuple(grids),
+        mrope_table=mrope_table,
+        mrope_delta=mrope_delta,
+        dense_mrope=dense_mrope,
+    )
+
+
+def _vision_positions(
+    state: Any, spec: Any, expanded_ids: list[int], grids: Sequence[tuple[int, int, int]]
+) -> tuple[Any, int, Any]:
+    """How a request's image tokens are positioned for these expanded ids:
+    ``(mrope_table, mrope_delta, dense_mrope)``, all empty for sequential
+    positions."""
+
+    import mlx.core as _mx
+
     # M-RoPE table for families that rope image tokens at grid positions.
     # Pure function of (expanded ids, grids) — recomputed per request, never
     # persisted in cache state. A None result (video pads, layout mismatch)
@@ -5960,7 +6059,9 @@ def _materialize_vision_splice(
     # armed by generation for the whole request (mtplx.dense_mrope). None for
     # every other family, for MTPLX_DENSE_MROPE=0, and (counted in the
     # demotion ledger) when the table cannot be built; the request then keeps
-    # sequential positions. Decided here once: the bank key scheme follows it.
+    # sequential positions. Decided when the request's images are first
+    # materialized: the bank key scheme follows it, and a repaired prompt is
+    # only served under the same scheme (_vision_gate_canonicalization).
     dense_mrope = None
     if spec.mrope_section and spec.model_type != "qwen4_exp":
         from mtplx.dense_mrope import build_request_state
@@ -5973,13 +6074,30 @@ def _materialize_vision_splice(
             spatial_merge_size=int(spec.spatial_merge_size),
             video_token_id=int(spec.video_token_id),
         )
+    return mrope_table, mrope_delta, dense_mrope
 
-    return expanded_ids, VisionSplice(
-        image_pad_token_id=int(spec.image_token_id),
-        embeddings=embeddings,
-        image_digests=tuple(digests),
-        pad_counts=tuple(pad_counts),
-        image_grids=tuple(grids),
+
+def _vision_splice_for_ids(state: Any, splice: Any, expanded_ids: list[int]) -> Any:
+    """The request's splice for the ids it is served: the same rows, digests
+    and grids, positioned for these ids. A repair that changes the text
+    before an image moves the image, and the position table (Flash-Next) or
+    state (dense Qwen) is a function of the ids. Sequential positions have
+    nothing to rebuild."""
+
+    if (
+        getattr(splice, "mrope_table", None) is None
+        and getattr(splice, "dense_mrope", None) is None
+    ):
+        return replace(splice, cursor=0)
+    mrope_table, mrope_delta, dense_mrope = _vision_positions(
+        state,
+        _server_vision_spec(state),
+        list(expanded_ids),
+        list(splice.image_grids or ()),
+    )
+    return replace(
+        splice,
+        cursor=0,
         mrope_table=mrope_table,
         mrope_delta=mrope_delta,
         dense_mrope=dense_mrope,
@@ -14084,7 +14202,12 @@ _COMMITTED_SPLICE_MAX_SPANS = 256
 
 
 def _is_chat_control_token(tokenizer: Any, token_id: int) -> bool:
-    """A chat-template control token (``<|im_end|>``, ``<end_of_turn>``)."""
+    """A chat-template control token (``<|im_end|>``, ``<end_of_turn>``).
+    An image row of a keyed stream is none."""
+    from mtplx.vision.splice import is_image_key
+
+    if is_image_key(token_id):
+        return False
     special = getattr(tokenizer, "all_special_ids", None)
     try:
         if special and int(token_id) in {int(x) for x in special}:
@@ -14125,6 +14248,8 @@ def _splice_committed_token_ids(
     never matched. Returns the ids and a receipt.
     """
 
+    from mtplx.vision.splice import is_image_key
+
     prompt = [int(token) for token in prompt_ids]
     stream = [int(token) for token in committed]
     receipt: dict[str, Any] = {"spans": 0, "tokens_in": 0, "tokens_out": 0}
@@ -14135,6 +14260,10 @@ def _splice_committed_token_ids(
         return prompt, receipt
 
     def _text(ids: Sequence[int]) -> str | None:
+        # An image row of a keyed stream (vision_bank_key_ids) is never text:
+        # the splice copies it only where both sides hold the same row.
+        if any(is_image_key(token) for token in ids):
+            return None
         try:
             text = tokenizer.decode(list(ids))
         except Exception:
@@ -14601,6 +14730,7 @@ def _maybe_canonicalize_committed_reasoning(
     transcript_stats: Any | None = None,
     strip_tool_call_preamble_text: bool = False,
     session_id: str | None = None,
+    prompt_view: Callable[[Sequence[int]], list[int] | None] | None = None,
 ) -> tuple[list[ChatMessage], list[int]] | None:
     """Session-owned committed-think canonicalization (2.8 headline, defect B).
 
@@ -14618,6 +14748,11 @@ def _maybe_canonicalize_committed_reasoning(
     client-rewritten turn (and everything after it) is never mixed with stale
     reasoning. ``session_id`` accepts the endpoint's already-resolved id so
     resolution (and its prefix-scan side effects) runs once per request.
+
+    ``prompt_view`` (image requests, see ``_image_prompt_view``) maps TEXT ids
+    to the content-keyed view an image session commits: every encode here is
+    compared with the committed stream in that view, and the ids returned are
+    in it (``_vision_gate_canonicalization`` decides what is served).
     """
     def _declined(reason: str, **extra: Any) -> None:
         # Every early exit leaves a receipt: a warm turn that re-prefilled
@@ -14673,8 +14808,13 @@ def _maybe_canonicalize_committed_reasoning(
     if not committed:
         _declined("no_committed_stream", session_id=session_id)
         return None
-    cp_raw = _common_prefix_len(prompt_ids, committed)
-    if cp_raw >= min(len(committed), len(prompt_ids)):
+    # A text request compares its own ids; an image request the view.
+    compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
+    if compare_ids is None:
+        _declined("image_keying_failed", session_id=session_id)
+        return None
+    cp_raw = _common_prefix_len(compare_ids, committed)
+    if cp_raw >= min(len(committed), len(compare_ids)):
         # already extends (or is contained in) the committed stream: the
         # healthy no-op, silent by contract (byte-identical resend test)
         return None
@@ -14692,7 +14832,7 @@ def _maybe_canonicalize_committed_reasoning(
     if splice_only_reason is not None:
         outcome["declined"] = splice_only_reason
         spliced = _splice_prompt_onto_committed(
-            state, messages, prompt_ids, committed, cp_raw, outcome
+            state, messages, compare_ids, committed, cp_raw, outcome
         )
         _record(template_observability)
         _record(request_observability)
@@ -14712,7 +14852,9 @@ def _maybe_canonicalize_committed_reasoning(
         _record(request_observability)
         return None
     try:
-        committed_text = state.runtime.tokenizer.decode(list(committed))
+        committed_text = state.runtime.tokenizer.decode(
+            _decodable_ids(state, committed)
+        )
     except Exception:
         return None
     committed_turns = _committed_assistant_turns(
@@ -14721,7 +14863,7 @@ def _maybe_canonicalize_committed_reasoning(
     )
     if not any(interior for interior, _gate, _markup in committed_turns):
         spliced = _splice_prompt_onto_committed(
-            state, messages, prompt_ids, committed, cp_raw, outcome
+            state, messages, compare_ids, committed, cp_raw, outcome
         )
         if spliced is not None:
             _record(template_observability)
@@ -14737,7 +14879,7 @@ def _maybe_canonicalize_committed_reasoning(
 
     if substituted == 0:
         spliced = _splice_prompt_onto_committed(
-            state, messages, prompt_ids, committed, cp_raw, outcome
+            state, messages, compare_ids, committed, cp_raw, outcome
         )
         _record(template_observability)
         _record(request_observability)
@@ -14757,6 +14899,19 @@ def _maybe_canonicalize_committed_reasoning(
         template_observability=canon_observability,
         allow_committed_reasoning=True,
     )
+    if prompt_view is not None:
+        # The substituted encode, in the view the session's stream is held in.
+        canon_ids = prompt_view(canon_ids)
+        if canon_ids is None:
+            # It no longer expands to this request's images (a substituted
+            # body carried an image placeholder): only the splice may serve.
+            outcome["refused_reason"] = "canonical_encode_changed_the_images"
+            spliced = _splice_prompt_onto_committed(
+                state, messages, compare_ids, committed, cp_raw, outcome
+            )
+            _record(template_observability)
+            _record(request_observability)
+            return spliced
     cp_canon = _common_prefix_len(canon_ids, committed)
     outcome["cp_canon"] = int(cp_canon)
     if cp_canon <= cp_raw:
@@ -14771,7 +14926,7 @@ def _maybe_canonicalize_committed_reasoning(
         # model had written. Give both the same splice and keep the canonical
         # one only when it reaches strictly further into the committed stream.
         canon_reach = _committed_splice_reach(state, canon_ids, committed)
-        raw_reach = _committed_splice_reach(state, prompt_ids, committed)
+        raw_reach = _committed_splice_reach(state, compare_ids, committed)
         raw_best = max(int(cp_raw), raw_reach[1] if raw_reach is not None else 0)
         if canon_reach is not None and canon_reach[1] > raw_best:
             spliced_ids, cp_after, receipt = canon_reach
@@ -14785,7 +14940,7 @@ def _maybe_canonicalize_committed_reasoning(
             _record(request_observability)
             return canon_messages, spliced_ids
         spliced = _splice_prompt_onto_committed(
-            state, messages, prompt_ids, committed, cp_raw, outcome
+            state, messages, compare_ids, committed, cp_raw, outcome
         )
         _record(template_observability)
         _record(request_observability)
@@ -26630,7 +26785,7 @@ def _history_ids_for_postcommit(
     ):
         try:
             committed_text = state.runtime.tokenizer.decode(
-                [int(token) for token in committed_stream_ids]
+                _decodable_ids(state, committed_stream_ids)
             )
         except Exception:
             committed_text = ""
@@ -26650,7 +26805,7 @@ def _history_ids_for_postcommit(
             if session_committed_ids:
                 try:
                     session_text = state.runtime.tokenizer.decode(
-                        [int(token) for token in session_committed_ids]
+                        _decodable_ids(state, session_committed_ids)
                     )
                 except Exception:
                     session_text = ""
@@ -37263,40 +37418,80 @@ def create_app(state: ServerState) -> FastAPI:
                 if vision_session_restore is None
                 else dict(template_observability)
             )
-            _canonicalized = _maybe_canonicalize_committed_reasoning(
-                state,
-                messages=messages_for_generation,
-                prompt_ids=prompt_ids,
-                headers=headers,
-                metadata=metadata,
-                request=request,
-                thinking_enabled=thinking_enabled,
-                reasoning_effort=reasoning_effort,
-                tools=prompt_tool_specs,
-                tool_choice=request.tool_choice,
-                tool_prompt_mode=template_tool_prompt_mode,
-                template_observability=_canon_observability,
-                # request_observability is bound later in the prologue on
-                # some branches; the outcome rides template_observability,
-                # which merges into the request stream downstream.
-                transcript_stats=policy.transcript_stats,
-                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
-                session_id=resolved_session_id,
-            )
+            prompt_view = None
+            raw_keyed = None
+            raw_expanded_ids: list[int] = []
             if vision_session_restore is not None:
-                _canonicalized = _vision_gate_text_canonicalization(
+                from mtplx.vision.splice import unkeyed_ids
+                # An image request's images are materialized here, before the
+                # repair instead of after it: its session commits the
+                # content-keyed view of what it was served, so the repair
+                # compares in that view, which needs every image's rows, grid
+                # and position scheme. The same work, earlier, and off the
+                # event loop as below (#487).
+                try:
+                    raw_expanded_ids, vision_splice = await asyncio.to_thread(
+                        _materialize_vision_splice, state, vision_images, prompt_ids
+                    )
+                except ValueError as vision_error:
+                    raise HTTPException(status_code=400, detail=str(vision_error))
+                prompt_view = _image_prompt_view(vision_splice)
+                # The view must describe exactly the ids the materializer
+                # built; any disagreement (a placeholder count the splice
+                # does not know) leaves the raw encode standing, unrepaired.
+                raw_keyed = prompt_view(prompt_ids) if prompt_view is not None else None
+                if raw_keyed is None or unkeyed_ids(
+                    raw_keyed, int(vision_splice.image_pad_token_id)
+                ) != [int(token) for token in raw_expanded_ids]:
+                    prompt_view = None
+            _canonicalized = None
+            if vision_session_restore is None or prompt_view is not None:
+                _canonicalized = _maybe_canonicalize_committed_reasoning(
                     state,
-                    raw_ids=prompt_ids,
-                    canonicalized=_canonicalized,
-                    canon_observability=_canon_observability,
-                    template_observability=template_observability,
-                    receipt=vision_session_restore,
+                    messages=messages_for_generation,
+                    prompt_ids=prompt_ids,
+                    headers=headers,
+                    metadata=metadata,
+                    request=request,
+                    thinking_enabled=thinking_enabled,
+                    reasoning_effort=reasoning_effort,
+                    tools=prompt_tool_specs,
+                    tool_choice=request.tool_choice,
+                    tool_prompt_mode=template_tool_prompt_mode,
+                    template_observability=_canon_observability,
+                    # request_observability is bound later in the prologue on
+                    # some branches; the outcome rides template_observability,
+                    # which merges into the request stream downstream.
+                    transcript_stats=policy.transcript_stats,
+                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     session_id=resolved_session_id,
+                    prompt_view=prompt_view,
                 )
-            if _canonicalized is not None:
+            if vision_session_restore is not None:
+                _served = (
+                    _vision_gate_canonicalization(
+                        state,
+                        raw_keyed=raw_keyed,
+                        canonicalized=_canonicalized,
+                        splice=vision_splice,
+                        canon_observability=_canon_observability,
+                        template_observability=template_observability,
+                        receipt=vision_session_restore,
+                        session_id=resolved_session_id,
+                    )
+                    if prompt_view is not None
+                    else None
+                )
+                if prompt_view is None:
+                    vision_session_restore["refused"] = "image_keying_failed"
+                if _served is not None:
+                    messages_for_generation, prompt_ids, vision_splice = _served
+                else:
+                    prompt_ids = raw_expanded_ids
+            elif _canonicalized is not None:
                 messages_for_generation, prompt_ids = _canonicalized
             ttft_clock.mark("canonicalize")
-        if vision_images:
+        if vision_images and vision_splice is None:
             # Off the event loop (#487): the tower forwards for every image
             # of the prompt ran inside this coroutine, so a history whose
             # screenshots missed the embed cache froze the whole server --
@@ -37310,6 +37505,7 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             except ValueError as vision_error:
                 raise HTTPException(status_code=400, detail=str(vision_error))
+        if vision_images:
             # Alias-boundary receipt for QA gates: positions before the first
             # image pad carry no pixel influence (causal attention), so this
             # is the exact bar a restore must stay under for a different
