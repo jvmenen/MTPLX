@@ -101,9 +101,11 @@ def policy(request, monkeypatch):
     # The toy prompts are far below the production block and match floors.
     monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "8")
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "8")
+    # Room for every checkpoint of these prompts: the tests are about where a
+    # restore may resume, not about which checkpoints the budget keeps.
+    monkeypatch.setenv("MTPLX_GDN_BOUNDARY_MAX", "16")
     for name in (
         "MTPLX_GDN_BOUNDARY_CAPTURE",
-        "MTPLX_GDN_BOUNDARY_MAX",
         "MTPLX_MTP_HISTORY_POLICY",
         "MTPLX_SESSION_NEAR_PREFIX_RESTORE",
         "MTPLX_ONE_COPY",
@@ -143,9 +145,9 @@ def _put(bank, rt, ids, images, state, *, boundaries=None):
     )
 
 
-def _bank_turn(bank, prompt, reply, images, *, policy):
-    """One finished image turn: the prompt with its checkpoints up to the
-    first image plus the anchor at its end, then the prompt plus its answer
+def _bank_turn(bank, prompt, reply, images, *, policy, expect=None):
+    """One finished image turn: the prompt with its checkpoints (outside its
+    images) plus the anchor at its end, then the prompt plus its answer
     (which inherits them, as the generation-final commit does)."""
 
     rt = _runtime()
@@ -155,7 +157,9 @@ def _bank_turn(bank, prompt, reply, images, *, policy):
     _put(bank, rt, prompt, images, state, boundaries=[*state.gdn_boundaries, anchor])
     full = [*prompt, *reply]
     entry = _put(bank, rt, full, images, _prefill(full, images, policy=policy))
-    assert [int(record[0]) for record in entry.gdn_boundaries] == [8, 16, 24, 32, 40, len(prompt)]
+    kept = [int(record[0]) for record in entry.gdn_boundaries]
+    # Every chunk end but 48, inside the screenshot's rows [43, 49).
+    assert kept == (expect or [8, 16, 24, 32, 40, 56, 64, 72, len(prompt)])
     return entry
 
 
@@ -217,3 +221,37 @@ def test_an_edit_before_the_screenshot_resumes_under_the_edit(policy):
     edited[20] = (edited[20] + 1) % 14
     second = [*edited, *_image(), *AFTER, *REPLY, *NEW_TURN]
     _check(bank, second, [(IMAGE_A, PADS)], policy=policy, cached=16)
+
+
+def test_an_edit_after_the_screenshot_resumes_under_the_edit(policy):
+    """The client re-renders something after the screenshot but before the
+    reply (a tool result it trimmed). The restore resumes at the checkpoint
+    under the edit, past the screenshot, instead of re-reading from the
+    screenshot on (fails on the old code: 40, the checkpoint before it)."""
+
+    bank = SessionBank()
+    _bank_turn(bank, FIRST_PROMPT, REPLY, [(IMAGE_A, PADS)], policy=policy)
+    edited = list(AFTER)
+    edited[10] = (edited[10] + 1) % 14  # position 43 + 6 + 10 = 59
+    second = [*BEFORE, *_image(), *edited, *REPLY, *NEW_TURN]
+    _check(bank, second, [(IMAGE_A, PADS)], policy=policy, cached=56)
+
+
+def test_an_edit_between_two_screenshots_resumes_past_the_first(policy):
+    """Two screenshots: an edit in the text between them resumes past the
+    first one, under the edit, and the second one is fed from the splice."""
+
+    bank = SessionBank()
+    between = AFTER[:12]
+    prompt = [*BEFORE, *_image(), *between, *_image(), *AFTER[12:]]
+    images = [(IMAGE_A, PADS), (IMAGE_B, PADS)]
+    # Images at [43, 49) and [61, 67): chunk ends 48 and 64 fall inside; the
+    # last forward of the 79-token prompt ends at 78.
+    _bank_turn(
+        bank, prompt, REPLY, images, policy=policy,
+        expect=[8, 16, 24, 32, 40, 56, 72, 78, len(prompt)],
+    )
+    edited = list(between)
+    edited[9] = (edited[9] + 1) % 14  # position 43 + 6 + 9 = 58
+    second = [*BEFORE, *_image(), *edited, *_image(), *AFTER[12:], *REPLY, *NEW_TURN]
+    _check(bank, second, images, policy=policy, cached=56)

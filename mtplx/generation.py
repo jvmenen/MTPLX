@@ -4919,7 +4919,7 @@ def _restore_near_prefix_prompt_state(
     cache_factory: Callable[[], Any] | None = None,
     stable_prefix_len: int | None = None,
     match_ids: Sequence[int] | None = None,
-    checkpoint_ceiling: int | None = None,
+    checkpoint_image_spans: Sequence[tuple[int, int]] = (),
     vision_splice: Any | None = None,
     session_id: str | None = None,
     reread: Callable[[int, str], dict[str, Any]] | None = None,
@@ -4927,9 +4927,8 @@ def _restore_near_prefix_prompt_state(
     """match_ids: the prompt as the bank knows it, when that differs from the
     model ids: an image prompt's content-keyed view (vision_bank_key_ids).
 
-    checkpoint_ceiling: the last position the suffix prefill may keep a
-    recurrent checkpoint at (an image prompt's first image, see
-    ``_checkpoint_sink``).
+    checkpoint_image_spans: an image prompt's image spans; the suffix prefill
+    keeps no recurrent checkpoint inside one (see ``_checkpoint_sink``).
 
     session_id: the requesting conversation. Another conversation's lease is
     served as a copy of the shared prefix (session_bank._lease_owned_by).
@@ -5336,8 +5335,8 @@ def _restore_near_prefix_prompt_state(
                 )
             # This lane has always shaped an image prompt's suffix prefill like
             # a text one's (the ladder), so its sink keeps cutting forwards;
-            # the ceiling keeps an image prompt's checkpoints at or before its
-            # first image, as the cold and exact lanes do.
+            # an image prompt keeps no checkpoint inside an image, as in the
+            # cold and exact lanes.
             suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
                 _checkpoint_sink(
                     inherited_boundaries,
@@ -5345,7 +5344,7 @@ def _restore_near_prefix_prompt_state(
                     prompt_len=len(prompt_ids),
                     restore_point=restore_point,
                     stable_prefix_len=stable_prefix_len,
-                    ceiling=checkpoint_ceiling,
+                    image_spans=checkpoint_image_spans,
                 )
                 if _gdn_boundary_capture_enabled()
                 else None
@@ -5495,11 +5494,13 @@ def _checkpoint_sink(
     restore_point: int | None = None,
     stable_prefix_len: int | None = None,
     ceiling: int | None = None,
+    image_spans: Sequence[tuple[int, int]] = (),
     cuts_forwards: bool = True,
 ) -> CheckpointSink:
     """The checkpoint list one prefill fills, with everything its retention
     needs known up front: the prompt end, the restore point, the stable edge,
-    the ceiling and the session bank's byte budget."""
+    the ceiling, an image prompt's image spans and the session bank's byte
+    budget."""
 
     sink = CheckpointSink(
         records or (),
@@ -5512,6 +5513,9 @@ def _checkpoint_sink(
                 None if stable_prefix_len is None else int(stable_prefix_len)
             ),
             ceiling=None if ceiling is None else int(ceiling),
+            image_spans=tuple(
+                (int(start), int(end)) for start, end in (image_spans or ())
+            ),
         ),
         cuts_forwards=cuts_forwards,
     )
@@ -6419,11 +6423,15 @@ def restore_or_prefill_prompt_state(
         # KV. Full-span matches (same pixels -> same surrogates through the
         # span) stay fully warm. 2026-08-07 pillar alias-leg regression.
         vision_restore_spans = vision_image_spans(bank_key_ids, vision_splice)
-    # The first image-pad position: an image prompt keeps recurrent
-    # checkpoints only at or before it, where the prefix is text. Without a
-    # known span there is no safe ceiling, so such a prompt keeps none.
+    # An image prompt keeps recurrent checkpoints anywhere but inside its
+    # images: a restore resumes at a whole image's edge, never in its rows
+    # (vision.splice.inside_image). Without known spans nothing says where
+    # the images are, so such a prompt keeps none.
+    checkpoint_image_spans: tuple[tuple[int, int], ...] = tuple(
+        (int(start), int(end)) for start, end in (vision_restore_spans or ())
+    )
     first_image_start: int | None = (
-        int(vision_restore_spans[0][0]) if vision_restore_spans else None
+        checkpoint_image_spans[0][0] if checkpoint_image_spans else None
     )
     keep_checkpoints = (
         session_bank is not None
@@ -6737,7 +6745,7 @@ def restore_or_prefill_prompt_state(
                 chunk_callback=prefill_callback,
                 chunk_started_s=prefill_started_s,
                 match_ids=bank_key_ids,
-                checkpoint_ceiling=first_image_start,
+                checkpoint_image_spans=checkpoint_image_spans,
                 vision_splice=vision_splice,
                 session_id=session_id,
                 cache_factory=restore_cache_factory,
@@ -6878,9 +6886,9 @@ def restore_or_prefill_prompt_state(
                     ),
                 )
                 # An image prompt's sink records only where the plain chunk
-                # grid already ends a forward, and nothing past its first
-                # image: its suffix prefill stays exactly what it was when it
-                # kept none.
+                # grid already ends a forward, and nothing inside an image:
+                # its suffix prefill stays exactly what it was when it kept
+                # none.
                 suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
                     _checkpoint_sink(
                         inherited_boundaries,
@@ -6888,7 +6896,7 @@ def restore_or_prefill_prompt_state(
                         prompt_len=len(prompt_ids),
                         restore_point=restored.entry.prefix_len,
                         stable_prefix_len=stable_prefix_len,
-                        ceiling=first_image_start,
+                        image_spans=checkpoint_image_spans,
                         cuts_forwards=vision_splice is None,
                     )
                     if keep_checkpoints
@@ -6972,7 +6980,7 @@ def restore_or_prefill_prompt_state(
             cache_factory=restore_cache_factory,
             stable_prefix_len=stable_prefix_len,
             match_ids=bank_key_ids,
-            checkpoint_ceiling=first_image_start,
+            checkpoint_image_spans=checkpoint_image_spans,
             vision_splice=vision_splice,
             session_id=session_id,
             reread=_reread,
@@ -6996,9 +7004,9 @@ def restore_or_prefill_prompt_state(
     # kvcache-v2: capture interior recurrent boundaries during the cold prefill
     # whenever the result will be banked — they are what make sub-prefix
     # restores on hybrid models exact instead of approximate. An image
-    # prompt keeps the ones at or before its first image (the text-only
-    # prefix a later turn can restore to when something after the image
-    # changes), recorded only where the plain chunk grid ends a forward so
+    # prompt keeps the ones outside its images (a later turn that changes
+    # something after an image resumes under the change, past the images it
+    # shares), recorded only where the plain chunk grid ends a forward so
     # its prefill is unchanged; it kept none until 2026-09-30, so every
     # screenshot turn that missed the cache re-read the whole conversation.
     gdn_boundary_sink: list[tuple[int, Any]] | None = (
@@ -7007,7 +7015,7 @@ def restore_or_prefill_prompt_state(
             session_bank=session_bank,
             prompt_len=len(prompt_ids),
             stable_prefix_len=stable_prefix_len,
-            ceiling=first_image_start,
+            image_spans=checkpoint_image_spans,
             cuts_forwards=vision_splice is None,
         )
         if keep_checkpoints

@@ -322,6 +322,33 @@ def test_a_ceiling_keeps_what_is_before_it_and_snapshots_nothing_past_it(monkeyp
     assert generation._sink_cuts_forwards([])
 
 
+def test_image_spans_keep_checkpoints_out_of_images_and_snapshot_none_there(monkeypatch):
+    """An image prompt keeps checkpoints before, between and after its
+    images, never inside one: a restore there would resume with part of an
+    image's rows. The pre-image anchor stays protected when the budget
+    thins the rest."""
+
+    snapshots: list[int] = []
+    real = generation.snapshot_untrimmable_cache
+
+    def counting(cache):
+        snapshots.append(int(cache[0].offset))
+        return real(cache)
+
+    monkeypatch.setattr(generation, "snapshot_untrimmable_cache", counting)
+    plan = AnchorPlan(record_count=8, prompt_end=95, image_spans=((43, 49), (61, 67)))
+    assert plan.admits(43) and plan.admits(49) and plan.admits(61) and plan.admits(67)
+    assert not any(plan.admits(p) for p in (44, 48, 62, 66))
+    sink = CheckpointSink(plan=plan, cuts_forwards=False)
+    for position in range(8, 96, 8):
+        _capture_gdn_boundary(sink, position, [_KV(position), _Recurrent(position)])
+    # 48 and 64 are inside the images; nothing was snapshotted there.
+    assert snapshots == [8, 16, 24, 32, 40, 56, 72, 80, 88]
+    # Nine captures for a budget of eight: the prompt-end anchor (24), the
+    # pre-image anchor (40) and the newest (88) are protected; 16 goes.
+    assert _positions(sink) == [8, 24, 32, 40, 56, 72, 80, 88]
+
+
 def test_the_receipt_reports_what_is_kept():
     records = [_record(p) for p in (2048, 8192, 16384)]
     report = checkpoint_coverage(records, budget_bytes=5 * ONE, first_image_start=20000)
