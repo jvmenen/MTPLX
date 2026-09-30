@@ -4989,7 +4989,8 @@ public final class MTPLXBackendStore: ObservableObject {
         // `in_flight[].last_progress`. During generation, accepting that
         // completed `latest` would make the hero gauge alternate between
         // the live current TPS and the previous/peak-like completed TPS.
-        if shouldAcceptSnapshotLatest(snapshot), let value = headlineDecodeTPS(from: latest) {
+        if shouldAcceptSnapshotLatest(snapshot),
+           let value = headlineDecodeTPS(from: latest, live: !snapshot.inFlight.isEmpty) {
             updateHeadlineDecode(value: value, isCompletion: snapshot.inFlight.isEmpty)
         }
         recordAIMEBackendMetrics(
@@ -5042,7 +5043,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 let mergedLatest = MetricsLatest(values: merged)
                 latest = mergedLatest
                 updateSmoothedMetrics(mergedLatest)
-                if let value = headlineDecodeTPS(from: mergedLatest) {
+                if let value = headlineDecodeTPS(from: mergedLatest, live: true) {
                     updateHeadlineDecode(value: value, isCompletion: false)
                 }
                 if Self.hasDecodeProgress(progress) {
@@ -5073,7 +5074,7 @@ public final class MTPLXBackendStore: ObservableObject {
             // request has already finished.
             updateSmoothedMetrics(envelope, snapToFinal: true)
             smoothedFrozen = true
-            if let value = headlineDecodeTPS(from: envelope) {
+            if let value = headlineDecodeTPS(from: envelope, live: false) {
                 updateHeadlineDecode(value: value, isCompletion: true)
             }
             prefillStatus = nil
@@ -5189,16 +5190,36 @@ public final class MTPLXBackendStore: ObservableObject {
     /// Headline decode rate for the hero gauge.
     ///
     /// The center gauge means "current decode TPS", not best, rolling,
-    /// display-window, or cumulative average. Those other values have
-    /// their own UI homes. Keeping this source to `decode_tok_s` prevents
-    /// the gauge from bouncing between the current sample and an earlier
-    /// high/peak-like value.
-    private func headlineDecodeTPS(from latest: MetricsLatest?) -> Double? {
+    /// display-window, or cumulative average. While a request streams that
+    /// is the rate of the phase the answer is in (reasoning, answer, tool
+    /// call): the server's `phase_tok_s`. The cumulative `decode_tok_s`
+    /// divided every token by the time since the first one, so a slow
+    /// reasoning phase held the gauge near 40 through answers decoding at
+    /// 57 to 79 (2026-09-29). A phase-aware frame without a phase rate yet
+    /// (the first second of decode) leaves the gauge where it is rather
+    /// than showing the spiky early cumulative figure. A completed request
+    /// is held at its receipt's cumulative `decode_tok_s`, the honest
+    /// whole-request summary.
+    private func headlineDecodeTPS(from latest: MetricsLatest?, live: Bool) -> Double? {
         guard let latest else { return nil }
-        if let raw = latest.values["decode_tok_s"]?.doubleValue, raw.isFinite, raw > 0 {
-            return raw
+        return Self.headlineDecodeTPS(values: latest.values, live: live)
+    }
+
+    nonisolated static func headlineDecodeTPS(
+        values: [String: JSONValue],
+        live: Bool
+    ) -> Double? {
+        func positive(_ key: String) -> Double? {
+            guard let value = values[key]?.doubleValue, value.isFinite, value > 0 else {
+                return nil
+            }
+            return value
         }
-        return nil
+        if live {
+            if let phase = positive("phase_tok_s") { return phase }
+            if values["decode_phase"] != nil { return nil }
+        }
+        return positive("decode_tok_s")
     }
 
     /// Push a new headline reading through the lifecycle state machine.
