@@ -93,6 +93,7 @@ This directory belongs to the fork [jvmenen/MTPLX](https://github.com/jvmenen/MT
 | 2026-09-30 | [qwen38](2026-09-30-qwen38.md) | Qwen3.8-27B dense: baseline, variants (draft temp, FR-Spec, chunk size, KV q8, verify-core), own findings list [VONDSTEN-QWEN38](VONDSTEN-QWEN38.md); plus finding 90 (fused MTP experts in the loader) |
 | 2026-09-30 | [building-mtp-packs](2026-09-30-building-mtp-packs.md) | How-to (English): building MTPLX packs with a BF16 MTP head, fused MTP experts, keeping an existing body and swapping only the head, measuring, pitfalls |
 | 2026-09-30 | [feature-gaps](2026-09-30-feature-gaps.md) | Features built for one model or pack but missing for another, ranked by effort against expected gain, with a suggested PR order |
+| 2026-09-30 | [kv-quantization](2026-09-30-kv-quantization.md) | KV quantization (q8/q4) at 20K and 60K on Qwen3.8-27B and Qwen3.6: slower everywhere (-25% to -72%), bank not smaller (snapshots store bf16); cause is a mask check that forces full dequantization, fix on `perf/kvq8-compiled-verify` recovers about half; recommendation KV off |
 | 2026-09-27 | [chat-decode-en-overhead](2026-09-27-chat-decode-en-overhead.md) | Findings 60 and 52, repeated with a 100 W charger: the difference in greedy decoding against 2.11.3 is text luck, not slower computation. Decision: the three upstream changes (correctness fix e36f5ffb, prefill speedups 9a86dd6c and 4314638a) stay; only the cost of the gate helper still to measure (`gatekosten.zsh`). Finding 52: the gap grows with conversation history (2.6 to 52 ms); phase breakdown failed due to a clock mismatch between client and hook, hook version 2 built and tested offline (`meet52b.zsh`) |
 
 ## Branches
@@ -132,4 +133,5 @@ All branches except `feat/faster-prompt-scoring` live in the fork on GitHub; loc
 | `pr/gemma4-probe` | PR branch for `fix/gemma4-probe-vocab` (finding 42): Gemma 4 check without `get_vocab()` | Pushed; PR [#541](https://github.com/youssofal/MTPLX/pull/541) submitted |
 | `pr/chat-scoped-segments` | PR branch for `perf/chat-scoped-segments` (finding 50): encoding scoped chat per turn | Pushed; PR [#542](https://github.com/youssofal/MTPLX/pull/542) submitted (depends on #533) |
 | `pr/first-token-logprobs-gemma4` | PR branch for `feat/first-token-logprobs-gemma4`: first-token logprobs on Gemma 4 | Pushed; PR [#543](https://github.com/youssofal/MTPLX/pull/543) submitted (depends on #530) |
+| `perf/kvq8-compiled-verify` | Quantized paged adapter serves its own tail mask (`MTPLX_KV_QUANT_TAILMASK_ELIDE`, off by default) | Pushed (6ce1fad4), measured on the real server (30 Sep, [kv-quantization](2026-09-30-kv-quantization.md)); PR only after Jeroen's approval |
 | `onderzoek` | This documentation | Pushed, ongoing |
