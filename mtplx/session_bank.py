@@ -32,6 +32,7 @@ from .cache_state import (
     snapshot_cache_lazy_hybrid,
 )
 from .cache_bank.codec import ColdEncodeInterrupted
+from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
 from .runtime_options import block_prefix_restore_enabled
 
@@ -918,9 +919,12 @@ class SessionBank:
         per_session_max_bytes: int = DEFAULT_PER_SESSION_MAX_BYTES,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
         cold_tier: Any | None = None,
+        checkpoint_budget_bytes: int | None = None,
     ) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be >= 1")
+        if checkpoint_budget_bytes is not None and checkpoint_budget_bytes < 0:
+            raise ValueError("checkpoint_budget_bytes must be >= 0")
         if max_bytes < 1:
             raise ValueError("max_bytes must be >= 1")
         if per_session_max_bytes < 1:
@@ -930,6 +934,15 @@ class SessionBank:
         self.max_entries = int(max_entries)
         self.max_bytes = int(max_bytes)
         self.per_session_max_bytes = int(per_session_max_bytes)
+        # Bytes of recurrent checkpoints (GDN boundary records) one entry's
+        # set may hold: every prefill's checkpoint list, every inherited
+        # set and every stored entry keeps its anchors within it
+        # (mtplx.checkpoint_anchors). None keeps what the prefill memory plan
+        # has always priced, MTPLX_GDN_BOUNDARY_MAX (8) checkpoints of the
+        # model at hand; the engine sets it from the memory budget.
+        self.checkpoint_budget_bytes: int | None = (
+            None if checkpoint_budget_bytes is None else int(checkpoint_budget_bytes)
+        )
         self.idle_ttl_s = float(idle_ttl_s)
         self._entries: dict[tuple[int, ...], SessionBankEntry] = {}
         self.last_miss_reason: str | None = None
@@ -1224,6 +1237,19 @@ class SessionBank:
                     inherited_loader = getattr(
                         prefix_donor, "gdn_boundary_loader", None
                     )
+        if normalized_boundaries:
+            # Every stored set keeps its anchors within the checkpoint budget,
+            # whatever produced it (a prefill, an inheriting commit, a set
+            # read back from disk, the batched lane's plain list). A set
+            # already within it is kept whole.
+            normalized_boundaries = retain_checkpoints(
+                normalized_boundaries,
+                AnchorPlan(
+                    budget_bytes=self.checkpoint_budget_bytes,
+                    prompt_end=len(tokens) - 1,
+                    tail_backoff=default_tail_backoff(),
+                ),
+            )
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
@@ -2466,6 +2492,7 @@ class SessionBank:
             # proof that entries which used to be refused wholesale are now
             # being admitted with a reduced boundary set.
             "shed_gdn_boundaries_to_fit": bool(self.shed_gdn_boundaries_to_fit),
+            "checkpoint_budget_bytes": self.checkpoint_budget_bytes,
             "boundary_shed_puts": int(self.boundary_shed_puts),
             "boundary_shed_records": int(self.boundary_shed_records),
             "per_session_max_bytes": self.per_session_max_bytes,
@@ -3239,8 +3266,8 @@ class SessionBank:
 
         Records are dropped FURTHEST-FROM-THE-TAIL first, and the newest record
         is never dropped while any is kept. That is deliberately not
-        ``generation._thin_gdn_boundary_records``'s geometric policy, which
-        preserves a deep-divergence anchor: under byte pressure the anchor is
+        ``checkpoint_anchors.retain_checkpoints``'s policy, which preserves
+        deep-divergence anchors (the grid): under byte pressure the anchor is
         the first thing that has to go, because agent divergence concentrates
         near the prompt tail (the same reason MTPLX_GDN_BOUNDARY_TAIL_INTERVAL
         gives the final chunk a finer grid). The trade is explicit: a

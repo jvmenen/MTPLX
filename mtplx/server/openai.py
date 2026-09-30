@@ -28337,7 +28337,11 @@ def _build_mtp_batch_session_hooks(
                     restore_point=restore_point,
                     boundary_hidden=hidden,
                     inherited_boundaries=_inherited_gdn_boundaries(
-                        entry, restore_point
+                        entry,
+                        restore_point,
+                        budget_bytes=getattr(
+                            session_bank, "checkpoint_budget_bytes", None
+                        ),
                     ),
                 )
             return None
