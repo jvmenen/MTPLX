@@ -1542,6 +1542,8 @@ def _draft_head_identity(runtime: Any) -> str | None:
     if draft_head is None:
         return None
     h = hashlib.sha256()
+    # An FR-Spec wrapper on the configured route: identify its pruned head.
+    draft_head = getattr(draft_head, "head", draft_head)
     for name in ("weight", "scales", "biases", "bias"):
         if hasattr(draft_head, name):
             h.update(_array_bytes(getattr(draft_head, name)))
