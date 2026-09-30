@@ -616,7 +616,9 @@ def _lease_advance(entry: Any) -> int | None:
     only copy, and it is ahead of its own tokens. A restore rewinds it: the
     attention layers trim, and the recurrent layers take the anchor recorded
     at the entry's own length. None means the cache is behind the entry
-    (something trimmed it), so the lease can serve nothing.
+    (something trimmed it) or no longer says where it is (a verifier's
+    tensor-offset adapter left in it by a round that raised), so the lease
+    can serve nothing.
     """
 
     recorded = getattr(entry, "lease_kv_offset", None)
@@ -625,7 +627,10 @@ def _lease_advance(entry: Any) -> int | None:
         return 0
     current = _cache_kv_offset(cache)
     if current is None:
-        return 0
+        # The offset was readable when the lease was taken. Reading its
+        # rows as the entry's own would resume a recurrent state the answer
+        # already advanced.
+        return None
     if current < int(recorded):
         return None
     return current - int(recorded)
@@ -2341,21 +2346,21 @@ class SessionBank:
         lease_views = None
         if take_lease:
             cache = entry.cache_ref
-            # Trim depth is the seed-forward contract, decided by the lookup
-            # shape. A lookup that EXTENDS the entry is served by the exact
-            # suffix-forward lane, which forwards prompt[prefix_len:] with NO
-            # seed re-forward — the cache must land at the FULL boundary or
-            # the first suffix token overwrites the final prefix position
-            # (integer-exact receipt: warm lease restores decoded different
-            # bytes than cold, F39 lane 2026-08-16). An exact full-prefix
-            # lookup keeps the pre-last-token trim: that consumer contract
-            # (BatchGenerator insert / stored-boundary-logits decode start)
-            # owns the final-token re-forward.
-            target = (
-                entry.prefix_len
-                if len(token_ids) > entry.prefix_len
-                else entry.prefix_len - 1
-            )
+            # The lease lands at the FULL boundary, whatever the lookup's
+            # shape: the state a clone or a copy of this entry lands at. A
+            # lookup that extends the entry forwards prompt[prefix_len:]
+            # with no seed re-forward, so a shorter cache lets the first
+            # suffix token overwrite the final prefix position (warm lease
+            # restores decoded different bytes than cold, F39 lane
+            # 2026-08-16). An exact full-prefix lookup starts decoding from
+            # the entry's stored logits (the MTP decode start, the Gemma 4
+            # lane, the benchmark runner), so a cache trimmed to the
+            # pre-last-token slot wrote the first answer token over the last
+            # prompt token: a lease resumed an identical prompt with other
+            # tokens than a clone did (2026-09-30). The batched AR lane
+            # never inserts a full-prefix cache and looks before it takes
+            # one (server _prepare_session_bank_restore).
+            target = entry.prefix_len
             # Validate everything before the lease is taken: a restore that
             # fails part-way must leave the entry, and the only live copy of
             # the conversation it holds, exactly as it was.
@@ -2375,10 +2380,7 @@ class SessionBank:
                 return cold_fallback()
             entry.cache_ref = None
             self._release_shared_leases(cache, keep=entry)
-            if len(token_ids) > entry.prefix_len:
-                trimmed = _trim_cache_ref_to_tokens(cache, entry.prefix_len)
-            else:
-                trimmed = _trim_cache_ref_to_prefix(cache, entry.prefix_len)
+            trimmed = _trim_cache_ref_to_tokens(cache, target)
             if not trimmed:
                 raise RuntimeError(
                     "session bank lease trim failed after validation "

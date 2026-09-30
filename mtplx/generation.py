@@ -105,6 +105,7 @@ from .graphbank import (
 )
 from .native_mlp import set_native_mlp_context
 from .one_copy import (
+    hand_back_on_raise,
     held_qsa_rows,
     lease_return as one_copy_lease_return,
     one_copy_runtime,
@@ -10850,7 +10851,16 @@ def generate_mtpk(
         and session_bank is not None
         and session_id is not None
         and prompt_ids
-        and int(prompt_state.suffix_tokens) > 0
+        and (
+            int(prompt_state.suffix_tokens) > 0
+            # An identical prompt took its conversation's only copy as a
+            # lease: banked again before the answer decodes into it, so a
+            # cancelled answer leaves the conversation where it was.
+            or (
+                one_copy_runtime(rt)
+                and str(prompt_state.restore_mode) == "reference_lease"
+            )
+        )
     ):
         commit_started = time.perf_counter()
         commit_snapshot_done = commit_started
@@ -11068,6 +11078,16 @@ def generate_mtpk(
         )
         else None
     )
+    if (
+        token_callback is not None
+        and compiled_verify_bank is not None
+        and one_copy_runtime(rt)
+    ):
+        # A cancelled answer raises out of the callback; the prompt's lease
+        # must not keep the verifier's adapters (one_copy.hand_back_on_raise).
+        token_callback = hand_back_on_raise(
+            token_callback, compiled_verify_bank, lambda: cache
+        )
     _dense_would_compile = (
         _compiled_verify_mode != "off" and _generic_compiled_verify
     ) or verify_strategy in {"graphbank", "graphbank_capture_commit"}

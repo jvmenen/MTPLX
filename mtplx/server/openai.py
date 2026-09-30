@@ -4485,6 +4485,18 @@ class _BatchedARGenerationService:
     def _prepare_session_bank_restore(self, job: _BatchedARJob) -> bool:
         if job.session_bank is None or len(job.prompt_ids) < 2:
             return False
+        # BatchGenerator cannot insert a full-prefix cache (below). Look
+        # before restoring: a one-copy lease taken only to be refused would
+        # drop the conversation's only copy.
+        longest = getattr(job.session_bank, "longest_prefix", None)
+        covering = longest(job.prompt_ids) if callable(longest) else None
+        if (
+            covering is not None
+            and getattr(covering, "live_ref_only", False)
+            and int(covering.prefix_len) >= len(job.prompt_ids)
+        ):
+            job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+            return False
         started = time.perf_counter()
         try:
             restored = job.session_bank.restore(

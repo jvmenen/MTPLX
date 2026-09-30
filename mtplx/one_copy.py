@@ -274,6 +274,42 @@ def lease_return(bank, runtime, *, restore_mode, cache, mtp_history_cache, token
     )
 
 
+def hand_back_on_raise(callback, bank, live_cache):
+    """``callback`` that hands the verifier's buffers back before a raise leaves.
+
+    A client that cancels an answer raises out of the token callback. The
+    prompt's lease is then the conversation's only copy, and the verifier's
+    bank still holds it as tensor-offset adapters whose offset the session
+    bank cannot read: the restore took the answer's rows for the prompt's own
+    and resumed a recurrent state the answer had already advanced (a retry
+    decoded other tokens than an uninterrupted turn, 2026-09-30). Demoting
+    here, as the end of every answer does (whole buffers, no compaction),
+    leaves stock containers that say how far the answer ran, and the restore
+    rewinds them to the prompt's anchor. The callback runs between rounds,
+    when every buffer is whole; a raise inside a round leaves the adapters,
+    and the bank refuses a lease it cannot read (``session_bank._lease_advance``).
+    ``live_cache`` returns the trunk cache the answer is decoding into.
+    """
+
+    def emit(tokens):
+        try:
+            callback(tokens)
+        except BaseException:
+            try:
+                bank.demote(live_cache(), compact=False, keep_capacity=True)
+            except Exception as exc:  # the raise below is the caller's news
+                import sys
+
+                print(
+                    f"[mtplx] one-copy hand-back on a cancelled answer failed ({exc}); "
+                    "its lease will not be served",
+                    file=sys.stderr,
+                )
+            raise
+
+    return emit
+
+
 def prefill_rows_scope(rows: int):
     """``qwen4_exp.qsa_rows_target(rows)``, or a no-op for 0 (no model import)."""
 

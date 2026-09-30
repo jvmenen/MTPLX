@@ -124,7 +124,11 @@ def test_session_bank_oversized_prompt_prefix_can_use_live_reference_lease():
     assert restored.restore_mode == "reference_lease"
     assert restored.cache is cache
     assert restored.mtp_history_cache is mtp_cache
-    assert cache[0].offset == 9
+    # The trunk lands at the entry's end, where a clone lands: an identical
+    # prompt decodes from the stored logits, so a cache one slot short
+    # wrote its first answer token over its last prompt token. The draft
+    # history keeps its own convention, one row behind the prefix.
+    assert cache[0].offset == 10
     assert mtp_cache[0].offset == 9
     assert entry.cache_ref is None
     assert entry.mtp_history_cache_ref is None

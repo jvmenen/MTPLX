@@ -300,7 +300,10 @@ def test_an_advanced_prompt_lease_restores_through_its_anchor(monkeypatch, exten
     restored = bank.restore(RUNTIME, lookup, mode="reference", session_id="s")
     assert restored is not None and restored.restore_mode == "reference_lease"
     assert restored.cache is trunk and entry.cache_ref is None
-    assert trunk[1].offset == (40 if extends else 39)
+    # Both lookup shapes land at the entry's end, where a clone lands: an
+    # identical prompt decodes from the entry's stored logits
+    # (tests/test_one_copy_cancelled_answer.py).
+    assert trunk[1].offset == 40
     for state, bits in zip((layer.cache if not isinstance(layer, QSACache) else None for layer in trunk), anchor_bits):
         if bits is None:
             continue
