@@ -325,3 +325,25 @@ def serial_read(
     if distribution is None:
         return -1, None
     return host_pick(distribution, uniform), distribution
+
+
+# Chain-lane interface shared with ``stock_draft_chain`` (the decode loop calls
+# whichever module claimed the request through these four names).
+def eval_arrays(support: tuple[Any, Any, Any]) -> tuple[Any, Any, Any]:
+    return tuple(support)
+
+
+def predict(plan: SampledChainPlan, support: tuple[Any, Any, Any], uniform: Any) -> Any:
+    return device_predict(plan, *support, uniform)
+
+
+def host_read(
+    plan: SampledChainPlan, support: tuple[Any, Any, Any]
+) -> SparseDistribution | None:
+    cand_local, cand_vals, cand_probs = support
+    return host_distribution(
+        plan,
+        np.asarray(cand_local),
+        np.asarray(cand_vals),
+        np.asarray(cand_probs),
+    )

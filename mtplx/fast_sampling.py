@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import numpy as np
@@ -376,6 +376,19 @@ def bind_batched_top_k_distributions(
     return partial(_fixed_batched_top_k_distributions, **common)
 
 
+class SerialSupportDevice(NamedTuple):
+    """Lazy device half of the serial support read (see below)."""
+
+    scaled: mx.array
+    cand_idx: mx.array
+    cand_vals: mx.array
+    cand_probs: mx.array | None
+    k: int
+    m: int
+    vocab_size: int
+    top_p_active: bool
+
+
 def _device_serial_support_arrays(
     logits: mx.array,
     config: SamplerConfig,
@@ -396,7 +409,22 @@ def _device_serial_support_arrays(
     Returns (token_rows [N,k] int64, prob_rows [N,k] float64 with top-p
     dropped entries exactly zero, vocab_size). Non-finite logits surface as
     non-finite prob rows for the caller's fallback.
+
+    Split into :func:`serial_support_device_arrays` (lazy MLX candidate
+    arrays) and :func:`serial_support_host_rows` (one eval plus the host
+    arithmetic) so a draft chain can queue the device half without a sync;
+    this wrapper is exactly the two halves back to back.
     """
+    return serial_support_host_rows(
+        serial_support_device_arrays(logits, config), config
+    )
+
+
+def serial_support_device_arrays(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> SerialSupportDevice:
+    """Lazy device half of :func:`_device_serial_support_arrays` (no eval)."""
     rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
     vocab_size = int(rows.shape[-1])
     k = min(int(config.top_k), vocab_size)
@@ -415,9 +443,41 @@ def _device_serial_support_arrays(
     cand_idx = mx.argpartition(-scaled, kth=m - 1, axis=-1)[:, :m]
     cand_vals = mx.take_along_axis(scaled, cand_idx, axis=-1)
     top_p_active = 0.0 < float(config.top_p) < 1.0
+    cand_probs = None
     if top_p_active:
         log_total = mx.logsumexp(scaled, axis=-1, keepdims=True)
         cand_probs = mx.exp(cand_vals - log_total)
+    return SerialSupportDevice(
+        scaled=scaled,
+        cand_idx=cand_idx,
+        cand_vals=cand_vals,
+        cand_probs=cand_probs,
+        k=k,
+        m=m,
+        vocab_size=vocab_size,
+        top_p_active=top_p_active,
+    )
+
+
+def serial_support_host_rows(
+    support: SerialSupportDevice,
+    config: SamplerConfig,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Host half of :func:`_device_serial_support_arrays`.
+
+    Reads the candidate arrays (they may already be evaluated, for example by
+    a pipelined draft chain) and runs the deterministic selection, the top-p
+    filter and the cutoff-tie spill fallback exactly as the serial lane does.
+    """
+    scaled = support.scaled
+    cand_idx = support.cand_idx
+    cand_vals = support.cand_vals
+    cand_probs = support.cand_probs
+    k = support.k
+    m = support.m
+    vocab_size = support.vocab_size
+    top_p_active = support.top_p_active
+    if top_p_active:
         mx.eval(cand_idx, cand_vals, cand_probs)
         cand_prob_rows = np.asarray(cand_probs, dtype=np.float64)
     else:

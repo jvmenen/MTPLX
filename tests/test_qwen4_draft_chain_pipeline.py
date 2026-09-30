@@ -164,11 +164,12 @@ def test_the_loop_hands_each_depth_over_and_reads_depth_by_depth():
     start = GENERATION_TEXT.index("_sc_pipeline = _qwen4_sampled_chain.pipeline_enabled()")
     body = GENERATION_TEXT[start : GENERATION_TEXT.index("_sampled_chain_rounds += 1", start)]
     # Each depth is scheduled inside the build loop, never after it.
-    assert "mx.async_eval(*_sc_support, _sc_token, _sc_hidden)" in body
+    assert "*_sc_mod.eval_arrays(_sc_support), _sc_token, _sc_hidden" in body
     # The single evaluation survives as the switch-off path.
     assert body.count("*_sc_predicted,") == 1
     # Depth d is awaited alone, so depth d+1 keeps running under the host read.
-    assert "_eval(*_sc_supports[_sc_depth], _sc_predicted[_sc_depth])" in body
+    assert "*_sc_mod.eval_arrays(_sc_supports[_sc_depth]),\n" in body
+    assert "_sc_predicted[_sc_depth],\n" in body
     # The window prefix is warmed with the verify call's own ledger arguments.
     assert body.count("completion_tokens=tokens,") == 2
     assert body.count("committed_count=len(tokens) - 1,") == 2

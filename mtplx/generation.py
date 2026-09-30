@@ -62,6 +62,7 @@ from .qwen4_draft_k20_prescatter import (
     release_draft_route as _qwen4_draft_k20_prescatter_release,
 )
 from . import qwen4_draft_device_chain as _qwen4_sampled_chain
+from . import stock_draft_chain as _stock_sampled_chain
 from .qwen4_block_verify import (
     build_verifier as _qwen4_build_block_verifier,
     is_enabled as _qwen4_block_verify_enabled,
@@ -12019,7 +12020,12 @@ def generate_mtpk(
     _sampled_chain_status = "off"
     _sampled_chain_rounds = 0
     _sampled_chain_cuts = 0
-    if _qwen4_sampled_chain.is_enabled():
+    # The chain lane that claimed this request: the Flash-Next FR-Spec chain,
+    # or (MTPLX_STOCK_SAMPLED_DRAFT_CHAIN, default off) the same scheme on the
+    # stock full-row serial reader. Both expose one call surface.
+    _sc_mod: Any = _qwen4_sampled_chain
+    _stock_chain_requested = _stock_sampled_chain.is_enabled()
+    if _qwen4_sampled_chain.is_enabled() or _stock_chain_requested:
         _sampled_chain_blockers = [
             _sc_name
             for _sc_name, _sc_blocked in (
@@ -12063,9 +12069,21 @@ def generate_mtpk(
         if _sampled_chain_blockers:
             _sampled_chain_status = "declined:" + ",".join(_sampled_chain_blockers)
         else:
-            _sampled_chain_plan, _sc_reason = _qwen4_sampled_chain.claim(
-                rt, draft_sampler
-            )
+            _sc_reason = "not_requested"
+            if _qwen4_sampled_chain.is_enabled():
+                _sampled_chain_plan, _sc_reason = _qwen4_sampled_chain.claim(
+                    rt, draft_sampler
+                )
+            if _sampled_chain_plan is None and _stock_chain_requested:
+                if adaptive_width_cycle_readers[0] is not _default_cycle_draft_reader:
+                    # The chain mirrors the default serial reader only.
+                    _sc_reason = "draft_reader_not_default"
+                else:
+                    _sampled_chain_plan, _sc_reason = _stock_sampled_chain.claim(
+                        rt, draft_sampler
+                    )
+                    if _sampled_chain_plan is not None:
+                        _sc_mod = _stock_sampled_chain
             _sampled_chain_status = (
                 "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
             )
@@ -13363,12 +13381,12 @@ def generate_mtpk(
                     mtp_depth=_sc_depth + 1,
                     position_offset=_sc_offset,
                 )
-                _sc_support = _qwen4_sampled_chain.device_support(
+                _sc_support = _sc_mod.device_support(
                     _sampled_chain_plan, _sc_logits
                 )
-                _sc_token = _qwen4_sampled_chain.device_predict(
+                _sc_token = _sc_mod.predict(
                     _sampled_chain_plan,
-                    *_sc_support,
+                    _sc_support,
                     mx.array(_sc_uniforms[_sc_depth], dtype=mx.float32),
                 )
                 _sc_supports.append(_sc_support)
@@ -13379,7 +13397,9 @@ def generate_mtpk(
                 if _sc_pipeline:
                     # Hand this depth to the GPU now; the next depth is built
                     # while it runs.
-                    mx.async_eval(*_sc_support, _sc_token, _sc_hidden)
+                    mx.async_eval(
+                        *_sc_mod.eval_arrays(_sc_support), _sc_token, _sc_hidden
+                    )
             _sc_window = [int(next_token)]
             if _sc_pipeline:
                 # The verify window opens with the primary, known already:
@@ -13392,7 +13412,11 @@ def generate_mtpk(
                     )
             else:
                 _eval(
-                    *[_sc_array for _sc_s in _sc_supports for _sc_array in _sc_s],
+                    *[
+                        _sc_array
+                        for _sc_s in _sc_supports
+                        for _sc_array in _sc_mod.eval_arrays(_sc_s)
+                    ],
                     *_sc_predicted,
                     _sc_hidden,
                 )
@@ -13401,21 +13425,19 @@ def generate_mtpk(
             for _sc_depth in range(cycle_depth):
                 if _sc_pipeline:
                     # Wait for this depth only; later depths keep running.
-                    _eval(*_sc_supports[_sc_depth], _sc_predicted[_sc_depth])
-                _sc_local, _sc_vals, _sc_probs = _sc_supports[_sc_depth]
-                _sc_q = _qwen4_sampled_chain.host_distribution(
-                    _sampled_chain_plan,
-                    np.asarray(_sc_local),
-                    np.asarray(_sc_vals),
-                    np.asarray(_sc_probs),
-                )
+                    _eval(
+                        *_sc_mod.eval_arrays(_sc_supports[_sc_depth]),
+                        _sc_predicted[_sc_depth],
+                    )
+                _sc_q = _sc_mod.host_read(_sampled_chain_plan, _sc_supports[_sc_depth])
                 if _sc_q is None:
                     # No finite positive mass: the same hard failure the
                     # serial reader raises, never a guessed token.
                     raise non_finite_logits_error(
-                        np.asarray(_sc_probs), "sampled draft chain"
+                        np.asarray(_sc_mod.eval_arrays(_sc_supports[_sc_depth])[-1]),
+                        "sampled draft chain",
                     )
-                _sc_host_token = _qwen4_sampled_chain.host_pick(
+                _sc_host_token = _sc_mod.host_pick(
                     _sc_q, _sc_uniforms[_sc_depth]
                 )
                 draft_tokens.append(_sc_host_token)
@@ -13475,7 +13497,7 @@ def generate_mtpk(
                         mtp_depth=_sc_depth + 1,
                         position_offset=_sc_offset,
                     )
-                    _sc_host_token, _sc_q = _qwen4_sampled_chain.serial_read(
+                    _sc_host_token, _sc_q = _sc_mod.serial_read(
                         _sampled_chain_plan, _sc_logits, _sc_uniforms[_sc_depth]
                     )
                     if _sc_q is None:
@@ -15677,7 +15699,7 @@ def generate_mtpk(
     # it armed with at most one stale entry, which the next claim clears and
     # which `take_prescatter_row`'s identity check can never mis-consume.
     _qwen4_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
-    _qwen4_sampled_chain.release(_sampled_chain_plan)
+    _sc_mod.release(_sampled_chain_plan)
     if constraint is not None:
         # Final sync so `completed` reflects every committed token (the loop
         # may exit between the per-cycle sync and the last commit).
