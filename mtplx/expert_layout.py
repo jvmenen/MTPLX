@@ -188,3 +188,50 @@ class NumberedExpertAccumulator:
             stack_fn=self.stack,
             strict=strict,
         )
+
+
+_FUSED_GATE_UP = ".mlp.experts.gate_up_proj"
+_FUSED_DOWN = ".mlp.experts.down_proj"
+
+
+def split_fused_experts(weights: dict[str, Any], *, hidden_size: int) -> dict[str, Any]:
+    """Map fused ``experts.gate_up_proj`` / ``experts.down_proj`` onto switch-MoE leaves.
+
+    Official Qwen3.5/3.6 MoE checkpoints store each MoE block's routed experts
+    as two fused tensors, the MTP layer included:
+
+        layers.N.mlp.experts.gate_up_proj   [E, 2*inter, hidden]
+        layers.N.mlp.experts.down_proj      [E, hidden, inter]
+
+    (or the transformers bmm layout ``[E, hidden, 2*inter]`` / ``[E, inter,
+    hidden]``). MLX's switch-MoE layers load them as ``switch_mlp.{gate,up,
+    down}_proj.weight``. Without this mapping ``load_weights(strict=False)``
+    drops both keys and the routed experts keep their random init. Gate is the
+    first half of the fused projection, as in transformers. Other keys pass
+    through unchanged; ``forge_qwen4_exp.write_mtp_sidecar`` applies the same
+    layout rules when it writes a sidecar.
+    """
+    if not any(key.endswith((_FUSED_GATE_UP, _FUSED_DOWN)) for key in weights):
+        return weights
+    import mlx.core as mx
+
+    hidden = int(hidden_size)
+    result: dict[str, Any] = {}
+    for key, value in weights.items():
+        if key.endswith(_FUSED_GATE_UP):
+            prefix = key[: -len(_FUSED_GATE_UP)]
+            if value.shape[1] == hidden:  # transformers bmm layout [E, hidden, 2*inter]
+                gate, up = mx.split(value, 2, axis=-1)
+                gate, up = gate.swapaxes(1, 2), up.swapaxes(1, 2)
+            else:  # hub Linear layout [E, 2*inter, hidden]
+                gate, up = mx.split(value, 2, axis=1)
+            result[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+            result[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
+        elif key.endswith(_FUSED_DOWN):
+            prefix = key[: -len(_FUSED_DOWN)]
+            if value.shape[2] == hidden:  # transformers bmm layout [E, inter, hidden]
+                value = value.swapaxes(1, 2)
+            result[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = value
+        else:
+            result[key] = value
+    return result
