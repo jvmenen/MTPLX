@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Fused MoE experts in a Qwen3.5/3.6 MTP head are loaded instead of silently dropped.** Official Qwen3.6-35B-A3B stores the MTP layer's routed experts as two fused tensors (`mtp.layers.0.mlp.experts.gate_up_proj` and `.down_proj`). The artifact check accepts that 19-key layout (`bf16-qwen-moe`), and a Forge build from the BF16 release keeps it in `mtp.safetensors`, but the MTP loader only stacked numbered experts, so `load_weights(strict=False)` dropped both tensors and the routed experts kept their random init. The loader now maps them onto `switch_mlp.{gate,up,down}_proj` with the layout rules `forge_qwen4_exp` already uses. Same Forge pack of `Qwen/Qwen3.6-35B-A3B` (6-bit g64 body, BF16 MTP head, fused sidecar), `mtplx tune`, suite `cold-long-code-192`, M5 Pro 64 GB, fans automatic, 2026-09-30: acceptance D2 0.691/0.367 before, 0.947/0.848 after; D1/D2/D3 76.1/69.8/58.5 tok/s before, 90.4/92.0/87.2 after (AR 64.2). Acceptance after the fix equals that of the same head re-saved as numbered experts.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
