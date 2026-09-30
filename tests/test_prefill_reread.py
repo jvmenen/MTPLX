@@ -651,3 +651,47 @@ def test_the_ledger_is_bounded():
     assert ledger.pop("r2") == {"cause": None}
     assert ledger.pop("r2") is None
 
+
+# ---- The app has a sentence for every miss code the server sends ---------
+
+
+def _server_miss_codes() -> set[str]:
+    import re
+
+    from mtplx.session_bank import CacheMissReason
+
+    root = Path(__file__).resolve().parents[1] / "mtplx"
+    codes = {reason.value for reason in CacheMissReason}
+    cold = (root / "cache_bank" / "cold_tier.py").read_text()
+    codes |= set(re.findall(r'_set_last_miss\(\s*f?"([a-z_]+)', cold))
+    codes |= set(re.findall(r'_stats\["last_miss_reason"\] = "([a-z_]+)"', cold))
+    bank = (root / "session_bank.py").read_text()
+    codes |= set(re.findall(r'last_miss_reason = "([a-z_]+)"', bank))
+    codes |= {"block_prefix_disabled", "no_gdn_boundaries", "below_block_min_match"}
+    server = (root / "server" / "openai.py").read_text()
+    codes |= set(re.findall(r'cache_miss_reason = "([a-z_]+)"', server))
+    codes |= set(re.findall(r'cache_miss_reason=None if restore_hit else "([a-z_]+)"', server))
+    frontier = server[server.index("def _live_frontier_miss_reason_from_counts"):]
+    frontier = frontier[: frontier.index("\ndef ", 1)]
+    codes |= set(re.findall(r'"(miss_[a-z_]+)"', frontier))
+    return codes
+
+
+def test_the_app_has_a_sentence_for_every_miss_code_the_server_sends():
+    import re
+
+    swift = (
+        Path(__file__).resolve().parents[1]
+        / "apps/MTPLXApp/Sources/MTPLXAppCore/Services/CacheExplanation.swift"
+    ).read_text()
+    quoted = set(re.findall(r'"([a-z_]+)"', swift))
+    prefixes = set(re.findall(r'hasPrefix\("([a-z_]+)"\)', swift))
+    codes = _server_miss_codes()
+    # The scan found the families it is meant to find.
+    assert {"new_session", "ssd_prefix_miss", "miss_no_tool_result", "legacy_ssd_cache_archived",
+            "vision_request_cache_bypass", "mtp_batch_cold_prefill"} <= codes
+    missing = sorted(
+        code for code in codes
+        if code not in quoted and not any(code.startswith(p) for p in prefixes)
+    )
+    assert not missing, f"no app sentence for server miss codes: {missing}"

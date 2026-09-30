@@ -460,6 +460,10 @@ public struct PrefillState: Codable, Equatable, Sendable {
     public var ssdRestoreS: Double?
     public var ssdSuffixTokens: Int?
     public var startedS: Double?
+    /// Why this prompt is read again and how long it should take (the
+    /// server's `reread`, published before the replay); nil from older
+    /// daemons and before the restore finished.
+    public var reread: PrefillReread?
 
     public init(
         phase: String,
@@ -483,7 +487,8 @@ public struct PrefillState: Codable, Equatable, Sendable {
         ssdCachedTokens: Int? = nil,
         ssdRestoreS: Double? = nil,
         ssdSuffixTokens: Int? = nil,
-        startedS: Double? = nil
+        startedS: Double? = nil,
+        reread: PrefillReread? = nil
     ) {
         self.phase = phase
         self.tokensDone = tokensDone
@@ -507,6 +512,7 @@ public struct PrefillState: Codable, Equatable, Sendable {
         self.ssdRestoreS = ssdRestoreS
         self.ssdSuffixTokens = ssdSuffixTokens
         self.startedS = startedS
+        self.reread = reread
     }
 
     enum CodingKeys: String, CodingKey {
@@ -532,6 +538,7 @@ public struct PrefillState: Codable, Equatable, Sendable {
         case ssdRestoreS = "ssd_restore_s"
         case ssdSuffixTokens = "ssd_suffix_tokens"
         case startedS = "started_s"
+        case reread
     }
 }
 
@@ -1195,7 +1202,8 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     public var unifiedMemoryBytes: Int?
     public var scheduler: DynamicObject?
     public var sessionBank: SessionBank?
-    public var ssdSessionCache: SessionBankColdTier?
+    /// The SSD tier's stats, read leniently (the low-disk banner reads it).
+    public var ssdSessionCache: SSDSessionCacheHealth?
     public var startup: Startup?
     public var thermal: Thermal?
     public var vision: VisionCapability?
