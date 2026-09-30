@@ -4431,6 +4431,8 @@ public final class MTPLXBackendStore: ObservableObject {
                 recoveryGeneration: nil
             )
         }
+        await syncClientWindowWithDaemon(target: target, configuration: configuration)
+        guard isCurrent() else { return false }
         if target == .hermes {
             let handoffID = UUID()
             guard await launchHermesTerminalHandoff(
@@ -4478,6 +4480,52 @@ public final class MTPLXBackendStore: ObservableObject {
         guard isCurrent() else { return false }
         onDaemonReady?(target)
         return isCurrent()
+    }
+
+    /// Brings Pi's or OpenCode's window to the one the running daemon
+    /// executes (`/health` `execution_window`) before the client launches.
+    /// The write before the daemon started could only use the window setting,
+    /// which on 2026-09-29 told Pi 262,144 tokens the engine could not serve.
+    private func syncClientWindowWithDaemon(
+        target: LaunchTarget?,
+        configuration: MTPLXAppConfiguration
+    ) async {
+        guard target == .pi || target == .openCode,
+              let served = health?.executionWindow,
+              served.tokens > 0
+        else { return }
+        let answer = served.answerTokens ?? ClientContextBudget.answerTokens(forWindow: served.tokens)
+        do {
+            if target == .openCode {
+                let result = try openCodeIntegration.sync(
+                    configuration: configuration,
+                    servedWindow: served
+                )
+                if result.didChange {
+                    await supervisor.logs.append(
+                        "OpenCode window set to the daemon's \(served.tokens) tokens, answers up to \(OpenCodeIntegration.outputLimit(forAnswerTokens: answer))",
+                        stream: .system
+                    )
+                }
+            }
+            if target == .pi {
+                let result = try piIntegration.sync(
+                    configuration: configuration,
+                    servedWindow: served
+                )
+                if result.didChange {
+                    await supervisor.logs.append(
+                        "Pi window set to the daemon's \(served.tokens) tokens, answers up to \(answer)",
+                        stream: .system
+                    )
+                }
+            }
+        } catch {
+            await supervisor.logs.append(
+                "could not set the client window from the daemon: \(String(describing: error))",
+                stream: .system
+            )
+        }
     }
 
     private func refreshPostStartState(

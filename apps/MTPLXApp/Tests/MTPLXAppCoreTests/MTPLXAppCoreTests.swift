@@ -5934,10 +5934,12 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(thinkingLevelMap["xhigh"]?.stringValue, "xhigh")
         XCTAssertEqual(model["contextWindow"]?.intValue, 131_072)
         // Pi silently substitutes a 16,384 output ceiling for models whose
-        // metadata omits maxTokens, so the real context ceiling must be
-        // advertised (SYNC PAIR: mtplx/pi.py build_pi_provider_config); the
-        // request-policy extension owns stripping Pi's generated wire cap.
-        XCTAssertEqual(model["maxTokens"]?.intValue, 131_072)
+        // metadata omits maxTokens, so an answer ceiling is always
+        // advertised: the answer share of the window (half, the rule the
+        // server publishes in /health execution_window), not the whole
+        // window. The request-policy extension owns stripping Pi's generated
+        // 16,384 wire cap.
+        XCTAssertEqual(model["maxTokens"]?.intValue, 65_536)
         XCTAssertFalse(root.recursivelyContainsKey("max_response_tokens"))
 
         let extensionURL = url.deletingLastPathComponent()

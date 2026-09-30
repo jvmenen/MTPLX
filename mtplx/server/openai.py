@@ -209,6 +209,7 @@ from mtplx.server.dashboard_state import DashboardState, InFlightHandle
 from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
 from mtplx import thermal_pressure as _thermal_pressure
+from mtplx.server.served_window import served_execution_window
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
 # of AttributeError; real ServerState installs its own in __init__.
@@ -35008,6 +35009,9 @@ def create_app(state: ServerState) -> FastAPI:
                 state.args.strip_assistant_reasoning_history
             ),
             "context_window": state.context_window,
+            # What clients should configure: the window this server executes
+            # and the answer share inside it (mtplx/server/served_window.py).
+            "execution_window": served_execution_window(state),
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
             "api_key_source": str(
