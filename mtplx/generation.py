@@ -99,6 +99,7 @@ from .graphbank import (
 from .native_mlp import set_native_mlp_context
 from .one_copy import (
     held_qsa_rows,
+    lease_return as one_copy_lease_return,
     one_copy_runtime,
     prefill_rows_scope,
     prefill_rows_target,
@@ -5127,194 +5128,223 @@ def _restore_near_prefix_prompt_state(
             served_truth["encode_completed_age_s"] = round(
                 max(0.0, time.monotonic() - float(_done_at)), 3
             )
-        if committed_history_required and mtp_history_cache is None:
-            continue
-        if (
-            boundary_restore
-            and committed_history_required
-            and boundary_hidden is None
-        ):
-            # Without the boundary's hidden state the committed MTP history
-            # cannot resume exactly at b; running a seed forward instead would
-            # advance the recurrent state twice. Fail closed to the next
-            # candidate (or cold).
-            continue
-        cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
-        ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
-        ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
-        ssd_cached_tokens = restore_point if ssd_cache_hit else 0
-        total_cache_restore_time_s = (
-            cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
+        # A one-copy lease taken at a boundary goes back to the bank at that
+        # boundary on every way out of this candidate but serving it (the
+        # checks below, a yielding postcommit, a cancel, an error).
+        lease_back = (
+            one_copy_lease_return(
+                session_bank,
+                rt,
+                restore_mode=storage_restore_mode,
+                cache=cache,
+                mtp_history_cache=mtp_history_cache,
+                token_ids=(
+                    tuple(entry.token_ids[:restore_point])
+                    if getattr(entry, "token_ids", None) is not None
+                    else None
+                ),
+                hidden=boundary_hidden,
+                source=entry,
+                boundaries=_inherited_gdn_boundaries(entry, restore_point),
+            )
+            if boundary_hidden is not None
+            else None
         )
-
-        _check_postcommit_abort(abort_check)
-        if boundary_restore:
-            # Boundary-true restore: KV and recurrent state both sit exactly
-            # at restore_point; token restore_point-1 must NOT be re-run (the
-            # recurrent state already consumed it). The suffix prefill below
-            # regenerates logits; MTP history resumes from boundary_hidden.
-            logits = None
-            hidden = boundary_hidden
-            repair_time = 0.0
-        else:
-            started = time.perf_counter()
-            with attention_phase("prefill"):
-                logits, hidden = _forward_ar_optional_hidden(
-                    rt,
-                    mx.array([[int(prompt_ids[restore_point - 1])]]),
-                    cache=cache,
-                    hidden_variant=base_hidden_variant,
-                    emit_logits=True,
-                    logits_keep=1 if _final_logits_prefill_enabled() else None,
-                )
-            if hidden is None:
-                _eval(logits)
-            else:
-                _eval(logits, hidden)
-            repair_time = time.perf_counter() - started
-        _check_postcommit_abort(abort_check)
-        restore_kind_base = (
-            "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
-        )
-        if restore_point < matched:
-            restore_kind_base = f"{restore_kind_base}_boundary"
-        restore_kind_suffix = (
-            "reference_lease"
-            if str(storage_restore_mode) == "reference_lease"
-            else "clone"
-        )
-        restore_kind = f"{restore_kind_base}_{restore_kind_suffix}"
-        if ssd_cache_hit:
-            restore_kind = f"ssd_{restore_kind}"
+        served = False
         try:
-            diagnostic = getattr(session_bank, "last_prefix_diagnostic", None)
-            if isinstance(diagnostic, dict):
-                diagnostic["restore_kind"] = restore_kind
-                diagnostic["cache_source"] = cache_source
-                diagnostic["ssd_cache_hit"] = bool(ssd_cache_hit)
-                diagnostic["ssd_cached_tokens"] = int(ssd_cached_tokens)
-                diagnostic["ssd_restore_s"] = float(ssd_restore_s)
-        except Exception:
-            pass
-        suffix = list(prompt_ids[restore_point:])
-        if boundary_restore and not suffix:
-            # A boundary restore has no seed logits; decode cannot start from
-            # an empty suffix. (Only reachable when a boundary coincides with
-            # a fully-contained prompt — fall through to other candidates.)
-            continue
-        inherited_boundaries = _inherited_gdn_boundaries(entry, restore_point)
-        restored = SimpleNamespace(
-            entry=SimpleNamespace(prefix_len=restore_point),
-            cache=cache,
-            logits=logits[:, -1, :] if logits is not None else None,
-            hidden=hidden[:, -1:, :] if hidden is not None else None,
-            mtp_history_cache=mtp_history_cache,
-            restore_mode=restore_kind,
-        )
-        _emit_prefill_restore_progress(
-            chunk_callback,
-            tokens_total=len(prompt_ids),
-            cached_tokens=restore_point,
-            new_prefill_tokens=len(suffix),
-            started_s=chunk_started_s if chunk_started_s is not None else started,
-            cache_source=cache_source,
-            ssd_cache_hit=ssd_cache_hit,
-            ssd_cached_tokens=ssd_cached_tokens,
-            ssd_restore_s=ssd_restore_s,
-            ssd_suffix_tokens=len(suffix),
-        )
-        if not suffix:
+            if committed_history_required and mtp_history_cache is None:
+                continue
+            if (
+                boundary_restore
+                and committed_history_required
+                and boundary_hidden is None
+            ):
+                # Without the boundary's hidden state the committed MTP history
+                # cannot resume exactly at b; running a seed forward instead would
+                # advance the recurrent state twice. Fail closed to the next
+                # candidate (or cold).
+                continue
+            cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+            ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+            ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
+            ssd_cached_tokens = restore_point if ssd_cache_hit else 0
+            total_cache_restore_time_s = (
+                cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
+            )
+
+            _check_postcommit_abort(abort_check)
+            if boundary_restore:
+                # Boundary-true restore: KV and recurrent state both sit exactly
+                # at restore_point; token restore_point-1 must NOT be re-run (the
+                # recurrent state already consumed it). The suffix prefill below
+                # regenerates logits; MTP history resumes from boundary_hidden.
+                logits = None
+                hidden = boundary_hidden
+                repair_time = 0.0
+            else:
+                started = time.perf_counter()
+                with attention_phase("prefill"):
+                    logits, hidden = _forward_ar_optional_hidden(
+                        rt,
+                        mx.array([[int(prompt_ids[restore_point - 1])]]),
+                        cache=cache,
+                        hidden_variant=base_hidden_variant,
+                        emit_logits=True,
+                        logits_keep=1 if _final_logits_prefill_enabled() else None,
+                    )
+                if hidden is None:
+                    _eval(logits)
+                else:
+                    _eval(logits, hidden)
+                repair_time = time.perf_counter() - started
+            _check_postcommit_abort(abort_check)
+            restore_kind_base = (
+                "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
+            )
+            if restore_point < matched:
+                restore_kind_base = f"{restore_kind_base}_boundary"
+            restore_kind_suffix = (
+                "reference_lease"
+                if str(storage_restore_mode) == "reference_lease"
+                else "clone"
+            )
+            restore_kind = f"{restore_kind_base}_{restore_kind_suffix}"
+            if ssd_cache_hit:
+                restore_kind = f"ssd_{restore_kind}"
+            try:
+                diagnostic = getattr(session_bank, "last_prefix_diagnostic", None)
+                if isinstance(diagnostic, dict):
+                    diagnostic["restore_kind"] = restore_kind
+                    diagnostic["cache_source"] = cache_source
+                    diagnostic["ssd_cache_hit"] = bool(ssd_cache_hit)
+                    diagnostic["ssd_cached_tokens"] = int(ssd_cached_tokens)
+                    diagnostic["ssd_restore_s"] = float(ssd_restore_s)
+            except Exception:
+                pass
+            suffix = list(prompt_ids[restore_point:])
+            if boundary_restore and not suffix:
+                # A boundary restore has no seed logits; decode cannot start from
+                # an empty suffix. (Only reachable when a boundary coincides with
+                # a fully-contained prompt — fall through to other candidates.)
+                continue
+            inherited_boundaries = _inherited_gdn_boundaries(entry, restore_point)
+            restored = SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=restore_point),
+                cache=cache,
+                logits=logits[:, -1, :] if logits is not None else None,
+                hidden=hidden[:, -1:, :] if hidden is not None else None,
+                mtp_history_cache=mtp_history_cache,
+                restore_mode=restore_kind,
+            )
+            _emit_prefill_restore_progress(
+                chunk_callback,
+                tokens_total=len(prompt_ids),
+                cached_tokens=restore_point,
+                new_prefill_tokens=len(suffix),
+                started_s=chunk_started_s if chunk_started_s is not None else started,
+                cache_source=cache_source,
+                ssd_cache_hit=ssd_cache_hit,
+                ssd_cached_tokens=ssd_cached_tokens,
+                ssd_restore_s=ssd_restore_s,
+                ssd_suffix_tokens=len(suffix),
+            )
+            if not suffix:
+                entry.hits += 1
+                entry.last_access_s = time.time()
+                repage_time = _maybe_repage_target_prefill_cache(rt, cache)
+                served = True
+                return PromptState(
+                    trunk_cache=cache,
+                    logits=logits[:, -1, :],
+                    hidden=hidden[:, -1:, :] if hidden is not None else None,
+                    committed_mtp_cache=mtp_history_cache,
+                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    prompt_eval_time_s=repair_time + repage_time,
+                    cache_restore_time_s=total_cache_restore_time_s,
+                    mtp_history_policy=mtp_history_policy,
+                    cached_tokens=restore_point,
+                    suffix_tokens=0,
+                    cache_hit=True,
+                    cache_source=cache_source,
+                    ssd_cache_hit=ssd_cache_hit,
+                    ssd_cached_tokens=ssd_cached_tokens,
+                    ssd_restore_s=ssd_restore_s,
+                    restore_mode=restore_kind,
+                    gdn_boundaries=inherited_boundaries,
+                    restore_served=served_truth,
+                )
+            suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
+                list(inherited_boundaries)
+                if _gdn_boundary_capture_enabled()
+                else None
+            )
+            if vision_splice is not None:
+                # #296: this lane was vision-blind — with no splice the suffix
+                # forwarded image-pad ids as plain tokens and the image rows
+                # never reached the KV (silent wrong answers after a warm
+                # restore). Rows for pads inside the restored prefix are already
+                # baked into that KV; the suffix consumes strictly after them.
+                # matched_ceiling clamps restore_point to before the first pad,
+                # so this cursor is provably 0 today — computed explicitly so the
+                # invariant survives any future ceiling change, and the
+                # unconsumed-rows assert downstream stays a live guard.
+                pad_id = int(vision_splice.image_pad_token_id)
+                vision_splice.cursor = sum(
+                    1 for token in prompt_ids[:restore_point] if token == pad_id
+                )
+            suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+                _prefill_restored_prompt_suffix(
+                    rt,
+                    restored,
+                    suffix,
+                    base_hidden_variant=base_hidden_variant,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_history_policy=mtp_history_policy,
+                    abort_check=abort_check,
+                    chunk_callback=chunk_callback,
+                    tokens_total=len(prompt_ids),
+                    cached_tokens=restore_point,
+                    chunk_started_s=chunk_started_s,
+                    gdn_boundary_sink=suffix_boundary_sink,
+                    stable_prefix_len=stable_prefix_len,
+                    vision_splice=vision_splice,
+                    # The whole prompt, so the PLE lookahead's worker rebuilds
+                    # each suffix chunk's n-gram history from the same tokens the
+                    # restored state cache holds.
+                    plan_ids=prompt_ids,
+                )
+            )
             entry.hits += 1
             entry.last_access_s = time.time()
-            repage_time = _maybe_repage_target_prefill_cache(rt, cache)
+            served = True
             return PromptState(
                 trunk_cache=cache,
-                logits=logits[:, -1, :],
-                hidden=hidden[:, -1:, :] if hidden is not None else None,
+                logits=suffix_logits,
+                hidden=suffix_hidden,
                 committed_mtp_cache=mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=repair_time + repage_time,
+                prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
+                prompt_mtp_history_time_s=mtp_history_time,
                 cache_restore_time_s=total_cache_restore_time_s,
                 mtp_history_policy=mtp_history_policy,
                 cached_tokens=restore_point,
-                suffix_tokens=0,
+                suffix_tokens=len(suffix),
                 cache_hit=True,
                 cache_source=cache_source,
                 ssd_cache_hit=ssd_cache_hit,
                 ssd_cached_tokens=ssd_cached_tokens,
                 ssd_restore_s=ssd_restore_s,
                 restore_mode=restore_kind,
-                gdn_boundaries=inherited_boundaries,
+                gdn_boundaries=(
+                    suffix_boundary_sink
+                    if suffix_boundary_sink is not None
+                    else inherited_boundaries
+                ),
                 restore_served=served_truth,
             )
-        suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
-            if _gdn_boundary_capture_enabled()
-            else None
-        )
-        if vision_splice is not None:
-            # #296: this lane was vision-blind — with no splice the suffix
-            # forwarded image-pad ids as plain tokens and the image rows
-            # never reached the KV (silent wrong answers after a warm
-            # restore). Rows for pads inside the restored prefix are already
-            # baked into that KV; the suffix consumes strictly after them.
-            # matched_ceiling clamps restore_point to before the first pad,
-            # so this cursor is provably 0 today — computed explicitly so the
-            # invariant survives any future ceiling change, and the
-            # unconsumed-rows assert downstream stays a live guard.
-            pad_id = int(vision_splice.image_pad_token_id)
-            vision_splice.cursor = sum(
-                1 for token in prompt_ids[:restore_point] if token == pad_id
-            )
-        suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-            _prefill_restored_prompt_suffix(
-                rt,
-                restored,
-                suffix,
-                base_hidden_variant=base_hidden_variant,
-                mtp_hidden_variant=mtp_hidden_variant,
-                mtp_history_policy=mtp_history_policy,
-                abort_check=abort_check,
-                chunk_callback=chunk_callback,
-                tokens_total=len(prompt_ids),
-                cached_tokens=restore_point,
-                chunk_started_s=chunk_started_s,
-                gdn_boundary_sink=suffix_boundary_sink,
-                stable_prefix_len=stable_prefix_len,
-                vision_splice=vision_splice,
-                # The whole prompt, so the PLE lookahead's worker rebuilds
-                # each suffix chunk's n-gram history from the same tokens the
-                # restored state cache holds.
-                plan_ids=prompt_ids,
-            )
-        )
-        entry.hits += 1
-        entry.last_access_s = time.time()
-        return PromptState(
-            trunk_cache=cache,
-            logits=suffix_logits,
-            hidden=suffix_hidden,
-            committed_mtp_cache=mtp_history_cache,
-            token_prefix=tuple(int(token) for token in prompt_ids),
-            prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
-            prompt_mtp_history_time_s=mtp_history_time,
-            cache_restore_time_s=total_cache_restore_time_s,
-            mtp_history_policy=mtp_history_policy,
-            cached_tokens=restore_point,
-            suffix_tokens=len(suffix),
-            cache_hit=True,
-            cache_source=cache_source,
-            ssd_cache_hit=ssd_cache_hit,
-            ssd_cached_tokens=ssd_cached_tokens,
-            ssd_restore_s=ssd_restore_s,
-            restore_mode=restore_kind,
-            gdn_boundaries=(
-                suffix_boundary_sink
-                if suffix_boundary_sink is not None
-                else inherited_boundaries
-            ),
-            restore_served=served_truth,
-        )
+        finally:
+            if lease_back is not None and not served:
+                lease_back.give_back()
     _note_near_prefix_miss(session_bank, first_reject)
     return None
 
@@ -6632,11 +6662,33 @@ def restore_or_prefill_prompt_state(
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None
         ):
-            _check_postcommit_abort(abort_check)
             suffix = list(prompt_ids[restored.entry.prefix_len :])
             inherited_boundaries = _inherited_gdn_boundaries(
                 restored.entry, restored.entry.prefix_len
             )
+            # A one-copy lease taken for a suffix prefill goes back to the
+            # bank at its restore point if the prefill stops early.
+            lease_back = (
+                one_copy_lease_return(
+                    session_bank,
+                    rt,
+                    restore_mode=restored.restore_mode,
+                    cache=restored.cache,
+                    mtp_history_cache=restored.mtp_history_cache,
+                    token_ids=getattr(restored.entry, "token_ids", None),
+                    hidden=restored.hidden,
+                    source=restored.entry,
+                    boundaries=inherited_boundaries,
+                )
+                if suffix
+                else None
+            )
+            try:
+                _check_postcommit_abort(abort_check)
+            except BaseException:
+                if lease_back is not None:
+                    lease_back.give_back()
+                raise
             exact_served: dict[str, Any] = {
                 "entry_prefix_len": int(restored.entry.prefix_len),
                 "entry_token_hash": str(
@@ -6689,58 +6741,63 @@ def restore_or_prefill_prompt_state(
                     restore_served=exact_served,
                 ))
 
-            _check_postcommit_abort(abort_check)
-            _emit_prefill_restore_progress(
-                prefill_callback,
-                tokens_total=len(prompt_ids),
-                cached_tokens=restored.entry.prefix_len,
-                new_prefill_tokens=len(suffix),
-                started_s=prefill_started_s,
-                cache_source=getattr(restored, "cache_source", "ram"),
-                ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                ssd_cached_tokens=int(
-                    getattr(restored, "ssd_cached_tokens", 0) or 0
-                ),
-                ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
-                ssd_suffix_tokens=len(suffix),
-            )
-            suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-                list(inherited_boundaries)
-                if session_bank is not None
-                and vision_splice is None
-                and _gdn_boundary_capture_enabled()
-                else None
-            )
-            if vision_splice is not None:
-                # Rows for pads inside the restored prefix are already baked
-                # into the restored KV; the suffix consumes strictly after
-                # them.
-                pad_id = int(vision_splice.image_pad_token_id)
-                vision_splice.cursor = sum(
-                    1
-                    for token in prompt_ids[: restored.entry.prefix_len]
-                    if token == pad_id
-                )
-            suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-                _prefill_restored_prompt_suffix(
-                    rt,
-                    restored,
-                    suffix,
-                    base_hidden_variant=base_hidden_variant,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_history_policy=mtp_history_policy,
-                    abort_check=abort_check,
-                    chunk_callback=prefill_callback,
+            try:
+                _check_postcommit_abort(abort_check)
+                _emit_prefill_restore_progress(
+                    prefill_callback,
                     tokens_total=len(prompt_ids),
                     cached_tokens=restored.entry.prefix_len,
-                    chunk_started_s=prefill_started_s,
-                    gdn_boundary_sink=suffix_boundary_sink,
-                    vision_splice=vision_splice,
-                    stable_prefix_len=stable_prefix_len,
-                    # The whole prompt: see the near-prefix caller above.
-                    plan_ids=prompt_ids,
+                    new_prefill_tokens=len(suffix),
+                    started_s=prefill_started_s,
+                    cache_source=getattr(restored, "cache_source", "ram"),
+                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                    ssd_cached_tokens=int(
+                        getattr(restored, "ssd_cached_tokens", 0) or 0
+                    ),
+                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
+                    ssd_suffix_tokens=len(suffix),
                 )
-            )
+                suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
+                    list(inherited_boundaries)
+                    if session_bank is not None
+                    and vision_splice is None
+                    and _gdn_boundary_capture_enabled()
+                    else None
+                )
+                if vision_splice is not None:
+                    # Rows for pads inside the restored prefix are already
+                    # baked into the restored KV; the suffix consumes strictly
+                    # after them.
+                    pad_id = int(vision_splice.image_pad_token_id)
+                    vision_splice.cursor = sum(
+                        1
+                        for token in prompt_ids[: restored.entry.prefix_len]
+                        if token == pad_id
+                    )
+                suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+                    _prefill_restored_prompt_suffix(
+                        rt,
+                        restored,
+                        suffix,
+                        base_hidden_variant=base_hidden_variant,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_history_policy=mtp_history_policy,
+                        abort_check=abort_check,
+                        chunk_callback=prefill_callback,
+                        tokens_total=len(prompt_ids),
+                        cached_tokens=restored.entry.prefix_len,
+                        chunk_started_s=prefill_started_s,
+                        gdn_boundary_sink=suffix_boundary_sink,
+                        vision_splice=vision_splice,
+                        stable_prefix_len=stable_prefix_len,
+                        # The whole prompt: see the near-prefix caller above.
+                        plan_ids=prompt_ids,
+                    )
+                )
+            except BaseException:
+                if lease_back is not None:
+                    lease_back.give_back()
+                raise
             return _emit_prefill_complete(PromptState(
                 trunk_cache=restored.cache,
                 logits=suffix_logits,

@@ -197,6 +197,83 @@ def _record_anchor_nbytes(rt: Any, nbytes: int) -> None:
         pass
 
 
+class LeaseReturn:
+    """What a warm prefill needs to give its lease back if it stops early.
+
+    Taken right after the restore handed the prefill a one-copy lease, before
+    anything is written: the recurrent state at the restore point (a real
+    copy, 115.6 MB on Flash-Next, so the prefill's in-place writes cannot
+    touch it) and the attention and draft-history offsets there. ``give_back``
+    banks the lease again at that point (``SessionBank.return_lease``); a
+    later restore rewinds whatever the prefill wrote past it.
+    """
+
+    def __init__(self, bank, runtime, *, cache, mtp_history_cache, token_ids,
+                 hidden, source, boundaries=()):
+        import mlx.core as mx
+
+        from .cache_state import snapshot_untrimmable_cache
+        from .session_bank import _cache_kv_offset
+
+        self.bank = bank
+        self.runtime = runtime
+        self.cache = cache
+        self.mtp_history_cache = mtp_history_cache
+        self.token_ids = tuple(int(token) for token in token_ids)
+        self.source = source
+        self.boundaries = list(boundaries or ())
+        self.kv_offset = _cache_kv_offset(cache)
+        self.mtp_offset = (
+            _cache_kv_offset(mtp_history_cache) if mtp_history_cache is not None else None
+        )
+        snapshot = snapshot_untrimmable_cache(cache)
+        leaves = [
+            leaf
+            for state in snapshot.states
+            if state is not None
+            for leaf in (state if isinstance(state, (list, tuple)) else [state])
+            if isinstance(leaf, mx.array)
+        ]
+        if leaves:
+            mx.eval(*leaves)
+        self.anchor = (len(self.token_ids), snapshot, hidden)
+
+    def give_back(self) -> Any:
+        if self.kv_offset is None:
+            return None
+        return self.bank.return_lease(
+            self.runtime,
+            token_ids=self.token_ids,
+            cache=self.cache,
+            mtp_history_cache=self.mtp_history_cache,
+            anchor=self.anchor,
+            kv_offset=self.kv_offset,
+            mtp_offset=self.mtp_offset,
+            source=self.source,
+            boundaries=self.boundaries,
+        )
+
+
+def lease_return(bank, runtime, *, restore_mode, cache, mtp_history_cache, token_ids,
+                 hidden, source, boundaries=()) -> LeaseReturn | None:
+    """A ``LeaseReturn`` when the restore handed over a one-copy lease, else None."""
+
+    if (
+        str(restore_mode) != "reference_lease"
+        or token_ids is None
+        or not callable(getattr(bank, "return_lease", None))
+    ):
+        return None
+    from .session_bank import _one_copy_cache
+
+    if not _one_copy_cache(cache):
+        return None
+    return LeaseReturn(
+        bank, runtime, cache=cache, mtp_history_cache=mtp_history_cache,
+        token_ids=token_ids, hidden=hidden, source=source, boundaries=boundaries,
+    )
+
+
 def prefill_rows_scope(rows: int):
     """``qwen4_exp.qsa_rows_target(rows)``, or a no-op for 0 (no model import)."""
 

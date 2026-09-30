@@ -26214,6 +26214,13 @@ def _store_retokenized_history_snapshot(
     # the committed policy unchanged. The lookups and the prefill store derive
     # the same answer from _bank_history_policy (#465).
     history_mtp_policy = _bank_history_policy(state)
+    # One-copy store: the postcommit takes its own conversation's lease and
+    # extends it in place (a clone restore copied the whole conversation
+    # beside it). A lease it took and could not finish goes back to the bank
+    # at its restore point (one_copy.LeaseReturn), and one it did finish is
+    # banked before any yield below, so a preempted postcommit never drops
+    # the conversation.
+    one_copy = one_copy_runtime(state.runtime)
     try:
         try:
             if _abort_requested():
@@ -26225,6 +26232,8 @@ def _store_retokenized_history_snapshot(
                     mtp_hidden_variant="post_norm",
                     mtp_history_policy=history_mtp_policy,
                     session_bank=state.sessions.bank,
+                    restore_mode="reference" if one_copy else "clone",
+                    session_id=session_id if one_copy else None,
                     template_hash=state.template_hash,
                     draft_head_identity=state.draft_head_identity,
                     policy_fingerprint=policy_fingerprint,
@@ -26239,21 +26248,29 @@ def _store_retokenized_history_snapshot(
                         False if oversized_nbytes_override is not None else None
                     ),
                 )
-            if _abort_requested():
+            # A one-copy prompt state holds the conversation's only copy: it
+            # is banked before the yield is honoured (a lease put copies
+            # nothing, so it costs milliseconds).
+            holds_lease = one_copy and "reference_lease" in str(
+                getattr(prompt_state, "restore_mode", "") or ""
+            )
+            if _abort_requested() and not holds_lease:
                 raise PostcommitAbort(_abort_reason())
             # Oversized regime: put() takes its nbytes_override branch, which
             # never reads mtp_history_snapshot (the lease carries live refs
             # instead) — snapshotting the MTP cache here would be pure waste.
             # Hand the live committed-MTP cache as a ref so the lease stays
             # restorable under the committed history policy (the same pairing
-            # the bank's lease restore trims and returns together).
+            # the bank's lease restore trims and returns together). The
+            # one-copy store hands it as a ref too.
+            mtp_by_ref = oversized_nbytes_override is not None or one_copy
             mtp_snapshot = (
                 snapshot_cache(prompt_state.committed_mtp_cache)
                 if prompt_state.committed_mtp_cache is not None
-                and oversized_nbytes_override is None
+                and not mtp_by_ref
                 else None
             )
-            if _abort_requested():
+            if _abort_requested() and not holds_lease:
                 raise PostcommitAbort(_abort_reason())
             entry = state.sessions.bank.put(
                 runtime=state.runtime,
@@ -26273,17 +26290,12 @@ def _store_retokenized_history_snapshot(
                 ),
                 mtp_history_snapshot=mtp_snapshot,
                 mtp_history_cache_ref=(
-                    prompt_state.committed_mtp_cache
-                    if oversized_nbytes_override is not None
-                    else None
+                    prompt_state.committed_mtp_cache if mtp_by_ref else None
                 ),
                 snapshot_epoch=len(history_ids),
                 mtp_snapshot_epoch=len(history_ids)
                 if mtp_snapshot is not None
-                or (
-                    oversized_nbytes_override is not None
-                    and prompt_state.committed_mtp_cache is not None
-                )
+                or (mtp_by_ref and prompt_state.committed_mtp_cache is not None)
                 else None,
                 nbytes_override=oversized_nbytes_override,
             )
@@ -30324,6 +30336,7 @@ def _run_generation(
                     state.runtime, prompt_tokens=len(prompt_ids)
                 )
             admission_pricing: dict[str, Any] = {}
+            answer_room: dict[str, Any] | None = None
             admission_shed = _prefill_admission_shed(
                 state,
                 prompt_ids=prompt_ids,
@@ -30389,6 +30402,24 @@ def _run_generation(
                 and admission_shed.get("prompt_publish_skipped")
             )
             store_prefix_snapshot = False if prompt_publish_skipped else None
+            # The whole answer, priced before the prefill: the one refusal
+            # comes here, never mid-stream; when only a shorter answer fits,
+            # the request runs with that limit and says so if it reaches it.
+            answer_room = _answer_room(
+                state,
+                prompt_ids=prompt_ids,
+                max_new_tokens=response_max,
+                mtp_depth=effective_depth,
+                session_bank=session_bank,
+                session_id=session_id,
+                growth=admission_pricing.get("growth"),
+            )
+            if answer_room is not None:
+                if request_observability is not None:
+                    request_observability["answer_room"] = answer_room
+                if answer_room.get("refused"):
+                    raise _answer_room_refusal(answer_room)
+                response_max = min(int(response_max), int(answer_room["answer_token_cap"]))
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -30907,6 +30938,20 @@ def _run_generation(
             else (getattr(out, "finish_reason", None) or "stop")
         )
         memory_stop = stats.get("memory_stop")
+        if (
+            memory_stop is None
+            and answer_room is not None
+            and stats.get("finish_reason") == "length"
+            and completion_tokens >= int(answer_room.get("answer_token_cap") or 0)
+        ):
+            # The answer reached the limit the memory set before its prefill.
+            memory_stop = {
+                "reason": "answer_capped_for_memory",
+                "requested_tokens": int(answer_room.get("requested_answer_tokens") or 0),
+                "cap_tokens": int(answer_room.get("answer_token_cap") or 0),
+                "completion_tokens": int(completion_tokens),
+            }
+            stats["memory_stop"] = memory_stop
         if isinstance(memory_stop, dict):
             # The answer ended between rounds, whole, because the fast path's
             # bank could not grow (generation, FixedM4GrowthRefused): the

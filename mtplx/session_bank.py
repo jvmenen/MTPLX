@@ -800,6 +800,9 @@ class SessionBankEntry:
     # decodes); a restore rewinds to them (``_lease_advance``).
     lease_kv_offset: int | None = None
     lease_mtp_offset: int | None = None
+    # A lease a stopped prefill gave back (return_lease): it has no logits for
+    # its last position, so it serves only prompts that extend it.
+    extension_only: bool = False
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -1332,7 +1335,12 @@ class SessionBank:
         extra_state: dict[str, Any] | None = None,
         gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
         timing_out: dict[str, Any] | None = None,
+        lease_kv_offset: int | None = None,
+        lease_mtp_offset: int | None = None,
     ) -> SessionBankEntry | None:
+        # lease_kv_offset / lease_mtp_offset: where the entry's own tokens end
+        # in a leased cache that already ran past them (return_lease); by
+        # default, where the cache is now.
         # timing_out: optional request-local dict the CALLER owns (never
         # shared bank state — puts run concurrently across the foreground,
         # postcommit, and batched lanes). Keys are written progressively as
@@ -1472,9 +1480,15 @@ class SessionBank:
                 restore_floor_tokens=cache_restore_floor,
                 window_nbytes=cache_window_nbytes,
                 gdn_boundaries=list(normalized_boundaries),
-                lease_kv_offset=_cache_kv_offset(cache),
+                lease_kv_offset=(
+                    int(lease_kv_offset)
+                    if lease_kv_offset is not None
+                    else _cache_kv_offset(cache)
+                ),
                 lease_mtp_offset=(
-                    _cache_kv_offset(mtp_history_cache_ref)
+                    int(lease_mtp_offset)
+                    if lease_mtp_offset is not None
+                    else _cache_kv_offset(mtp_history_cache_ref)
                     if mtp_history_cache_ref is not None
                     else None
                 ),
@@ -2283,6 +2297,11 @@ class SessionBank:
             and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+            return cold_fallback()
+        if len(token_ids) <= entry.prefix_len and entry.extension_only:
+            # A returned lease (return_lease) has no logits for its last
+            # position: it serves prompts that extend it, never its own.
+            self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
         actual_restore_mode = "clone"
         rewind_anchor: Any = False
@@ -3467,6 +3486,68 @@ class SessionBank:
             if other.cache_ref is cache:
                 other.release_live_refs()
 
+    def return_lease(
+        self,
+        runtime: Any,
+        *,
+        token_ids: list[int] | tuple[int, ...],
+        cache: list[Any],
+        mtp_history_cache: Any | None,
+        anchor: tuple[int, CacheSnapshot, Any],
+        kv_offset: int,
+        mtp_offset: int | None,
+        source: SessionBankEntry,
+        boundaries: Any = (),
+    ) -> SessionBankEntry | None:
+        """Bank a lease again when the prefill that took it stops early.
+
+        A one-copy lease is its conversation's only copy, and a warm prefill
+        takes it. A prefill that stops part-way (a client cancel, a
+        postcommit that yields to the next request, an error) used to drop it
+        with the request, and the next turn re-read the whole conversation
+        (the copying store kept a snapshot beside every lease, which hid
+        this). The lease comes back as an entry for the tokens it was
+        restored at (``token_ids``, its restore point), with the recurrent
+        ``anchor`` recorded there and the attention and draft-history offsets
+        of that point: the cache may have run past it, and a restore rewinds
+        it (``_lease_advance``). The entry keeps ``source``'s identity. It has
+        no logits, so it serves only prompts that extend it. Returns None for
+        a cache the one-copy store does not keep.
+        """
+
+        if not _one_copy_cache(cache):
+            return None
+        position = int(anchor[0])
+        if position != len(token_ids):
+            raise ValueError("a returned lease's anchor must sit at its own length")
+        kept = [
+            record for record in (boundaries or ())
+            if int(record[0]) < position
+        ]
+        entry = self.put(
+            runtime=runtime,
+            token_ids=list(token_ids),
+            cache=cache,
+            logits=None,
+            hidden=anchor[2],
+            hidden_variant=source.hidden_variant,
+            keep_live_ref=True,
+            session_id=source.session_id,
+            template_hash=source.template_hash,
+            mtp_history_policy=source.mtp_history_policy,
+            draft_head_identity=source.draft_head_identity,
+            policy_fingerprint=source.policy_fingerprint,
+            mtp_history_cache_ref=mtp_history_cache,
+            snapshot_epoch=position,
+            mtp_snapshot_epoch=position if mtp_history_cache is not None else None,
+            gdn_boundaries=[*kept, anchor],
+            lease_kv_offset=int(kv_offset),
+            lease_mtp_offset=mtp_offset,
+        )
+        if entry is not None:
+            entry.extension_only = True
+        return entry
+
     def _release_stale_session_leases(self, newest: SessionBankEntry) -> None:
         """A session keeps at most one lease: the one just committed (#456).
 
@@ -3916,7 +3997,11 @@ class SessionBank:
 
         exact = self.longest_prefix(tokens)
         exact_len = int(exact.prefix_len) if exact is not None else 0
-        exact_serves = exact is not None and _exact_restore_serves(exact, identity)
+        exact_serves = (
+            exact is not None
+            and _exact_restore_serves(exact, identity)
+            and (exact_len < len(tokens) or not exact.extension_only)
+        )
         if exact_serves:
             take(exact, exact_len, "exact")
         if not near_prefix or len(tokens) < 2:
