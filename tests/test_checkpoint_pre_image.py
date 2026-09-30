@@ -1,4 +1,4 @@
-"""An image prompt keeps the recurrent checkpoints before its first image.
+"""An image prompt keeps recurrent checkpoints before and after its images.
 
 Until 2026-09-30 a prefill that carried an image captured no recurrent
 checkpoints at all (the cold and exact-restore lanes built no sink for it).
@@ -7,17 +7,20 @@ changed anything after an image (a Pi screenshot turn whose tool call parts
 from the stored reply) nothing was restorable and the whole conversation was
 read again: 123K to 138K tokens cold on 2026-09-29.
 
-Only the text before the first image is restorable today: the near-prefix
-lane matches raw ids and stops at the first image pad (matched_ceiling), and
-how images are restored is not changed here. So an image prompt now keeps
-the checkpoints at or before its first image, recorded only where its plain
-chunk grid already ends a forward, and reports how close to the image the
-newest one sits. These tests drive the real restore_or_prefill_prompt_state
+At first only the text before the first image was restorable: the
+near-prefix lane matched raw ids and stopped at the first image pad, so an
+image prompt kept the checkpoints at or before its first image. The lane now
+matches the content-keyed view and resumes past whole images, so an image
+prompt keeps every checkpoint outside its images (never one inside, where a
+restore would resume with part of an image's rows), still recorded only
+where its plain chunk grid already ends a forward, and reports how close to
+the first image the newest one before it sits. These tests drive the real
+restore_or_prefill_prompt_state
 on a real SessionBank with a toy hybrid model (an attention layer and a
 recurrent running sum, logits exact small-integer sums over every input row,
 image rows included), for both prefill loops:
 
-* the prompt keeps checkpoints up to its first image, none past it, and its
+* the prompt keeps checkpoints outside its image, none inside it, and its
   coverage report says so (fails on the old code: no checkpoints);
 * keeping them does not change the image prefill: same forwards, same logits;
 * the next turn, changed after the image, restores at the pre-image anchor
@@ -25,8 +28,8 @@ image rows included), for both prefill loops:
 * a turn changed before the image restores at the newest anchor at or below
   its match, never past it;
 * a turn that extends the image prompt restores it exactly through the image
-  and banks an entry that still carries the pre-image anchors (fails on the
-  old code: none).
+  and banks an entry that still carries the anchors (fails on the old code:
+  none).
 
 CPU-sized: 16-id vocabulary, no model pack, no tower.
 """
@@ -194,13 +197,18 @@ def _positions(records) -> list[int]:
     return [int(record[0]) for record in records]
 
 
-def test_an_image_prompt_keeps_checkpoints_up_to_its_first_image(policy):
+# The plain chunk ends of the 73-token prompt, but 48: it falls inside the
+# image's rows [43, 49).
+OUTSIDE_THE_IMAGE = [8, 16, 24, 32, 40, 56, 64, 72]
+
+
+def test_an_image_prompt_keeps_checkpoints_outside_its_image(policy):
     bank = SessionBank()
     rt = _runtime()
     state = _state(rt, _prompt(TEXT_BEFORE, AFTER_ONE), policy=policy, bank=bank)
-    # Chunk ends at or before the first image pad, none past it.
-    assert _positions(state.gdn_boundaries) == [8, 16, 24, 32, 40]
-    assert state.checkpoint_coverage["anchors"] == [8, 16, 24, 32, 40]
+    # Chunk ends before and after the image, none inside it.
+    assert _positions(state.gdn_boundaries) == OUTSIDE_THE_IMAGE
+    assert state.checkpoint_coverage["anchors"] == OUTSIDE_THE_IMAGE
     assert state.checkpoint_coverage["pre_image"] == {
         "first_image_start": IMAGE_START,
         "anchor": 40,
@@ -210,7 +218,7 @@ def test_an_image_prompt_keeps_checkpoints_up_to_its_first_image(policy):
     keyed = vision_bank_key_ids(list(state.token_prefix), _splice(IMAGE))
     entry = bank.longest_prefix(keyed)
     assert entry is not None and entry.prefix_len == len(keyed)
-    assert _positions(entry.gdn_boundaries) == [8, 16, 24, 32, 40]
+    assert _positions(entry.gdn_boundaries) == OUTSIDE_THE_IMAGE
 
 
 def test_keeping_them_does_not_change_the_image_prefill(policy):
@@ -263,8 +271,8 @@ def test_a_turn_that_extends_the_image_prompt_carries_its_anchors(policy):
     extended = [*first, *AFTER_TWO]
     warm = _state(_runtime(), extended, policy=policy, bank=bank)
     assert warm.cached_tokens == len(first)
-    assert _positions(warm.gdn_boundaries) == [8, 16, 24, 32, 40]
+    assert _positions(warm.gdn_boundaries) == OUTSIDE_THE_IMAGE
     cold = _state(_runtime(), extended, policy=policy)
     assert warm.logits.tolist() == cold.logits.tolist()
     keyed = vision_bank_key_ids(extended, _splice(IMAGE))
-    assert _positions(bank.longest_prefix(keyed).gdn_boundaries) == [8, 16, 24, 32, 40]
+    assert _positions(bank.longest_prefix(keyed).gdn_boundaries) == OUTSIDE_THE_IMAGE

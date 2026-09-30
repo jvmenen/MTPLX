@@ -148,6 +148,35 @@ class TestSameConversationSurvives:
         assert receipt["kept_session_entries"]["entries"] == 1
         assert stranger.token_ids not in manager.bank._entries
 
+    def test_an_image_divergence_is_priced_from_the_checkpoint_under_it(self, monkeypatch):
+        """The admission asks the restore's own question for an image prompt,
+        partial matches included: an entry with the anchor at its prompt's
+        end (past the image) is priced as the restore that resumes there,
+        not as a cold read (it used to skip partial image matches: 0)."""
+
+        from mtplx.cache_state import CacheSnapshot
+        from mtplx.vision.splice import vision_bank_key_ids
+
+        splice = SimpleNamespace(image_pad_token_id=PAD, image_digests=[123], pad_counts=[300])
+        before = list(range(60_000)) + [PAD] * 300 + list(range(100_000, 150_000))
+        prompt = before[:105_300] + list(range(3_000_000, 3_017_700))
+        manager, lane = _world(ssd=True)
+        entry = _flash_next_entry(manager.bank, vision_bank_key_ids(before, splice))
+        # The previous prompt ended at 105,000: its anchor lies past the image.
+        entry.gdn_boundaries = [
+            (105_000, CacheSnapshot(states=(None,), meta_states=(None,)), None)
+        ]
+
+        receipt, _state = _admit(
+            monkeypatch, manager, lane, prompt,
+            base_gib=_base_for(-1.0, entry.nbytes), vision_splice=splice,
+        )
+
+        assert receipt["reusable_prefix_tokens"] == 105_000
+        assert receipt["reusable_prefix_mode"] == "near_prefix"
+        assert "refused" not in receipt
+        assert manager.bank._entries.get(entry.token_ids) is entry
+
 
 class TestWhenBothCannotFit:
     def test_refused_before_work_and_the_retry_waits_for_the_ssd_write(self, monkeypatch):

@@ -17,8 +17,9 @@ frontier advances, in this order:
 
 * the prompt-end anchor: the newest checkpoint at least ``tail_backoff``
   tokens before the prompt end, where the next agent turn diverges (the
-  reply after it is re-rendered); for an image prompt, the newest checkpoint
-  at or before its first image;
+  reply after it is re-rendered);
+* for an image prompt, the pre-image anchor: the newest checkpoint at or
+  before its first image, where a turn that changes that image resumes;
 * the restore point this prefill resumed from (the previous prompt's end);
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
 * the newest checkpoint;
@@ -43,8 +44,9 @@ session bank's ``checkpoint_budget_bytes``). Without one it is what today's
 memory plan prices: ``MTPLX_GDN_BOUNDARY_MAX`` (8) checkpoints of the model at
 hand. A restore never starts past the proven matched prefix: selection
 (``SessionBankEntry.recurrent_boundary_at_or_below``) only ever returns a
-checkpoint at or below it, and ``ceiling`` keeps image prompts' checkpoints at
-or before their first image.
+checkpoint at or below it, and ``image_spans`` keeps every checkpoint of an
+image prompt out of its images (a restore never resumes with part of an
+image's rows, ``vision.splice.inside_image``).
 """
 
 from __future__ import annotations
@@ -95,8 +97,13 @@ class AnchorPlan:
     length minus one; None when unknown, and the newest checkpoint stands in).
     ``restore_point``: where the prefill resumed from a stored entry.
     ``stable_prefix``: the stable prompt-prefix edge, when the prompt has one.
-    ``ceiling``: no checkpoint past this position (an image prompt's first
-    image-pad position: the prefix before it is text only).
+    ``ceiling``: no checkpoint past this position.
+    ``image_spans``: ``[start, end)`` of each image's rows in an image prompt;
+    no checkpoint strictly inside one. Image prompts kept none past their
+    first image until the restores could resume past a whole image (the
+    content-keyed near-prefix lane, 2026-09-30); a checkpoint between or
+    after images is a state a cold prefill of the same keyed prefix reaches
+    exactly.
     """
 
     budget_bytes: int | None = None
@@ -106,10 +113,20 @@ class AnchorPlan:
     restore_point: int | None = None
     stable_prefix: int | None = None
     ceiling: int | None = None
+    image_spans: tuple[tuple[int, int], ...] = ()
     grid_tokens: int = GRID_TOKENS
 
     def admits(self, position: int) -> bool:
-        return self.ceiling is None or int(position) <= int(self.ceiling)
+        position = int(position)
+        if self.ceiling is not None and position > int(self.ceiling):
+            return False
+        return not any(
+            int(start) < position < int(end) for start, end in self.image_spans
+        )
+
+    @property
+    def first_image_start(self) -> int | None:
+        return int(self.image_spans[0][0]) if self.image_spans else None
 
 
 def _tree_nbytes(value: Any) -> int:
@@ -187,9 +204,16 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
     if plan.ceiling is not None:
         limit = min(limit, int(plan.ceiling))
     below_limit = [position for position in positions if position <= limit]
+    first_image = plan.first_image_start
+    pre_image = (
+        [position for position in positions if position <= first_image]
+        if first_image is not None
+        else []
+    )
     protected: list[int] = []
     for position in (
         below_limit[-1] if below_limit else None,
+        pre_image[-1] if pre_image else None,
         plan.restore_point,
         plan.stable_prefix,
         newest,
