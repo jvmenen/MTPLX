@@ -210,6 +210,7 @@ from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
 from mtplx import thermal_pressure as _thermal_pressure
 from mtplx.server.served_window import served_execution_window
+from mtplx.prefill_plan import publishable_reread
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
 # of AttributeError; real ServerState installs its own in __init__.
@@ -16422,6 +16423,12 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         record.get("request_received_monotonic_s")
     ).items():
         record.setdefault(key, value)
+    # Why this request re-read part of its prompt, as its prefill events said.
+    rereads = getattr(getattr(state, "dashboard", None), "rereads", None)
+    if rereads is not None and record.get("request_id"):
+        reread = rereads.pop(str(record["request_id"]))
+        if reread is not None:
+            record.setdefault("reread", reread)
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -17994,6 +18001,23 @@ def _dashboard_publish_prefill(
         enriched = dict(payload)
         enriched["request_id"] = request_id
         enriched["session_id"] = session_id
+        # Why part of the prompt is read again (mtplx/prefill_plan.py): the
+        # event that starts the replay brings the facts; later events of the
+        # same request carry the explanation forward, since each replaces
+        # the in-flight prefill state, and the receipt keeps it.
+        facts = enriched.get("reread")
+        if isinstance(facts, dict):
+            explanation = publishable_reread(
+                facts,
+                session_served_before=_session_served_before(state, session_id),
+                rates=dashboard.prefill_history.rates(),
+            )
+            dashboard.rereads.put(request_id, explanation)
+            enriched["reread"] = explanation
+        elif enriched.get("phase") == "chunk":
+            carried = dashboard.rereads.get(request_id)
+            if carried is not None:
+                enriched["reread"] = carried
         # Live tok/s during chunked prefill (completion provides its own).
         if enriched.get("phase") == "chunk":
             # Use exactly the measured work shown by the live gauge. A
@@ -18026,6 +18050,22 @@ def _dashboard_publish_prefill(
         dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
     except Exception as exc:
         _safe_stdout_print(f"[dashboard] publish_prefill suppressed error: {exc!r}")
+
+
+def _session_served_before(state: "ServerState", session_id: str | None) -> bool:
+    """This server committed an earlier turn of the conversation.
+
+    The engine session exists from the current request's admission on, so
+    its committed ids, written when a turn commits, are the evidence.
+    """
+
+    if not session_id:
+        return False
+    peek = getattr(getattr(state, "sessions", None), "peek", None)
+    if not callable(peek):
+        return False
+    session = peek(str(session_id))
+    return bool(session is not None and getattr(session, "committed_token_ids", ()))
 
 
 def _dashboard_publish_progress(
