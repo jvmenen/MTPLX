@@ -1008,6 +1008,30 @@ def _wide_prefill_rungs(wide: int) -> list[int]:
     return rungs
 
 
+def qwen4_wide_prefill_rungs(rt: Any, *, prompt_tokens: int) -> list[int]:
+    """The wide prefill widths this prompt may run, widest first, before any
+    memory is read; empty when the lane is off, the chunk knobs are pinned,
+    or the prompt fits one default chunk.
+
+    These are the candidates both deciders price: the serve path hands them
+    to the prefill admission, which prices every width with the rest of the
+    request after anything it reclaims and settles on the widest that fits
+    (``mtplx.server.prefill_safety.settle_wide_prefill_chunk``);
+    ``qwen4_wide_prefill_chunk_tokens`` is the stand-alone gate for a request
+    no admission priced.
+    """
+
+    wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
+    if wide <= 2048 or _prefill_chunk_env_is_pinned():
+        return []
+    prompt_tokens = max(0, int(prompt_tokens))
+    if prompt_tokens <= 2048:
+        return []
+    # A rung the prompt cannot fill buys nothing over the next one down.
+    rungs = [rung for rung in _wide_prefill_rungs(wide) if rung < 2 * prompt_tokens]
+    return rungs or [wide]
+
+
 def qwen4_wide_prefill_chunk_tokens(
     rt: Any, *, prompt_tokens: int, receipt: dict | None = None
 ) -> int | None:
@@ -1033,12 +1057,11 @@ def qwen4_wide_prefill_chunk_tokens(
     here, and ``--prefill-chunk-tokens`` never reaches this function.
     """
 
+    rungs = qwen4_wide_prefill_rungs(rt, prompt_tokens=prompt_tokens)
+    if not rungs:
+        return None
     wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
-    if wide <= 2048 or _prefill_chunk_env_is_pinned():
-        return None
     prompt_tokens = max(0, int(prompt_tokens))
-    if prompt_tokens <= 2048:
-        return None
     limit = _metal_memory_limit_bytes(rt)
     if limit <= 0:
         return wide
@@ -1048,9 +1071,7 @@ def qwen4_wide_prefill_chunk_tokens(
     released = False
     granted: int | None = None
     bill: dict[str, int] = {}
-    # A rung the prompt cannot fill buys nothing over the next one down.
-    rungs = [rung for rung in _wide_prefill_rungs(wide) if rung < 2 * prompt_tokens]
-    for rung in rungs or [wide]:
+    for rung in rungs:
         bill = _qwen4_wide_prefill_need(
             rt, rows=rung, prompt_tokens=prompt_tokens, per_token=per_token
         )

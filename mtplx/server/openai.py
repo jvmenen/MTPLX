@@ -120,7 +120,11 @@ from mtplx.server.stream_recovery import (
     _run_stream_recovery_chain,
     _update_recovery_metrics,
 )
-from mtplx.server.prefill_safety import make_prefill_system_guard, score_prompt_with_memory_policy
+from mtplx.server.prefill_safety import (
+    make_prefill_system_guard,
+    score_prompt_with_memory_policy,
+    settle_wide_prefill_chunk,
+)
 from mtplx.server.retry_prompt import served_prompt_with_appended_turn
 from mtplx.constrained import (
     ResponseFormatError,
@@ -1196,8 +1200,8 @@ def _server_runtime_env_overrides(
     # nothing. An operator export wins, and the launch flag
     # --prefill-chunk-tokens is a request-local override above all of this.
     # Flash-Next's own prefill width lives there too (2026-09-18): a
-    # 4,096-row chunk granted per request against live memory
-    # (generation.qwen4_wide_prefill_chunk_tokens), and for forwards of 2,048
+    # 4,096-row chunk granted per request by the prefill admission after its
+    # reclamation (prefill_safety.settle_wide_prefill_chunk), and for forwards of 2,048
     # rows or more the block-sparse attention lane from 16,384 tokens of
     # history. Both were measured on an M5 Max, so the block asks for tensor
     # units and an M1 to M4 keeps today's values.
@@ -18671,7 +18675,7 @@ def _coerce_setting(name: str, value: Any) -> Any:
     if name == "prefill_chunk_tokens" and str(value).strip().lower() in {"0", "auto"}:
         # 0 (or "auto") unpins the chunk: requests go back to the served
         # family's own plan, which for Flash-Next on tensor-unit GPUs is the
-        # memory-gated wide chunk (generation.qwen4_wide_prefill_chunk_tokens).
+        # memory-gated wide chunk (prefill_safety.settle_wide_prefill_chunk).
         return 0
 
     if name in {
@@ -21745,6 +21749,7 @@ def _prefill_admission_shed(
     restore_identity: dict[str, Any] | None = None,
     pricing: dict[str, Any] | None = None,
     prompt_scoring: bool = False,
+    wide_prefill_rungs: Sequence[int] = (),
 ) -> dict[str, Any] | None:
     """Price a request before its prefill; give back idle memory, or refuse.
 
@@ -21803,6 +21808,11 @@ def _prefill_admission_shed(
     anyway). Returns the receipt when it acted, else None; either way the
     growth model it settled on lands in ``pricing["growth"]`` (the per-chunk
     check reserves its ``chunk_bytes`` before every forward).
+
+    ``wide_prefill_rungs`` are the family's wider chunks for this prompt
+    (``generation.qwen4_wide_prefill_rungs``): priced like every other width,
+    so the width the request runs is chosen here, against what is live after
+    reclamation, by the one bill that also decides admission.
     """
 
     if not _prefill_admission_shed_enabled():
@@ -21822,6 +21832,7 @@ def _prefill_admission_shed(
             restore_identity=restore_identity,
             pricing=pricing,
             prompt_scoring=prompt_scoring,
+            wide_prefill_rungs=wide_prefill_rungs,
         )
         _note_guard_health(state, where="prefill_admission", error=None)
         return receipt
@@ -21887,6 +21898,7 @@ def _run_prefill_admission(
     restore_identity: dict[str, Any] | None = None,
     pricing: dict[str, Any] | None = None,
     prompt_scoring: bool = False,
+    wide_prefill_rungs: Sequence[int] = (),
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
@@ -21966,6 +21978,13 @@ def _run_prefill_admission(
         )
 
         widths = prompt_scoring_forward_widths(runtime, prompt_tokens, prefill_chunk_tokens)
+    elif wide_prefill_rungs and None not in widths:
+        # The family's wider chunks join the ladder, widest first: the
+        # choice between them and the profile's chunk is made below, after
+        # reclamation, by the same pricing (2026-09-29: cold 123K prompts ran
+        # at 2,048 rows because the wide gate refused before a reclamation
+        # that left room for 4,096).
+        widths = sorted({*(int(rung) for rung in wide_prefill_rungs), *widths}, reverse=True)
     output_tokens = int(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
@@ -29936,20 +29955,18 @@ def _run_generation(
             # the admission guard, which prices the rows each forward runs.
             if prefill_chunk_tokens is None:
                 prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            wide_prefill_rungs: list[int] = []
             if prefill_chunk_tokens is None:
                 # The family's own wider chunk (Flash-Next on tensor-unit
-                # GPUs), granted per request against live memory.  An explicit
-                # flag or a caller's tighter chunk never reaches this line.
-                from mtplx.generation import qwen4_wide_prefill_chunk_tokens
+                # GPUs): its widths are candidates the admission prices below
+                # with the rest of the request, after anything it reclaims.
+                # An explicit flag or a caller's tighter chunk never reaches
+                # this line.
+                from mtplx.generation import qwen4_wide_prefill_rungs
 
-                _wide_chunk_receipt: dict[str, Any] = {}
-                prefill_chunk_tokens = qwen4_wide_prefill_chunk_tokens(
-                    state.runtime,
-                    prompt_tokens=len(prompt_ids),
-                    receipt=_wide_chunk_receipt,
+                wide_prefill_rungs = qwen4_wide_prefill_rungs(
+                    state.runtime, prompt_tokens=len(prompt_ids)
                 )
-                if _wide_chunk_receipt and request_observability is not None:
-                    request_observability["prefill_wide_chunk"] = _wide_chunk_receipt
             admission_pricing: dict[str, Any] = {}
             admission_shed = _prefill_admission_shed(
                 state,
@@ -29977,12 +29994,26 @@ def _run_generation(
                     "policy_fingerprint": session_policy_fingerprint,
                 },
                 pricing=admission_pricing,
+                wide_prefill_rungs=wide_prefill_rungs,
             )
             if admission_shed is not None and request_observability is not None:
                 request_observability["prefill_admission_shed"] = admission_shed
             if admission_shed is not None and admission_shed.get("refused"):
                 raise _prefill_admission_refusal(state, admission_shed)
-            if admission_shed is not None and admission_shed.get(
+            if wide_prefill_rungs:
+                # The width the admission settled on after reclamation (or,
+                # when it priced nothing, the live-memory gate's answer).
+                _wide_chunk_receipt: dict[str, Any] = {}
+                prefill_chunk_tokens = settle_wide_prefill_chunk(
+                    state.runtime,
+                    prompt_tokens=len(prompt_ids),
+                    rungs=wide_prefill_rungs,
+                    pricing=admission_pricing,
+                    receipt=_wide_chunk_receipt,
+                )
+                if _wide_chunk_receipt and request_observability is not None:
+                    request_observability["prefill_wide_chunk"] = _wide_chunk_receipt
+            elif admission_shed is not None and admission_shed.get(
                 "prefill_chunk_tokens"
             ) != admission_shed.get("prefill_chunk_requested"):
                 # The admission narrowed the chunk to fit this request (a
