@@ -6,9 +6,10 @@ Question: during decode on Qwen3.6-35B-A3B, how long per MTP round does the GPU 
 
 - **Host time with an idle GPU is 2.7 to 3.2 ms of a 26 to 30 ms round: 9.4 to 11.2%** (measured directly, all workloads, with and without FR-Spec). On top of that, about 1 ms more sits hidden inside the blocking verify eval (inferred, see §3). Realistic total: ~14%.
 - **The largest piece is building the verify graph: ~1.95 ms per round** (2.1 ms at 14K context). The Balance pack is 6-bit, so the compiled verify is gated off (`quant_bits_gate:bits=6`) and every round rebuilds the 40-layer graph in Python while the GPU waits. The rest: ~0.5 ms host work between the target-row evals, ~0.4 ms around the two draft steps.
-- **Fix built and measured: `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8`** (branch `perf/host-overlap-36`, off by default). It submits the verify graph to the GPU every 8 layers with `mx.async_eval`, so the GPU works on the first layers while the host builds the rest. Tokens are identical in every run (all workloads, with and without FR-Spec). In-process decode: **+10 to +14%** (reasoning 94.0 to 103.7 tok/s, code 107 to 121, 14K context 82.3 to 90.7). **On the real server (production arguments, port 8001, bench36 workload): +4.7%** (round 25.95 to 24.68 ms, 2 runs each); the server keeps only half the in-process gain, cause not yet found (§5).
+- **Fix built and measured: `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8`** (off by default, PR branch `perf/verify-async-chunk`). It submits the verify graph to the GPU every 8 layers with `mx.async_eval`, so the GPU works on the first layers while the host builds the rest. Tokens are identical in every run (all workloads, with and without FR-Spec). In-process decode: **+10 to +14%** (reasoning 94.0 to 103.7 tok/s, code 107 to 121, 14K context 82.3 to 90.7). **On the real server with nominal thermal pressure: +8.8%** (round 25.73 to 23.47 ms, 92.5 to 100.6 tok/s).
+- **The earlier "server keeps half the gain" (+4.7%) was thermal, not the server** (§7). With the switch on, the GPU no longer idles between rounds, so the chip draws more power. Once macOS reports heavy thermal pressure (level 2), the GPU clocks down and the round lands at ~25.2 ms, close to the baseline. The first server A/B ran back to back for 10 minutes on a warm machine. A timeline inside the server process shows the same host time per round as in-process: streaming callbacks cost 0.013 ms per round, and no other thread touches the GPU.
 - For comparison, the existing `MTPLX_COMPILED_VERIFY_FORCE=1` gives +3.6% in the same setup and is not bit-identical at long context (report 26 Sep). The async chunk gives three times as much, stays bit-identical, and needs no compiled graph.
-- **Recommendation:** put `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` in the Bink server env after a longer agent-workload check (bit-identical, +5% on the server now), and find out why the server keeps only half of the in-process gain; closing that gap is worth another ~5%. It is also a good upstream PR: small, bit-identical, and it helps every model whose verify runs eager (6-bit packs, and every model beyond the compiled-verify context limit of 32K).
+- **Recommendation:** put `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` in the Bink server env after a longer agent-workload check. It is bit-identical and gives +9% while the machine has thermal headroom (the normal case for bursty agent turns), and about 0 to 2% under sustained heavy thermal pressure. It never costs speed. It is also a good upstream PR: small, bit-identical, and it helps every model whose verify runs eager (6-bit packs, and every model beyond the compiled-verify context limit of 32K).
 
 ## 1. Setup
 
@@ -77,7 +78,7 @@ The async-chunk experiment (§4) shortened the round by 2.4 to 2.9 ms, more than
 
 | # | Candidate | Estimated gain | Measured | Exact? | Status |
 |---|---|---|---|---|---|
-| A | `mx.async_eval` on the residual stream every N layers in the eager verify (`MTPLX_VERIFY_ASYNC_CHUNK_LAYERS`) | build 1.95 ms + part of the preamble → ~2.5 ms (~9%) | **+10 to +14% in-process**, all workloads; **+4.7% on the server** (§5) | bit-identical (tokens identical in every run) | built, `perf/host-overlap-36` (7467558b) |
+| A | `mx.async_eval` on the residual stream every N layers in the eager verify (`MTPLX_VERIFY_ASYNC_CHUNK_LAYERS`) | build 1.95 ms + part of the preamble → ~2.5 ms (~9%) | **+10 to +14% in-process**, all workloads; **+8.8% on the server at nominal thermal pressure**, 0 to 2% under heavy pressure (§7) | bit-identical (tokens identical in every run) | built; PR branch `perf/verify-async-chunk` (5fbdfe94, 50a03d5a), not opened |
 | B | `MTPLX_COMPILED_VERIFY_FORCE=1` (existing switch) | build → compiled dispatch | +3.6% (96.1 against 92.7 tok/s); round 26.2 → 25.3 ms | not bit-identical at long context (report 26 Sep) | exists; A is better |
 | C | Trim Python overhead in the verify build (cache env reads, flatten the `batch_invariant_prefill` → `nax_verify` → `QuantizedLinear` chain) | ~0.5 ms (~2%); with A mostly hidden anyway | not built | bit-identical | not worth it after A |
 | D | One eval for all target rows instead of 2.4 to 2.8 per round (`fast_sampling.py:421`) | saves ~1.5 eval round-trips, ~0.2 to 0.3 ms (~1%) | not built | bit-identical if the host half is unchanged | small |
@@ -111,7 +112,7 @@ The long-context rows are noisier (one run of each pair was slow in both variant
 
 ## 5. Prototype and measurement
 
-**Code** (worktree `~/Dev/MTPLX-host36`, branch `perf/host-overlap-36` from `origin/main` 1de2b1c0, commit 7467558b, local):
+**Code** (worktree `~/Dev/MTPLX-host36`, branch `perf/host-overlap-36` from `origin/main` 1de2b1c0, commit 7467558b, pushed to the fork; PR branch `perf/verify-async-chunk` = the same change cherry-picked onto `origin/main` plus a CHANGELOG entry):
 
 - `mtplx/gdn_capture.py`: `_verify_async_chunk_layers()` reads `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS` (default off; `0`/`off`/invalid = off). In `forward_with_gdn_capture` the layer loop calls `mx.async_eval(hidden_states)` after every N layers, never after the last one, and only for decode-sized windows (T ≤ `MTPLX_TARGET_LAYER_EVAL_MAX_Q`, default 8; prefill is untouched). When the existing blocking layer-eval schedule applies it wins.
 - `tests/test_verify_async_chunk.py`: a tiny Qwen3.5-MoE model (8 layers, GDN plus attention, 8 experts); logits, hidden state and all GDN captures bit-identical with the switch on for N = 2, 3, 8, the expected number of submits (3, 2, 0), no submits for a prefill-sized window, env parsing. All 269 tests in the 14 test files that touch `gdn_capture` pass; ruff reports no new findings.
@@ -135,19 +136,50 @@ Verify per round 22.3 → 19.9 ms; draft and acceptance unchanged; tokens identi
 | async 8, run 1 | 23.19 | 24.72 | 25.55 | 25.04 | 24.58 | 96.7 |
 | async 8, run 2 | 24.87 | 24.58 | 25.00 | 24.53 | 24.78 | 96.8 |
 
-On the server the round drops from 25.95 to 24.68 ms (-4.9%) and decode rises from 92.4 to 96.8 tok/s (**+4.7%**). That is half the in-process gain (-1.3 ms per round against -2.4 ms). The baseline round is the same in both setups (~26 ms), so the server loses part of the overlap with the switch on. Not investigated; the most likely cause is the server's other threads (asyncio event loop, SSE per token at `--stream-interval 1`) taking the GIL while the decode thread sits in `mx.async_eval`, which delays the build of the next chunk. Next step to confirm: the same A/B with a larger `--stream-interval`, or a timeline inside the server process. Base 1 overlapped briefly with a unit-test run (tiny model); base 2 is clean and the slower of the two, so that does not flatter the result.
+On the server the round drops from 25.95 to 24.68 ms (-4.9%) and decode rises from 92.4 to 96.8 tok/s (**+4.7%**). That is half the in-process gain (-1.3 ms per round against -2.4 ms). §7 explains it: thermal pressure, not the server. Base 1 overlapped briefly with a unit-test run (tiny model); base 2 is clean and the slower of the two, so that does not flatter the result.
 
 ## 6. Conclusion and recommendation
 
 - On Qwen3.6-35B-A3B the host share is five times larger than on Qwen3.8-27B: ~11% measured, ~14% including the eval preamble, against ~2%. The cause is the eager verify of the 6-bit pack: ~2 ms of Python graph building per round, with nothing on the GPU.
-- Hiding that build behind the GPU with chunked `async_eval` gives ~10% decode in-process and ~5% on the real server, bit-identical, with a 30-line change. That clears the 3% bar.
+- Hiding that build behind the GPU with chunked `async_eval` gives ~10% decode in-process and +8.8% on the real server with thermal headroom, bit-identical, with a 30-line change. That clears the 3% bar. Under heavy thermal pressure the gain drops to 0 to 2%.
 - Next steps:
-  1. Find the server gap (larger `--stream-interval` as a test, or a timeline inside the server).
+  1. ~~Find the server gap~~: done, thermal (§7).
   2. Longer check on the Bink workload (agent turns at 20K to 60K context, where the verify is longer and the gain in relative terms smaller), then `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` in the server env.
-  3. Upstream PR (small, off by default, bit-identical). Also relevant for other eager-verify cases: 6-bit packs of other models and contexts above `MTPLX_COMPILED_VERIFY_MAX_CONTEXT` (32K), where Qwen3.8 and the 4-bit packs also fall back to eager.
+  3. Upstream PR: prepared, not opened. Branch `perf/verify-async-chunk` on the fork (5fbdfe94 plus CHANGELOG 50a03d5a), text in `~/Dev/laya-nl/pr-teksten/pr-verify-async-chunk.md`. Also relevant for other eager-verify cases: 6-bit packs of other models and contexts above `MTPLX_COMPILED_VERIFY_MAX_CONTEXT` (32K), where Qwen3.8 and the 4-bit packs also fall back to eager.
   4. Remaining host time after A: ~0.9 ms around acceptance and drafts plus the first chunk's build (~0.4 ms), together ~5%. Candidates D and E attack that part; each gives at most 1 to 3%.
 - Side finding: `MTPLX_TARGET_LAYER_EVAL_MODE` is in `EXTERNAL_RUNTIME_ENV_KEYS` (`commands/public.py:238`) but no code reads it. A dead switch, probably left over from an earlier async variant.
 
+## 7. Why the first server A/B kept only half the gain (measured)
+
+**Timeline inside the server.** A hook loaded into the server process (`run_srv_prof.py` + `prof_srv.py`) times every eval, the verify dispatch (wall time and decode-thread CPU time), each draft step, every `token_callback` and `abort_check`, over all 11 bench requests:
+
+| Per round (mean ms) | Server, off | Server, async 8 (fast run) | Server, async 8 (slow run) |
+|---|---|---|---|
+| Verify dispatch (with async 8: build plus 4 submits) | 1.79 | 13.42 | 13.84 |
+| Verify eval | 18.17 | 4.33 | 4.55 |
+| Target-row and draft evals | 5.11 | 5.08 | 5.29 |
+| `token_callback` (SSE, `--stream-interval 1`) | 0.013 | 0.012 | 0.013 |
+| Host outside evals | 2.59 | 2.80 | 2.76 |
+| Round | 25.86 | 23.60 | 24.44 |
+
+- The server does no extra per-round work that matters: streaming costs 0.013 ms per round and `abort_check` rounds to 0. No other thread submits GPU work during decode (postcommit and SSD run outside the timed generation). The GIL hypothesis is ruled out: host time outside evals is the same in the fast and the slow run. A larger `--stream-interval` A/B was therefore not needed.
+- The slow run differs only in **GPU time**: every GPU segment is ~4% longer at the same host time. The same happens in-process: a 4,096-token run after 10 minutes of server runs gave 98.0 tok/s instead of 102.0.
+- Per-process GPU time (`ioreg` `AppUsage.accumulatedGPUTime`, `gpusample.py`): WindowServer uses only 1.0 to 1.7% of the GPU during a run. Foreign GPU work is not the cause.
+
+**Thermal pressure.** `notifyutil -g com.apple.system.thermalpressurelevel` logged every 2 s, with a wait for level 0 before each run. Per request, ms per round with the thermal levels seen during that request:
+
+| Run | Requests 1 to 11 |
+|---|---|
+| async 8, a | 23.38[0] 23.36[0] 23.39[0] 23.34[0] 23.34[0] 23.32[0] 23.92[0] 23.84[0] 23.43[0] 23.78[0] 22.99[0/1] |
+| off, a | 25.51[0] 25.56[0] 25.76[0] 25.54[0] 25.60[0] 25.47[0] 26.40[0] 26.23[0] 25.77[0] 25.95[0] 25.23[0] |
+| async 8, b | 23.55[0] 23.44[0/1] 24.83[1/2] 25.09[2] 25.11[2] 25.03[2] 25.58[2] 25.73[2] 25.21[2] 25.57[2] 24.67[2] |
+| off, b | 25.58[0] 25.58[0] 25.71[0] 25.66[0] 25.59[0] 25.53[0] 26.26[0] 26.13[0] 25.63[0] 25.86[0] 25.21[0] |
+
+- At level 0: 25.73 ms (off) against 23.47 ms (async 8), **92.5 against 100.6 tok/s, +8.8%**. That matches the in-process gain (-2.3 ms against -2.4 ms per round).
+- At level 2 the async run slows to ~25.2 ms per round, while the baseline never left level 0 in these runs. Without GPU gaps the chip's average power goes up, so it reaches the thermal limit sooner and then clocks down. Run b started right after the machine had cooled to level 0 but was still warm, and reached level 2 within two requests.
+- The earlier bimodal runs fit the same pattern: fast at first, then slower from some request onward (`on8_1`, `on8_3`, `on8_5`). The profiled runs were not systematically faster; their timing depended on machine temperature.
+- **No exact software fix closes this.** The kernels and their energy per token are unchanged; only the idle time is gone. The mitigation is cooling: the fan mode was not tested, because Bink runs `--fan-mode default` and fan control needs the SMC helper. For bursty agent traffic the machine is mostly at level 0, where the full gain applies.
+
 ## Material
 
-`~/Dev/laya-nl/host36/`: `run1.zsh` (one tune run), `job.zsh` (GPU slot, port 8000 and swap checks), `prof_hook.py` (profiling hook, including the `PROF_LAYER_ASYNC` experiment and `PROF_THINKING`), `tl36.py` (per-round timeline), `summ.py`, `srv.zsh` + `bench36_8001.py` (server A/B on port 8001), prompt suites `reason*.jsonl`, raw results in `res/` (`cand-*`, `prof-*`, `*.tl.json`, `*.pstats`, `srv-*.json`) and logs in `logs/`.
+`~/Dev/laya-nl/host36/`: `run1.zsh` (one tune run), `job.zsh` (GPU slot, port 8000 and swap checks), `prof_hook.py` (profiling hook, including the `PROF_LAYER_ASYNC` experiment and `PROF_THINKING`), `tl36.py` (per-round timeline), `summ.py`, `srv.zsh` + `bench36_8001.py` (server A/B on port 8001, with thermal and GPU sampling), `run_srv_prof.py` + `prof_srv.py` + `srvtl.py` (timeline inside the server), `gpusample.py` (per-process GPU time from `ioreg`), `cool.zsh`, `therm.py`, prompt suites `reason*.jsonl`, raw results in `res/` (`cand-*`, `prof-*`, `*.tl.json`, `*.pstats`, `srv-*.json`) and logs in `logs/`.
