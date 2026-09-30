@@ -37,6 +37,7 @@ from .attention_context import attention_phase, exact_verify, model_forward_kind
 from .checkpoint_anchors import (
     AnchorPlan,
     CheckpointSink,
+    checkpoint_coverage,
     default_tail_backoff,
     retain_checkpoints,
 )
@@ -3403,6 +3404,9 @@ class GenerationStats:
     # the existing cumulative timers. Observational only — no metric above
     # is redefined and no evaluation point moves.
     session_restore_served: dict[str, object] = field(default_factory=dict)
+    # Recurrent checkpoints the prompt left for later turns, and an image
+    # prompt's pre-image coverage (PromptState.checkpoint_coverage).
+    session_checkpoints: dict[str, object] = field(default_factory=dict)
     prompt_state_total_time_s: float = 0.0
     prompt_state_unattributed_time_s: float = 0.0
     first_primary_sample_time_s: float = 0.0
@@ -3882,6 +3886,11 @@ class PromptState:
     # matches[0] before generation may skip it on achievable-boundary
     # checks, so served truth is recorded where the restore succeeds.
     restore_served: dict = field(default_factory=dict)
+    # The recurrent checkpoints this prompt leaves for later turns
+    # (checkpoint_anchors.checkpoint_coverage): positions, bytes, budget, and
+    # for an image prompt how close to its first image the newest one sits
+    # ({} when no session bank took part).
+    checkpoint_coverage: dict = field(default_factory=dict)
 
 
 class PostcommitAbort(RuntimeError):
@@ -4371,6 +4380,7 @@ def _prefill_restored_prompt_suffix(
     if (
         stable_prefix_len is not None
         and gdn_boundary_sink is not None
+        and _sink_cuts_forwards(gdn_boundary_sink)
         and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
     ):
         _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
@@ -4429,12 +4439,18 @@ def _prefill_restored_prompt_suffix(
         gdn_boundary_sink is not None
         and _cache_has_recurrent_entries(restored.cache)
     )
+    # Whether the checkpoints may reshape this prefill (the tail ladder, the
+    # stable edge, in-forward captures). An image prompt's sink may not: it
+    # records only at the plain chunk ends.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(
+        gdn_boundary_sink
+    )
     body = suffix[:-1]
     body_array = None
     spans: list[tuple[int, int]] = []
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-        if capture_boundaries
+        if shape_boundaries
         else None
     )
     _inforward_edges: tuple[int, ...] = ()
@@ -4442,7 +4458,7 @@ def _prefill_restored_prompt_suffix(
         body_array = mx.array([body])
         spans, _inforward_edges = _prefill_boundary_plan(
             len(body),
-            capture_boundaries=capture_boundaries,
+            capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
             mandatory_edges=(
@@ -5117,6 +5133,10 @@ def _restore_near_prefix_prompt_state(
                 gdn_boundaries=inherited_boundaries,
                 restore_served=served_truth,
             )
+        # This lane has always shaped an image prompt's suffix prefill like a
+        # text one's (the ladder), so its sink keeps cutting forwards; the
+        # ceiling only stops it keeping checkpoints past the first image,
+        # which no restore could use.
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
             _checkpoint_sink(
                 inherited_boundaries,
@@ -5124,6 +5144,7 @@ def _restore_near_prefix_prompt_state(
                 prompt_len=len(prompt_ids),
                 restore_point=restore_point,
                 stable_prefix_len=stable_prefix_len,
+                ceiling=matched_ceiling if vision_splice is not None else None,
             )
             if _gdn_boundary_capture_enabled()
             else None
@@ -5231,6 +5252,23 @@ def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
     return any(not _is_trimmable(entry) for entry in (cache or []))
 
 
+def _sink_admits(sink: Any, position: int) -> bool:
+    """Whether a checkpoint at ``position`` belongs in ``sink`` at all (an
+    image prompt's sink takes none past its first image). Plain lists take
+    every position."""
+
+    admits = getattr(sink, "admits", None)
+    return True if admits is None else bool(admits(int(position)))
+
+
+def _sink_cuts_forwards(sink: Any) -> bool:
+    """Whether the prefill may end forwards or add in-forward captures for
+    this sink. False for image prompts' sinks: they record only where the
+    forwards already end, so their prefill is unchanged."""
+
+    return bool(getattr(sink, "cuts_forwards", True))
+
+
 def _retain_boundary_sink(sink: list) -> None:
     """Trim a checkpoint list to its anchors and byte budget (see
     ``mtplx.checkpoint_anchors``). A plain list, one built outside
@@ -5252,10 +5290,12 @@ def _checkpoint_sink(
     prompt_len: int,
     restore_point: int | None = None,
     stable_prefix_len: int | None = None,
+    ceiling: int | None = None,
+    cuts_forwards: bool = True,
 ) -> CheckpointSink:
     """The checkpoint list one prefill fills, with everything its retention
-    needs known up front: the prompt end, the restore point, the stable edge
-    and the session bank's byte budget."""
+    needs known up front: the prompt end, the restore point, the stable edge,
+    the ceiling and the session bank's byte budget."""
 
     sink = CheckpointSink(
         records or (),
@@ -5267,7 +5307,9 @@ def _checkpoint_sink(
             stable_prefix=(
                 None if stable_prefix_len is None else int(stable_prefix_len)
             ),
+            ceiling=None if ceiling is None else int(ceiling),
         ),
+        cuts_forwards=cuts_forwards,
     )
     sink.retain()
     return sink
@@ -5292,8 +5334,12 @@ def _capture_gdn_boundary(
     byte budget (``mtplx.checkpoint_anchors``). The repeated geometric
     thinning it replaces re-ranked every record against the newest one and
     eroded the middle (a 16,371-token match restored at 4,096, 2026-09-29).
+    A position the sink does not admit (past an image prompt's first image)
+    is not snapshotted at all.
     """
     if sink is None or tokens_done < 1:
+        return
+    if not _sink_admits(sink, tokens_done):
         return
     try:
         hidden_leaf = None
@@ -5587,6 +5633,8 @@ def _append_gdn_boundary_record(
     """Append one boundary record and keep the anchors (see
     ``_capture_gdn_boundary``)."""
 
+    if not _sink_admits(sink, tokens_done):
+        return
     sink.append((int(tokens_done), snapshot, hidden_leaf))
     _retain_boundary_sink(sink)
 
@@ -6158,6 +6206,17 @@ def restore_or_prefill_prompt_state(
         # KV. Full-span matches (same pixels -> same surrogates through the
         # span) stay fully warm. 2026-08-07 pillar alias-leg regression.
         vision_restore_spans = vision_image_spans(bank_key_ids, vision_splice)
+    # The first image-pad position: an image prompt keeps recurrent
+    # checkpoints only at or before it, where the prefix is text. Without a
+    # known span there is no safe ceiling, so such a prompt keeps none.
+    first_image_start: int | None = (
+        int(vision_restore_spans[0][0]) if vision_restore_spans else None
+    )
+    keep_checkpoints = (
+        session_bank is not None
+        and _gdn_boundary_capture_enabled()
+        and (vision_splice is None or first_image_start is not None)
+    )
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
@@ -6298,6 +6357,12 @@ def restore_or_prefill_prompt_state(
             }
 
     def _emit_prefill_complete(state: PromptState) -> PromptState:
+        if session_bank is not None:
+            state.checkpoint_coverage = checkpoint_coverage(
+                state.gdn_boundaries,
+                budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                first_image_start=first_image_start,
+            )
         _maybe_store_prefix_snapshot(state)
         if prefill_callback is None:
             return state
@@ -6527,6 +6592,9 @@ def restore_or_prefill_prompt_state(
                 ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                 ssd_suffix_tokens=len(suffix),
             )
+            # An image prompt's sink records only where the plain chunk grid
+            # already ends a forward, and nothing past its first image: its
+            # suffix prefill stays exactly what it was when it kept none.
             suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
                 _checkpoint_sink(
                     inherited_boundaries,
@@ -6534,10 +6602,10 @@ def restore_or_prefill_prompt_state(
                     prompt_len=len(prompt_ids),
                     restore_point=restored.entry.prefix_len,
                     stable_prefix_len=stable_prefix_len,
+                    ceiling=first_image_start,
+                    cuts_forwards=vision_splice is None,
                 )
-                if session_bank is not None
-                and vision_splice is None
-                and _gdn_boundary_capture_enabled()
+                if keep_checkpoints
                 else None
             )
             if vision_splice is not None:
@@ -6626,17 +6694,22 @@ def restore_or_prefill_prompt_state(
     mtp_history_position_base = 1 if mtp_position_mode == "absolute" else 0
     # kvcache-v2: capture interior recurrent boundaries during the cold prefill
     # whenever the result will be banked — they are what make sub-prefix
-    # restores on hybrid models exact instead of approximate.
+    # restores on hybrid models exact instead of approximate. An image
+    # prompt keeps the ones at or before its first image (the text-only
+    # prefix a later turn can restore to when something after the image
+    # changes), recorded only where the plain chunk grid ends a forward so
+    # its prefill is unchanged; it kept none until 2026-09-30, so every
+    # screenshot turn that missed the cache re-read the whole conversation.
     gdn_boundary_sink: list[tuple[int, Any]] | None = (
         _checkpoint_sink(
             [],
             session_bank=session_bank,
             prompt_len=len(prompt_ids),
             stable_prefix_len=stable_prefix_len,
+            ceiling=first_image_start,
+            cuts_forwards=vision_splice is None,
         )
-        if session_bank is not None
-        and vision_splice is None
-        and _gdn_boundary_capture_enabled()
+        if keep_checkpoints
         else None
     )
     if _mtp_history_uses_committed_cache(mtp_history_policy):
@@ -7800,6 +7873,9 @@ def _prefill(
     capture_boundaries = (
         gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
     )
+    # An image prompt's sink records only at the plain chunk ends (see
+    # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(gdn_boundary_sink)
 
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
@@ -7807,18 +7883,18 @@ def _prefill(
         _cold_edges: tuple[int, ...] = ()
         if (
             stable_prefix_len is not None
-            and capture_boundaries
+            and shape_boundaries
             and 0 < int(stable_prefix_len) < len(body)
         ):
             _cold_edges = (int(stable_prefix_len),)
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-            if capture_boundaries
+            if shape_boundaries
             else None
         )
         spans, _inforward_edges = _prefill_boundary_plan(
             len(body),
-            capture_boundaries=capture_boundaries,
+            capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
             mandatory_edges=_cold_edges,
@@ -7924,6 +8000,9 @@ def _prefill_committed_mtp_history_streaming(
     capture_boundaries = (
         gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
     )
+    # An image prompt's sink records only at the plain chunk ends (see
+    # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(gdn_boundary_sink)
     body = prompt_ids[:-1]
     history_start_token_index = 1
     use_absolute_positions = mtp_position_mode == "absolute"
@@ -7953,18 +8032,18 @@ def _prefill_committed_mtp_history_streaming(
     _cold_edges: tuple[int, ...] = ()
     if (
         stable_prefix_len is not None
-        and capture_boundaries
+        and shape_boundaries
         and 0 < int(stable_prefix_len) < len(body)
     ):
         _cold_edges = (int(stable_prefix_len),)
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-        if capture_boundaries
+        if shape_boundaries
         else None
     )
     mtp_streaming_spans, _inforward_edges = _prefill_boundary_plan(
         len(body),
-        capture_boundaries=capture_boundaries,
+        capture_boundaries=shape_boundaries,
         inforward=_inforward_hooks is not None,
         tail_interval=_gdn_boundary_tail_interval(),
         mandatory_edges=_cold_edges,
@@ -9137,6 +9216,9 @@ def generate_ar(
         ),
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
+        ),
+        session_checkpoints=dict(
+            getattr(prompt_state, "checkpoint_coverage", None) or {}
         ),
         verify_time_s=target_decode_time,
         verify_forward_time_s=target_forward_graph_time,
@@ -15970,6 +16052,9 @@ def generate_mtpk(
         pre_first_token_setup_s=float(pre_first_token_setup_s),
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
+        ),
+        session_checkpoints=dict(
+            getattr(prompt_state, "checkpoint_coverage", None) or {}
         ),
         prompt_state_total_time_s=float(prompt_state_total_time_s),
         prompt_state_unattributed_time_s=float(

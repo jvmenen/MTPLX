@@ -17587,6 +17587,9 @@ def _metrics_envelope(
         # diagnostics, prompt-state wall decomposition, first-primary-sample
         # latency, round-1 timer snapshot.
         "session_restore_served": stats.get("session_restore_served") or {},
+        # Recurrent checkpoints the prompt left for later turns, and for an
+        # image prompt how close to its first image the newest one sits.
+        "session_checkpoints": stats.get("session_checkpoints") or {},
         "prompt_state_total_time_s": float(
             stats.get("prompt_state_total_time_s") or 0.0
         ),
@@ -24258,6 +24261,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "session_prefill_store",
     "pre_first_token_setup_s",
     "session_restore_served",
+    "session_checkpoints",
     "prompt_state_total_time_s",
     "prompt_state_unattributed_time_s",
     "first_primary_sample_time_s",

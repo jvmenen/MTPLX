@@ -303,6 +303,7 @@
  "server_seed": "<int>",
  "server_tok_s": "<float>",
  "session_cache_hit": false,
+ "session_checkpoints": {},
  "session_id": null,
  "session_prefill_store": {},
  "session_prompt_prefix_bank_commit": {},

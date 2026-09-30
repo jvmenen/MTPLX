@@ -13,6 +13,8 @@ These tests pin the policy's own promises:
 * over a whole session, coverage is never coarser than the grid the budget
   can hold for the longest prompt, plus one chunk;
 * a restore never starts past the matched prefix;
+* a ceiling (an image prompt's first image) keeps what is at or before it and
+  takes no snapshot past it;
 * the receipt reports what is kept.
 """
 
@@ -25,6 +27,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+import mtplx.generation as generation
 from mtplx.cache_state import CacheSnapshot
 from mtplx.checkpoint_anchors import (
     GRID_TOKENS,
@@ -36,6 +39,7 @@ from mtplx.checkpoint_anchors import (
 )
 from mtplx.generation import (
     _append_gdn_boundary_record,
+    _capture_gdn_boundary,
     _checkpoint_sink,
     _inherited_gdn_boundaries,
     _prefill_spans_with_tail_grid,
@@ -293,6 +297,29 @@ def test_no_restore_starts_past_the_matched_prefix():
         expected = _at_or_below(positions, matched)
         assert (chosen[0] if chosen else 0) == expected <= matched
         assert _recurrent_restore_point(entry, matched) == expected
+
+
+def test_a_ceiling_keeps_what_is_before_it_and_snapshots_nothing_past_it(monkeypatch):
+    snapshots: list[int] = []
+    real = generation.snapshot_untrimmable_cache
+
+    def counting(cache):
+        snapshots.append(int(cache[0].offset))
+        return real(cache)
+
+    monkeypatch.setattr(generation, "snapshot_untrimmable_cache", counting)
+    sink = CheckpointSink(
+        plan=AnchorPlan(record_count=8, prompt_end=95, ceiling=40),
+        cuts_forwards=False,
+    )
+    assert not generation._sink_cuts_forwards(sink)
+    for position in range(8, 96, 8):
+        _capture_gdn_boundary(sink, position, [_KV(position), _Recurrent(position)])
+    assert _positions(sink) == [8, 16, 24, 32, 40]
+    assert snapshots == [8, 16, 24, 32, 40]
+    # A plain list takes every position and may reshape the prefill.
+    assert generation._sink_admits([], 10**9)
+    assert generation._sink_cuts_forwards([])
 
 
 def test_the_receipt_reports_what_is_kept():
