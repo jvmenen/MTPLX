@@ -6891,6 +6891,8 @@ def test_streaming_tool_call_canonicalizes_shell_alias_to_bash(monkeypatch):
 
 
 def test_streaming_unclosed_tool_call_errors_instead_of_hidden_runaway(monkeypatch):
+    # The runaway backstop is opt-in (tests/test_hidden_tool_guard_opt_in.py).
+    monkeypatch.setenv("MTPLX_STREAM_HIDDEN_TOOL_GUARD", "on")
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -6925,6 +6927,8 @@ def test_streaming_unclosed_tool_call_errors_instead_of_hidden_runaway(monkeypat
 
 
 def test_streaming_long_content_first_write_survives_hidden_tool_guard(monkeypatch):
+    # Armed, so the known-parameter stand-down is what this exercises.
+    monkeypatch.setenv("MTPLX_STREAM_HIDDEN_TOOL_GUARD", "on")
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stream_interval = 1

@@ -520,12 +520,30 @@ STREAM_COMMIT_WAIT_MAX_S = float(
 # Runaway-hidden-generation backstop. Native-tool agent workloads stream
 # multi-thousand-token arguments (whole files) as legitimate hidden text, so
 # the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+# The backstop itself is opt-in (_stream_hidden_tool_guard_enabled).
 STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
     os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
 )
 STREAM_HIDDEN_TOOL_GUARD_S = float(
     os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
 )
+
+
+def _stream_hidden_tool_guard_enabled() -> bool:
+    """``MTPLX_STREAM_HIDDEN_TOOL_GUARD=on`` arms the hidden-tool backstop.
+
+    The backstop cancels a stream whose tool call has buffered at least the
+    token and time ceilings above outside a known parameter, and sends
+    "malformed tool_call: unterminated stream". A token count and a clock
+    cannot tell a runaway from a long valid call: it cancelled a Cline write
+    (2026-07-25), JSON-dialect writes (#196) and, on 2026-09-29, an 82 s Pi
+    answer that was most likely a long edit. A generation stop must have zero
+    false positives, so it ships off. This flag is its only switch: the
+    ceilings only tune an armed guard, and 0 means cancel at once.
+    """
+
+    raw = os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD", "").strip().lower()
+    return raw in {"1", "on", "true", "yes"}
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
@@ -38969,6 +38987,7 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_tool_deltas_emitted = False
                 early_tool_cancel_used = False
                 pending_tool_cancel_started_s: float | None = None
+                hidden_tool_guard_armed = _stream_hidden_tool_guard_enabled()
                 hidden_tool_guard_started_s: float | None = None
                 hidden_tool_guard_started_tokens: int | None = None
                 buffer_read_only_force_answer_stream = bool(
@@ -39605,7 +39624,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         yield mark_sse_sent(chunk)
                             if (
-                                content_tool_translator is not None
+                                hidden_tool_guard_armed
+                                and content_tool_translator is not None
                                 and content_tool_translator.buffering_tool_call
                                 and not streamed_tool_deltas_emitted
                                 and not content_tool_translator.tool_argument_in_progress
