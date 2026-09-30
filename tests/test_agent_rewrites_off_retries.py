@@ -1,9 +1,14 @@
 """MTPLX_AGENT_REWRITES=off and the stream worker's steering retries.
 
-The tool-fed empty retry and the stalled-promise retry re-generate a turn from
-the transcript plus an injected user message. #282 made
-MTPLX_AGENT_REWRITES=off a hard passthrough guarantee with no injected
-steering text, so under off both retries must stand down.
+The tool-fed empty retry re-generates a turn from the transcript plus an
+injected user message. #282 made MTPLX_AGENT_REWRITES=off a hard passthrough
+guarantee with no injected steering text, so under off it must stand down.
+
+The stalled-promise retry used to be the second steering retry. It was
+removed on 2026-09-30 (it threw away finished answers whose last line read
+like a promise), so a stalled promise now finishes in one pass in every
+posture; tests/test_finished_answers_are_never_regenerated.py covers the
+answer shapes it used to catch.
 """
 
 from __future__ import annotations
@@ -64,8 +69,6 @@ def _pass_kind(observability: dict) -> str:
         return "reasoning_completion_repair"
     if observability.get("tool_fed_empty_retry_attempted"):
         return "tool_fed_empty_retry"
-    if observability.get("stalled_agent_retry_attempted"):
-        return "stalled_agent_retry"
     return "first"
 
 
@@ -118,26 +121,32 @@ def _run_stream(monkeypatch, texts):
     return prompts, kinds, final[-1]["mtplx_stats"]
 
 
-@pytest.mark.parametrize(
-    ("first_text", "retry_kind"),
-    [
-        (ORPHAN_TAIL, "tool_fed_empty_retry"),
-        (STALLED_PROMISE, "stalled_agent_retry"),
-    ],
-    ids=["orphan_tool_markup", "stalled_promise"],
-)
 @pytest.mark.parametrize("mode", [None, "on"], ids=["default", "on"])
-def test_steering_retries_run_in_the_default_and_on_postures(
-    monkeypatch, first_text, retry_kind, mode
+def test_the_tool_fed_empty_retry_runs_in_the_default_and_on_postures(
+    monkeypatch, mode
 ):
     if mode is None:
         monkeypatch.delenv("MTPLX_AGENT_REWRITES", raising=False)
     else:
         monkeypatch.setenv("MTPLX_AGENT_REWRITES", mode)
 
-    _prompts, kinds, _stats = _run_stream(monkeypatch, [first_text, ANSWER])
+    _prompts, kinds, _stats = _run_stream(monkeypatch, [ORPHAN_TAIL, ANSWER])
 
-    assert kinds == ["first", retry_kind]
+    assert kinds == ["first", "tool_fed_empty_retry"]
+
+
+@pytest.mark.parametrize("mode", [None, "on", "off"], ids=["default", "on", "off"])
+def test_a_stalled_promise_finishes_in_one_pass_in_every_posture(monkeypatch, mode):
+    if mode is None:
+        monkeypatch.delenv("MTPLX_AGENT_REWRITES", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_AGENT_REWRITES", mode)
+
+    prompts, kinds, stats = _run_stream(monkeypatch, [STALLED_PROMISE, ANSWER])
+
+    assert kinds == ["first"]
+    assert len(prompts) == 1
+    assert "stalled_agent_retry_attempted" not in stats
 
 
 @pytest.mark.parametrize(

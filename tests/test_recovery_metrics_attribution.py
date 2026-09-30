@@ -4,7 +4,6 @@ from copy import deepcopy
 
 import pytest
 from fastapi.testclient import TestClient
-from test_agent_rewrites_off_retries import STALLED_PROMISE
 from test_server_openai import _fake_streaming_session_state
 from test_stream_recovery_paths import ANSWER, ORPHAN_TAIL, THINKING_ONLY, _tool_fed_request
 
@@ -17,7 +16,6 @@ from mtplx.server.stream_recovery import _STREAM_RECOVERY_STAT_PREFIXES
     ("inspection_empty_retry", ""),
     ("tool_fed_empty_retry", ORPHAN_TAIL),
     ("reasoning_completion_repair", THINKING_ONLY),
-    ("stalled_agent_retry", STALLED_PROMISE),
     ("read_only_force_answer_retry", "</think>\n\nLet me inspect another file first."),
 ])
 def test_actual_retry_writers_keep_interleaved_metrics_separate(

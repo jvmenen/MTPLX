@@ -11914,10 +11914,12 @@ def _agent_steering_enabled() -> bool:
 def _steering_retries_allowed() -> bool:
     """Stream retries that append a steering user turn, unless rewrites are off.
 
-    The tool-fed empty retry and the stalled-promise retry re-generate from
-    the transcript plus an injected instruction. MTPLX_AGENT_REWRITES=off is
-    the #282 hard passthrough guarantee, so it disables them; the default
-    posture keeps them.
+    The tool-fed empty retry re-generates from the transcript plus an
+    injected instruction. MTPLX_AGENT_REWRITES=off is the #282 hard
+    passthrough guarantee, so it disables it; the default posture keeps it.
+    (A second one, the stalled-promise retry, was removed on 2026-09-30: it
+    read finished answers such as `Say "A" or "B" and I'll run it` as a
+    stalled tool call and threw them away.)
     """
 
     return _agent_rewrites_mode() != "off"
@@ -24408,14 +24410,6 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "stream_attempts_prompt_eval_time_s",
     "stream_attempts_new_prefill_tokens",
     "stream_attempts_completion_tokens",
-    "stalled_agent_retry_attempted",
-    "stalled_agent_retry_succeeded",
-    "stalled_agent_retry_reason",
-    "stalled_agent_retry_first_completion_tokens",
-    "stalled_agent_retry_first_decode_tok_s",
-    "stalled_agent_retry_prompt_tokens",
-    "stalled_agent_retry_completion_tokens",
-    "stalled_agent_retry_finish_reason",
     "visible_reasoning_stripped",
     "nonstream_reasoning_content_routed",
     "tool_parse_success",
@@ -38133,165 +38127,6 @@ def create_app(state: ServerState) -> FastAPI:
                     _update_recovery_metrics(state, retry_stats)
                     return retry_generated
 
-                def maybe_retry_stalled_agent_tool_promise(
-                    generated: dict[str, Any],
-                ) -> dict[str, Any]:
-                    if (
-                        not tools_active
-                        or not tool_result_history_present
-                        or request.seed is not None
-                        or not _steering_retries_allowed()
-                    ):
-                        return generated
-                    raw_text = _strip_mtplx_internal_continuation_markers(
-                        _strip_generated_chat_template_sentinels(
-                            str(generated.get("text") or "")
-                        )
-                    )
-                    if not raw_text.strip():
-                        return generated
-                    raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
-                        state,
-                        raw_text,
-                        thinking_enabled=thinking_enabled,
-                    )
-                    extraction = omlx_extract_tool_calls_with_thinking(
-                        raw_reasoning_text,
-                        raw_content_text,
-                        state.runtime.tokenizer,
-                        tool_specs,
-                    )
-                    if extraction.tool_calls:
-                        return generated
-                    visible_candidate = (
-                        "\n\n".join(
-                            part.strip()
-                            for part in (raw_reasoning_text, raw_content_text)
-                            if part and part.strip()
-                        )
-                        or raw_text
-                    )
-                    if not _looks_like_stalled_agent_tool_promise(visible_candidate):
-                        return generated
-
-                    repair_messages = list(messages_for_generation)
-                    repair_messages.append(
-                        ChatMessage(
-                            role="user",
-                            content=(
-                                "Continue the active coding task now. Your previous "
-                                "draft ended by promising to inspect, run, edit, or "
-                                "check more work, but it did not include a tool call. "
-                                "If more work is needed, emit exactly one declared "
-                                "tool call now. If no more tool is needed, answer "
-                                'with concrete final results. Do not say "let me" '
-                                "and do not quote MTPLX internal notes."
-                            ),
-                        )
-                    )
-                    repair_observability: dict[str, Any] = {}
-                    repair_prompt_ids = _encode_messages(
-                        state.runtime.tokenizer,
-                        repair_messages,
-                        enable_thinking=thinking_enabled,
-                        reasoning_effort=reasoning_effort,
-                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-                        scoped_reasoning_history=_reasoning_history_scoped_active(
-                            state
-                        ),
-                        preserve_reasoning_history=(
-                            _reasoning_history_preserve_echo_active(state)
-                        ),
-                        tools=tool_specs,
-                        tool_prompt_mode=tool_prompt_mode,
-                        template_observability=repair_observability,
-                        # Repair re-encodes run on the gate's canonical
-                        # messages: without this flag the substituted think
-                        # interiors are dropped and the repair prompt
-                        # re-poisons what canonicalization just fixed
-                        # (audit F11 #5).
-                        allow_committed_reasoning=True,
-                    )
-                    first_stats = dict(generated.get("stats") or {})
-                    retry_observability = dict(request_observability)
-                    retry_observability.update(
-                        {
-                            "stalled_agent_retry_attempted": True,
-                            "stalled_agent_retry_reason": "tool_promise_without_tool_call",
-                            "stalled_agent_retry_first_completion_tokens": int(
-                                generated.get("completion_tokens") or 0
-                            ),
-                            "stalled_agent_retry_first_decode_tok_s": first_stats.get(
-                                "decode_tok_s"
-                            ),
-                            "stalled_agent_retry_prompt_tokens": len(repair_prompt_ids),
-                        }
-                    )
-                    retry_generated = _run_generation_dispatched(
-                        state,
-                        repair_prompt_ids,
-                        batch_key="chat.stream.stalled_agent_retry",
-                        response_id=response_id,
-                        max_tokens=request_max_tokens,
-                        temperature=sampler_temperature,
-                        top_p=sampler_top_p,
-                        top_k=sampler_top_k,
-                        presence_penalty=sampler_presence_penalty,
-                        frequency_penalty=sampler_frequency_penalty,
-                        seed=None,
-                        draft_sampler=request_draft_sampler,
-                        generation_mode=request_generation_mode,
-                        constraint_spec=constraint_spec,
-                        depth=request_depth,
-                        resolved_mtp_depth=effective_request_depth,
-                        token_callback=on_tokens,
-                        session_id=session_id,
-                        cache_miss_reason=cache_miss_reason,
-                        session_restore_mode=session_restore_mode,
-                        session_bank=session_bank_for_generation,
-                        session_template_hash=state.template_hash,
-                        session_draft_head_identity=state.draft_head_identity,
-                        session_policy_fingerprint=session_restore_policy_fingerprint,
-                        background_request=background,
-                        commit_final_state_to_bank=False,
-                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
-                        session_keep_live_ref=session_keep_live_ref,
-                        vision_splice=vision_splice,
-                        request_observability=retry_observability,
-                        prefill_callback=on_prefill,
-                        cancel_event=cancel_event,
-                    )
-                    retry_text = _strip_mtplx_internal_continuation_markers(
-                        _strip_generated_chat_template_sentinels(
-                            str(retry_generated.get("text") or "")
-                        )
-                    )
-                    retry_reasoning, retry_content = _tool_extraction_text_parts(
-                        state,
-                        retry_text,
-                        thinking_enabled=thinking_enabled,
-                    )
-                    retry_extraction = omlx_extract_tool_calls_with_thinking(
-                        retry_reasoning,
-                        retry_content,
-                        state.runtime.tokenizer,
-                        tool_specs,
-                    )
-                    retry_stats = retry_generated.setdefault("stats", {})
-                    retry_stats.update(retry_observability)
-                    retry_succeeded = bool(
-                        retry_extraction.tool_calls
-                    ) or not _looks_like_stalled_agent_tool_promise(retry_text)
-                    retry_stats["stalled_agent_retry_succeeded"] = retry_succeeded
-                    retry_stats["stalled_agent_retry_completion_tokens"] = int(
-                        retry_generated.get("completion_tokens") or 0
-                    )
-                    retry_stats["stalled_agent_retry_finish_reason"] = str(
-                        retry_generated.get("finish_reason") or "stop"
-                    )
-                    _update_recovery_metrics(state, retry_stats)
-                    return retry_generated
-
                 def maybe_retry_read_only_force_answer(
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
@@ -38625,7 +38460,6 @@ def create_app(state: ServerState) -> FastAPI:
                     maybe_retry_degenerate_tool_fed_empty_completion,
                     maybe_repair_tool_fed_reasoning_only_completion,
                     maybe_retry_read_only_force_answer,
-                    maybe_retry_stalled_agent_tool_promise,
                 ]
 
                 def worker() -> None:

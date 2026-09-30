@@ -1,6 +1,6 @@
 """Session/canonicalization hardening smalls (audit F11 #5/#6/#8/#9/P2).
 
-Covers: the three repair re-encodes preserving committed reasoning, the
+Covers: the repair prompts preserving committed reasoning, the
 transient trailing-sentinel registry, the system-suffix conversion of the
 no-tools/post-tool contracts, the burst-pinned date line, single-call
 session resolution, reasoning_effort ladder mapping, and the warmup
@@ -24,12 +24,13 @@ OPENAI_PY = Path(oa.__file__)
 # --- repair-encode preserves committed reasoning (x3 sites) ---------------
 
 
-def test_all_three_repair_encodes_preserve_committed_reasoning():
+def test_every_repair_prompt_keeps_committed_reasoning():
     """The stream retry/repair helpers re-encode the gate's canonical
     messages; every one of them must pass allow_committed_reasoning=True or
     the repair prompt drops the substituted think and re-poisons what
-    canonicalization just fixed (audit F11 #5). AST-pinned so a fourth
-    repair site added without the flag fails this test."""
+    canonicalization just fixed (audit F11 #5). AST-pinned so a new repair
+    site added without the flag fails this test. There were three sites
+    until the stalled-agent retry was removed on 2026-09-30."""
     tree = ast.parse(OPENAI_PY.read_text())
     repair_calls: list[tuple[int, bool]] = []
     for node in ast.walk(tree):
@@ -56,8 +57,8 @@ def test_all_three_repair_encodes_preserve_committed_reasoning():
             for keyword in call.keywords
         )
         repair_calls.append((node.lineno, has_flag))
-    assert len(repair_calls) == 3, (
-        f"expected exactly the three known repair encodes, found {repair_calls}"
+    assert len(repair_calls) == 2, (
+        f"expected exactly the two known repair encodes, found {repair_calls}"
     )
     missing = [line for line, has_flag in repair_calls if not has_flag]
     assert not missing, (

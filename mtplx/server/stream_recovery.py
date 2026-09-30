@@ -9,7 +9,6 @@ _STREAM_RECOVERY_STAT_PREFIXES = (
     "tool_fed_empty_retry_",
     "reasoning_completion_repair_",
     "read_only_force_answer_retry_",
-    "stalled_agent_retry_",
 )
 # Key on a recovery pass's result naming the prompt it was generated from,
 # when that prompt is not the request's own (the tool-fed empty retry).
