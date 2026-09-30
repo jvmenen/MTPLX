@@ -79,7 +79,14 @@ def test_the_16371_match_restores_at_8192_not_4096():
     """B-cache 2.6: the retry restored at 4,096 and prefilled to 46,938
     tokens; its next request matched 16,371. The old list's best boundary at
     or below 16,371 was 4,096; the grid keeps 8,192, and nothing past the
-    match is ever a candidate."""
+    match is ever a candidate.
+
+    Eight checkpoints over 47K tokens only guarantee the 16K grid: 8,192
+    survives here because the inherited set held one checkpoint. Had it also
+    held 2,048, the first checkpoint and the restore point would share the
+    first 8K cell and the last slot would go to a newer cell, and this match
+    would restore at 4,096 again (ten checkpoints restore it at 8,192). The
+    general bound is pinned in tests/test_checkpoint_anchors.py."""
 
     previous = SimpleNamespace(gdn_boundaries=[_rec(4096)])
     sink = list(_inherited_gdn_boundaries(previous, 4096))
