@@ -19749,6 +19749,17 @@ _RETRY_SENTENCES = {
         "A retry can succeed once other apps give memory back: close some "
         "apps and try again, or shorten the prompt."
     ),
+    "after_the_conversation_cache_reaches_ssd": (
+        "A retry can succeed in a few seconds: this conversation's cached "
+        "context is being written to the SSD cache, and once it is on disk "
+        "the engine moves it out of memory instead of deleting it."
+    ),
+    "not_while_the_conversation_stays_in_memory": (
+        "A retry cannot succeed as is: this conversation's cached context "
+        "cannot move to the SSD cache (it is off, full, or did not take it), "
+        "and the engine keeps it rather than delete it. Free disk space for "
+        "the SSD cache, start a new conversation, or raise the memory limit."
+    ),
 }
 
 
@@ -19812,6 +19823,19 @@ def _admission_released_text(receipt: Mapping[str, Any]) -> str:
     return text + ")."
 
 
+def _admission_kept_text(receipt: Mapping[str, Any]) -> str:
+    kept = receipt.get("kept_session_entries_resident_after")
+    if not isinstance(kept, Mapping) or not kept.get("held_bytes"):
+        return ""
+    return (
+        "It kept this conversation's cached context "
+        f"({int(kept.get('longest_shared_prefix_tokens') or 0)} tokens in common "
+        f"with this prompt, {_gib_text(kept.get('held_bytes'))}) in memory: it is "
+        "not on the SSD cache yet, and deleting it would make the next turns "
+        "re-read the conversation."
+    )
+
+
 def _prefill_admission_refusal(
     state: "ServerState", receipt: Mapping[str, Any]
 ) -> HTTPException:
@@ -19834,7 +19858,11 @@ def _prefill_admission_refusal(
     when = receipt.get("retry_when")
     retry = _RETRY_SENTENCES.get(str(when), "") if when else ""
     holders = _admission_holders_text(receipt)
-    released = _admission_released_text(receipt)
+    released = " ".join(
+        part
+        for part in (_admission_released_text(receipt), _admission_kept_text(receipt))
+        if part
+    )
     if receipt.get("refusal_reason") == "system_memory_short_after_reclamation":
         available = receipt.get("system_available_bytes_after")
         if available is None:
@@ -19902,6 +19930,9 @@ def _prefill_admission_refusal(
             "system_shed_floor_bytes",
             "holders",
             "reclamation_steps",
+            "kept_session_entries",
+            "kept_session_entries_resident_after",
+            "kept_session_entries_moved_to_ssd",
         )
         if receipt.get(key) is not None
     }
@@ -20698,25 +20729,6 @@ def _prefill_admission_shed_enabled() -> bool:
     return os.environ.get(
         "MTPLX_PREFILL_ADMISSION_SHED", "1"
     ).strip().lower() not in {"0", "off", "false", "no"}
-
-
-def _prefill_admission_min_miss_tokens() -> int:
-    """Uncached tokens that read as a rewritten prefix (agent compaction).
-
-    Every request is projected; this threshold gates only the superseded
-    inference. A prompt that restores nothing from its own session is taken
-    as a rewrite, and that session's banked entries cleared, only when at
-    least this many of its tokens are uncached: a short side request under
-    the same session (a title, a summary) must not clear the conversation it
-    rides on. The threshold used to skip the whole projection, so a warm turn
-    under 4,096 new tokens was admitted blind while its restore copied the
-    reused prefix (#499, 48 GB: 38.5 GiB active against a 36 GiB limit).
-    """
-    raw = os.environ.get("MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS", "4096")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 4096
 
 
 def _prefill_admission_live_prefix_enabled() -> bool:
@@ -21734,6 +21746,73 @@ def _admission_retry_verdict(
     return True, "after_other_apps_free_memory"
 
 
+def _admission_kept_rows(
+    rows: Iterable[Mapping[str, Any]], *, reused_tokens: int
+) -> list[dict[str, Any]]:
+    """The one same-conversation entry the admission keeps: the one that
+    shares the most of the prompt, when that is more than the restore reuses
+    (the restore source is protected already, and a sibling holding no more
+    of the prompt duplicates state that stays). Of equals, the smaller entry
+    (it holds the same prompt state in fewer bytes), then the one in RAM."""
+
+    candidates = [
+        dict(row)
+        for row in rows
+        if int(row.get("shared_tokens") or 0) > int(reused_tokens or 0)
+    ]
+    if not candidates:
+        return []
+    best = max(
+        candidates,
+        key=lambda row: (
+            int(row.get("shared_tokens") or 0),
+            -int(row.get("tokens") or 0),
+            bool(row.get("resident")),
+        ),
+    )
+    return [best]
+
+
+def _kept_conversation_retry_verdict(
+    receipt: dict[str, Any],
+    kept_resident: list[Mapping[str, Any]],
+    *,
+    can_succeed: bool,
+    when: str,
+) -> tuple[bool, str]:
+    """The retry verdict when this conversation's own kept state is what
+    does not fit beside the request.
+
+    The admission never deletes a same-conversation entry: one the SSD cache
+    has published leaves RAM before a refusal, one still in RAM is not on disk
+    yet. When the generic verdict says nothing else would free enough, the
+    answer depends on that entry: its SSD write is queued (it runs once this
+    request is refused, and the retry then moves the entry out of RAM), or
+    nothing will put it on disk (the SSD cache is off, full, or refused it).
+    """
+
+    resident = int(sum(int(row.get("held_bytes") or 0) for row in kept_resident))
+    if resident <= 0:
+        return can_succeed, when
+    pending = any(bool(row.get("ssd_write_pending")) for row in kept_resident)
+    receipt["kept_session_entries_resident_after"] = {
+        "entries": len(kept_resident),
+        "held_bytes": resident,
+        "longest_shared_prefix_tokens": int(
+            max(int(row.get("shared_tokens") or 0) for row in kept_resident)
+        ),
+        "ssd_write_pending": pending,
+    }
+    over = int(receipt.get("projected_bytes_after") or 0) - int(
+        receipt.get("limit_bytes") or 0
+    )
+    if when != "not_without_a_shorter_prompt" or resident < over:
+        return can_succeed, when
+    if pending:
+        return True, "after_the_conversation_cache_reaches_ssd"
+    return False, "not_while_the_conversation_stays_in_memory"
+
+
 def _prefill_admission_shed(
     state: "ServerState",
     *,
@@ -21787,9 +21866,10 @@ def _prefill_admission_shed(
          by a live reference to a cache decode is about to mutate);
          then the queued settles and SSD encodes of entries already out of
          RAM (their arrays stay held until the idle lane runs them);
-      3. the session's own entries when a cold miss of at least
-         ``MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS`` shows its client
-         rewrote the prefix (agent compaction), with their queued SSD encode;
+      3. (removed 2026-09-30: the "superseded" clear of the session's own
+         entries; the session's same-conversation entries, those sharing at
+         least half of themselves with the prompt, are protected in every
+         step and their SSD writes are never cancelled);
       4. idle entries of inactive sessions, least recently used first;
       5. chain prefixes and sibling snapshots (``shrink_for_admission``);
       6. whole idle conversations, leases and live caches included, least
@@ -21797,7 +21877,11 @@ def _prefill_admission_shed(
          with their queued SSD encode cancelled
          (``EngineSessionManager.release_idle_sessions``);
       7. only when the request would otherwise be refused: the incoming
-         conversation's own entries other than its restore sources.
+         conversation's own entries other than its restore sources and its
+         same-conversation entries;
+      8. only when it would still be refused: the same-conversation entries
+         the SSD cache has published leave RAM. One not on disk yet stays,
+         priced, and the request is refused with that reason.
 
     Never an in-flight session, never an entry the prompt restores from;
     every step that evicts cancels the evicted entries' own queued jobs, and
@@ -22328,6 +22412,42 @@ def _run_prefill_admission(
     # health reports it (_note_guard_health) until a later admission gets
     # through reclamation cleanly.
     step_errors: list[BaseException] = []
+    # The session's entry that holds the most of this prompt beyond what the
+    # restore reuses (same_conversation_entries: in RAM or held by a queued
+    # SSD write, sharing at least half of itself with the prompt). It is the
+    # conversation's newest state even when the restore cannot use it for
+    # this prompt (a divergence the lookup cannot splice, a screenshot turn):
+    # no step deletes it or cancels its SSD write. Once published it may
+    # leave RAM for the SSD cache as the last step before a refusal; before
+    # that it is priced where it is, and when it and this request do not fit
+    # together the request is refused here. A sibling that holds no more of
+    # the prompt than the restore source or this entry is a duplicate and
+    # stays reclaimable.
+    kept_rows: list[dict[str, Any]] = []
+    same_conversation_fn = getattr(session_bank, "same_conversation_entries", None)
+    if session_bank is not None and session_id and callable(same_conversation_fn):
+        try:
+            kept_rows = _admission_kept_rows(
+                same_conversation_fn(session_id, probe_ids) or (),
+                reused_tokens=reused_tokens,
+            )
+        except Exception as exc:
+            receipt["same_conversation_error"] = repr(exc)
+            step_errors.append(exc)
+    kept_keys = {tuple(row["key"]) for row in kept_rows}
+    if kept_rows:
+        receipt["kept_session_entries"] = {
+            "entries": len(kept_rows),
+            "held_bytes": int(sum(int(row.get("held_bytes") or 0) for row in kept_rows)),
+            "longest_shared_prefix_tokens": int(
+                max(int(row.get("shared_tokens") or 0) for row in kept_rows)
+            ),
+            "resident_entries": sum(1 for row in kept_rows if row.get("resident")),
+            "durable_entries": sum(1 for row in kept_rows if row.get("durable")),
+            "ssd_write_pending_entries": sum(
+                1 for row in kept_rows if row.get("ssd_write_pending")
+            ),
+        }
     if early_pool_clear_error is not None:
         receipt["cache_cleared"] = False
         receipt["cache_clear_error"] = repr(early_pool_clear_error)
@@ -22424,7 +22544,12 @@ def _run_prefill_admission(
             try:
                 receipt["queued_persistence_release"] = queued_fn(
                     deficit(now),
-                    keep_session_ids=in_flight_ids,
+                    # Never the SSD write of this conversation's own state.
+                    keep_session_ids=(
+                        in_flight_ids | {str(session_id)}
+                        if kept_rows
+                        else in_flight_ids
+                    ),
                     reason="prefill_admission_queued_persistence",
                 )
                 clear_pool()
@@ -22448,44 +22573,19 @@ def _run_prefill_admission(
         if session_bank is not None and deficit(now) > 0:
             try:
                 receipt["bank_bytes_before"] = int(session_bank.total_nbytes)
-                # 3. Nothing restorable, exact or by block prefix, and a large
-                # cold miss: the client rewrote this session's prefix (agent
-                # compaction), so its banked entries can never be restored by
-                # this lineage again. A short side request that shares nothing
-                # with its session (a title, a summary) is not that evidence.
-                if (
-                    session_id
-                    and reused_tokens == 0
-                    and miss_tokens >= _prefill_admission_min_miss_tokens()
-                ):
-                    receipt["superseded_session_entries_evicted"] = int(
-                        session_bank.clear(session_id=session_id)
-                    )
-                    cancel = getattr(session_bank, "cancel_session_persistence", None)
-                    if callable(cancel):
-                        try:
-                            receipt["superseded_persistence_cancelled"] = int(
-                                cancel(session_id)
-                            )
-                        except QueuedPersistenceCancelError as exc:
-                            # The entries are gone from RAM; the jobs that
-                            # could not be cancelled still hold theirs. The
-                            # steps below still run.
-                            receipt["superseded_persistence_cancelled"] = int(
-                                exc.cancelled
-                            )
-                            receipt["superseded_persistence_error"] = repr(exc)
-                            step_errors.append(exc)
-                    clear_pool()
-                    now = measure()
-                    steps.append("superseded_session")
-                    replan(
-                        "superseded_session",
-                        receipt["superseded_session_entries_evicted"],
-                    )
-                elif session_id and reused_tokens > 0:
-                    # A restorable prefix exists: pin this session so the LRU
-                    # pass below cannot evict the entry the restore depends on.
+                # 3. The superseded-session clear is gone (2026-09-30). It read
+                # "nothing restorable and a large miss" as a rewritten
+                # history and deleted the session's entries with their SSD
+                # write, but the restore lookup it asked excludes partial
+                # image matches: on 2026-09-29 it deleted the only 4 GB entry
+                # of a live Pi conversation four times, and each turn after
+                # re-read 123K-138K tokens cold. The same-conversation entries
+                # (kept_rows) are protected in every step below; an entry
+                # that shares less than half of itself with the prompt is
+                # reclaimed by those steps like any other.
+                if session_id and (reused_tokens > 0 or kept_rows):
+                    # A restorable prefix or the conversation's own state:
+                    # pin this session so the LRU pass below cannot evict it.
                     session_bank.touch_sessions([session_id])
                 # 4. Idle entries of inactive sessions.
                 remaining = deficit(now)
@@ -22497,7 +22597,7 @@ def _run_prefill_admission(
                                 max(0, bank_bytes_now - remaining),
                                 reason="prefill_admission",
                                 protect_active=True,
-                                protect_keys=restore["keys"],
+                                protect_keys=set(restore["keys"]) | kept_keys,
                                 protect_session_ids=in_flight_ids,
                             )
                         )
@@ -22527,7 +22627,7 @@ def _run_prefill_admission(
                                 max(0, bank_bytes_now - remaining),
                                 protect_tokens=probe_ids,
                                 reason="prefill_admission_chain",
-                                protect_keys=restore["keys"],
+                                protect_keys=set(restore["keys"]) | kept_keys,
                                 protect_session_ids=in_flight_ids,
                             )
                         except QueuedPersistenceCancelError as exc:
@@ -22605,13 +22705,16 @@ def _run_prefill_admission(
     ):
         try:
             # No ownership hold: this request holds the session's slot.
-            receipt["own_session_release"] = own_fn(
-                None,
-                only_session_ids={str(session_id)},
-                protect_tokens=probe_ids,
-                restore_identity=identity,
-                reason="prefill_admission_own_session",
-            )
+            own_release_kwargs: dict[str, Any] = {
+                "only_session_ids": {str(session_id)},
+                "protect_tokens": probe_ids,
+                "restore_identity": identity,
+                "reason": "prefill_admission_own_session",
+            }
+            if kept_keys:
+                # The same-conversation entries and their SSD writes stay.
+                own_release_kwargs["protect_keys"] = kept_keys
+            receipt["own_session_release"] = own_fn(None, **own_release_kwargs)
             clear_pool()
             now = measure()
             steps.append("own_session_siblings")
@@ -22627,6 +22730,28 @@ def _run_prefill_admission(
                 receipt["own_session_release"] = partial
                 clear_pool()
                 now = measure()
+
+    # 8. Before refusing: the same-conversation entries the SSD cache has
+    # published leave RAM (a later restore reads them from disk). One not on
+    # disk yet stays where it is, priced, and its write is never cancelled.
+    move_fn = getattr(session_bank, "move_durable_entries_to_ssd", None)
+    if (
+        chosen is _ADMISSION_NO_FIT
+        and kept_keys
+        and callable(move_fn)
+        and refusal_deficit(now, current) > 0
+    ):
+        try:
+            moved = move_fn(kept_keys, reason="prefill_admission_moved_to_ssd")
+            receipt["kept_session_entries_moved_to_ssd"] = moved
+            if int((moved or {}).get("entries") or 0) > 0:
+                clear_pool()
+                now = measure()
+                steps.append("same_conversation_to_ssd")
+                replan("same_conversation_to_ssd", moved.get("entries"))
+        except Exception as exc:
+            receipt["kept_session_entries_move_error"] = repr(exc)
+            step_errors.append(exc)
 
     if chosen is _ADMISSION_NO_FIT:
         # Re-priced on what reclamation left: the widest chunk that now fits
@@ -22698,6 +22823,22 @@ def _run_prefill_admission(
             growth=growth_after,
             weights=geometry.weights_bytes,
         )
+        if kept_rows and callable(same_conversation_fn):
+            # What of the conversation's own state is still in RAM, and
+            # whether its SSD write is on the way (then a retry moves it).
+            try:
+                kept_after = [
+                    row
+                    for row in same_conversation_fn(session_id, probe_ids) or ()
+                    if row.get("resident") and tuple(row["key"]) in kept_keys
+                ]
+            except Exception as exc:
+                kept_after = []
+                receipt["same_conversation_error"] = repr(exc)
+                step_errors.append(exc)
+            can_succeed, when = _kept_conversation_retry_verdict(
+                receipt, kept_after, can_succeed=can_succeed, when=when
+            )
         receipt["retry_can_succeed"] = bool(can_succeed)
         receipt["retry_when"] = when
     _note_guard_health(

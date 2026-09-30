@@ -9,9 +9,10 @@ mid-prefill and the sustained-pressure guard killed the request with a
 structured 507 ~30 s later.
 
 These tests pin the admission guard that sheds BEFORE the prefill:
-unused allocator storage first, then superseded same-session entries and
-LRU idle entries with active sessions protected — and stays perfectly inert
-when memory is healthy.
+unused allocator storage first, then LRU idle entries with active sessions
+protected — and stays perfectly inert when memory is healthy. (A superseded
+clear of the incoming session's own entries ran before the LRU pass until
+2026-09-30; tests/test_admission_keeps_the_conversation.py covers why it went.)
 """
 
 from __future__ import annotations
@@ -285,7 +286,13 @@ class TestIncidentShape:
         assert bank.shrink_calls == []
         assert bank.total_nbytes == 6 * GIB
 
-    def test_superseded_session_snapshot_released_first(self, monkeypatch):
+    def test_a_rewritten_history_is_reclaimed_without_a_session_clear(self, monkeypatch):
+        """This test used to pin the superseded clear: a miss read as a
+        rewritten history cleared the session's entries and cancelled their
+        SSD writes. That inference deleted a live conversation's only entry
+        on 2026-09-29, so it is gone; an entry that shares nothing with the
+        prompt is still reclaimed, by the LRU pass like any idle entry."""
+
         _pin_live_stats(monkeypatch, active=93 * GIB, cache=2 * GIB)
         # The compaction rewrote the prefix: the session's banked snapshot
         # (prefix 900..999) can never match the new prompt (0..39999).
@@ -297,8 +304,10 @@ class TestIncidentShape:
         assert receipt["action"] == "prefill_admission_shed"
         assert receipt["reusable_prefix_tokens"] == 0
         assert receipt["miss_tokens"] == 40_000
-        assert receipt["superseded_session_entries_evicted"] == 1
-        assert bank.cleared_sessions == ["pi"]
+        assert "superseded_session_entries_evicted" not in receipt
+        assert bank.cleared_sessions == []
+        assert superseded not in bank.entries
+        assert "lru_idle_entries" in receipt["reclamation_steps"]
         assert receipt["cache_cleared"] is True
 
     def test_guard_event_recorded(self, monkeypatch):
@@ -312,11 +321,9 @@ class TestIncidentShape:
             event.get("action") == "prefill_admission_shed" for event in events
         )
 
-    def test_lru_shrink_protects_active_and_runs_after_superseded(
-        self, monkeypatch
-    ):
-        # Deficit larger than the superseded snapshot alone: the LRU pass
-        # must run with protect_active=True.
+    def test_lru_shrink_protects_active_sessions(self, monkeypatch):
+        # The LRU pass runs with protect_active=True. (It used to run after
+        # the superseded clear, removed on 2026-09-30.)
         _pin_live_stats(monkeypatch, active=95 * GIB, cache=3 * GIB)
         superseded = _Entry(range(900, 1000), "pi", 1 * GIB)
         strangers = [
@@ -326,7 +333,7 @@ class TestIncidentShape:
         bank = _Bank([*strangers, superseded])
         receipt = _shed(_state(), list(range(40_000)), bank, "pi")
         assert receipt is not None
-        assert receipt["superseded_session_entries_evicted"] == 1
+        assert "superseded_session_entries_evicted" not in receipt
         assert len(bank.shrink_calls) == 1
         _target, reason, protect_active = bank.shrink_calls[0]
         assert reason == "prefill_admission"
@@ -448,20 +455,22 @@ class TestBlockPrefixRestorableEntries:
         assert receipt["reusable_prefix_tokens"] == 8_200
         assert receipt["reusable_prefix_mode"] == "exact"
 
-    def test_overlap_under_the_restore_floor_is_still_superseded(
+    def test_overlap_under_the_restore_floor_is_still_reclaimable(
         self, monkeypatch
     ):
         _pin_live_stats(monkeypatch, active=95 * GIB, cache=1 * GIB)
         prompt = list(range(40_000))
         # A compaction that kept only the first 300 tokens (system prompt)
-        # shares less than a restorable block: the entry is superseded.
+        # shares less than a restorable block: the entry is reclaimable (by
+        # the LRU pass now that the superseded clear is gone).
         stale = _Entry(prompt[:300] + list(range(90_000, 91_000)), "pi", 6 * GIB)
         bank = _Bank([stale])
         receipt = _shed(_state(), prompt, bank, "pi")
         assert receipt is not None
         assert receipt["reusable_prefix_tokens"] == 0
         assert receipt["reusable_prefix_mode"] == "none"
-        assert bank.cleared_sessions == ["pi"]
+        assert bank.cleared_sessions == []
+        assert stale not in bank.entries
 
     def test_bank_without_the_shared_prefix_probe_keeps_the_exact_estimate(
         self, monkeypatch
@@ -478,7 +487,9 @@ class TestBlockPrefixRestorableEntries:
         receipt = _shed(_state(), prompt, bank, "gate")
         assert receipt is not None
         assert receipt["reusable_prefix_tokens"] == 0
-        assert bank.cleared_sessions == ["gate"]
+        # No superseded clear (removed 2026-09-30): the estimate is what this
+        # pins, and nothing clears the session on it.
+        assert bank.cleared_sessions == []
 
 
 class _LiveSession:
@@ -564,7 +575,7 @@ class TestLiveSessionPrefix:
         receipt = _shed(state, prompt, bank, "warm")
         assert receipt is not None
         assert receipt["reusable_prefix_mode"] == "none"
-        assert bank.cleared_sessions == ["warm"]
+        assert bank.cleared_sessions == []
 
     def test_state_without_sessions_keeps_the_bank_estimate(self, monkeypatch):
         _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
@@ -574,7 +585,7 @@ class TestLiveSessionPrefix:
         receipt = _shed(_state(), prompt, bank, "warm")
         assert receipt is not None
         assert receipt["reusable_prefix_mode"] == "none"
-        assert bank.cleared_sessions == ["warm"]
+        assert bank.cleared_sessions == []
 
 
 class _ChainBank(_Bank):
