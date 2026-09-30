@@ -485,11 +485,26 @@ def _near_prefix_candidate_len(
     if not prefix:
         return None
     matched = common_prefix_len(tokens, prefix)
+    # An image prompt is matched in its content-keyed view: the match is
+    # content-true, but a restore never cuts an image (image_safe_restore_len).
+    # A cut back to an image's start is no tiny gap; the block rules judge it.
+    from .vision.splice import image_safe_restore_len
+
+    whole = image_safe_restore_len(
+        tokens, matched, reforwards_last_token=not entry.has_recurrent
+    )
+    cut_before_image = whole != matched
+    matched = whole
     gap = len(prefix) - matched
     required_match = min(min_match, max(1, len(prefix) - gap_limit))
     # A stored prefix may include assistant output after the exact prompt
     # boundary; a prompt wholly contained in it is not a tiny-gap restore.
-    if 0 <= gap <= gap_limit and matched >= required_match and matched < len(tokens):
+    if (
+        not cut_before_image
+        and 0 <= gap <= gap_limit
+        and matched >= required_match
+        and matched < len(tokens)
+    ):
         return int(matched)
     if not allow_block_prefix:
         if diag is not None:
@@ -533,9 +548,20 @@ def _recurrent_restore_point(entry: Any, matched: int) -> int:
     best = 0
     for record in records:
         boundary = int(record[0])
-        if boundary <= int(matched):
+        if boundary <= int(matched) and _restorable_boundary(entry.token_ids, boundary):
             best = max(best, boundary)
     return best
+
+
+def _restorable_boundary(token_ids: Any, boundary: int) -> bool:
+    """Whether a recurrent boundary may be restored at: never inside one of
+    the entry's images (``vision.splice.image_safe_restore_len``). An image
+    entry is keyed by its content view, where image rows are marked; a text
+    entry has none and every boundary stays restorable."""
+
+    from .vision.splice import inside_image
+
+    return not inside_image(token_ids or (), int(boundary))
 
 
 def _near_candidate_serves(
@@ -943,13 +969,19 @@ class SessionBankEntry:
     def recurrent_boundary_at_or_below(
         self, matched: int
     ) -> tuple[int, CacheSnapshot, Any] | None:
-        """Newest stored recurrent boundary b <= matched, if any."""
+        """Newest stored recurrent boundary b <= matched, if any. A boundary
+        inside one of the entry's images is never a restore point
+        (``_restorable_boundary``)."""
         self._ensure_boundaries_loaded()
         best: tuple[int, CacheSnapshot, Any] | None = None
         for record in self.gdn_boundaries:
             boundary, snapshot = int(record[0]), record[1]
             hidden = record[2] if len(record) > 2 else None
-            if boundary <= int(matched) and (best is None or boundary > best[0]):
+            if (
+                boundary <= int(matched)
+                and (best is None or boundary > best[0])
+                and _restorable_boundary(self.token_ids, boundary)
+            ):
                 best = (boundary, snapshot, hidden)
         return best
 
