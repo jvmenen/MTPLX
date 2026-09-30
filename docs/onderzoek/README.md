@@ -21,7 +21,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 
 ### Documenteren
 
-- **Elk onderzoek of elke meting krijgt een rapport** in deze map: `JJJJ-MM-DD-onderwerp.md`, in het Nederlands. Nieuwe uitkomsten bij een bestaand onderwerp voeg je als sectie met datum toe aan dat rapport.
+- **Elk onderzoek of elke meting krijgt een rapport** in deze map: `JJJJ-MM-DD-onderwerp.md`, in het Engels (afspraak 30 september 2026; oudere rapporten zijn Nederlands). Nieuwe uitkomsten bij een bestaand onderwerp voeg je als sectie met datum toe aan dat rapport.
 - **Werk bij elke wijziging drie dingen bij:** het rapport, [VONDSTEN.md](VONDSTEN.md) (status en volgende stap; afgehandeld naar onderen met datum en uitkomst) en de tabellen in deze README.
 - **Scheid gemeten van geschat.** Schrijf erbij waar een getal vandaan komt (echt model, synthetische tensors, testmodel, alleen code gelezen), met hardware, model, profiel en datum.
 - **Openbaar:** de fork is publiek. Geen klantnamen, privéberichten of inhoud van chats in rapporten; alleen aantallen en uitkomsten.
@@ -91,6 +91,7 @@ Deze map hoort bij de fork [jvmenen/MTPLX](https://github.com/jvmenen/MTPLX) en 
 | 2026-09-26 | [modeltest](2026-09-26-modeltest.md) | Integratietak op Qwen3.5-9B, Ternary-Bonsai-2-27B en Gemma 4 tegen 2.12.0: Bonsai OK; 9B werkt (agent −70%) maar andere gretige teksten door de invariante prefill (extra meting klaar); Gemma zonder regressie, classificatieroutes ook op main niet beschikbaar; Gemma-steun voor eerste-token-logprobs gebouwd |
 | 2026-09-27 | [herstelpaden-en-gemma-scoring](2026-09-27-herstelpaden-en-gemma-scoring.md) | Vondst 44: herstel na een herhaalpoging gaat van de herhaalprompt uit (op de server: volledig uit de bank, 51 nieuwe tokens) en statistiek over alle pogingen. Vondst 57: scoreroute op Gemma 4 werkt (60/60, deterministisch). Beide klaar voor een PR na akkoord |
 | 2026-09-30 | [qwen38](2026-09-30-qwen38.md) | Qwen3.8-27B dicht: nulmeting, varianten (draft-temp, FR-Spec, chunkgrootte, KV q8, verify-core), eigen vondstenlijst [VONDSTEN-QWEN38](VONDSTEN-QWEN38.md); plus vondst 90 (samengevoegde MTP-experts in de loader) |
+| 2026-09-30 | [building-mtp-packs](2026-09-30-building-mtp-packs.md) | How-to (English): building MTPLX packs with a BF16 MTP head, fused MTP experts, keeping an existing body and swapping only the head, measuring, pitfalls |
 | 2026-09-27 | [chat-decode-en-overhead](2026-09-27-chat-decode-en-overhead.md) | Vondst 60 en 52, herhaald met een 100 W-lader: het verschil bij greedy decoderen tegen 2.11.3 is tekstgeluk, geen tragere berekening. Besluit: de drie upstream-wijzigingen (correctheidsfix e36f5ffb, prefillversnellingen 9a86dd6c en 4314638a) blijven; alleen de kosten van de gate-helper nog meten (`gatekosten.zsh`). Vondst 52: gat groeit met de gespreksgeschiedenis (2,6 tot 52 ms); fase-uitsplitsing mislukte door een klokverschil tussen client en hook, hook versie 2 gebouwd en offline getoetst (`meet52b.zsh`) |
 
 ## Takken
