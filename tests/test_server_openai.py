@@ -12271,8 +12271,13 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_visi
         assert commit["strip_tool_call_preamble_text"] is True
     if with_vision:
         # Even the unsafe/idle-postcommit arm must not publish raw image
-        # placeholders as a session frontier that different pixels can adopt.
-        assert state.sessions.peek("hermes-preamble").committed_token_ids == ()
+        # placeholders as a session frontier that different pixels can adopt:
+        # the prompt prefix it commits is the content-keyed view.
+        from mtplx.vision.splice import is_image_key
+
+        committed = state.sessions.peek("hermes-preamble").committed_token_ids
+        assert committed and 999999 not in committed
+        assert is_image_key(committed[-1])
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):

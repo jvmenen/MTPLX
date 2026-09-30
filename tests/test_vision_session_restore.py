@@ -480,8 +480,13 @@ def test_image_turn_after_text_history_restores_to_the_pad_boundary(harness):
     # (This dict is what generation spreads into the request log row, next to
     # its own cached_tokens: "held N, shares M, first pad at P, restored K".)
     assert observed["request_vision_images"] == 1
-    # An image turn still never advances the raw-id session frontier.
-    assert list(harness.state.sessions.peek(SESSION).committed_token_ids) == committed
+    # The image turn advances the session frontier in the content-keyed
+    # view: its image rows stand for image A, never for the raw pad id.
+    frontier = harness.state.sessions.peek(SESSION).committed_token_ids
+    assert list(frontier) == vision_bank_key_ids(
+        prompt_ids + call["reply"], call["splice"]
+    )
+    assert PAD not in frontier
 
 
 def _image_turn(harness) -> tuple[list[dict], list[int], dict]:
@@ -547,14 +552,14 @@ def test_other_pixels_in_the_old_slot_never_restore_past_the_old_image(harness):
     assert call["logits"] != _cold_logits(prompt_ids, [IMAGE_A, IMAGE_B])
 
 
-def test_a_follow_up_never_drops_below_the_text_history(harness):
-    """The floor after an image turn. The raw-id session frontier stays put
-    on image turns, so the committed stream never covers the image turn's own
-    answer. A client that strips that answer's reasoning parts from the
-    banked ids there, and the restore falls back to the text under the first
-    image: the text history stays warm on every later turn."""
+def test_a_client_that_strips_the_image_turns_reasoning_restores_all_of_it(harness):
+    """The image turn committed its keyed view, so the session holds the
+    image turn's own answer. A client that strips that answer's reasoning
+    resends a history that parts from the banked ids there; the repair puts
+    the committed reasoning back past the image, and the follow-up restores
+    the whole image turn. Never less than the text history."""
 
-    history, committed, _first_call = _image_turn(harness)
+    history, committed, first_call = _image_turn(harness)
 
     _echoed, call = _chat(
         harness, _second_image_request(history, IMAGE_A), SHORT_ANSWER
@@ -562,8 +567,12 @@ def test_a_follow_up_never_drops_below_the_text_history(harness):
 
     prompt_ids = call["prompt_ids"]
     assert prompt_ids[: len(committed)] == committed
-    assert call["cached_tokens"] >= len(committed)
+    assert call["cached_tokens"] == len(first_call["prompt_ids"]) + len(
+        first_call["reply"]
+    )
     assert call["logits"] == _cold_logits(prompt_ids, [IMAGE_A, IMAGE_B])
+    receipt = call["observability"]["request_vision_session_restore"]
+    assert receipt["canonicalized"] is True and receipt["refused"] is None
 
 
 # The image turn's answer starts with the merged token too, so the resent
@@ -575,10 +584,9 @@ def test_the_repair_crosses_an_image_its_session_holds(harness):
     history, _committed = _text_turn(harness)
     messages = [*history, _image_message("look at this: ", IMAGE_A)]
     echoed, call = _chat(harness, messages, IMAGE_ANSWER)
-    # The session holds the image turn in the content-keyed view of what it
-    # was served (what the image turn commits; set here by hand).
+    # The image turn committed the content-keyed view of what it was served.
     frontier = vision_bank_key_ids(call["prompt_ids"] + call["reply"], call["splice"])
-    harness.state.sessions.peek(SESSION).committed_token_ids = tuple(frontier)
+    assert list(harness.state.sessions.peek(SESSION).committed_token_ids) == frontier
 
     _echoed, follow = _chat(
         harness, _second_image_request([*messages, echoed], IMAGE_A), SHORT_ANSWER
@@ -594,6 +602,36 @@ def test_the_repair_crosses_an_image_its_session_holds(harness):
     receipt = follow["observability"]["request_vision_session_restore"]
     assert receipt["canonicalized"] is True and receipt["refused"] is None
     assert receipt["committed_prefix_tokens"] == len(frontier)
+
+
+def test_a_pi_session_restores_all_but_the_new_turn_after_a_screenshot(harness):
+    """Consecutive Pi-shaped prompts: two text turns, a screenshot, then an
+    edit, a write and a read turn. Every answer starts with the token the
+    model sampled and the tokenizer never produces (and, with thinking on,
+    the client drops its reasoning), so every history the client re-sends
+    parts from the session's stream inside the previous answer, after the
+    screenshot. On 2026-09-29 each such turn restored nothing past the
+    screenshot and read 123K to 138K tokens again. Every turn after the
+    screenshot restores its prompt minus the new turn (the previous turn's
+    prompt and answer), and its logits equal a cold prefill."""
+
+    messages: list[dict] = [{"role": "user", "content": "read the game file."}]
+    echoed, _call = _chat(harness, messages, FIRST_ANSWER)
+    messages += [echoed, {"role": "user", "content": "run it."}]
+    echoed, _call = _chat(harness, messages, IMAGE_ANSWER)
+    messages += [echoed, _image_message("screenshot: ", IMAGE_A)]
+    echoed, previous = _chat(harness, messages, IMAGE_ANSWER)
+    messages.append(echoed)
+    for request in ("edit the bird speed.", "write the file.", "read it back."):
+        messages.append({"role": "user", "content": request})
+        echoed, call = _chat(harness, messages, IMAGE_ANSWER)
+        messages.append(echoed)
+        held = len(previous["prompt_ids"]) + len(previous["reply"])
+        assert call["cached_tokens"] >= held, request
+        assert call["logits"] == _cold_logits(call["prompt_ids"], [IMAGE_A])
+        receipt = call["observability"]["request_vision_session_restore"]
+        assert receipt["canonicalized"] is True and receipt["refused"] is None
+        previous = call
 
 
 def test_the_splice_never_copies_across_image_rows_that_differ():

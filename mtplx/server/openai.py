@@ -5631,6 +5631,37 @@ def _expand_image_pads(
     return expanded
 
 
+def _expanded_position(
+    expanded_ids: Sequence[int],
+    *,
+    image_pad_id: int,
+    pad_counts: Sequence[int],
+    text_position: int,
+) -> int | None:
+    """Where the boundary ``text_position`` tokens into the encode (each image
+    one placeholder) lands in the ids ``_expand_image_pads`` made of it (each
+    image its rows). None when no such boundary exists."""
+
+    text = 0
+    image = 0
+    row = 0
+    for position, token in enumerate(expanded_ids):
+        if row == 0 and text == text_position:
+            return position
+        if int(token) != image_pad_id:
+            text += 1
+            continue
+        if image >= len(pad_counts):
+            return None
+        if row == 0:
+            text += 1
+        row += 1
+        if row >= int(pad_counts[image]):
+            image += 1
+            row = 0
+    return len(expanded_ids) if row == 0 and text == text_position else None
+
+
 # Tower OUTPUT cache, keyed by image content digest. Agent clients (OpenCode,
 # Claude Code) resend the identical image with every follow-up turn; without
 # this, each turn re-preprocesses and re-forwards the tower for pixels that
@@ -5772,6 +5803,44 @@ def _decodable_ids(state: Any, token_ids: Sequence[int]) -> list[int]:
     if pad_id is None:
         return [int(token) for token in token_ids if not is_image_key(token)]
     return unkeyed_ids(token_ids, int(pad_id))
+
+
+def _vision_session_frontier_enabled() -> bool:
+    """Image turns advance their session's committed stream (in the keyed
+    view, see ``_session_frontier_ids``) only while both vision session
+    switches are on; either one off keeps the frontier where the last text
+    turn left it, as before."""
+
+    return _vision_session_cache_enabled() and _vision_session_restore_enabled()
+
+
+def _session_frontier_ids(token_ids: Sequence[int], splice: Any) -> list[int] | None:
+    """The ids a session commits for ids it served.
+
+    A text turn commits its ids. An image turn commits the content-keyed
+    view the session bank keys it by (``vision.splice.vision_bank_key_ids``):
+    each image row becomes a stand-in for its image's bytes, row, grid and
+    position scheme. Image turns used to skip the commit altogether (the
+    2026-08-17 fix of the pillar alias leg): the stream held raw ids, every
+    image row shares the pad id, so a later request with other pixels behind
+    the same ids matched the frontier and adopted this conversation's KV. No
+    text id and no raw pad id ever equals a stand-in, so in the keyed view a
+    request can match past an image only when it carries the same image at
+    the same place, which is also when that KV is its own.
+
+    None (skip the commit, as before) when the splice carries no content
+    identity or its pad layout does not match the ids, or when a vision
+    session switch is off.
+    """
+
+    ids = [int(token) for token in token_ids]
+    if splice is None:
+        return ids
+    if not _vision_session_frontier_enabled():
+        return None
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    return vision_bank_key_ids(ids, splice)
 
 
 def _vision_canonicalization_refusal(
@@ -26397,15 +26466,14 @@ def _store_retokenized_history_snapshot(
                 "best_prefix_nbytes": int(best_prefix_nbytes),
                 **prefix_probe,
             }
-            if session is not None and history_vision_splice is not None:
-                # The engine-session frontier is raw-token-id keyed and has
-                # no image identity, so a committed vision frontier lets a
-                # later request with DIFFERENT pixels but identical pad ids
-                # extend/restore another image's KV (the pillar alias leg).
-                # Vision turns keep their warm reuse through the bank lane,
-                # whose keys are content surrogates. Before the F39 frontier
-                # fix these turns never committed by accident; now they skip
-                # deliberately.
+            if (
+                session is not None
+                and history_vision_splice is not None
+                and not _vision_session_frontier_enabled()
+            ):
+                # An image history advances the frontier only in the keyed
+                # view (``_session_frontier_ids``), and only while both
+                # vision session switches are on.
                 outcome["session_commit"] = {
                     "committed": False,
                     "reason": "vision_session_frontier_skip",
@@ -26415,7 +26483,7 @@ def _store_retokenized_history_snapshot(
             if session is not None:
                 try:
                     commit = session.commit_retokenized_prefix(
-                        token_ids=history_ids,
+                        token_ids=history_bank_ids,
                         expected_revision=expected_session_revision,
                         nbytes=0,
                     )
@@ -26590,11 +26658,14 @@ def _store_retokenized_history_snapshot(
             **prefix_probe,
         }
     session_commit: dict[str, Any] | None = None
-    if session is not None and history_vision_splice is not None:
-        # Raw-id session frontiers carry no image identity; a committed
-        # vision frontier aliases DIFFERENT pixels behind identical pad ids
-        # (pillar alias leg). Vision reuse rides the surrogate-keyed bank
-        # entry stored above; the session frontier deliberately stays put.
+    if (
+        session is not None
+        and history_vision_splice is not None
+        and not _vision_session_frontier_enabled()
+    ):
+        # An image history advances the frontier only in the keyed view
+        # (``_session_frontier_ids``), and only while both vision session
+        # switches are on.
         session_commit = {
             "committed": False,
             "reason": "vision_session_frontier_skip",
@@ -26612,7 +26683,7 @@ def _store_retokenized_history_snapshot(
                     **prefix_probe,
                 }
             commit = session.commit_retokenized_prefix(
-                token_ids=history_ids,
+                token_ids=history_bank_ids,
                 expected_revision=expected_session_revision,
                 nbytes=int(entry.nbytes),
             )
@@ -37519,6 +37590,22 @@ def create_app(state: ServerState) -> FastAPI:
             )
             if _first_pad is not None:
                 template_observability["first_image_pad_position"] = int(_first_pad)
+            # The encoder counted the stable prefix (the tokens before a
+            # transient trailing hint) with one placeholder per image; the
+            # prefill's chunk edge and the session's prompt-prefix commit
+            # read it against the ids the model reads, each image its rows.
+            _stable_text = template_observability.get("stable_prefix_len")
+            if isinstance(_stable_text, int):
+                _stable_served = _expanded_position(
+                    prompt_ids,
+                    image_pad_id=_pad_id,
+                    pad_counts=list(vision_splice.pad_counts or ()),
+                    text_position=_stable_text,
+                )
+                if _stable_served is None:
+                    template_observability.pop("stable_prefix_len", None)
+                else:
+                    template_observability["stable_prefix_len"] = int(_stable_served)
             if vision_session_restore is not None:
                 template_observability["request_vision_session_restore"] = (
                     vision_session_restore
@@ -38059,14 +38146,12 @@ def create_app(state: ServerState) -> FastAPI:
                     first_token_logprobs_top_k=first_token_logprobs_top_k,
                 )
                 generated_result = attach_response_observability(generated_result)
-                if vision_splice is None:
-                    # Raw-id session frontiers carry no image identity: a
-                    # committed vision frontier lets a same-text request
-                    # with DIFFERENT pixels adopt and restore this KV whole
-                    # (pillar alias leg). Vision reuse rides the
-                    # surrogate-keyed bank lane only.
+                # An image turn commits the content-keyed view of its prompt
+                # (never raw pad ids, which alias other pixels) or nothing.
+                frontier_prompt_ids = _session_frontier_ids(prompt_ids, vision_splice)
+                if frontier_prompt_ids is not None:
                     session.commit(
-                        prompt_ids=prompt_ids,
+                        prompt_ids=frontier_prompt_ids,
                         generated_ids=generated_result["tokens"],
                         finish_reason=generated_result.get("finish_reason", "stop"),
                     )
@@ -39142,13 +39227,21 @@ def create_app(state: ServerState) -> FastAPI:
                         if assistant_tool_calls
                         else "postcommit_prompt_prefix"
                     )
-                    if read_only_force_answer_contract_active or vision_splice is not None:
+                    # An image turn commits the keyed view of its prompt
+                    # (never raw pad ids, which alias other pixels) or
+                    # nothing.
+                    _frontier_ids = (
+                        None
+                        if read_only_force_answer_contract_active
+                        else _session_frontier_ids(prompt_ids, vision_splice)
+                    )
+                    if _frontier_ids is None:
                         prompt_prefix_commit_info = {
                             "committed": False,
                             "reason": (
-                                "vision_session_frontier_skip"
-                                if vision_splice is not None
-                                else "transient_generation_contract"
+                                "transient_generation_contract"
+                                if read_only_force_answer_contract_active
+                                else "vision_session_frontier_skip"
                             ),
                             "prefix_len": int(
                                 getattr(session, "prefix_len", 0) or 0
@@ -39172,13 +39265,22 @@ def create_app(state: ServerState) -> FastAPI:
                         _stable_prefix = template_observability.get(
                             "stable_prefix_len"
                         )
-                        _prefix_commit_ids = prompt_ids
+                        _prefix_commit_ids = _frontier_ids
                         if (
                             isinstance(_stable_prefix, int)
                             and 0 < _stable_prefix < len(prompt_ids)
                         ):
-                            _prefix_commit_ids = prompt_ids[
-                                :_stable_prefix
+                            from mtplx.vision.splice import (
+                                image_safe_restore_len,
+                            )
+
+                            # A frontier never ends inside an image.
+                            _prefix_commit_ids = _frontier_ids[
+                                :image_safe_restore_len(
+                                    _frontier_ids,
+                                    _stable_prefix,
+                                    reforwards_last_token=False,
+                                )
                             ]
                         prompt_prefix_commit = session.commit_prompt_prefix(
                             prompt_ids=_prefix_commit_ids,
@@ -39530,12 +39632,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     generated["stats"][
                                         "session_postcommit_snapshot"
                                     ] = postcommit
-                                    if vision_splice is None:
-                                        # Vision frontiers alias different
-                                        # pixels behind identical pad ids;
-                                        # bank lane (surrogate keys) only.
+                                    # An image turn commits the keyed view
+                                    # of its prompt, never raw pad ids.
+                                    frontier_prompt_ids = _session_frontier_ids(
+                                        prompt_ids, vision_splice
+                                    )
+                                    if frontier_prompt_ids is not None:
                                         session.commit(
-                                            prompt_ids=prompt_ids,
+                                            prompt_ids=frontier_prompt_ids,
                                             generated_ids=generated["tokens"],
                                             finish_reason=generated.get(
                                                 "finish_reason", "stop"
