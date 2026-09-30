@@ -398,3 +398,66 @@ def test_the_stable_prefix_is_counted_in_the_ids_the_model_reads() -> None:
     assert oa._expanded_position(
         expanded, image_pad_id=PAD, pad_counts=[4, 2], text_position=len(text) + 1
     ) is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_both_foreground_commits_hand_the_session_the_keyed_prompt(monkeypatch, stream):
+    """The two foreground ``session.commit`` sites of ``chat_completions``
+    (the non-stream one and the streaming one after a stored final commit)
+    commit the keyed view of an image prompt plus the generated ids."""
+
+    from fastapi.testclient import TestClient
+    from test_server_openai import _fake_streaming_generation, _fake_streaming_session_state
+
+    from mtplx.server.openai import create_app
+    from mtplx.vision.splice import is_image_key
+
+    state = _fake_streaming_session_state()
+    state.args.enable_thinking = False
+    state._vision_spec_cache = SimpleNamespace(image_token_id=999999)
+    splice = SimpleNamespace(
+        image_pad_token_id=999999, image_digests=[123], pad_counts=[2], total_rows=2,
+    )
+    materialized: list[list[int]] = []
+
+    def materialize(_state, _images, ids, **_kwargs):
+        expanded = [*ids, 999999, 999999]
+        materialized.append(expanded)
+        return expanded, splice
+
+    monkeypatch.setattr(oa, "_vision_extract_and_flatten", lambda messages: (messages, [object()]))
+    monkeypatch.setattr(oa, "_materialize_vision_splice", materialize)
+    monkeypatch.setattr(
+        oa,
+        "_store_generation_final_history_snapshot",
+        lambda *_args, **_kwargs: {"stored": True, "mode": "generation_final_exact", "nbytes": 0},
+    )
+    fake_generation = _fake_streaming_generation("done")
+
+    def generation_with_a_final_state(*args, **kwargs):
+        # A final state is what routes the streaming turn to its stored
+        # generation-final commit (the store itself is stubbed above).
+        return {**fake_generation(*args, **kwargs), "_final_state": SimpleNamespace()}
+
+    monkeypatch.setattr(oa, "_run_generation", generation_with_a_final_state)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "vision-commit"},
+            json={
+                "messages": [{"role": "user", "content": "Look."}],
+                "max_tokens": 16,
+                "stream": stream,
+                "enable_thinking": False,
+            },
+        )
+    assert response.status_code == 200, response.text
+    committed = list(state.sessions.peek("vision-commit").committed_token_ids)
+    served = materialized[0]  # the prompt; a later one is the postcommit's history
+    assert committed == [
+        *vision_bank_key_ids(served, splice),
+        *[ord(char) for char in "done"],
+    ]
+    assert 999999 not in committed
+    assert is_image_key(committed[len(served) - 1])
