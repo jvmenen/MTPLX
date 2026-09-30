@@ -559,7 +559,12 @@ def test_other_pixels_in_the_screenshot_are_named_before_the_replay(vision_bank)
     assert explanation["recompute_tokens"] == len(second) - facts["restore_point_tokens"]
 
 
-def test_a_reply_that_changed_after_the_screenshot_resumes_before_it(vision_bank):
+def test_a_reply_that_changed_after_the_screenshot_resumes_at_the_change(vision_bank):
+    """The restore matches an image prompt in its content-keyed view, so a
+    reply that parts after an unchanged screenshot resumes where it parts,
+    past the screenshot (it used to stop before the screenshot, re-reading
+    it and everything after it)."""
+
     rt = _toy_runtime()
     tok = SeamTokenizer()
     first, _ = _screenshot_prompt(HISTORY, IMAGE_A, "what is on screen.")
@@ -574,12 +579,12 @@ def test_a_reply_that_changed_after_the_screenshot_resumes_before_it(vision_bank
     seam = len(first) + next(i for i, (a, b) in enumerate(zip(reply, resent)) if a != b)
     facts = payload["reread"]
     assert facts["history_matched_tokens"] == seam
-    assert facts["restore_point_tokens"] <= pad
+    assert facts["restore_point_tokens"] == seam > pad
     explanation = explain_reread(facts, session_served_before=True)
     assert explanation["cause"] == "history_changed"
     assert explanation["cause_at_token"] == seam
-    assert explanation["resume_limit"] == "screenshot"
-    assert explanation["resume_limit_at_token"] == pad
+    assert explanation["resume_limit"] is None
+    assert explanation["recompute_tokens"] == len(second) - seam
 
 
 # ---- The server: classify, estimate, carry forward, receipt -------------

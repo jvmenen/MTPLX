@@ -21784,7 +21784,13 @@ def _live_session_prefix_tokens(
     pending postcommit is about to put it: a session record keeps its
     committed tokens after the bank lets go of the state behind them, and
     those tokens alone would make a cold prefill look warm.
+
+    An image prompt is passed in its content-keyed view (the bank's view),
+    and no credit ever ends inside an image
+    (``vision.splice.image_safe_restore_len``, the rule every restore obeys).
     """
+
+    from mtplx.vision.splice import image_safe_restore_len
 
     sessions = getattr(state, "sessions", None)
     if sessions is None:
@@ -21792,6 +21798,9 @@ def _live_session_prefix_tokens(
     coverage_fn = getattr(bank, "session_coverage_tokens", None)
 
     def credit(session: Any, matched_tokens: int) -> int:
+        matched_tokens = image_safe_restore_len(
+            prompt_ids, matched_tokens, reforwards_last_token=True
+        )
         session_id = getattr(session, "session_id", None)
         if not callable(coverage_fn) or not session_id:
             return int(matched_tokens)
@@ -22472,9 +22481,10 @@ def _run_prefill_admission(
             # The bank answers with the restore's own lanes and gates (exact
             # prefix; near prefix with recurrent boundaries, identity,
             # epochs, lease usability), the same selection reclamation
-            # protects.
+            # protects. An image prompt asks in its content-keyed view,
+            # partial matches included, as its restore does.
             try:
-                plan = plan_fn(probe_ids, near_prefix=vision_splice is None, **identity)
+                plan = plan_fn(probe_ids, near_prefix=True, **identity)
             except Exception:
                 plan = None
             if plan:
@@ -22517,8 +22527,8 @@ def _run_prefill_admission(
             # pending postcommit is about to bank one; #447: a warm 212K
             # session read as a full miss, was cleared as "superseded", and
             # every retry was a cold 211,807-token miss until a restart).
-            if vision_splice is None and _prefill_admission_live_prefix_enabled():
-                live_tokens = _live_session_prefix_tokens(state, prompt_ids, session_bank)
+            if _prefill_admission_live_prefix_enabled():
+                live_tokens = _live_session_prefix_tokens(state, probe_ids, session_bank)
                 if live_tokens > reused_tokens:
                     reused_tokens = live_tokens
                     reused_mode = "live_session"
