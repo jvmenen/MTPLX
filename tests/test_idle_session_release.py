@@ -365,15 +365,6 @@ class TestDurability:
         lane.run_all()
         assert tier.encoded == [kept.token_ids]
 
-    def test_the_superseded_clear_cancels_its_sessions_encode(self):
-        lane = _Lane()
-        bank = _bank(tier=_Tier(), lane=lane)
-        _put(bank, (1, 1, 1), session_id="conv", nbytes=100)
-        assert bank.cancel_session_persistence("conv") == 0  # still resident
-        bank.clear(session_id="conv")
-        assert bank.cancel_session_persistence("conv") == 1
-        assert lane.pending == {}
-
 
 class TestColdTierPublication:
     """``is_published`` asks the manifest, the only thing a restore reads."""

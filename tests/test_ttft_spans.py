@@ -96,7 +96,7 @@ def test_discard_after_the_client_saw_a_delta_keeps_the_ttft():
     clock.mark("dispatch", 0.1)
     clock.mark("engine_first_token", 0.5)
     clock.mark("first_delta_sent", 0.51)
-    clock.discard_attempt("chat.stream.stalled_agent_retry", now=3.0)
+    clock.discard_attempt("chat.stream.tool_fed_empty_retry", now=3.0)
 
     summary = clock.summary()
 
@@ -301,14 +301,14 @@ def test_nonstream_blank_retry_names_the_discarded_attempt(monkeypatch):
 
 def test_streamed_repair_retry_names_the_discarded_attempt(monkeypatch):
     """Item 3: a stream repair path that throws away its first generation
-    (here the stalled-agent retry: a tool promise without a tool call after
-    tool results) says so in the response: two attempts, the retry path, and
-    the wall time of the first one."""
+    (here the tool-fed empty retry: orphaned tool-control markup after tool
+    results) says so in the response: two attempts, the retry path, and the
+    wall time of the first one."""
 
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     texts = [
-        "</think>\n\nLet me read the file now.",
+        "</think>\n\nparameter=limit>\n180\n</parameter>\n</function>\n</tool_call>",
         "</think>\n\nPart 2 has 93 lines.",
     ]
     calls: list[str] = []
@@ -392,7 +392,7 @@ def test_streamed_repair_retry_names_the_discarded_attempt(monkeypatch):
     assert len(calls) == 2, calls
     stats = _stream_stats(body)
     assert stats["attempts"] == 2
-    assert stats["retry_path"] == "chat.stream.stalled_agent_retry"
+    assert stats["retry_path"] == "chat.stream.tool_fed_empty_retry"
     assert stats["discarded_attempt_wall_s"] > 0.0
 
 

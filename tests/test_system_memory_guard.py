@@ -578,7 +578,8 @@ class TestAdmission:
             _state(), prompt_ids=PROMPT, session_bank=bank, session_id="pi"
         )
         assert receipt is not None
-        assert bank.cleared_sessions == ["pi"]
+        # No superseded clear since 2026-09-30: the LRU pass is the bank step.
+        assert bank.cleared_sessions == []
         assert bank.shrink_calls and bank.shrink_calls[0][1] == "prefill_admission"
 
     def test_a_desktop_that_recovers_after_the_shed_is_admitted(self, monkeypatch):

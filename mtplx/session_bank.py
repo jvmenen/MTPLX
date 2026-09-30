@@ -4034,6 +4034,90 @@ class SessionBank:
             best = max(best, reach)
         return int(best)
 
+    def same_conversation_entries(
+        self,
+        session_id: str | None,
+        prompt_tokens: list[int] | tuple[int, ...] | None,
+    ) -> list[dict[str, Any]]:
+        """This session's entries that hold the same conversation as the
+        prompt: in RAM, or out of RAM with their SSD write still queued, and
+        sharing at least half of their own tokens with it.
+
+        The prefill admission keeps them through reclamation. A prompt that
+        diverges from its session's entry late in the history (a re-encoded
+        tool call, a screenshot turn the restore cannot splice) still has
+        that entry as the conversation's newest state; clearing it as
+        "superseded" turned a 4 GB warm entry into four cold 123K-138K
+        prefills on 2026-09-29. An entry that shares less than half of itself
+        with the prompt is a rewritten history (agent compaction) and stays
+        reclaimable like any other.
+        """
+
+        if not session_id or not prompt_tokens:
+            return []
+        tokens = tuple(int(token) for token in prompt_tokens)
+        candidates: list[tuple[SessionBankEntry, bool]] = [
+            (entry, True)
+            for entry in list(self._entries.values())
+            if entry.session_id == session_id
+        ]
+        candidates.extend(
+            (row["entry"], False)
+            for row in self._queued_holders()
+            if row["entry"].session_id == session_id
+        )
+        rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for entry, resident in candidates:
+            if id(entry) in seen:
+                continue
+            seen.add(id(entry))
+            length = len(entry.token_ids)
+            shared = common_prefix_len(tokens, entry.token_ids)
+            if length <= 0 or shared <= 0 or 2 * shared < length:
+                continue
+            rows.append(
+                {
+                    "key": entry.token_ids,
+                    "tokens": int(length),
+                    "shared_tokens": int(shared),
+                    "held_bytes": int(entry.held_nbytes if resident else entry.nbytes),
+                    "resident": bool(resident),
+                    "durable": self.entry_is_durable(entry),
+                    "ssd_write_pending": self._persistence_pending_for(entry),
+                }
+            )
+        return rows
+
+    def _persistence_pending_for(self, entry: SessionBankEntry) -> bool:
+        """Whether the newest queued SSD write under this entry's key is
+        this entry's own."""
+
+        key = cold_persistence_key(entry)
+        with self._persistence_pending_lock:
+            entry_ref = self._persistence_pending.get(key)
+        return entry_ref is not None and entry_ref() is entry
+
+    def move_durable_entries_to_ssd(
+        self, keys: Any, *, reason: str = "moved_to_ssd"
+    ) -> dict[str, Any]:
+        """Let RAM go of each of these entries the cold tier has published:
+        a restore reads it back from disk. An entry not on disk yet stays, and
+        no queued write is cancelled. Returns what left RAM."""
+
+        moved = 0
+        held = 0
+        longest = 0
+        for key in keys or ():
+            entry = self._entries.get(tuple(key))
+            if entry is None or not self.entry_is_durable(entry):
+                continue
+            held += int(entry.held_nbytes)
+            longest = max(longest, len(entry.token_ids))
+            self._evict_entry(entry, reason=reason, cancel_queued_persistence=False)
+            moved += 1
+        return {"entries": moved, "held_bytes": held, "longest_prefix_tokens": longest}
+
     def held_by_session(self) -> list[dict[str, Any]]:
         """What each session's RAM entries hold, largest first (the 507's
         holder list and the admission receipt read it)."""
@@ -4184,23 +4268,6 @@ class SessionBank:
             raise QueuedPersistenceCancelError(failures, cancelled=cancelled, keys=keys)
         return cancelled, keys
 
-    def cancel_session_persistence(self, session_id: str | None) -> int:
-        """Cancel the queued jobs (settle and SSD encode) of ``session_id``'s
-        entries that are gone from RAM (the superseded clear): a queued job
-        holds its entry's arrays until it runs."""
-
-        if not session_id:
-            return 0
-        released = {
-            id(row["entry"])
-            for row in self._queued_holders()
-            if row["entry"].session_id == session_id
-        }
-        if not released:
-            return 0
-        cancelled, _keys = self._cancel_queued_persistence(released)
-        return cancelled
-
     def _queued_holders(self) -> list[dict[str, Any]]:
         """Entries out of RAM that a queued job still holds, one row each."""
 
@@ -4331,6 +4398,7 @@ class SessionBank:
         restore_identity: dict[str, Any] | None = None,
         hold_session: Callable[[str], Callable[[], None] | None] | None = None,
         reason: str = "idle_session_release",
+        protect_keys: Any = (),
     ) -> dict[str, Any]:
         """Release whole sessions' RAM state until ``target_bytes`` is freed.
 
@@ -4356,6 +4424,9 @@ class SessionBank:
         (its generation slot), or None when the session is busy and must be
         skipped. ``only_session_ids`` limits the release to those sessions
         (the caller's own conversation, whose non-source entries go last).
+        ``protect_keys`` names more entries that stay, in RAM or held by their
+        queued SSD write, with that write (the admission's same-conversation
+        entries, ``same_conversation_entries``).
 
         Bytes are the entries' ``held_nbytes``: what the bank believes it
         gives back. The caller re-measures the allocator afterwards; only
@@ -4372,6 +4443,7 @@ class SessionBank:
         )
         plan = self.restore_plan(protect_tokens, **(restore_identity or {}))
         protected_keys: set[tuple[int, ...]] = set(plan["keys"])
+        protected_keys.update(tuple(key) for key in (protect_keys or ()))
 
         def group_of(entry: SessionBankEntry) -> str:
             return entry.session_id or f"anon:{entry.token_hash}"
@@ -4393,6 +4465,8 @@ class SessionBank:
             if entry.session_id and entry.session_id in kept:
                 continue
             if only is not None and entry.session_id not in only:
+                continue
+            if entry.token_ids in protected_keys:
                 continue
             queued.setdefault(group_of(entry), []).append(entry)
             groups.setdefault(group_of(entry), [])

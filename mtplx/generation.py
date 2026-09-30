@@ -1094,6 +1094,30 @@ def _wide_prefill_rungs(wide: int) -> list[int]:
     return rungs
 
 
+def qwen4_wide_prefill_rungs(rt: Any, *, prompt_tokens: int) -> list[int]:
+    """The wide prefill widths this prompt may run, widest first, before any
+    memory is read; empty when the lane is off, the chunk knobs are pinned,
+    or the prompt fits one default chunk.
+
+    These are the candidates both deciders price: the serve path hands them
+    to the prefill admission, which prices every width with the rest of the
+    request after anything it reclaims and settles on the widest that fits
+    (``mtplx.server.prefill_safety.settle_wide_prefill_chunk``);
+    ``qwen4_wide_prefill_chunk_tokens`` is the stand-alone gate for a request
+    no admission priced.
+    """
+
+    wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
+    if wide <= 2048 or _prefill_chunk_env_is_pinned():
+        return []
+    prompt_tokens = max(0, int(prompt_tokens))
+    if prompt_tokens <= 2048:
+        return []
+    # A rung the prompt cannot fill buys nothing over the next one down.
+    rungs = [rung for rung in _wide_prefill_rungs(wide) if rung < 2 * prompt_tokens]
+    return rungs or [wide]
+
+
 def qwen4_wide_prefill_chunk_tokens(
     rt: Any, *, prompt_tokens: int, receipt: dict | None = None
 ) -> int | None:
@@ -1119,12 +1143,11 @@ def qwen4_wide_prefill_chunk_tokens(
     here, and ``--prefill-chunk-tokens`` never reaches this function.
     """
 
+    rungs = qwen4_wide_prefill_rungs(rt, prompt_tokens=prompt_tokens)
+    if not rungs:
+        return None
     wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
-    if wide <= 2048 or _prefill_chunk_env_is_pinned():
-        return None
     prompt_tokens = max(0, int(prompt_tokens))
-    if prompt_tokens <= 2048:
-        return None
     limit = _metal_memory_limit_bytes(rt)
     if limit <= 0:
         return wide
@@ -1134,9 +1157,7 @@ def qwen4_wide_prefill_chunk_tokens(
     released = False
     granted: int | None = None
     bill: dict[str, int] = {}
-    # A rung the prompt cannot fill buys nothing over the next one down.
-    rungs = [rung for rung in _wide_prefill_rungs(wide) if rung < 2 * prompt_tokens]
-    for rung in rungs or [wide]:
+    for rung in rungs:
         bill = _qwen4_wide_prefill_need(
             rt, rows=rung, prompt_tokens=prompt_tokens, per_token=per_token
         )
@@ -6350,9 +6371,18 @@ def restore_or_prefill_prompt_state(
             else bool(store_prefix_snapshot)
         )
         if not enabled or session_bank is None:
+            if session_bank is None:
+                skip_reason = "no_bank"
+            elif store_prefix_snapshot is None:
+                # The operator's kill switch.
+                skip_reason = "disabled"
+            else:
+                # This request's caller decided (the memory admission, or a
+                # postcommit whose snapshot could never be banked).
+                skip_reason = "skipped_for_request"
             state.prefill_store_snapshot = {
                 "stored": False,
-                "skip_reason": "disabled" if session_bank is not None else "no_bank",
+                "skip_reason": skip_reason,
             }
             return
         if vision_splice is not None and bank_key_ids is None:
@@ -8806,6 +8836,7 @@ def generate_ar(
     capture_final_state: bool = False,
     abort_check: Callable[[], bool] | None = None,
     first_token_logprobs_top_k: int | None = None,
+    store_prefix_snapshot: bool | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -8868,6 +8899,7 @@ def generate_ar(
         prefill_callback=prefill_callback,
         abort_check=abort_check,
         capture_hidden=ar_return_hidden,
+        store_prefix_snapshot=store_prefix_snapshot,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     cache = prompt_state.trunk_cache
@@ -10069,8 +10101,15 @@ def generate_mtpk(
     constraint: Any | None = None,
     adaptive_width_policy: Any | None = None,
     first_token_logprobs_top_k: int | None = None,
+    store_prefix_snapshot: bool | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
+
+    ``store_prefix_snapshot`` is this request's store-on-prefill decision
+    (``restore_or_prefill_prompt_state``): None follows the
+    MTPLX_SESSION_STORE_ON_PREFILL kill switch, False skips the prompt
+    snapshot for this request only (the server's admission does this when
+    the snapshot's copy is what would cross the memory line).
 
     The implementation is deliberately conservative: every reject restores the
     target cache snapshot and re-forwards only the committed prefix. This keeps
@@ -10587,6 +10626,7 @@ def generate_mtpk(
             # 10+ minutes, 2026-07-03).
             abort_check=abort_check,
             stable_prefix_len=_stable_prefix_len,
+            store_prefix_snapshot=store_prefix_snapshot,
         )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()

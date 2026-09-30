@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 def prompt_scoring_forward_widths(
@@ -98,6 +98,66 @@ def prompt_scoring_growth(
         chunk_bytes=srv._admission_chunk_bytes(geometry, rows, scratch),
     )
     return model
+
+
+_WIDE_CHUNK_ADMISSION_REFUSED_REASON = (
+    "the prefill admission priced the wider chunk with the rest of the "
+    "request after reclaiming what it could and it did not fit under the "
+    "memory line; the request's prefill_admission_shed receipt carries the "
+    "arithmetic"
+)
+
+
+def settle_wide_prefill_chunk(
+    runtime: Any,
+    *,
+    prompt_tokens: int,
+    rungs: Sequence[int],
+    pricing: Mapping[str, Any],
+    receipt: dict[str, Any] | None = None,
+) -> int | None:
+    """The family's wide prefill chunk this request runs, or None for the
+    profile's own plan.
+
+    The prefill admission prices the wide ``rungs`` with every other width
+    after anything it reclaims and settles on the widest that fits: when it
+    priced them (``pricing["growth"]``), its choice stands. The choice used
+    to be made before the admission by a second bill against live memory, so
+    a cold 123K prompt on 2026-09-29 ran at 2,048 rows although 4,096 fitted
+    once the admission had freed memory. When the admission priced nothing
+    (switched off, no Metal limit, or its own guard failed), the live-memory
+    gate decides as it always did.
+    """
+
+    from mtplx.generation import qwen4_wide_prefill_chunk_tokens
+
+    settled = pricing.get("growth")
+    if not isinstance(settled, Mapping) or "prefill_chunk_tokens" not in settled:
+        gate_receipt: dict[str, Any] = {}
+        granted_width = qwen4_wide_prefill_chunk_tokens(
+            runtime, prompt_tokens=prompt_tokens, receipt=gate_receipt
+        )
+        if receipt is not None and gate_receipt:
+            receipt.update(gate_receipt, decided_by="live_memory_gate")
+        return granted_width
+    width = settled.get("prefill_chunk_tokens")
+    candidates = [int(rung) for rung in rungs]
+    granted = width is not None and int(width) in candidates
+    if receipt is not None:
+        receipt.update(
+            wide_chunk_tokens=max(candidates),
+            candidate_chunk_tokens=candidates,
+            granted=granted,
+            granted_chunk_tokens=int(width) if granted else 0,
+            growth_bytes=int(settled.get("growth_bytes") or 0),
+            decided_by="prefill_admission",
+        )
+    if not granted:
+        from mtplx.demotions import note
+
+        note("qwen4_wide_prefill_chunk_refused", _WIDE_CHUNK_ADMISSION_REFUSED_REASON)
+        return None
+    return int(width)
 
 
 def make_prefill_system_guard(
