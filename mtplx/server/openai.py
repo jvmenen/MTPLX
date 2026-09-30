@@ -17634,6 +17634,9 @@ def _metrics_envelope(
         # diagnostics, prompt-state wall decomposition, first-primary-sample
         # latency, round-1 timer snapshot.
         "session_restore_served": stats.get("session_restore_served") or {},
+        # Recurrent checkpoints the prompt left for later turns, and for an
+        # image prompt how close to its first image the newest one sits.
+        "session_checkpoints": stats.get("session_checkpoints") or {},
         "prompt_state_total_time_s": float(
             stats.get("prompt_state_total_time_s") or 0.0
         ),
@@ -24687,6 +24690,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "session_prefill_store",
     "pre_first_token_setup_s",
     "session_restore_served",
+    "session_checkpoints",
     "prompt_state_total_time_s",
     "prompt_state_unattributed_time_s",
     "first_primary_sample_time_s",
@@ -28805,7 +28809,11 @@ def _build_mtp_batch_session_hooks(
                     restore_point=restore_point,
                     boundary_hidden=hidden,
                     inherited_boundaries=_inherited_gdn_boundaries(
-                        entry, restore_point
+                        entry,
+                        restore_point,
+                        budget_bytes=getattr(
+                            session_bank, "checkpoint_budget_bytes", None
+                        ),
                     ),
                 )
             return None
@@ -42963,8 +42971,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("MTPLX_SSD_SESSION_CACHE", "on"),
         help=(
             "Persistent SessionBank cold tier (default on; kvcache-v2). "
-            "Budgeted by min(configured cap, free_disk/4), disabled below "
-            "10 GiB free."
+            "Budgeted by the configured cap and free disk: normally a quarter of "
+            "the space it can use, raised to hold two copies of the largest "
+            "conversation, never taking free disk below 10 GiB."
         ),
     )
     parser.add_argument(

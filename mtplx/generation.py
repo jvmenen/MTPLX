@@ -34,6 +34,13 @@ from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .adaptive_dtemp import build_adaptive_dtemp_controller
 from .attention_context import attention_phase, exact_verify, model_forward_kind
+from .checkpoint_anchors import (
+    AnchorPlan,
+    CheckpointSink,
+    checkpoint_coverage,
+    default_tail_backoff,
+    retain_checkpoints,
+)
 from .demotions import mark as _demotion_mark, note as _note_demotion, since as _demotions_since
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
@@ -3526,6 +3533,9 @@ class GenerationStats:
     # the existing cumulative timers. Observational only — no metric above
     # is redefined and no evaluation point moves.
     session_restore_served: dict[str, object] = field(default_factory=dict)
+    # Recurrent checkpoints the prompt left for later turns, and an image
+    # prompt's pre-image coverage (PromptState.checkpoint_coverage).
+    session_checkpoints: dict[str, object] = field(default_factory=dict)
     prompt_state_total_time_s: float = 0.0
     prompt_state_unattributed_time_s: float = 0.0
     first_primary_sample_time_s: float = 0.0
@@ -4008,6 +4018,11 @@ class PromptState:
     # matches[0] before generation may skip it on achievable-boundary
     # checks, so served truth is recorded where the restore succeeds.
     restore_served: dict = field(default_factory=dict)
+    # The recurrent checkpoints this prompt leaves for later turns
+    # (checkpoint_anchors.checkpoint_coverage): positions, bytes, budget, and
+    # for an image prompt how close to its first image the newest one sits
+    # ({} when no session bank took part).
+    checkpoint_coverage: dict = field(default_factory=dict)
 
 
 class PostcommitAbort(RuntimeError):
@@ -4497,6 +4512,7 @@ def _prefill_restored_prompt_suffix(
     if (
         stable_prefix_len is not None
         and gdn_boundary_sink is not None
+        and _sink_cuts_forwards(gdn_boundary_sink)
         and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
     ):
         _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
@@ -4555,12 +4571,18 @@ def _prefill_restored_prompt_suffix(
         gdn_boundary_sink is not None
         and _cache_has_recurrent_entries(restored.cache)
     )
+    # Whether the checkpoints may reshape this prefill (the tail ladder, the
+    # stable edge, in-forward captures). An image prompt's sink may not: it
+    # records only at the plain chunk ends.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(
+        gdn_boundary_sink
+    )
     body = suffix[:-1]
     body_array = None
     spans: list[tuple[int, int]] = []
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-        if capture_boundaries
+        if shape_boundaries
         else None
     )
     _inforward_edges: tuple[int, ...] = ()
@@ -4568,7 +4590,7 @@ def _prefill_restored_prompt_suffix(
         body_array = mx.array([body])
         spans, _inforward_edges = _prefill_boundary_plan(
             len(body),
-            capture_boundaries=capture_boundaries,
+            capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
             mandatory_edges=(
@@ -5156,7 +5178,11 @@ def _restore_near_prefix_prompt_state(
                 ),
                 hidden=boundary_hidden,
                 source=entry,
-                boundaries=_inherited_gdn_boundaries(entry, restore_point),
+                boundaries=_inherited_gdn_boundaries(
+                    entry,
+                    restore_point,
+                    budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                ),
             )
             if boundary_hidden is not None
             else None
@@ -5238,7 +5264,11 @@ def _restore_near_prefix_prompt_state(
                 # an empty suffix. (Only reachable when a boundary coincides with
                 # a fully-contained prompt — fall through to other candidates.)
                 continue
-            inherited_boundaries = _inherited_gdn_boundaries(entry, restore_point)
+            inherited_boundaries = _inherited_gdn_boundaries(
+                entry,
+                restore_point,
+                budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+            )
             restored = SimpleNamespace(
                 entry=SimpleNamespace(prefix_len=restore_point),
                 cache=cache,
@@ -5289,8 +5319,19 @@ def _restore_near_prefix_prompt_state(
                     gdn_boundaries=inherited_boundaries,
                     restore_served=served_truth,
                 )
+            # This lane has always shaped an image prompt's suffix prefill like
+            # a text one's (the ladder), so its sink keeps cutting forwards;
+            # the ceiling only stops it keeping checkpoints past the first
+            # image, which no restore could use.
             suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-                list(inherited_boundaries)
+                _checkpoint_sink(
+                    inherited_boundaries,
+                    session_bank=session_bank,
+                    prompt_len=len(prompt_ids),
+                    restore_point=restore_point,
+                    stable_prefix_len=stable_prefix_len,
+                    ceiling=matched_ceiling if vision_splice is not None else None,
+                )
                 if _gdn_boundary_capture_enabled()
                 else None
             )
@@ -5381,14 +5422,6 @@ def _gdn_boundary_capture_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
-def _gdn_boundary_max_count() -> int:
-    raw = os.environ.get("MTPLX_GDN_BOUNDARY_MAX", "8")
-    try:
-        return max(2, int(raw))
-    except (TypeError, ValueError):
-        return 8
-
-
 def _gdn_boundary_tail_interval() -> int:
     """Sub-chunk capture grid for the final prefill chunk (0 disables).
 
@@ -5409,65 +5442,67 @@ def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
     return any(not _is_trimmable(entry) for entry in (cache or []))
 
 
-def _thin_gdn_boundary_records(
-    records: list[tuple[int, Any, Any]], cap: int
-) -> list[tuple[int, Any, Any]]:
-    """Thin boundary records to `cap` with geometric distance-from-tail coverage.
+def _sink_admits(sink: Any, position: int) -> bool:
+    """Whether a checkpoint at ``position`` belongs in ``sink`` at all (an
+    image prompt's sink takes none past its first image). Plain lists take
+    every position."""
 
-    The retired policy ("keep the oldest + a dense tail", implemented as
-    pop(1) on every over-cap append) had no coverage guarantee in the middle:
-    any append churn after the cap — postcommit re-forward chunk edges,
-    inheritance re-thinning on clone/lease chains — ate the mid-prefix records
-    one by one, leaving [oldest, <recent tail>]. A near-miss prefix match that
-    landed in the hole then restored at the OLDEST boundary: measured
-    2026-07-17 on the Hermes lane, matched≈22.5k restored at 2,048 → 20k+
-    re-prefill and 35-50s TTFT (MEASUREMENTS 01:05 §B).
+    admits = getattr(sink, "admits", None)
+    return True if admits is None else bool(admits(int(position)))
 
-    This policy keeps, in one pass over the records sorted by position:
-      - the newest record (divergence distance ~0),
-      - one record per power-of-two bucket of distance-from-newest
-        (256..512, 512..1024, ... tokens), preferring the record CLOSEST to
-        the newest inside each bucket,
-      - the oldest record (deep-divergence anchor).
-    Coverage invariant (unit-tested): for any matched position covered by the
-    original records, restoring at the nearest kept boundary at or below it
-    re-prefills at most ~3x the true divergence distance from the tail (plus
-    one capture-grid interval) — cost stays proportional to how far the
-    request actually diverged, never a cliff.
-    """
-    if len(records) <= max(2, cap):
-        return list(records)
-    ordered = sorted(records, key=lambda record: int(record[0]))
-    newest = ordered[-1]
-    oldest = ordered[0]
-    newest_pos = int(newest[0])
-    kept: dict[int, tuple[int, Any, Any]] = {int(newest[0]): newest, int(oldest[0]): oldest}
-    # Walk from the tail toward the head (distance from newest increasing).
-    # Keep the first record past each doubling floor — one keeper per
-    # distance scale, geometric spacing by construction regardless of how
-    # dense or lumpy the input grid is. The first floor adapts to the record
-    # span so the doubling chain always reaches the oldest record within the
-    # cap budget (cap-2 scales after newest+oldest): full-span coverage with
-    # worst-case slack span/2^(cap-2) instead of an uncovered deep-middle.
-    span = max(1, newest_pos - int(oldest[0]))
-    base = 256
-    scales = max(1, cap - 2)
-    while base * (1 << (scales - 1)) < span and base < span:
-        base *= 2
-    floor = 0
-    next_floor = base
-    idx = len(ordered) - 2
-    while idx > 0 and len(kept) < cap:
-        pos = int(ordered[idx][0])
-        distance = newest_pos - pos
-        if distance > floor:
-            kept.setdefault(pos, ordered[idx])
-            while next_floor < distance:
-                next_floor *= 2
-            floor = next_floor
-            next_floor *= 2
-        idx -= 1
-    return sorted(kept.values(), key=lambda record: int(record[0]))
+
+def _sink_cuts_forwards(sink: Any) -> bool:
+    """Whether the prefill may end forwards or add in-forward captures for
+    this sink. False for image prompts' sinks: they record only where the
+    forwards already end, so their prefill is unchanged."""
+
+    return bool(getattr(sink, "cuts_forwards", True))
+
+
+def _retain_boundary_sink(sink: list) -> None:
+    """Trim a checkpoint list to its anchors and byte budget (see
+    ``mtplx.checkpoint_anchors``). A plain list, one built outside
+    ``restore_or_prefill_prompt_state``, keeps the anchors its positions
+    alone determine within the default budget."""
+
+    if isinstance(sink, CheckpointSink):
+        sink.retain()
+        return
+    sink[:] = retain_checkpoints(
+        sink, AnchorPlan(tail_backoff=_gdn_boundary_tail_backoff())
+    )
+
+
+def _checkpoint_sink(
+    records: Any,
+    *,
+    session_bank: Any,
+    prompt_len: int,
+    restore_point: int | None = None,
+    stable_prefix_len: int | None = None,
+    ceiling: int | None = None,
+    cuts_forwards: bool = True,
+) -> CheckpointSink:
+    """The checkpoint list one prefill fills, with everything its retention
+    needs known up front: the prompt end, the restore point, the stable edge,
+    the ceiling and the session bank's byte budget."""
+
+    sink = CheckpointSink(
+        records or (),
+        plan=AnchorPlan(
+            budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+            prompt_end=max(0, int(prompt_len) - 1),
+            tail_backoff=_gdn_boundary_tail_backoff(),
+            restore_point=None if restore_point is None else int(restore_point),
+            stable_prefix=(
+                None if stable_prefix_len is None else int(stable_prefix_len)
+            ),
+            ceiling=None if ceiling is None else int(ceiling),
+        ),
+        cuts_forwards=cuts_forwards,
+    )
+    sink.retain()
+    return sink
 
 
 def _capture_gdn_boundary(
@@ -5476,7 +5511,7 @@ def _capture_gdn_boundary(
     cache: list[Any],
     hidden_last: Any | None = None,
 ) -> None:
-    """Append a recurrent-only snapshot at `tokens_done`, geometric retention.
+    """Append a recurrent-only snapshot at `tokens_done`, then keep the anchors.
 
     `hidden_last` is the base hidden state of token `tokens_done - 1` when the
     producing chunk computed hidden (MTP streaming prefill). Restores use it to
@@ -5485,12 +5520,16 @@ def _capture_gdn_boundary(
     second time and break exactness (temp-0 divergence, found 2026-07-03).
 
     Snapshot cost is MB-scale per boundary (conv tail + GDN matrix state), so
-    the count is capped; over cap the list is re-thinned to geometric
-    distance-from-tail coverage (see _thin_gdn_boundary_records — the previous
-    oldest+dense-tail pop(1) policy left a mid-prefix coverage hole that
-    near-miss restores fell into).
+    the list is trimmed after every capture to its explicit anchors within the
+    byte budget (``mtplx.checkpoint_anchors``). The repeated geometric
+    thinning it replaces re-ranked every record against the newest one and
+    eroded the middle (a 16,371-token match restored at 4,096, 2026-09-29).
+    A position the sink does not admit (past an image prompt's first image)
+    is not snapshotted at all.
     """
     if sink is None or tokens_done < 1:
+        return
+    if not _sink_admits(sink, tokens_done):
         return
     try:
         hidden_leaf = None
@@ -5499,9 +5538,7 @@ def _capture_gdn_boundary(
         sink.append(
             (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
         )
-        cap = _gdn_boundary_max_count()
-        if len(sink) > cap:
-            sink[:] = _thin_gdn_boundary_records(sink, cap)
+        _retain_boundary_sink(sink)
     except Exception:
         # Boundary capture is an accelerator for future restores; never let it
         # break the cold prefill that is running right now.
@@ -5517,9 +5554,9 @@ def _gdn_boundary_tail_layout() -> str:
     Flash-Next (M5 Max, 2026-09-18): a 256-row forward runs at about 750
     tok/s against 1,720 for a 2,048-row one, so a 4K prompt spent 2.6 s of
     its 3.7 s in that tail, and widening the chunk made prefill slower.  The
-    boundary list keeps at most MTPLX_GDN_BOUNDARY_MAX records with one per
-    power-of-two distance from the newest, so most of what the dense grid
-    captured was thinned away again.
+    boundary list keeps only a few anchors within its byte budget
+    (``mtplx.checkpoint_anchors``), so most of what the dense grid captured
+    was dropped again.
     """
 
     raw = (os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_LAYOUT") or "").strip().lower()
@@ -5551,14 +5588,12 @@ def _gdn_boundary_tail_backoff() -> int:
     turn), so the closer this boundary is, the less the warm turn re-prefills:
     64 tokens instead of up to 256 on the interval grid.  It also shortens the
     one narrow forward every cold prompt still pays (64 rows cost about
-    0.15 s on Flash-Next, 220 to 256 rows about 0.30 s).
+    0.15 s on Flash-Next, 220 to 256 rows about 0.30 s).  The rung it places
+    is the prompt-end anchor ``mtplx.checkpoint_anchors`` keeps first, which
+    owns the parse so the session bank reads the same value.
     """
 
-    raw = os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_BACKOFF", "64")
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 64
+    return default_tail_backoff()
 
 
 def _geometric_tail_edges(
@@ -5577,8 +5612,10 @@ def _geometric_tail_edges(
     grid's.  Behind it the
     edges sit at ``top - (2**k - 1) * rung``, ``rung`` being the minimum rung
     width rounded up to the interval grid: their distances from the prompt
-    end fall one into each power-of-two bucket that
-    ``_thin_gdn_boundary_records`` keeps.  The deepest edge is dropped while
+    end fall one into each power-of-two bucket, so a mid-tail edit finds a
+    rung near it while the budget keeps them (the top edge is the prompt-end
+    anchor ``mtplx.checkpoint_anchors`` always keeps first).  The deepest
+    edge is dropped while
     the span in front of it would be narrower than the one behind it, so
     widths only shrink toward the prompt end and the wide part of the chunk
     stays wide.
@@ -5783,12 +5820,13 @@ def _append_gdn_boundary_record(
     snapshot: CacheSnapshot,
     hidden_leaf: Any | None,
 ) -> None:
-    """Append one boundary record and keep the geometric retention."""
+    """Append one boundary record and keep the anchors (see
+    ``_capture_gdn_boundary``)."""
 
+    if not _sink_admits(sink, tokens_done):
+        return
     sink.append((int(tokens_done), snapshot, hidden_leaf))
-    cap = _gdn_boundary_max_count()
-    if len(sink) > cap:
-        sink[:] = _thin_gdn_boundary_records(sink, cap)
+    _retain_boundary_sink(sink)
 
 
 def _record_inforward_gdn_boundary(
@@ -5887,8 +5925,8 @@ def _bank_inforward_boundaries(
         return 0
     reason = "the model returned no complete capture for a requested row"
     banked = 0
-    # Ascending, so the sink stays in position order and the geometric
-    # retention sees the records in the order the ladder appends them.
+    # Ascending, so the sink stays in position order and sees the records in
+    # the order the ladder appends them.
     for row in sorted(int(row) for row in rows):
         states = (captured or {}).get(row)
         if states is None:
@@ -5914,7 +5952,9 @@ def _bank_inforward_boundaries(
     return banked
 
 
-def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
+def _inherited_gdn_boundaries(
+    entry: Any, restore_point: int, *, budget_bytes: int | None = None
+) -> list:
     """Boundaries carried over from a restored SessionBank entry.
 
     A boundary record (position, recurrent snapshot[, hidden]) describes the
@@ -5927,16 +5967,26 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
     last completed postcommit (measured 2026-07-04: rounds pinned at a stale
     6.5k prefix while prompts grew to 12.5k, and the follow-up turn went
     fully cold with `no_snapshot_coverage`).
+
+    The inherited set keeps its anchors under ``budget_bytes`` (the session
+    bank's checkpoint budget; None keeps the default count). The restore
+    point is the only anchor it protects (the prefill that follows protects
+    its own prompt end): it sits at the previous prompt's end, where a later
+    turn may diverge again, and the grid covers everything before it. A set
+    already within the budget is kept whole. Re-thinning here was the second
+    site that hollowed out mid-prefix coverage on clone/lease chains.
     """
     records = list(getattr(entry, "gdn_boundaries", None) or [])
     kept = [record for record in records if int(record[0]) <= int(restore_point)]
-    cap = _gdn_boundary_max_count()
-    if len(kept) > cap:
-        # Geometric retention, mirroring _capture_gdn_boundary — the old
-        # oldest+dense-tail pop(1) here was the second churn site that
-        # hollowed out mid-prefix coverage on clone/lease chains.
-        kept = _thin_gdn_boundary_records(kept, cap)
-    return kept
+    return retain_checkpoints(
+        kept,
+        AnchorPlan(
+            budget_bytes=budget_bytes,
+            prompt_end=int(restore_point),
+            tail_backoff=0,
+            restore_point=int(restore_point),
+        ),
+    )
 
 
 def _accepts_keyword(fn: Any, name: str) -> bool:
@@ -6355,6 +6405,17 @@ def restore_or_prefill_prompt_state(
         # KV. Full-span matches (same pixels -> same surrogates through the
         # span) stay fully warm. 2026-08-07 pillar alias-leg regression.
         vision_restore_spans = vision_image_spans(bank_key_ids, vision_splice)
+    # The first image-pad position: an image prompt keeps recurrent
+    # checkpoints only at or before it, where the prefix is text. Without a
+    # known span there is no safe ceiling, so such a prompt keeps none.
+    first_image_start: int | None = (
+        int(vision_restore_spans[0][0]) if vision_restore_spans else None
+    )
+    keep_checkpoints = (
+        session_bank is not None
+        and _gdn_boundary_capture_enabled()
+        and (vision_splice is None or first_image_start is not None)
+    )
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
@@ -6537,6 +6598,12 @@ def restore_or_prefill_prompt_state(
             }
 
     def _emit_prefill_complete(state: PromptState) -> PromptState:
+        if session_bank is not None:
+            state.checkpoint_coverage = checkpoint_coverage(
+                state.gdn_boundaries,
+                budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
+                first_image_start=first_image_start,
+            )
         _maybe_store_prefix_snapshot(state)
         if prefill_callback is None:
             return state
@@ -6696,7 +6763,9 @@ def restore_or_prefill_prompt_state(
         ):
             suffix = list(prompt_ids[restored.entry.prefix_len :])
             inherited_boundaries = _inherited_gdn_boundaries(
-                restored.entry, restored.entry.prefix_len
+                restored.entry,
+                restored.entry.prefix_len,
+                budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
             )
             # A one-copy lease taken for a suffix prefill goes back to the
             # bank at its restore point if the prefill stops early.
@@ -6797,11 +6866,21 @@ def restore_or_prefill_prompt_state(
                         else None
                     ),
                 )
+                # An image prompt's sink records only where the plain chunk
+                # grid already ends a forward, and nothing past its first
+                # image: its suffix prefill stays exactly what it was when it
+                # kept none.
                 suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-                    list(inherited_boundaries)
-                    if session_bank is not None
-                    and vision_splice is None
-                    and _gdn_boundary_capture_enabled()
+                    _checkpoint_sink(
+                        inherited_boundaries,
+                        session_bank=session_bank,
+                        prompt_len=len(prompt_ids),
+                        restore_point=restored.entry.prefix_len,
+                        stable_prefix_len=stable_prefix_len,
+                        ceiling=first_image_start,
+                        cuts_forwards=vision_splice is None,
+                    )
+                    if keep_checkpoints
                     else None
                 )
                 if vision_splice is not None:
@@ -6906,12 +6985,22 @@ def restore_or_prefill_prompt_state(
     mtp_history_position_base = 1 if mtp_position_mode == "absolute" else 0
     # kvcache-v2: capture interior recurrent boundaries during the cold prefill
     # whenever the result will be banked — they are what make sub-prefix
-    # restores on hybrid models exact instead of approximate.
+    # restores on hybrid models exact instead of approximate. An image
+    # prompt keeps the ones at or before its first image (the text-only
+    # prefix a later turn can restore to when something after the image
+    # changes), recorded only where the plain chunk grid ends a forward so
+    # its prefill is unchanged; it kept none until 2026-09-30, so every
+    # screenshot turn that missed the cache re-read the whole conversation.
     gdn_boundary_sink: list[tuple[int, Any]] | None = (
-        []
-        if session_bank is not None
-        and vision_splice is None
-        and _gdn_boundary_capture_enabled()
+        _checkpoint_sink(
+            [],
+            session_bank=session_bank,
+            prompt_len=len(prompt_ids),
+            stable_prefix_len=stable_prefix_len,
+            ceiling=first_image_start,
+            cuts_forwards=vision_splice is None,
+        )
+        if keep_checkpoints
         else None
     )
     if _mtp_history_uses_committed_cache(mtp_history_policy):
@@ -8075,6 +8164,9 @@ def _prefill(
     capture_boundaries = (
         gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
     )
+    # An image prompt's sink records only at the plain chunk ends (see
+    # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(gdn_boundary_sink)
 
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
@@ -8082,18 +8174,18 @@ def _prefill(
         _cold_edges: tuple[int, ...] = ()
         if (
             stable_prefix_len is not None
-            and capture_boundaries
+            and shape_boundaries
             and 0 < int(stable_prefix_len) < len(body)
         ):
             _cold_edges = (int(stable_prefix_len),)
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-            if capture_boundaries
+            if shape_boundaries
             else None
         )
         spans, _inforward_edges = _prefill_boundary_plan(
             len(body),
-            capture_boundaries=capture_boundaries,
+            capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
             mandatory_edges=_cold_edges,
@@ -8199,6 +8291,9 @@ def _prefill_committed_mtp_history_streaming(
     capture_boundaries = (
         gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
     )
+    # An image prompt's sink records only at the plain chunk ends (see
+    # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
+    shape_boundaries = capture_boundaries and _sink_cuts_forwards(gdn_boundary_sink)
     body = prompt_ids[:-1]
     history_start_token_index = 1
     use_absolute_positions = mtp_position_mode == "absolute"
@@ -8228,18 +8323,18 @@ def _prefill_committed_mtp_history_streaming(
     _cold_edges: tuple[int, ...] = ()
     if (
         stable_prefix_len is not None
-        and capture_boundaries
+        and shape_boundaries
         and 0 < int(stable_prefix_len) < len(body)
     ):
         _cold_edges = (int(stable_prefix_len),)
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
-        if capture_boundaries
+        if shape_boundaries
         else None
     )
     mtp_streaming_spans, _inforward_edges = _prefill_boundary_plan(
         len(body),
-        capture_boundaries=capture_boundaries,
+        capture_boundaries=shape_boundaries,
         inforward=_inforward_hooks is not None,
         tail_interval=_gdn_boundary_tail_interval(),
         mandatory_edges=_cold_edges,
@@ -9414,6 +9509,9 @@ def generate_ar(
         ),
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
+        ),
+        session_checkpoints=dict(
+            getattr(prompt_state, "checkpoint_coverage", None) or {}
         ),
         verify_time_s=target_decode_time,
         verify_forward_time_s=target_forward_graph_time,
@@ -16310,6 +16408,9 @@ def generate_mtpk(
         pre_first_token_setup_s=float(pre_first_token_setup_s),
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
+        ),
+        session_checkpoints=dict(
+            getattr(prompt_state, "checkpoint_coverage", None) or {}
         ),
         prompt_state_total_time_s=float(prompt_state_total_time_s),
         prompt_state_unattributed_time_s=float(
