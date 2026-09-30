@@ -82,6 +82,7 @@ from mtplx.a3b_mtp_batch import (
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
+from mtplx.one_copy import one_copy_runtime
 from mtplx.mtp_patch import MTPContract
 from mtplx.mtp_batch_numerics import (
     MTP_BATCH_NUMERICS_CHOICES,
@@ -26529,6 +26530,19 @@ def _generation_final_bank_metadata(
     """
     backend_id = _bank_backend_id(state)
     committed_mtp_cache = getattr(final_state, "final_committed_mtp_cache", None)
+    if committed_mtp_cache is not None and one_copy_runtime(state.runtime):
+        # One-copy store: the draft head's history rides the lease by
+        # reference, like the trunk; a snapshot here would be copied into the
+        # entry (session_bank live_ref_entry).
+        return {
+            "hidden_variant": (
+                "gemma4_pre_norm" if backend_id == GEMMA4_BACKEND else "post_norm"
+            ),
+            "mtp_history_policy": _bank_history_policy(state),
+            "mtp_history_snapshot": None,
+            "mtp_history_cache_ref": committed_mtp_cache,
+            "mtp_snapshot_epoch": token_count,
+        }
     mtp_snapshot = (
         snapshot_cache(committed_mtp_cache) if committed_mtp_cache is not None else None
     )

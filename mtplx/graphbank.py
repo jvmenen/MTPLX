@@ -815,6 +815,10 @@ class TensorOffsetQSACache:
             self.capacity if dense_capacity is None else int(dense_capacity)
         )
         self.indexer_budget = int(indexer_budget)
+        # "adopted" when from_qsa_cache took the stock buffers as they were,
+        # "copied" when it padded or cut them into new arrays; None for a bank
+        # built directly (a shadow twin, a test).
+        self.promotion: str | None = None
 
     @property
     def rope_delta(self) -> mx.array | None:
@@ -951,17 +955,24 @@ class TensorOffsetQSACache:
             capacity_bucket = 0
 
         logical_capacity = offset + reserve_tokens
+        kv_step = getattr(entry.kv, "step", 256)
         dense_capacity = cls._bank_capacity(
-            logical_capacity, ratio, getattr(entry.kv, "step", 256),
+            logical_capacity, ratio, kv_step,
             rows_gather=rows_gather,
         )
         raw_capacity = cls._bank_capacity(
             logical_capacity,
             ratio,
-            getattr(entry.kv, "step", 256),
+            kv_step,
             rows_gather=rows_gather,
             bucket=capacity_bucket,
         )
+        adopted = cls.adoptable_rows(
+            entry, raw_capacity, kv_step=kv_step, rows_gather=rows_gather,
+            bucket=capacity_bucket,
+        )
+        if adopted is not None:
+            raw_capacity = adopted
         pooled_capacity = raw_capacity // ratio
 
         # Allocate the admitted width directly. Growing on the KV step and
@@ -1006,7 +1017,7 @@ class TensorOffsetQSACache:
                     capacity=raw_capacity
                 )
 
-        return cls(
+        bank = cls(
             kv,
             raw,
             pooled,
@@ -1020,6 +1031,84 @@ class TensorOffsetQSACache:
             dense_capacity=dense_capacity,
             indexer_budget=int(indexer_budget or 0),
         )
+        bank.promotion = "adopted" if adopted is not None else "copied"
+        return bank
+
+    @staticmethod
+    def held_rows(entry: Any) -> int | None:
+        """Rows a stock QSA cache's attention and raw index buffers all hold.
+
+        None when a buffer is missing or the three row-indexed buffers
+        (keys, values, raw index keys) disagree. The pooled buffer is not
+        consulted: it is small, and a short suffix that completes no block
+        leaves it at its previous size.
+        """
+
+        kv = getattr(entry, "kv", None)
+        keys = getattr(kv, "keys", None)
+        values = getattr(kv, "values", None)
+        raw = getattr(entry, "raw_keys", None)
+        if keys is None or values is None or raw is None:
+            return None
+        rows = int(keys.shape[2])
+        if int(values.shape[2]) != rows or int(raw.shape[1]) != rows:
+            return None
+        return rows
+
+    @classmethod
+    def adoptable_rows(
+        cls, entry: Any, planned: int, *, kv_step: int, rows_gather: bool,
+        bucket: int,
+    ) -> int | None:
+        """The capacity a bank built from ``entry`` can take without a copy.
+
+        The bank used to be a second, padded copy of the conversation: the
+        stock buffers were concatenated with zeros up to the planned rows
+        even when they already held them. A cache sized for this request
+        (qwen4_exp.qsa_rows_target during its prefill) or a lease demoted
+        with its capacity kept holds its keys, values and raw index keys in
+        buffers of exactly the planned rows, and the bank adopts them as its
+        own (the verify writes then donate into the very buffers the prefill
+        filled).
+
+        A larger buffer is adopted only where the capacity is not part of the
+        arithmetic: on the rows-gather lane with the bucket in force (each
+        verify row attends over its own selected rows; the padded tail never
+        enters a value; see ``_bank_capacity``), page-aligned like every
+        bucketed capacity, and at most one bucket larger, so the selector's
+        work over the pooled blocks grows by at most one bucket. The dense
+        lane and an unbucketed bank keep their exact width. None means the
+        stock pad-or-cut construction runs.
+        """
+
+        return cls.adoptable_capacity(
+            cls.held_rows(entry), planned,
+            ratio=max(1, int(getattr(entry, "ratio", 4) or 4)),
+            kv_step=kv_step, rows_gather=rows_gather, bucket=bucket,
+        )
+
+    @staticmethod
+    def adoptable_capacity(
+        held: int | None, planned: int, *, ratio: int, kv_step: int,
+        rows_gather: bool, bucket: int,
+    ) -> int | None:
+        """``adoptable_rows`` on row counts alone (the admission's arithmetic)."""
+
+        planned = int(planned)
+        if held is None or int(held) < planned:
+            return None
+        rows = int(held)
+        if rows == planned:
+            return rows
+        if not rows_gather or int(bucket) <= 0:
+            return None
+        quantum = math.lcm(max(1, int(ratio)), max(1, int(kv_step)))
+        if rows % quantum:
+            return None
+        bucket_rows = quantum * ((int(bucket) + quantum - 1) // quantum)
+        if rows - planned > bucket_rows:
+            return None
+        return rows
 
     @property
     def capacity(self) -> int:
@@ -1143,13 +1232,20 @@ class TensorOffsetQSACache:
     def nbytes(self) -> int:
         return int(self.kv.nbytes + self.raw_keys.nbytes + self.pooled.nbytes)
 
-    def demote(self, *, compact: bool = True):
+    def demote(self, *, compact: bool = True, keep_capacity: bool = False):
         """Hand the state back as a stock ``QSACache``.
 
         The rotary delta does not travel: keys and pooled keys are stored
         already rotated, and the delta is a function of the request's own
         ids and image grids, recomputed by the next request. Nothing of it
         reaches the session bank, RAM or SSD.
+
+        ``keep_capacity`` hands back the bank's own buffers whole (no cut to
+        the dense width, no compaction copy): the one-copy conversation store
+        keeps them as the conversation's only copy, and the next request's
+        prefill writes into them in place and its bank adopts them again.
+        Stock readers only ever read the valid rows below the offset, so the
+        extra rows change nothing they compute.
         """
 
         from .models.qwen4_exp import QSACache
@@ -1157,6 +1253,15 @@ class TensorOffsetQSACache:
         offset = self.kv.size()
         entry = QSACache(self.ratio)
         entry.indexer_budget = self.indexer_budget
+        if keep_capacity:
+            entry.kv.step = self.kv.step
+            entry.kv.keys = self.kv.keys
+            entry.kv.values = self.kv.values
+            entry.kv.offset = int(offset)
+            entry.raw_keys = self.raw_keys
+            entry.pooled = self.pooled
+            entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
+            return entry
         entry.kv = self.kv.demote()
         entry.kv.keys, entry.kv.values = self.attention_kv(entry.kv.keys, entry.kv.values, 1)
         entry.raw_keys = self._fixed_bank(self.raw_keys, self.dense_capacity, 1)
@@ -2905,10 +3010,21 @@ class CompiledVerifyBank:
                 for entry in qsa_entries
             ]
             admit = self.capacity_plan.admit_growth if self.capacity_plan else None
-            if any(rows > entry.capacity for rows, entry in zip(planned, qsa_entries)):
+            growing = [
+                (rows, entry) for rows, entry in zip(planned, qsa_entries)
+                if rows > entry.capacity
+            ]
+            if growing:
+                # The banks grow one layer at a time below, each old layer
+                # released as soon as its replacement is written, so the
+                # transition's peak is one layer's new buffers, not a second
+                # bank (the 09-29 refusals priced the whole new bank and were
+                # 0.51 GB short where one layer needed 0.22 GB). ``admit``
+                # takes the new rows and prices that one-layer transition
+                # (generation._qwen4_fixed_m4_growth_fits).
                 if admit is not None and not admit(max(planned)):
-                    # Check the original allocation before giving up the
-                    # request. No cache leaf changes before this admission.
+                    # Check the unbucketed width before giving up the request.
+                    # No cache leaf changes before this admission.
                     planned = [
                         entry._bank_capacity(next_capacity, entry.ratio, entry.kv.step,
                                              rows_gather=entry.fixed_rows_gather)
@@ -2920,10 +3036,18 @@ class CompiledVerifyBank:
                         entry.capacity_bucket = 0
                     self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0
                     dispatch["capacity_bucket"] = 0
+                # Nothing compiled may still hold an old leaf: a shadow twin or
+                # a retained input list would keep every old layer alive until
+                # the whole transition ends.
+                self._clear_shadow_leaf_refs()
+                self._held_state_refs.clear()
             for entry in qsa_entries:
-                capacity_changed = (
-                    entry.ensure_capacity(next_capacity) or capacity_changed
-                )
+                grew = entry.ensure_capacity(next_capacity)
+                if grew:
+                    # Write this layer's new banks now; its old banks go with
+                    # the last reference to them, before the next layer grows.
+                    mx.eval(*entry.state_leaves)
+                capacity_changed = grew or capacity_changed
             dispatch["dense_capacity"] = min(entry.dense_capacity for entry in qsa_entries)
             dispatch["growth_tokens"] = next_growth_tokens
         route_changed = False
@@ -4423,12 +4547,16 @@ class CompiledVerifyBank:
         ) + (time.perf_counter() - started)
         return len(leaves)
 
-    def demote(self, cache: Any, *, compact: bool = True) -> int:
+    def demote(
+        self, cache: Any, *, compact: bool = True, keep_capacity: bool = False,
+    ) -> int:
         """Restore stock containers for every tensor-offset adapter in place.
 
         Mandatory before postcommit / final-state capture: downstream cache
         consumers must never see promoted adapters. Skip publication copies
-        when the caller will discard the state.
+        when the caller will discard the state. ``keep_capacity`` hands the
+        fixed QSA banks back whole, for the one-copy conversation store
+        (``TensorOffsetQSACache.demote``).
         """
         try:
             from .cache_state import TensorOffsetVllmMetalPagedKVCache
@@ -4448,7 +4576,7 @@ class CompiledVerifyBank:
         count = 0
         for idx, entry in enumerate(cache or []):
             if isinstance(entry, TensorOffsetQSACache):
-                cache[idx] = entry.demote(compact=compact)
+                cache[idx] = entry.demote(compact=compact, keep_capacity=keep_capacity)
                 count += 1
             elif isinstance(entry, TensorOffsetKVCache):
                 cache[idx] = entry.demote()

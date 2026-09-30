@@ -132,11 +132,20 @@ def test_installed_bank_releases_each_layer_during_publication(pack, lane, dtype
             assert bool(mx.all(leaf == value).item())
 
 
+@pytest.mark.parametrize("one_copy", [False, True])
 @pytest.mark.parametrize("capture", [False, True])
-def test_generation_compacts_only_published_state_and_reports_demotion(pack, lane, capture):
+def test_generation_compacts_only_published_state_and_reports_demotion(pack, lane, capture, one_copy):
+    """The copying store compacts published state; the one-copy store never copies.
+
+    With the one-copy store (mtplx/one_copy.py) the session bank keeps the
+    conversation as a lease on the bank's own buffers, so demotion hands them
+    back whole whether or not the state is published.
+    """
+
     from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
 
     smoke, model = pack
+    lane.setenv("MTPLX_ONE_COPY", "1" if one_copy else "0")
     runtime = smoke._tiny_runtime(model)
     install_qwen4_fixed_verify_route(runtime)
     lane.setenv("MTPLX_COMPILED_VERIFY", "1")
@@ -173,9 +182,15 @@ def test_generation_compacts_only_published_state_and_reports_demotion(pack, lan
     )
     report = result.stats.graphbank["compiled_verify"]
     assert report["fixed_m4"]["installed"]
-    assert len(copies) == (4 if capture else 0), "unpublished state must not be copied"
+    if one_copy:
+        assert copies == [], "the one-copy store never copies at demotion"
+    else:
+        assert len(copies) == (4 if capture else 0), "unpublished state must not be copied"
     assert report.get("demote_time_s", 0) >= 3.25
     if capture:
         assert result.final_state.safe_to_commit
+        if one_copy:
+            qsa = next(e for e in result.final_state.final_trunk_cache if isinstance(e, QSACache))
+            assert qsa.kv.keys.shape[2] > qsa.offset, "the bank's capacity comes back whole"
     else:
         assert result.final_state is None

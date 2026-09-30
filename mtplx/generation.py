@@ -96,6 +96,13 @@ from .graphbank import (
     stamp_rope_delta,
 )
 from .native_mlp import set_native_mlp_context
+from .one_copy import (
+    held_qsa_rows,
+    one_copy_runtime,
+    prefill_rows_scope,
+    prefill_rows_target,
+    prompt_lease_fields,
+)
 from .mtp_history_cache_only import (
     mtp_history_cache_arrays,
     mtp_history_cache_only_enabled,
@@ -394,6 +401,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     prompt_ids: list[int] | None = None,
     receipt: dict | None = None,
     capacity_plan: FixedM4CapacityPlan | None = None,
+    held_rows: int | None = None,
 ) -> bool:
     """Construction gate for the shape-specialized physical-M4 verifier.
 
@@ -462,6 +470,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
         rt, prompt_tokens=int(prompt_tokens), session_bank=session_bank,
         prompt_ids=prompt_ids, receipt=receipt,
         capacity_plan=capacity_plan or FixedM4CapacityPlan.for_request(max_tokens, runtime=rt),
+        held_rows=held_rows,
     )
     if receipt is not None:
         receipt.update(engaged=fits, reason="admitted" if fits else "memory_gate")
@@ -650,6 +659,7 @@ def _qwen4_fixed_m4_admission(
     session_bank: Any | None,
     receipt: dict,
     capacity_plan: FixedM4CapacityPlan | None = None,
+    held_rows: int | None = None,
 ) -> tuple[bool, int | None]:
     """Admit one request to the compiled fixed-M4 verify lane.
 
@@ -693,6 +703,7 @@ def _qwen4_fixed_m4_admission(
         prompt_ids=list(bank_key_ids),
         receipt=receipt,
         capacity_plan=capacity_plan,
+        held_rows=held_rows,
     )
     return admitted, (vision["rope_delta"] if admitted else None)
 
@@ -751,6 +762,80 @@ def _qwen4_fixed_m4_bank_rows(
     ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
     plan = capacity_plan or FixedM4CapacityPlan.for_request(None, runtime=rt)
     return plan.rows(prompt_tokens, ratio, TensorOffsetQSACache.step)
+
+
+def _qwen4_fixed_m4_promotion_adopts(
+    rt: Any, prompt_tokens: int, plan: FixedM4CapacityPlan, bank_rows: int,
+    held_rows: int,
+) -> bool:
+    """Whether the promotion adopts the stock buffers instead of copying them.
+
+    The same rule the bank applies when it is built
+    (``TensorOffsetQSACache.adoptable_rows``), on this request's plan.
+    """
+
+    from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
+
+    args = _qwen4_text_args(rt)
+    ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
+    rows_gather = _qsa_gather_enabled() and int(prompt_tokens) >= _qsa_gather_min_context()
+    return TensorOffsetQSACache.adoptable_capacity(
+        held_rows, bank_rows, ratio=ratio, kv_step=TensorOffsetQSACache.step,
+        rows_gather=rows_gather, bucket=int(plan.bucket or 0),
+    ) is not None
+
+
+def _qwen4_qsa_layer_count(rt: Any) -> int:
+    """QSA (full-attention) layers of the served Flash-Next geometry, or 0."""
+
+    args = _qwen4_text_args(rt)
+    return sum(
+        1 for kind in (getattr(args, "layer_types", None) or ())
+        if kind != "linear_attention"
+    )
+
+
+def _qwen4_fixed_m4_growth_fits(
+    rt: Any, rows: int, *, session_bank: Any | None = None,
+    protect_ids: Sequence[int] | None = None,
+) -> bool:
+    """Admission for one growth step of an installed fixed-M4 bank.
+
+    The bank grows one QSA layer at a time and releases each old layer as
+    its replacement is written (graphbank ``reserve_fixed_m4_window``), so
+    the step needs one layer's new banks at ``rows`` rows, not a second
+    bank. Before refusing, the allocator's cached bytes are released and
+    idle session-bank entries give way (the running conversation is held by
+    this request, not by the bank; its own prompt entry is protected). The
+    request's answer was admitted with its whole budget, so a refusal here
+    means something outside the engine took the memory.
+    """
+
+    per_token = _qwen4_fixed_m4_promotion_bytes_per_token(rt)
+    layers = _qwen4_qsa_layer_count(rt)
+    limit = _metal_memory_limit_bytes(rt)
+    if per_token <= 0 or layers <= 0 or limit <= 0:
+        return True
+    need = int(rows) * per_token // layers
+    line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
+    if _mlx_live_memory_bytes() + need <= line:
+        return True
+    _mlx_release_allocator_cache()
+    live = _mlx_live_memory_bytes()
+    if live + need <= line:
+        return True
+    reclaim = getattr(session_bank, "shrink_for_admission", None)
+    if callable(reclaim):
+        bank_before = int(getattr(session_bank, "total_nbytes", 0) or 0)
+        reclaim(
+            max(0, bank_before - max(0, live + need - line)),
+            protect_tokens=list(protect_ids or ()),
+            reason="fixed_m4_growth",
+        )
+        _mlx_release_allocator_cache()
+        if _mlx_live_memory_bytes() + need <= line:
+            return True
+    return False
 
 
 def _mlx_live_memory_bytes() -> int:
@@ -1117,6 +1202,7 @@ def _qwen4_fixed_m4_lane_fits(
     prompt_ids: list[int] | None = None, receipt: dict | None = None,
     capacity_plan: FixedM4CapacityPlan | None = None,
     promotion_rows: int | None = None,
+    held_rows: int | None = None,
 ) -> bool:
     """Per-request memory gate for the strict fixed-M4 lane.
 
@@ -1126,6 +1212,11 @@ def _qwen4_fixed_m4_lane_fits(
     machine: the lane's 7.1 GB promotion adder pushed the request into a
     507 while plain main ran. A skipped request constructs no bank and is
     byte-for-byte the plain eager batched path.
+
+    ``held_rows`` is what the request's stock QSA buffers already hold (the
+    one-copy store sizes them for the bank during the prefill). A promotion
+    that adopts them allocates nothing, so it is admitted without a price:
+    the compiled lane no longer competes with the conversation it serves.
 
     MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT is an operator belt in prompt tokens;
     0 or unset leaves the live gate alone in charge: live allocator bytes
@@ -1155,6 +1246,21 @@ def _qwen4_fixed_m4_lane_fits(
         _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
         if promotion_rows is None else int(promotion_rows)
     )
+    if (
+        promotion_rows is None
+        and held_rows is not None
+        and _qwen4_fixed_m4_promotion_adopts(rt, prompt_tokens, plan, bank_rows, held_rows)
+    ):
+        if receipt is not None:
+            receipt.update(
+                promotion_bytes=0,
+                promotion_rows=bank_rows,
+                held_rows=int(held_rows),
+                capacity_bucket=plan.bucket,
+                reserve_tokens=plan.reserve_tokens,
+                promotion="adopted",
+            )
+        return True
     need = bank_rows * per_token
     live = _mlx_live_memory_bytes()
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
@@ -4758,8 +4864,12 @@ def _restore_near_prefix_prompt_state(
     stable_prefix_len: int | None = None,
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
+    session_id: str | None = None,
 ) -> PromptState | None:
     """matched_ceiling: hard cap on any candidate's matched length.
+
+    session_id: the requesting conversation. Another conversation's lease is
+    served as a copy of the shared prefix (session_bank._lease_owned_by).
 
     Vision requests pass the FIRST image-pad position: this lane matches on
     raw token ids, where every pad equals every pad, so an uncapped match
@@ -4795,6 +4905,9 @@ def _restore_near_prefix_prompt_state(
     _prefix_restore_supports_served = callable(
         _prefix_restore_fn
     ) and _accepts_served_out(_prefix_restore_fn)
+    _prefix_restore_supports_session = callable(
+        _prefix_restore_fn
+    ) and _accepts_keyword(_prefix_restore_fn, "session_id")
     # Pass the serve floor so the bank's resident-duplicate shadow gate can
     # mirror THIS caller's eligibility exactly (explicit capability
     # attribute; duck-typed banks get the legacy call shape).
@@ -4913,6 +5026,8 @@ def _restore_near_prefix_prompt_state(
                 restore_kwargs: dict[str, Any] = {"served_out": attempt_served}
                 if not _prefix_restore_supports_served:
                     restore_kwargs = {}
+                if _prefix_restore_supports_session:
+                    restore_kwargs["session_id"] = session_id
                 restore_started = time.perf_counter()
                 prefix_restore = restore_entry_prefix_cache(
                     rt,
@@ -5753,6 +5868,15 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
     return kept
 
 
+def _accepts_keyword(fn: Any, name: str) -> bool:
+    """Whether ``fn`` takes keyword ``name`` (detected once, never by retry)."""
+
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _accepts_served_out(fn: Any) -> bool:
     """Feature-detect the passive-probe ``served_out`` kwarg.
 
@@ -6253,11 +6377,30 @@ def restore_or_prefill_prompt_state(
         store_started = time.perf_counter()
         snapshot_done = store_started
         try:
-            mtp_snapshot = (
-                snapshot_cache(state.committed_mtp_cache)
-                if state.committed_mtp_cache is not None
-                else None
-            )
+            boundaries = list(getattr(state, "gdn_boundaries", None) or [])
+            if one_copy_runtime(rt):
+                # One-copy store: a lease plus a prompt-end anchor, never a
+                # snapshot of views the decode would then have to copy.
+                bank_fields = prompt_lease_fields(
+                    state.trunk_cache,
+                    committed_mtp_cache=state.committed_mtp_cache,
+                    hidden=state.hidden,
+                    prompt_len=len(prompt_ids),
+                    boundaries=boundaries,
+                )
+                has_mtp = state.committed_mtp_cache is not None
+            else:
+                mtp_snapshot = (
+                    snapshot_cache(state.committed_mtp_cache)
+                    if state.committed_mtp_cache is not None
+                    else None
+                )
+                bank_fields = {
+                    "keep_live_ref": False,
+                    "mtp_history_snapshot": mtp_snapshot,
+                    "gdn_boundaries": boundaries,
+                }
+                has_mtp = mtp_snapshot is not None
             snapshot_done = time.perf_counter()
             put_timing: dict[str, object] = {}
             entry = session_bank.put(
@@ -6267,17 +6410,15 @@ def restore_or_prefill_prompt_state(
                 logits=state.logits,
                 hidden=state.hidden,
                 hidden_variant=base_hidden_variant,
-                keep_live_ref=False,
                 session_id=session_id,
                 template_hash=template_hash,
                 mtp_history_policy=mtp_history_policy,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
-                mtp_history_snapshot=mtp_snapshot,
                 snapshot_epoch=len(prompt_ids),
-                mtp_snapshot_epoch=len(prompt_ids) if mtp_snapshot is not None else None,
-                gdn_boundaries=list(getattr(state, "gdn_boundaries", None) or []),
+                mtp_snapshot_epoch=len(prompt_ids) if has_mtp else None,
                 timing_out=put_timing,
+                **bank_fields,
             )
             put_done = time.perf_counter()
             state.prefill_store_snapshot = _prefill_store_result(
@@ -6424,6 +6565,7 @@ def restore_or_prefill_prompt_state(
                     else None
                 ),
                 vision_splice=vision_splice,
+                session_id=session_id,
                 cache_factory=restore_cache_factory,
                 # Tool-round prefix stability (defect A): the suffix prefill
                 # behind this lane must treat the pre-nudge stable edge as a
@@ -6611,6 +6753,7 @@ def restore_or_prefill_prompt_state(
                 vision_restore_spans[0][0] if vision_restore_spans else None
             ),
             vision_splice=vision_splice,
+            session_id=session_id,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
@@ -10410,28 +10553,35 @@ def generate_mtpk(
     except (TypeError, ValueError):
         _stable_prefix_len = None
     _prompt_state_started = time.perf_counter()
-    prompt_state = restore_or_prefill_prompt_state(
-        rt,
-        prompt_ids,
-        vision_splice=vision_splice,
-        base_hidden_variant=base_hidden_variant,
-        mtp_hidden_variant=mtp_hidden_variant,
-        mtp_history_policy=mtp_history_policy,
-        session_bank=session_bank,
-        restore_mode=session_restore_mode,
-        session_id=session_id,
-        template_hash=session_template_hash,
-        draft_head_identity=session_draft_head_identity,
-        policy_fingerprint=session_policy_fingerprint,
-        prefill_callback=prefill_callback,
-        # kvcache-v2: client disconnect aborts the prefill through the same
-        # chunk-granular check the postcommit path uses — an abandoned agent
-        # request must not pin the GPU for a full long-context prefill
-        # (measured: an orphaned ~200k prefill blocked all sessions for
-        # 10+ minutes, 2026-07-03).
-        abort_check=abort_check,
-        stable_prefix_len=_stable_prefix_len,
+    # One capacity plan per request, shared by the prefill (which sizes the
+    # QSA buffers to the bank's rows), the fixed-M4 admission and the bank.
+    fixed_m4_capacity_plan = FixedM4CapacityPlan.for_request(max_tokens, runtime=rt)
+    one_copy_rows_target = prefill_rows_target(
+        rt, len(prompt_ids), fixed_m4_capacity_plan
     )
+    with prefill_rows_scope(one_copy_rows_target):
+        prompt_state = restore_or_prefill_prompt_state(
+            rt,
+            prompt_ids,
+            vision_splice=vision_splice,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            restore_mode=session_restore_mode,
+            session_id=session_id,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+            prefill_callback=prefill_callback,
+            # kvcache-v2: client disconnect aborts the prefill through the same
+            # chunk-granular check the postcommit path uses — an abandoned agent
+            # request must not pin the GPU for a full long-context prefill
+            # (measured: an orphaned ~200k prefill blocked all sessions for
+            # 10+ minutes, 2026-07-03).
+            abort_check=abort_check,
+            stable_prefix_len=_stable_prefix_len,
+        )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()
     pre_first_token_setup_s = 0.0
@@ -10453,11 +10603,47 @@ def generate_mtpk(
         commit_started = time.perf_counter()
         commit_snapshot_done = commit_started
         try:
-            mtp_snapshot = (
-                snapshot_cache(prompt_state.committed_mtp_cache)
-                if prompt_state.committed_mtp_cache is not None
-                else None
+            # Issue #121 root cause (measured 2026-07-16): this commit is
+            # the PRIMARY store for tool-session turns and it dropped the
+            # recurrent boundaries the prefill captured/inherited. Every
+            # descendant entry was boundary-less, so hybrid-model
+            # near-prefix restores fail-closed (no_snapshot_coverage) and
+            # agent turns pinned on the oldest clean-prefix entry while
+            # skip% decayed (78%->52% over 12 turns in the replay).
+            prompt_boundaries = list(
+                getattr(prompt_state, "gdn_boundaries", None) or []
             )
+            if one_copy_runtime(rt):
+                # One-copy store: a lease on the live cache plus a recurrent
+                # anchor at the prompt's end. Decode keeps writing into the
+                # leased buffers; a restore of this entry trims the attention
+                # layers and takes the anchor for the recurrent ones
+                # (session_bank._lease_advance), so the post-decode cache can
+                # never serve under the pre-decode prefix.
+                prompt_bank_fields = prompt_lease_fields(
+                    prompt_state.trunk_cache,
+                    committed_mtp_cache=prompt_state.committed_mtp_cache,
+                    hidden=prompt_state.hidden,
+                    prompt_len=len(prompt_ids),
+                    boundaries=prompt_boundaries,
+                )
+            else:
+                # This prompt cache is committed before decode continues and
+                # mutates the same KV/MTP objects. A live reference lease
+                # here can restore a post-decode cache under a pre-decode
+                # token prefix on the next OpenCode turn. Store a real
+                # snapshot or skip; generation-final/postcommit snapshots are
+                # the safe places for live leases.
+                prompt_bank_fields = {
+                    "keep_live_ref": False,
+                    "mtp_history_snapshot": (
+                        snapshot_cache(prompt_state.committed_mtp_cache)
+                        if prompt_state.committed_mtp_cache is not None
+                        else None
+                    ),
+                    "mtp_history_cache_ref": None,
+                    "gdn_boundaries": prompt_boundaries,
+                }
             commit_snapshot_done = time.perf_counter()
             commit_put_timing: dict[str, object] = {}
             entry = session_bank.put(
@@ -10467,36 +10653,17 @@ def generate_mtpk(
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
                 hidden_variant=base_hidden_variant,
-                # This prompt cache is committed before decode continues and
-                # mutates the same KV/MTP objects. A live reference lease here
-                # can restore a post-decode cache under a pre-decode token
-                # prefix on the next OpenCode turn. Store a real snapshot or
-                # skip; generation-final/postcommit snapshots are the safe
-                # places for live leases.
-                keep_live_ref=False,
                 session_id=session_id,
                 template_hash=session_template_hash,
                 mtp_history_policy=prompt_state.mtp_history_policy,
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
-                mtp_history_snapshot=mtp_snapshot,
-                mtp_history_cache_ref=None,
                 snapshot_epoch=len(prompt_ids),
                 mtp_snapshot_epoch=len(prompt_ids)
-                if mtp_snapshot is not None
-                or prompt_state.committed_mtp_cache is not None
+                if prompt_state.committed_mtp_cache is not None
                 else None,
-                # Issue #121 root cause (measured 2026-07-16): this commit is
-                # the PRIMARY store for tool-session turns and it dropped the
-                # recurrent boundaries the prefill captured/inherited. Every
-                # descendant entry was boundary-less, so hybrid-model
-                # near-prefix restores fail-closed (no_snapshot_coverage) and
-                # agent turns pinned on the oldest clean-prefix entry while
-                # skip% decayed (78%->52% over 12 turns in the replay).
-                gdn_boundaries=list(
-                    getattr(prompt_state, "gdn_boundaries", None) or []
-                ),
                 timing_out=commit_put_timing,
+                **prompt_bank_fields,
             )
             put_done = time.perf_counter()
             prompt_prefix_bank_commit = {
@@ -10578,7 +10745,6 @@ def generate_mtpk(
     # is ever sliced by a tensor offset (_qwen4_vision_compiled_verify_admission
     # names the shapes and settings that stay eager).
     fixed_m4_admission: dict[str, object] = {}
-    fixed_m4_capacity_plan = FixedM4CapacityPlan.for_request(max_tokens, runtime=rt)
     qwen4_fixed_m4_compiled_verify, fixed_m4_rope_delta = _qwen4_fixed_m4_admission(
         rt,
         vision_splice=vision_splice,
@@ -10592,11 +10758,19 @@ def generate_mtpk(
         session_bank=session_bank,
         receipt=fixed_m4_admission,
         capacity_plan=fixed_m4_capacity_plan,
+        held_rows=(
+            held_qsa_rows(prompt_state.trunk_cache) if one_copy_runtime(rt) else None
+        ),
     )
     if qwen4_fixed_m4_compiled_verify:
-        fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
-            rt, prompt_tokens=len(prompt_ids), promotion_rows=rows,
-        )
+        if one_copy_runtime(rt):
+            fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_growth_fits(
+                rt, rows, session_bank=session_bank, protect_ids=bank_commit_ids,
+            )
+        else:
+            fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
+                rt, prompt_tokens=len(prompt_ids), promotion_rows=rows,
+            )
     _generic_compiled_verify = (
         verify_strategy in {"capture_commit", "graphbank_capture_commit"}
         or generic_compiled_target_prefix
@@ -15785,7 +15959,14 @@ def generate_mtpk(
         # Demotion is after the decode timing window. Report its complete
         # cost, including evaluated publication copies, in the request stats.
         demote_started = time.perf_counter()
-        compiled_verify_bank.demote(cache, compact=capture_final_state and pending_primary is None and repetition_result is None)
+        # One-copy store: the banks hand their buffers back whole; the session
+        # bank keeps the conversation as a lease, so no compact copy is made
+        # for it (graphbank TensorOffsetQSACache.demote).
+        compiled_verify_bank.demote(
+            cache,
+            compact=capture_final_state and pending_primary is None and repetition_result is None,
+            keep_capacity=one_copy_runtime(rt),
+        )
         compiled_verify_report["demote_time_s"] = time.perf_counter() - demote_started
         if _env_truthy("MTPLX_COMPILED_VERIFY_STATS"):
             try:

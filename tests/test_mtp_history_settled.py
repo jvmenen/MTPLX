@@ -317,7 +317,8 @@ def _saved_arrays(entry) -> list[mx.array]:
     )
 
 
-def _bank_then_restore(tiny_pack, monkeypatch, *, lazy: bool):
+def _bank_then_restore(tiny_pack, monkeypatch, *, lazy: bool, one_copy: bool = False):
+    monkeypatch.setenv("MTPLX_ONE_COPY", "1" if one_copy else "0")
     bank = SessionBank()
     first = _generate(
         tiny_pack,
@@ -330,6 +331,21 @@ def _bank_then_restore(tiny_pack, monkeypatch, *, lazy: bool):
         commit_prompt_state_to_bank=True,
     )
     entries = list(bank._entries.values())
+    if one_copy:
+        # The one-copy store banks the prompt as a lease on the live history
+        # (mtplx/one_copy.py); the warm turn rewinds it to the prompt's end.
+        assert len(entries) == 1 and entries[0].live_ref_only
+        assert entries[0].mtp_history_cache_ref is not None
+        assert entries[0].mtp_history_snapshot is None
+        warm = _generate(
+            tiny_pack,
+            monkeypatch,
+            max_tokens=24,
+            lazy=lazy,
+            session_bank=bank,
+            session_id="snapshot-before-settle",
+        )
+        return first, [], warm
     assert len(entries) == 1 and entries[0].mtp_history_snapshot is not None
     # Read after the generation settled the history and wrote past it.
     saved = _saved_arrays(entries[0])
@@ -356,6 +372,34 @@ def test_a_bank_snapshot_taken_before_the_settle_keeps_its_bits_and_restores(
     assert len(lazy_saved) == len(eager_saved)
     assert all(_same_bits(a, b) for a, b in zip(lazy_saved, eager_saved))
     _assert_same_decode(lazy_warm, eager_warm)
+
+
+def test_a_prompt_lease_taken_before_the_settle_restores_like_the_snapshot(
+    tiny_pack, monkeypatch
+):
+    """The one-copy store's prompt lease serves the warm turn the snapshot served."""
+
+    lazy_first, _, lazy_warm = _bank_then_restore(
+        tiny_pack, monkeypatch, lazy=True, one_copy=True
+    )
+    eager_first, _, eager_warm = _bank_then_restore(
+        tiny_pack, monkeypatch, lazy=False, one_copy=True
+    )
+    _copy_first, _saved, copy_warm = _bank_then_restore(tiny_pack, monkeypatch, lazy=True)
+    assert lazy_warm.out.stats.cached_tokens == copy_warm.out.stats.cached_tokens > 0
+    _assert_bounded(lazy_warm)
+    assert list(lazy_first.out.tokens) == list(eager_first.out.tokens)
+    _assert_same_decode(lazy_warm, eager_warm)
+    # Across the two stores the buffers differ in size (the lease keeps its
+    # capacity), so the draft history is compared on its valid rows.
+    assert list(lazy_warm.out.tokens) == list(copy_warm.out.tokens)
+    assert _same_bits(
+        lazy_warm.out.final_state.final_logits, copy_warm.out.final_state.final_logits
+    )
+    ours = [leaf for entry in _qsa_entries(lazy_warm.history) for leaf in entry.state]
+    theirs = [leaf for entry in _qsa_entries(copy_warm.history) for leaf in entry.state]
+    assert ours and len(ours) == len(theirs)
+    assert all(_same_bits(a, b) for a, b in zip(ours, theirs))
 
 
 def _postcommit(bank, run, prompt, session_id) -> list[int]:

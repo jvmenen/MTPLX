@@ -2927,6 +2927,83 @@ def _qsa_rows_gather_kv_route(cache: Any, rows: int) -> Any:
     return _qsa_stock_rows_gather_kv
 
 
+_QSA_ROWS_TARGET: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mtplx_qsa_rows_target", default=0
+)
+
+
+@contextlib.contextmanager
+def qsa_rows_target(rows: int | None):
+    """Size every QSA buffer that grows inside this scope to ``rows`` at once.
+
+    The fixed-M4 verifier keeps the conversation in fixed banks of a planned
+    number of rows. A prefill that grows its stock buffers step by step ends
+    at a different size, so the bank used to be built as a second, padded
+    copy of the whole history, and the stock growth itself re-copied the
+    history on every chunk. Inside this scope the first write that needs
+    more room allocates exactly ``rows`` for the attention keys and values,
+    the raw index keys and the pooled keys, so the buffers the prefill fills
+    are the buffers the verifier adopts (graphbank's from_qsa_cache). Only
+    growth consults it: a buffer that already holds ``rows`` is untouched,
+    and a write past ``rows`` grows the stock way. ``None`` or 0 is a no-op.
+    """
+
+    token = _QSA_ROWS_TARGET.set(max(0, int(rows or 0)))
+    try:
+        yield
+    finally:
+        _QSA_ROWS_TARGET.reset(token)
+
+
+def qsa_rows_target_value() -> int:
+    """Rows the current scope asks QSA growth to allocate, or 0."""
+
+    return int(_QSA_ROWS_TARGET.get())
+
+
+class QSAKVCache(KVCache):
+    """The stock KV cache of one QSA layer, sized once to the rows target.
+
+    Identical to ``KVCache`` except when a write needs more room while a
+    ``qsa_rows_target`` scope is active and the target covers the write: the
+    buffers then grow straight to the target (the history kept, the rest
+    zeros) instead of by one step. The write itself and the views it returns
+    are the stock ones, so attention reads exactly the same rows.
+    """
+
+    def update_and_fetch(self, keys, values):
+        prev = int(self.offset)
+        needed = prev + int(keys.shape[2])
+        if self.keys is None or needed > int(self.keys.shape[2]):
+            target = qsa_rows_target_value()
+            if target >= needed:
+                self._grow_to(target, keys, values)
+        return super().update_and_fetch(keys, values)
+
+    def _grow_to(self, rows: int, keys: mx.array, values: mx.array) -> None:
+        batch, heads, _steps, key_dim = keys.shape
+        value_dim = values.shape[3]
+        prev = int(self.offset)
+        if self.keys is None or prev == 0:
+            self.keys = mx.zeros((batch, heads, rows, key_dim), keys.dtype)
+            self.values = mx.zeros((batch, heads, rows, value_dim), values.dtype)
+            return
+        self.keys = mx.concatenate(
+            [
+                self.keys[..., :prev, :],
+                mx.zeros((batch, heads, rows - prev, key_dim), self.keys.dtype),
+            ],
+            axis=2,
+        )
+        self.values = mx.concatenate(
+            [
+                self.values[..., :prev, :],
+                mx.zeros((batch, heads, rows - prev, value_dim), self.values.dtype),
+            ],
+            axis=2,
+        )
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -2947,7 +3024,7 @@ class QSACache:
     step = 256
 
     def __init__(self, compress_ratio: int = 4):
-        self.kv = KVCache()
+        self.kv = QSAKVCache()
         self.ratio = max(1, int(compress_ratio))
         self.rows_gather_kv_m4 = _qsa_stock_rows_gather_kv
         self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
@@ -2982,6 +3059,21 @@ class QSACache:
         cap = ((end + step - 1) // step) * step
         return max(cap, 2 * current)
 
+    def _growth_rows(self, end: int, current: int, reserved: int, per_row: int = 1) -> int:
+        """Rows a growing raw (per_row 1) or pooled (per_row = ratio) buffer takes.
+
+        Inside a ``qsa_rows_target`` scope that covers the write, the target
+        (in this buffer's own rows), so the index buffers stay the same size
+        as the attention buffers; otherwise the geometric growth above. A
+        staged host reservation (compiled-indexer graph buckets) may demand a
+        wider backing in either case.
+        """
+
+        target = qsa_rows_target_value() // max(1, int(per_row))
+        if target >= end:
+            return max(target, reserved)
+        return max(self._grown_cap(end, current, self.step), reserved)
+
     def write_raw(self, keys: mx.array) -> None:
         """Store this forward's indexer keys at their absolute positions.
 
@@ -2992,9 +3084,7 @@ class QSACache:
         end = start + keys.shape[1]
         if self.raw_keys is None or end > self.raw_keys.shape[1]:
             current = 0 if self.raw_keys is None else self.raw_keys.shape[1]
-            # Geometric growth bounds copy traffic; a staged host reservation
-            # (compiled-indexer graph buckets) may demand a wider backing.
-            cap = max(self._grown_cap(end, current, self.step), self._reserved_raw_capacity)
+            cap = self._growth_rows(end, current, self._reserved_raw_capacity)
             grown = mx.zeros((1, cap, keys.shape[2]), keys.dtype)
             if self.raw_keys is not None:
                 grown[:, : self.raw_keys.shape[1], :] = self.raw_keys
@@ -3004,9 +3094,8 @@ class QSACache:
     def write_pooled(self, blocks: mx.array, nb_start: int, nb_total: int) -> None:
         if self.pooled is None or nb_total > self.pooled.shape[1]:
             current = 0 if self.pooled is None else self.pooled.shape[1]
-            cap = max(
-                self._grown_cap(nb_total, current, self.step),
-                self._reserved_pooled_capacity,
+            cap = self._growth_rows(
+                nb_total, current, self._reserved_pooled_capacity, self.ratio
             )
             grown = mx.zeros((1, cap, blocks.shape[2]), blocks.dtype)
             if self.pooled is not None:

@@ -554,6 +554,8 @@ def _near_candidate_serves(
         return False
     if entry.live_ref_only and entry.cache_ref is None:
         return False  # a lease a restore already consumed
+    if entry.live_ref_only and _lease_advance(entry) is None:
+        return False  # a lease whose cache was trimmed behind it
     if not _restore_identity_compatible(entry, **identity):
         return False
     has_mtp = (
@@ -579,10 +581,178 @@ def _near_candidate_serves(
     return True
 
 
+def _one_copy_cache(cache: list[Any] | None) -> bool:
+    """Whether ``cache`` is kept by the one-copy conversation store.
+
+    Such a cache is banked as a lease on the live buffers, never as views of
+    them: a view shares the buffer, so MLX could no longer write the next
+    turn in place and would copy the whole history (mtplx/one_copy.py).
+    """
+
+    from .one_copy import one_copy_enabled, qsa_entries
+
+    return one_copy_enabled() and bool(qsa_entries(cache))
+
+
+def _cache_kv_offset(cache: list[Any] | None) -> int | None:
+    """Tokens the attention layers of a stock cache hold, or None."""
+
+    for entry in cache or ():
+        if entry is None or not _is_trimmable(entry):
+            continue
+        offset = getattr(entry, "offset", None)
+        if isinstance(offset, (int, np.integer)):
+            return int(offset)
+    return None
+
+
+def _lease_advance(entry: Any) -> int | None:
+    """Tokens a leased cache ran past its entry: 0, a count, or None if invalid.
+
+    A one-copy lease taken when a prompt's prefill ends keeps pointing at the
+    live cache while the answer decodes into it; if the answer is never
+    committed (cancelled, refused as unsafe) that lease is the conversation's
+    only copy, and it is ahead of its own tokens. A restore rewinds it: the
+    attention layers trim, and the recurrent layers take the anchor recorded
+    at the entry's own length. None means the cache is behind the entry
+    (something trimmed it), so the lease can serve nothing.
+    """
+
+    recorded = getattr(entry, "lease_kv_offset", None)
+    cache = getattr(entry, "cache_ref", None)
+    if recorded is None or cache is None:
+        return 0
+    current = _cache_kv_offset(cache)
+    if current is None:
+        return 0
+    if current < int(recorded):
+        return None
+    return current - int(recorded)
+
+
+def _mtp_lease_advance(entry: Any) -> int:
+    """Rows a leased draft history ran past its entry (0 when unknown)."""
+
+    recorded = getattr(entry, "lease_mtp_offset", None)
+    cache = getattr(entry, "mtp_history_cache_ref", None)
+    if recorded is None or cache is None:
+        return 0
+    current = _cache_kv_offset(cache)
+    if current is None:
+        return 0
+    return max(0, current - int(recorded))
+
+
+def _lease_rewind_anchor(entry: Any) -> tuple[int, Any, Any] | None | bool:
+    """The anchor an advanced lease restores its recurrent state from.
+
+    False when the lease has not advanced (the live state is the entry's own),
+    the anchor at exactly the entry's length when it has, None when it has
+    advanced without one (or is invalid): then it cannot serve an exact
+    restore.
+    """
+
+    advance = _lease_advance(entry)
+    if advance == 0:
+        return False
+    if advance is None:
+        return None
+    anchor = entry.recurrent_boundary_at_or_below(entry.prefix_len)
+    if anchor is None or int(anchor[0]) != int(entry.prefix_len):
+        return None
+    return anchor
+
+
+def _lease_owned_by(entry: Any, session_id: str | None) -> bool:
+    """Whether a request of ``session_id`` may take ``entry``'s lease itself.
+
+    A lease is its conversation's only copy. The conversation's own next
+    turn takes it in place; any other request (another session sharing a
+    prefix: a subagent, a forked chat) is served a copy of the prefix it
+    shares (``_lease_view_snapshot``) and the owner keeps its lease. An entry
+    or a request without a session id takes the lease, as before.
+    """
+
+    owner = getattr(entry, "session_id", None)
+    return owner is None or session_id is None or str(owner) == str(session_id)
+
+
+def _lease_view_snapshot(entry: Any) -> tuple[CacheSnapshot, CacheSnapshot | None] | None:
+    """Views of a lease's live buffers, at the entry's own state, for a copy.
+
+    What a restore by copy reads instead of the snapshot a lease never holds:
+    the attention layers as views (the borrower's first write copies them
+    into buffers of its own, so the owner's in-place writes stay free), the
+    recurrent layers cloned, from the entry's anchor when an answer ran the
+    lease past its entry. The draft history comes back as views too. None
+    when the lease cannot serve its own state.
+    """
+
+    cache = getattr(entry, "cache_ref", None)
+    if cache is None:
+        return None
+    anchor = _lease_rewind_anchor(entry)
+    if anchor is None:
+        return None
+    snapshot = snapshot_cache_lazy_hybrid(cache)
+    if anchor is not False:
+        states = tuple(
+            anchored if anchored is not None else state
+            for state, anchored in zip(snapshot.states, anchor[1].states)
+        )
+        meta = tuple(
+            anchored if anchored is not None else state
+            for state, anchored in zip(snapshot.meta_states, anchor[1].meta_states)
+        )
+        snapshot = CacheSnapshot(states=states, meta_states=meta)
+    mtp_ref = getattr(entry, "mtp_history_cache_ref", None)
+    mtp_snapshot = snapshot_cache_lazy_hybrid(mtp_ref) if mtp_ref is not None else None
+    return snapshot, mtp_snapshot
+
+
+def _cache_ref_trimmable_to(cache: list[Any] | None, target_offset: int) -> bool:
+    """Whether every offset-bearing entry of ``cache`` can trim to ``target_offset``.
+
+    The validation half of the trims below, run before a restore takes a
+    lease: a trim that fails part-way used to leave the lease consumed and
+    the cache half-trimmed, dropping the only live copy of the conversation.
+    """
+
+    if cache is None:
+        return False
+    target_offset = max(0, int(target_offset))
+    for entry in cache:
+        current = int(getattr(entry, "offset", target_offset) or 0)
+        if current < target_offset:
+            return False
+        if current > target_offset and not callable(getattr(entry, "trim", None)):
+            return False
+    return True
+
+
+def _cache_ref_trimmable_by(cache: list[Any] | None, tokens: int) -> bool:
+    """Whether every entry of ``cache`` can trim ``tokens`` rows (validation)."""
+
+    if cache is None:
+        return False
+    tokens = max(0, int(tokens))
+    if tokens == 0:
+        return True
+    for entry in cache:
+        if not callable(getattr(entry, "trim", None)):
+            return False
+        current = getattr(entry, "offset", None)
+        if isinstance(current, (int, np.integer)) and int(current) < tokens:
+            return False
+    return True
+
+
 def _exact_restore_serves(entry: Any, identity: dict[str, Any]) -> bool:
     """Mirror restore()'s gates for the exact-prefix entry."""
 
     if entry.live_ref_only and entry.cache_ref is None:
+        return False
+    if entry.live_ref_only and _lease_rewind_anchor(entry) is None:
         return False
     if not _restore_identity_compatible(entry, **identity):
         return False
@@ -624,6 +794,12 @@ class SessionBankEntry:
     # ``held_nbytes`` adds them up; every budget and guard reads that.
     lease_pinned_nbytes: int = 0
     lease_aux_nbytes: int = 0
+    # One-copy leases (mtplx/one_copy.py): the attention offset of the leased
+    # trunk cache and the draft history's offset when the lease was taken.
+    # The cache may run past them afterwards (a prompt lease while its answer
+    # decodes); a restore rewinds to them (``_lease_advance``).
+    lease_kv_offset: int | None = None
+    lease_mtp_offset: int | None = None
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -1296,24 +1472,43 @@ class SessionBank:
                 restore_floor_tokens=cache_restore_floor,
                 window_nbytes=cache_window_nbytes,
                 gdn_boundaries=list(normalized_boundaries),
+                lease_kv_offset=_cache_kv_offset(cache),
+                lease_mtp_offset=(
+                    _cache_kv_offset(mtp_history_cache_ref)
+                    if mtp_history_cache_ref is not None
+                    else None
+                ),
             )
-            self.eviction_log.append(
-                {
-                    "reason": reason,
-                    "session_id": session_id,
-                    "prefix_len": len(tokens),
-                    "token_hash": entry.token_hash,
-                    "nbytes": int(nbytes),
-                    "budget": int(self.per_session_max_bytes),
-                    "fallback": "live_reference_lease",
-                }
-            )
+            if reason != "one_copy_lease":
+                self.eviction_log.append(
+                    {
+                        "reason": reason,
+                        "session_id": session_id,
+                        "prefix_len": len(tokens),
+                        "token_hash": entry.token_hash,
+                        "nbytes": int(nbytes),
+                        "budget": int(self.per_session_max_bytes),
+                        "fallback": "live_reference_lease",
+                    }
+                )
             self._entries[tokens] = entry
             self._release_stale_session_leases(entry)
             self._supersede_contained_prefixes(tokens)
             self._evict_if_needed(protected_tokens=tokens)
             return entry
 
+        if keep_live_ref and cache and _one_copy_cache(cache):
+            # One-copy store: the live cache IS the entry. No snapshot views:
+            # a view would share the buffers, and the next turn's first write
+            # would then copy the whole history instead of writing in place
+            # (the 09-29 duplicate that switched the compiled route off).
+            live_entry = live_ref_entry("one_copy_lease", 0)
+            if live_entry is not None:
+                self.last_put_nbytes = int(live_entry.held_nbytes)
+                if timing_out is not None:
+                    timing_out["one_copy_lease"] = True
+                self._schedule_live_ref_spill(live_entry)
+                return live_entry
         if nbytes_override is not None and int(nbytes_override) > self.per_session_max_bytes:
             self.last_put_nbytes = int(nbytes_override)
             self.last_put_skipped_oversized_snapshot = True
@@ -2090,9 +2285,17 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return cold_fallback()
         actual_restore_mode = "clone"
-        if mode == "reference" and entry.cache_ref is not None:
+        rewind_anchor: Any = False
+        # A lease is taken in place only by its own conversation; any other
+        # request is served a copy of it (``_lease_owned_by``).
+        take_lease = (
+            mode == "reference"
+            and entry.cache_ref is not None
+            and (not entry.live_ref_only or _lease_owned_by(entry, session_id))
+        )
+        lease_views = None
+        if take_lease:
             cache = entry.cache_ref
-            entry.cache_ref = None
             # Trim depth is the seed-forward contract, decided by the lookup
             # shape. A lookup that EXTENDS the entry is served by the exact
             # suffix-forward lane, which forwards prompt[prefix_len:] with NO
@@ -2103,18 +2306,63 @@ class SessionBank:
             # lookup keeps the pre-last-token trim: that consumer contract
             # (BatchGenerator insert / stored-boundary-logits decode start)
             # owns the final-token re-forward.
+            target = (
+                entry.prefix_len
+                if len(token_ids) > entry.prefix_len
+                else entry.prefix_len - 1
+            )
+            # Validate everything before the lease is taken: a restore that
+            # fails part-way must leave the entry, and the only live copy of
+            # the conversation it holds, exactly as it was.
+            rewind_anchor = (
+                _lease_rewind_anchor(entry) if entry.live_ref_only else False
+            )
+            mtp_ref = entry.mtp_history_cache_ref
+            if (
+                rewind_anchor is None
+                or not _cache_ref_trimmable_to(cache, target)
+                or (
+                    mtp_ref is not None
+                    and not _cache_ref_trimmable_to(mtp_ref, entry.prefix_len - 1)
+                )
+            ):
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return cold_fallback()
+            entry.cache_ref = None
+            self._release_shared_leases(cache, keep=entry)
             if len(token_ids) > entry.prefix_len:
                 trimmed = _trim_cache_ref_to_tokens(cache, entry.prefix_len)
             else:
                 trimmed = _trim_cache_ref_to_prefix(cache, entry.prefix_len)
             if not trimmed:
-                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
-                return cold_fallback()
+                raise RuntimeError(
+                    "session bank lease trim failed after validation "
+                    f"(prefix_len={entry.prefix_len}, target={target})"
+                )
+            if rewind_anchor is not False:
+                # The lease ran past its entry (an answer decoded into it and
+                # was never committed): the recurrent layers go back to the
+                # anchor recorded at the entry's own length.
+                restore_cache(cache, rewind_anchor[1])
             actual_restore_mode = "reference_lease"
-        else:
-            if entry.live_ref_only:
+        elif entry.live_ref_only:
+            # A copy of the lease at the entry's own state, as a snapshot
+            # would have served it; the lease stays with its conversation.
+            lease_views = _lease_view_snapshot(entry)
+            if lease_views is None:
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return cold_fallback()
+            cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+            restore_cache(
+                cache,
+                lease_views[0],
+                restore_meta_state=cache_factory is None,
+                clone_states=False,
+            )
+            if not _trim_cache_ref_to_tokens(cache, entry.prefix_len):
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return cold_fallback()
+        else:
             cache = cache_factory() if cache_factory is not None else runtime.make_cache()
             restore_cache(
                 cache,
@@ -2123,10 +2371,24 @@ class SessionBank:
                 clone_states=not entry.lazy_kv,
             )
         mtp_history_cache = None
-        if mode == "reference" and entry.mtp_history_cache_ref is not None:
+        if take_lease and entry.mtp_history_cache_ref is not None:
             mtp_history_cache = entry.mtp_history_cache_ref
             entry.mtp_history_cache_ref = None
             if not _trim_cache_ref_to_prefix(mtp_history_cache, entry.prefix_len):
+                # Validated above when the trunk lease was taken with it; a
+                # snapshot-backed entry reaches here without that check.
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return cold_fallback()
+        elif lease_views is not None and lease_views[1] is not None:
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
+            restore_cache(mtp_history_cache, lease_views[1], clone_states=False)
+            if not _trim_cache_ref_by_tokens(
+                mtp_history_cache, _mtp_lease_advance(entry)
+            ):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return cold_fallback()
         elif entry.mtp_history_snapshot is not None:
@@ -2178,6 +2440,7 @@ class SessionBank:
         cache_factory: Callable[[], list[Any]] | None = None,
         mtp_cache_factory: Callable[[], list[Any]] | None = None,
         served_out: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> tuple[list[Any], list[Any] | None, str] | None:
         """Restore a cached entry to an earlier safe prefix boundary.
 
@@ -2320,20 +2583,83 @@ class SessionBank:
         if served_out is not None:
             _mnt = {}
             served_out["maintenance"] = _mnt
-        if mode == "reference" and entry.cache_ref is not None:
+        mtp_rewind = 0
+        # A lease is taken in place only by its own conversation; any other
+        # request is served a copy of it (``_lease_owned_by``).
+        take_lease = (
+            mode == "reference"
+            and entry.cache_ref is not None
+            and (not entry.live_ref_only or _lease_owned_by(entry, session_id))
+        )
+        lease_views = None
+        if take_lease:
             cache = entry.cache_ref
-            entry.cache_ref = None
-            _trim_started = time.perf_counter()
-            if not trim_to_target(cache):
+            lease_target = (
+                restore_point if boundary_snapshot is not None else restore_point - 1
+            )
+            advance = _lease_advance(entry) if entry.live_ref_only else 0
+            mtp_ref = entry.mtp_history_cache_ref
+            mtp_rewind = _mtp_lease_advance(entry) if entry.live_ref_only else 0
+            # Validate before the lease is taken (see restore()). A lease that
+            # ran past its entry is only served through a recurrent boundary:
+            # the attention layers trim, the recurrent ones cannot.
+            if (
+                advance is None
+                or (advance and boundary_snapshot is None)
+                or not _cache_ref_trimmable_to(cache, lease_target)
+                or (
+                    mtp_ref is not None
+                    and not _cache_ref_trimmable_by(
+                        mtp_ref, mtp_rewind + mtp_history_trim_tokens
+                    )
+                )
+            ):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
+            entry.cache_ref = None
+            self._release_shared_leases(cache, keep=entry)
+            _trim_started = time.perf_counter()
+            trimmed = (
+                _trim_cache_ref_to_tokens(cache, lease_target)
+                if advance
+                else trim_to_target(cache)
+            )
+            if not trimmed:
+                raise RuntimeError(
+                    "session bank lease trim failed after validation "
+                    f"(prefix_len={entry.prefix_len}, restore_point={restore_point})"
+                )
             if _mnt is not None:
                 _mnt["trim_s"] = time.perf_counter() - _trim_started
             actual_restore_mode = "reference_lease"
-        else:
-            if entry.live_ref_only:
+        elif entry.live_ref_only:
+            # A copy of the lease's prefix; the lease stays with its owner.
+            if boundary_snapshot is None:
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
+            lease_views = _lease_view_snapshot(entry)
+            if lease_views is None:
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return None
+            mtp_rewind = _mtp_lease_advance(entry)
+            _factory_started = time.perf_counter()
+            cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+            _install_started = time.perf_counter()
+            restore_cache(
+                cache,
+                lease_views[0],
+                restore_meta_state=cache_factory is None,
+                clone_states=False,
+            )
+            _trim_started = time.perf_counter()
+            if not _trim_cache_ref_to_tokens(cache, restore_point):
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return None
+            if _mnt is not None:
+                _mnt["factory_s"] = _install_started - _factory_started
+                _mnt["install_s"] = _trim_started - _install_started
+                _mnt["trim_s"] = time.perf_counter() - _trim_started
+        else:
             _factory_started = time.perf_counter()
             cache = cache_factory() if cache_factory is not None else runtime.make_cache()
             _install_started = time.perf_counter()
@@ -2373,12 +2699,27 @@ class SessionBank:
                 )
 
         mtp_history_cache = None
-        if mode == "reference" and entry.mtp_history_cache_ref is not None:
+        if take_lease and entry.mtp_history_cache_ref is not None:
             mtp_history_cache = entry.mtp_history_cache_ref
             entry.mtp_history_cache_ref = None
+            # A lease's draft history first goes back to where it stood when
+            # the lease was taken, then by the prompt-prefix gap as before.
             if not _trim_cache_ref_by_tokens(
                 mtp_history_cache,
-                mtp_history_trim_tokens,
+                mtp_rewind + mtp_history_trim_tokens,
+            ):
+                self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+                return None
+        elif lease_views is not None and lease_views[1] is not None:
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
+            restore_cache(mtp_history_cache, lease_views[1], clone_states=False)
+            if not _trim_cache_ref_by_tokens(
+                mtp_history_cache,
+                mtp_rewind + mtp_history_trim_tokens,
             ):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
@@ -2862,6 +3203,20 @@ class SessionBank:
         if int(entry.snapshot_epoch) != int(snapshot_epoch):
             # Superseded: the newer commit scheduled its own (coalesced) job.
             return False
+        if _lease_advance(entry) != 0 or _mtp_lease_advance(entry) != 0:
+            # A prompt lease whose answer decoded into the cache: the live
+            # state is no longer this entry's, and encoding it under these
+            # tokens would persist the wrong state. The generation-final
+            # commit spills the conversation instead.
+            self.eviction_log.append(
+                {
+                    "reason": "ssd_spill_lease_advanced",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                }
+            )
+            return False
         cold = self.cold_tier
         spill = getattr(cold, "spill_entry", None) if cold is not None else None
         if not callable(spill):
@@ -3094,6 +3449,23 @@ class SessionBank:
             for entry in self._entries.values()
             if entry.session_id == session_id
         )
+
+    def _release_shared_leases(
+        self, cache: list[Any], *, keep: SessionBankEntry
+    ) -> None:
+        """A restore took ``cache``: every other lease on it is void.
+
+        The taker will trim and overwrite rows past its restore point, so no
+        other entry may keep serving from the same buffers. The entries stay
+        (they keep their recurrent anchors for inheritance), only their
+        references go, exactly like a consumed lease.
+        """
+
+        for other in list(self._entries.values()):
+            if other is keep:
+                continue
+            if other.cache_ref is cache:
+                other.release_live_refs()
 
     def _release_stale_session_leases(self, newest: SessionBankEntry) -> None:
         """A session keeps at most one lease: the one just committed (#456).

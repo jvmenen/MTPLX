@@ -1,0 +1,170 @@
+"""One copy of the conversation's attention state (Flash-Next).
+
+On 2026-09-29 a 138K-token Pi session held the same conversation two or three
+times: the session bank's snapshot views, the live cache the next request
+wrote into (a view blocks MLX's in-place write, so the first write copied the
+whole buffer), and the fixed-M4 verifier's padded bank (promotion
+concatenated the history into new arrays). The duplicates switched the
+compiled decode route off from 98K tokens and caused both mid-answer 507s.
+
+The one-copy store keeps a single set of buffers per conversation:
+
+- the prefill sizes the QSA buffers once to the rows the verifier's bank will
+  have (``qwen4_exp.qsa_rows_target``), so the bank adopts them instead of
+  copying (``graphbank.TensorOffsetQSACache.adoptable_rows``);
+- the bank hands the same buffers back at the end of the request
+  (``demote(keep_capacity=True)``);
+- the session bank keeps the conversation as a reference lease with its
+  recurrent anchors and never as views of the live buffers.
+
+Numerics do not change: every reader still reads the rows it read before,
+at the widths it read them.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+_DISABLE_VALUES = {"0", "false", "no", "off"}
+
+
+def one_copy_enabled() -> bool:
+    """The one-copy conversation store (MTPLX_ONE_COPY, on unless set off)."""
+
+    return str(os.environ.get("MTPLX_ONE_COPY", "1")).strip().lower() not in _DISABLE_VALUES
+
+
+def one_copy_runtime(rt: Any) -> bool:
+    """True for a runtime whose verifier keeps the conversation in fixed QSA banks."""
+
+    return one_copy_enabled() and bool(getattr(rt, "qwen4_fixed_m4_compiled_verify", False))
+
+
+def qsa_entries(cache: Any) -> list[Any]:
+    """The QSA layers of a trunk cache, stock or promoted."""
+
+    from .graphbank import TensorOffsetQSACache
+    from .models.qwen4_exp import QSACache
+
+    return [
+        entry for entry in (cache or ())
+        if isinstance(entry, (QSACache, TensorOffsetQSACache))
+    ]
+
+
+def held_qsa_rows(cache: Any) -> int | None:
+    """Rows every stock QSA layer of ``cache`` already holds, or None.
+
+    None when the cache has no QSA layer or its layers disagree (then the
+    verifier's promotion pads and copies, as it always did).
+    """
+
+    from .graphbank import TensorOffsetQSACache
+
+    rows: set[int] = set()
+    entries = qsa_entries(cache)
+    if not entries:
+        return None
+    for entry in entries:
+        held = (
+            entry.capacity
+            if isinstance(entry, TensorOffsetQSACache)
+            else TensorOffsetQSACache.held_rows(entry)
+        )
+        if held is None:
+            return None
+        rows.add(int(held))
+    return rows.pop() if len(rows) == 1 else None
+
+
+def prefill_rows_target(rt: Any, prompt_tokens: int, plan: Any) -> int:
+    """Rows a request's prefill should size its QSA buffers to, or 0.
+
+    The rows the fixed-M4 bank will be built with for this prompt
+    (``FixedM4CapacityPlan.rows``), when the prompt starts on the rows-gather
+    lane with the capacity bucket in force: there the capacity is a whole
+    number of pages (in-place writes stay in place) and a bucket-larger
+    buffer changes no value. The dense lane keeps its exact capacity and the
+    stock step growth (its buffers are small and its width is arithmetic), so
+    it gets 0.
+    """
+
+    if plan is None or not one_copy_runtime(rt):
+        return 0
+    from .graphbank import TensorOffsetQSACache
+    from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
+
+    prompt_tokens = max(0, int(prompt_tokens))
+    if not (_qsa_gather_enabled() and prompt_tokens >= _qsa_gather_min_context()):
+        return 0
+    rows = int(plan.rows(prompt_tokens, _qsa_ratio(rt), TensorOffsetQSACache.step))
+    if int(getattr(plan, "bucket", 0) or 0) <= 0:
+        return 0
+    return rows
+
+
+def prompt_lease_fields(
+    cache: Any,
+    *,
+    committed_mtp_cache: Any,
+    hidden: Any,
+    prompt_len: int,
+    boundaries: Any,
+) -> dict[str, Any]:
+    """``SessionBank.put`` arguments that bank a finished prompt as a lease.
+
+    The prompt's prefill used to be banked as a snapshot of views before the
+    answer decoded into the same buffers, which made the first decode write
+    copy the whole history. Here the bank takes a lease on the live cache
+    and a recurrent anchor at the prompt's end: if the answer is committed,
+    its entry replaces this lease and inherits the anchor; if it is not
+    (cancelled, refused), a restore rewinds the lease to the anchor. The
+    anchor is evaluated now, so it holds its own 115 MB and never pins the
+    live recurrent buffers the verifier writes in place.
+    """
+
+    import mlx.core as mx
+
+    from .cache_state import snapshot_untrimmable_cache
+
+    prompt_len = int(prompt_len)
+    snapshot = snapshot_untrimmable_cache(cache)
+    leaves = [
+        leaf
+        for state in snapshot.states
+        if state is not None
+        for leaf in (state if isinstance(state, (list, tuple)) else [state])
+        if isinstance(leaf, mx.array)
+    ]
+    if leaves:
+        mx.eval(*leaves)
+    kept = [
+        record for record in (boundaries or ())
+        if int(record[0]) != prompt_len
+    ]
+    return {
+        "keep_live_ref": True,
+        "mtp_history_snapshot": None,
+        "mtp_history_cache_ref": committed_mtp_cache,
+        "gdn_boundaries": [*kept, (prompt_len, snapshot, hidden)],
+    }
+
+
+def prefill_rows_scope(rows: int):
+    """``qwen4_exp.qsa_rows_target(rows)``, or a no-op for 0 (no model import)."""
+
+    import contextlib
+
+    if int(rows or 0) <= 0:
+        return contextlib.nullcontext()
+    from .models.qwen4_exp import qsa_rows_target
+
+    return qsa_rows_target(int(rows))
+
+
+def _qsa_ratio(rt: Any) -> int:
+    model = getattr(rt, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None) or getattr(getattr(text, "model", None), "args", None)
+    return max(1, int(getattr(args, "indexer_compress_ratio", 4) or 4))
