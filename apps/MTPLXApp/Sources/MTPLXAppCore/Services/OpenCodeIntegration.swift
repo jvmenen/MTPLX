@@ -168,24 +168,37 @@ public struct OpenCodeIntegration: Sendable {
             .appendingPathComponent("default.dat")
     }
 
+    /// `servedWindow` is the window the running daemon published
+    /// (`/health` `execution_window`); the limits follow it. Without it (the
+    /// write before the daemon starts) the limits already written for this
+    /// model are kept, so a launch never rewrites them twice; a model with no
+    /// limits yet gets the window setting.
     @discardableResult
-    public func sync(configuration: MTPLXAppConfiguration) throws -> OpenCodeConfigResult {
+    public func sync(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow? = nil
+    ) throws -> OpenCodeConfigResult {
         let modelID = Self.modelID(for: configuration.model)
         let modelReference = "mtplx/\(modelID)"
         let baseURL = Self.baseURLString(host: configuration.host, port: configuration.port)
-        let contextLimit = configuration.effectiveContextWindow(default: 262_144)
         let sessionHeadersPluginURL = configURL.deletingLastPathComponent()
             .appendingPathComponent(Self.sessionHeadersPluginName)
         var backupURL: URL?
 
         var root = try loadRoot()
         var providers = root["provider"]?.objectValue ?? [:]
+        let limits = Self.modelLimits(
+            configuration: configuration,
+            servedWindow: servedWindow,
+            existingProvider: providers["mtplx"],
+            modelID: modelID
+        )
         providers["mtplx"] = .object(
             Self.providerConfig(
                 modelID: modelID,
                 baseURL: baseURL,
                 apiKey: configuration.apiKey,
-                contextLimit: contextLimit,
+                limits: limits,
                 vision: MTPLXModelOption.supportsVision(model: configuration.model),
                 reasoningEffort: Self.resolvedReasoningEffort(
                     forModelID: modelID,
@@ -925,14 +938,43 @@ public struct OpenCodeIntegration: Sendable {
     /// conversation window on small seats, so every reply was summarised
     /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
     static func outputLimit(forContextWindow context: Int) -> Int {
-        min(32_000, max(1, context / 2))
+        outputLimit(forAnswerTokens: ClientContextBudget.answerTokens(forWindow: context))
+    }
+
+    static func outputLimit(forAnswerTokens answer: Int) -> Int {
+        min(32_000, max(1, answer))
+    }
+
+    /// `limit.context` and `limit.output` for the MTPLX model: from the
+    /// served window when known, else the limits this model already has,
+    /// else the window setting. The output limit is the answer share of the
+    /// window, capped at the 32,000 OpenCode injects.
+    static func modelLimits(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow?,
+        existingProvider: JSONValue?,
+        modelID: String
+    ) -> (context: Int, output: Int) {
+        if servedWindow == nil,
+           let limit = existingProvider?.objectValue?["models"]?.objectValue?[modelID]?
+               .objectValue?["limit"]?.objectValue,
+           let context = limit["context"]?.intValue, context > 0,
+           let output = limit["output"]?.intValue, output > 0 {
+            return (context, output)
+        }
+        let budget = ClientContextBudget.resolve(
+            configuration: configuration,
+            served: servedWindow,
+            defaultWindow: 262_144
+        )
+        return (budget.contextWindow, outputLimit(forAnswerTokens: budget.answerTokens))
     }
 
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String?,
-        contextLimit: Int,
+        limits: (context: Int, output: Int),
         vision: Bool,
         reasoningEffort: String?
     ) -> [String: JSONValue] {
@@ -964,8 +1006,8 @@ public struct OpenCodeIntegration: Sendable {
             "tool_call": .bool(true),
             "temperature": .bool(true),
             "limit": .object([
-                "context": .number(Double(contextLimit)),
-                "output": .number(Double(Self.outputLimit(forContextWindow: contextLimit))),
+                "context": .number(Double(limits.context)),
+                "output": .number(Double(limits.output)),
             ]),
             "modalities": .object([
                 "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),

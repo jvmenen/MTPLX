@@ -4724,8 +4724,13 @@ def _emit_prefill_restore_progress(
     ssd_cached_tokens: int = 0,
     ssd_restore_s: float = 0.0,
     ssd_suffix_tokens: int | None = None,
+    reread: dict[str, Any] | None = None,
 ) -> None:
-    """Publish useful prefill state immediately after a prefix restore."""
+    """Publish useful prefill state immediately after a prefix restore.
+
+    ``reread`` (mtplx.prefill_plan.reread_facts): what matched, where the
+    state resumes and how much is recomputed, published before the replay.
+    """
 
     if callback is None:
         return
@@ -4744,6 +4749,8 @@ def _emit_prefill_restore_progress(
         }
         if cache_source:
             payload["cache_source"] = str(cache_source)
+        if reread is not None:
+            payload["reread"] = dict(reread)
         if ssd_cache_hit:
             payload.update(
                 {
@@ -4891,11 +4898,15 @@ def _restore_near_prefix_prompt_state(
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
     session_id: str | None = None,
+    reread: Callable[[int, str], dict[str, Any]] | None = None,
 ) -> PromptState | None:
     """matched_ceiling: hard cap on any candidate's matched length.
 
     session_id: the requesting conversation. Another conversation's lease is
     served as a copy of the shared prefix (session_bank._lease_owned_by).
+
+    reread(restore_point, source) builds the facts the prefill event carries
+    before the suffix replay (restore_or_prefill_prompt_state passes it).
 
     Vision requests pass the FIRST image-pad position: this lane matches on
     raw token ids, where every pad equals every pad, so an uncapped match
@@ -5247,6 +5258,11 @@ def _restore_near_prefix_prompt_state(
                 ssd_cached_tokens=ssd_cached_tokens,
                 ssd_restore_s=ssd_restore_s,
                 ssd_suffix_tokens=len(suffix),
+                reread=(
+                    reread(restore_point, "ssd" if ssd_cache_hit else cache_source)
+                    if reread is not None and chunk_callback is not None and suffix
+                    else None
+                ),
             )
             if not suffix:
                 entry.hits += 1
@@ -6378,6 +6394,21 @@ def restore_or_prefill_prompt_state(
     # function returns. The callback must be cheap and exception-safe —
     # it runs on the generation hot path.
     prefill_started_s = time.perf_counter()
+
+    def _reread(restore_point: int, source: str) -> dict[str, Any]:
+        # Why part of the prompt is read again, published before the replay
+        # (mtplx/prefill_plan.py): bank accessors only, no tensor work.
+        from mtplx.prefill_plan import reread_facts
+
+        return reread_facts(
+            session_bank=session_bank,
+            session_id=session_id,
+            bank_ids=bank_key_ids if bank_key_ids is not None else prompt_ids,
+            restore_point=restore_point,
+            source=source,
+            image_spans=vision_restore_spans,
+        )
+
     if prefill_callback is not None:
         try:
             prefill_callback(
@@ -6640,6 +6671,7 @@ def restore_or_prefill_prompt_state(
                 # omitting it here left the hottest tool-round path
                 # block-rounding down ~one 256-token block per round.
                 stable_prefix_len=stable_prefix_len,
+                reread=_reread,
             )
             if near_prompt_state is not None:
                 return _emit_prefill_complete(near_prompt_state)
@@ -6756,6 +6788,14 @@ def restore_or_prefill_prompt_state(
                     ),
                     ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                     ssd_suffix_tokens=len(suffix),
+                    reread=(
+                        _reread(
+                            int(restored.entry.prefix_len),
+                            str(getattr(restored, "cache_source", "ram") or "ram"),
+                        )
+                        if prefill_callback is not None
+                        else None
+                    ),
                 )
                 suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
                     list(inherited_boundaries)
@@ -6846,10 +6886,21 @@ def restore_or_prefill_prompt_state(
             ),
             vision_splice=vision_splice,
             session_id=session_id,
+            reread=_reread,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
 
+    if prefill_callback is not None:
+        # Nothing restorable: say why before the full read starts.
+        _emit_prefill_restore_progress(
+            prefill_callback,
+            tokens_total=len(prompt_ids),
+            cached_tokens=0,
+            new_prefill_tokens=len(prompt_ids),
+            started_s=prefill_started_s,
+            reread=_reread(0, "none"),
+        )
     mtp_history_cache = None
     prompt_history_time = 0.0
     mtp_history_position_base = 1 if mtp_position_mode == "absolute" else 0

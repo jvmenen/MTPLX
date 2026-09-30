@@ -486,6 +486,60 @@ struct MemoryGuardBanner: View {
     }
 }
 
+// MARK: - SSDLowDiskBanner
+
+/// The SSD cache is short of disk: it may skip saves (low) or has stopped
+/// saving (full). Driven by the SSD tier's `/health` stats; saved copies
+/// stay, so a warm restore still works, but new progress may be read again.
+struct SSDLowDiskBanner: View {
+    let notice: SSDLowDiskNotice
+
+    var body: some View {
+        let tint = notice.severity == .full ? Brand.danger : Brand.warning
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.title3)
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(notice.message)
+                    .font(.caption)
+                    .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                .fill(tint.opacity(0.12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                        .strokeBorder(tint.opacity(0.45), lineWidth: Brand.hairlineStrong)
+                }
+        }
+    }
+}
+
+// MARK: - RereadExplanationText
+
+/// Why a prompt is read again, in plain sentences, while the prefill runs
+/// (the server's `reread`; `CacheExplanation.rereadSentences`).
+struct RereadExplanationText: View {
+    let reread: PrefillReread
+    let ssd: SSDLowDiskNotice?
+
+    var body: some View {
+        Text(CacheExplanation.rereadLine(reread, ssd: ssd))
+            .font(.caption)
+            .foregroundStyle(Brand.warning)
+            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(3)
+    }
+}
+
 // MARK: - ConnectionIssueBanner
 
 /// Top-of-window banner when the SSE connection is reconnecting or failed.

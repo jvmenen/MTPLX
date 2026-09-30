@@ -280,8 +280,16 @@ public struct PiIntegration: Sendable {
         return cancellationMarked && commandRemoved && receiptRemoved
     }
 
+    /// `servedWindow` is the window the running daemon published
+    /// (`/health` `execution_window`). With it, the window fields MTPLX wrote
+    /// earlier are brought to what the engine executes; without it (the write
+    /// before the daemon starts) existing window fields are left alone, so a
+    /// launch never rewrites them twice.
     @discardableResult
-    public func sync(configuration: MTPLXAppConfiguration) throws -> PiConfigResult {
+    public func sync(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow? = nil
+    ) throws -> PiConfigResult {
         let modelID = Self.modelID(for: configuration.model)
         let modelReference = "\(Self.providerID)/\(modelID)"
         let baseURL = OpenCodeIntegration.baseURLString(
@@ -291,7 +299,11 @@ public struct PiIntegration: Sendable {
         let apiKey = configuration.apiKey?.isEmpty == false
             ? configuration.apiKey!
             : Self.localAPIKey
-        let contextWindow = configuration.effectiveContextWindow(default: 131_072)
+        let budget = ClientContextBudget.resolve(
+            configuration: configuration,
+            served: servedWindow,
+            defaultWindow: 131_072
+        )
         var backupURL: URL?
 
         var root = try loadRoot()
@@ -303,10 +315,11 @@ public struct PiIntegration: Sendable {
                     modelID: modelID,
                     baseURL: baseURL,
                     apiKey: apiKey,
-                    contextWindow: contextWindow,
+                    budget: budget,
                     vision: MTPLXModelOption.supportsVision(model: configuration.model),
                     reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID)
-                )
+                ),
+                refreshManagedWindow: servedWindow != nil
             )
         )
         root["providers"] = .object(providers)
@@ -560,7 +573,8 @@ public struct PiIntegration: Sendable {
     /// explicit maxTokens) survive a sync untouched.
     static func mergedProviderConfig(
         existing: JSONValue?,
-        fresh: [String: JSONValue]
+        fresh: [String: JSONValue],
+        refreshManagedWindow: Bool = false
     ) -> [String: JSONValue] {
         guard let existingObject = existing?.objectValue else { return fresh }
         var defaults = fresh
@@ -605,6 +619,12 @@ public struct PiIntegration: Sendable {
                 if freshObject["input"]?.arrayValue?.contains(.string("image")) == true {
                     entry["input"] = freshObject["input"]
                 }
+                if refreshManagedWindow, Self.windowFieldsWereWrittenByMTPLX(existingEntry) {
+                    // The engine's executed window is engine truth, like
+                    // `input` above; a pair the user edited stays theirs.
+                    entry["contextWindow"] = freshObject["contextWindow"]
+                    entry["maxTokens"] = freshObject["maxTokens"]
+                }
                 resultModels[index] = .object(entry)
             } else {
                 resultModels.append(freshModel)
@@ -614,11 +634,25 @@ public struct PiIntegration: Sendable {
         return merged
     }
 
+    /// Whether a model entry's `contextWindow`/`maxTokens` pair is one MTPLX
+    /// wrote: `maxTokens` equal to the window (every MTPLX write before the
+    /// served window existed) or to the answer share of the window
+    /// (`ClientContextBudget.answerTokens`, the rule the server publishes).
+    /// Any other pair is a user edit and survives every sync (#282).
+    static func windowFieldsWereWrittenByMTPLX(_ entry: [String: JSONValue]) -> Bool {
+        guard let window = entry["contextWindow"]?.intValue,
+              let maxTokens = entry["maxTokens"]?.intValue,
+              window > 0
+        else { return false }
+        return maxTokens == window
+            || maxTokens == ClientContextBudget.answerTokens(forWindow: window)
+    }
+
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String,
-        contextWindow: Int,
+        budget: ClientContextBudget,
         vision: Bool,
         reasoningEnabled: Bool
     ) -> [String: JSONValue] {
@@ -627,7 +661,11 @@ public struct PiIntegration: Sendable {
         // request fields the MTPLX server accepts — top-level enable_thinking
         // plus reasoning_effort mapped through thinkingLevelMap. The server
         // narrows effort to the loaded family's declared tiers; Pi's default
-        // level is "medium", the Qwen 3.8 family coding default.
+        // level is "medium", the Qwen 3.8 family coding default. One field
+        // differs on purpose: the app advertises the answer share of the
+        // served window as maxTokens, while the CLI keeps the window there
+        // under its uncapped contract (its extension strips the advertised
+        // value); the app's merge treats either pair as MTPLX's own.
         return [
             "baseUrl": .string(baseURL),
             "api": .string("openai-completions"),
@@ -656,13 +694,17 @@ public struct PiIntegration: Sendable {
                         "xhigh": .string("xhigh"),
                     ]),
                     "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
-                    "contextWindow": .number(Double(contextWindow)),
+                    "contextWindow": .number(Double(budget.contextWindow)),
                     // Pi silently substitutes a 16,384 output ceiling for
-                    // models whose metadata omits maxTokens. Advertise the
-                    // real context ceiling; the request-policy extension
-                    // strips only Pi's generated 16,384 leftover, so an
-                    // explicit user cap still passes through untouched.
-                    "maxTokens": .number(Double(contextWindow)),
+                    // models whose metadata omits maxTokens, so the answer
+                    // ceiling is always advertised: the answer share of the
+                    // window (ClientContextBudget.answerTokens), not the
+                    // whole window, which asked the engine to plan an answer
+                    // as long as the conversation. Pi clamps each request to
+                    // the room its prompt leaves. The request-policy
+                    // extension strips only Pi's generated 16,384 leftover,
+                    // so an explicit user cap still passes through untouched.
+                    "maxTokens": .number(Double(budget.answerTokens)),
                     "cost": .object([
                         "input": .number(0),
                         "output": .number(0),

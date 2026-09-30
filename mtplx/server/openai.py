@@ -217,6 +217,10 @@ from mtplx.reasoning_codecs import (
 )
 from mtplx.server.dashboard_state import DashboardState, InFlightHandle
 from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
+from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
+from mtplx import thermal_pressure as _thermal_pressure
+from mtplx.server.served_window import served_execution_window
+from mtplx.prefill_plan import publishable_reread
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
 # of AttributeError; real ServerState installs its own in __init__.
@@ -16442,6 +16446,19 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     # request finished instead of rendering a dash. setdefault so a producer
     # that already knows a more precise instant keeps it.
     record.setdefault("completed_at_s", time.time())
+    # Thermal pressure (the kernel's throttle verdict, not the fan state):
+    # the level at completion and the worst level in effect since the request
+    # arrived, from the background sampler's cache. No OS call here.
+    for key, value in _thermal_pressure.receipt_fields(
+        record.get("request_received_monotonic_s")
+    ).items():
+        record.setdefault(key, value)
+    # Why this request re-read part of its prompt, as its prefill events said.
+    rereads = getattr(getattr(state, "dashboard", None), "rereads", None)
+    if rereads is not None and record.get("request_id"):
+        reread = rereads.pop(str(record["request_id"]))
+        if reread is not None:
+            record.setdefault("reread", reread)
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -18015,6 +18032,23 @@ def _dashboard_publish_prefill(
         enriched = dict(payload)
         enriched["request_id"] = request_id
         enriched["session_id"] = session_id
+        # Why part of the prompt is read again (mtplx/prefill_plan.py): the
+        # event that starts the replay brings the facts; later events of the
+        # same request carry the explanation forward, since each replaces
+        # the in-flight prefill state, and the receipt keeps it.
+        facts = enriched.get("reread")
+        if isinstance(facts, dict):
+            explanation = publishable_reread(
+                facts,
+                session_served_before=_session_served_before(state, session_id),
+                rates=dashboard.prefill_history.rates(),
+            )
+            dashboard.rereads.put(request_id, explanation)
+            enriched["reread"] = explanation
+        elif enriched.get("phase") == "chunk":
+            carried = dashboard.rereads.get(request_id)
+            if carried is not None:
+                enriched["reread"] = carried
         # Live tok/s during chunked prefill (completion provides its own).
         if enriched.get("phase") == "chunk":
             # Use exactly the measured work shown by the live gauge. A
@@ -18047,6 +18081,22 @@ def _dashboard_publish_prefill(
         dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
     except Exception as exc:
         _safe_stdout_print(f"[dashboard] publish_prefill suppressed error: {exc!r}")
+
+
+def _session_served_before(state: "ServerState", session_id: str | None) -> bool:
+    """This server committed an earlier turn of the conversation.
+
+    The engine session exists from the current request's admission on, so
+    its committed ids, written when a turn commits, are the evidence.
+    """
+
+    if not session_id:
+        return False
+    peek = getattr(getattr(state, "sessions", None), "peek", None)
+    if not callable(peek):
+        return False
+    session = peek(str(session_id))
+    return bool(session is not None and getattr(session, "committed_token_ids", ()))
 
 
 def _dashboard_publish_progress(
@@ -18089,12 +18139,17 @@ def _dashboard_publish_progress(
         dashboard.in_flight.update_progress(request_id, enriched)
         registry_update_time_s = time.perf_counter() - registry_started_s
         decode_tok_s = payload.get("decode_tok_s")
+        # The live chart plots what the live gauge shows: the current phase's
+        # rate when the stream measures one, else the cumulative rate.
+        live_tok_s = payload.get("phase_tok_s")
+        if not (isinstance(live_tok_s, (int, float)) and live_tok_s > 0):
+            live_tok_s = decode_tok_s
         is_new_max = False
         rolling_update_time_s = 0.0
-        if isinstance(decode_tok_s, (int, float)) and decode_tok_s > 0:
+        if isinstance(live_tok_s, (int, float)) and live_tok_s > 0:
             rolling_started_s = time.perf_counter()
             is_new_max = dashboard.rolling.observe_progress(
-                float(decode_tok_s),
+                float(live_tok_s),
                 payload.get("session_id") or request_id,
             )
             rolling_update_time_s = time.perf_counter() - rolling_started_s
@@ -23769,7 +23824,15 @@ def _stream_progress_payload(
     completion_tokens: int,
     decode_started_s: float | None,
     now_s: float,
+    phase_meter: PhaseRateMeter | None = None,
 ) -> dict[str, Any]:
+    """Live decode figures for one progress frame.
+
+    ``decode_tok_s`` stays the cumulative rate since the first token, the
+    figure receipts keep. With a ``phase_meter`` the frame also carries the
+    current phase (reasoning, answer, tool call) and its own recent rate,
+    ``phase_tok_s``, which the live gauge shows."""
+
     decode_elapsed_s = (
         max(0.0, float(now_s) - float(decode_started_s))
         if decode_started_s is not None
@@ -23780,11 +23843,14 @@ def _stream_progress_payload(
         if completion_tokens > 0 and decode_elapsed_s > 0.0
         else None
     )
-    return {
+    payload: dict[str, Any] = {
         "completion_tokens": int(completion_tokens),
         "decode_elapsed_s": decode_elapsed_s,
         "decode_tok_s": decode_tok_s,
     }
+    if phase_meter is not None:
+        payload.update(phase_meter.snapshot(now_s))
+    return payload
 
 
 class _OwnerStallProbe:
@@ -34324,7 +34390,7 @@ def _chat_ui_html(
       if (!progress) return;
       const tokens = Number(progress.completion_tokens ?? progress.generated_tokens);
       const elapsed = Number(progress.decode_elapsed_s ?? progress.elapsed_s);
-      const tps = Number(progress.decode_tok_s ?? progress.tok_s);
+      const tps = Number(progress.phase_tok_s ?? progress.decode_tok_s ?? progress.tok_s);
       if (Number.isFinite(tokens) && tokens >= 0) liveState.tokens = tokens;
       if (Number.isFinite(elapsed) && elapsed >= 0) liveState.elapsed = elapsed;
       if (Number.isFinite(tps) && tps >= 0) liveState.tps = tps;
@@ -35130,6 +35196,9 @@ def create_app(state: ServerState) -> FastAPI:
         if dashboard is not None:
             dashboard.bus.attach_loop(asyncio.get_running_loop())
         bg_tasks: list[asyncio.Task[Any]] = []
+        # Thermal pressure for flight samples and receipts: a background
+        # thread keeps the level cached; readers never call the OS.
+        thermal_pressure_sampler = _thermal_pressure.start_process_sampler()
         if dashboard is not None and bool(
             getattr(state.args, "enable_thermal_poll", False)
         ):
@@ -35160,6 +35229,7 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            thermal_pressure_sampler.stop()
             # Issue #290: BEFORE the scheduler shutdown cancels queued
             # futures, give pending SSD session-cache writes a bounded
             # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
@@ -35425,6 +35495,7 @@ def create_app(state: ServerState) -> FastAPI:
                 fan_mode=fan_mode,
                 smart_status=smart_status,
             ),
+            "thermal_pressure": _thermal_pressure.process_sampler().health_payload(),
             "available_generation_modes": ["mtp", "ar"],
             "load_mtp": bool(state.args.load_mtp),
             "mtp_enabled": bool(
@@ -35449,6 +35520,9 @@ def create_app(state: ServerState) -> FastAPI:
                 state.args.strip_assistant_reasoning_history
             ),
             "context_window": state.context_window,
+            # What clients should configure: the window this server executes
+            # and the answer share inside it (mtplx/server/served_window.py).
+            "execution_window": served_execution_window(state),
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
             "api_key_source": str(
@@ -39439,6 +39513,9 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
+                # Rate of the phase the answer is in (reasoning, answer, tool
+                # call), for the live gauge; receipts keep the cumulative rate.
+                stream_phase_meter = PhaseRateMeter()
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
                 early_tool_cancel_used = False
@@ -40017,10 +40094,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     len(stream_tokens),
                                     token_timestamp_s,
                                 )
+                                stream_phase_meter.observe(
+                                    len(stream_tokens), token_timestamp_s
+                                )
                                 progress_payload = _stream_progress_payload(
                                     completion_tokens=streamed_progress_tokens,
                                     decode_started_s=streamed_decode_started_s,
                                     now_s=token_timestamp_s,
+                                    phase_meter=stream_phase_meter,
                                 )
                                 progress_payload["request_id"] = response_id
                                 progress_payload["session_id"] = session_id
@@ -40074,11 +40155,23 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         yield mark_sse_sent(chunk)
                             else:
-                                for _field, text in drain_stream_tokens(stream_tokens):
+                                pieces = drain_stream_tokens(stream_tokens)
+                                for _field, text in pieces:
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
                                         yield mark_sse_sent(chunk)
+                            if stream_tokens:
+                                stream_phase_meter.note_phase(
+                                    decode_phase_for_fields(
+                                        (field for field, _text in pieces),
+                                        tool_call_open=bool(
+                                            content_tool_translator is not None
+                                            and content_tool_translator.buffering_tool_call
+                                        ),
+                                    ),
+                                    token_timestamp_s,
+                                )
                             if (
                                 hidden_tool_guard_armed
                                 and content_tool_translator is not None
