@@ -1901,6 +1901,7 @@ def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     # Unmeasured quantizations (e.g. the 6-bit 9B) stay eager. The Prism
     # ternary 2-bit trunk (Ternary Bonsai 2) engages after its loader's
     # float16 checks: parity2 and speed receipts in the Bonsai night report.
+    # MTPLX_COMPILED_VERIFY_ALLOW_BITS (e.g. 6) opts further widths in.
     if bits == 2 and _prism_ternary_fp16_loaded(runtime):
         return True
     if bits is not None and bits in _compiled_verify_extra_allowed_bits():
