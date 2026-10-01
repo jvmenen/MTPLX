@@ -938,17 +938,13 @@ public struct OpenCodeIntegration: Sendable {
     /// conversation window on small seats, so every reply was summarised
     /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
     static func outputLimit(forContextWindow context: Int) -> Int {
-        outputLimit(forAnswerTokens: ClientContextBudget.answerTokens(forWindow: context))
-    }
-
-    static func outputLimit(forAnswerTokens answer: Int) -> Int {
-        min(32_000, max(1, answer))
+        min(32_000, max(1, context / 2))
     }
 
     /// `limit.context` and `limit.output` for the MTPLX model: from the
     /// served window when known, else the limits this model already has,
-    /// else the window setting. The output limit is the answer share of the
-    /// window, capped at the 32,000 OpenCode injects.
+    /// else the window setting. The output limit is OpenCode's reply reserve
+    /// for that window (`outputLimit(forContextWindow:)`).
     static func modelLimits(
         configuration: MTPLXAppConfiguration,
         servedWindow: ServedExecutionWindow?,
@@ -962,12 +958,12 @@ public struct OpenCodeIntegration: Sendable {
            let output = limit["output"]?.intValue, output > 0 {
             return (context, output)
         }
-        let budget = ClientContextBudget.resolve(
+        let context = ClientContextBudget.window(
             configuration: configuration,
             served: servedWindow,
             defaultWindow: 262_144
         )
-        return (budget.contextWindow, outputLimit(forAnswerTokens: budget.answerTokens))
+        return (context, outputLimit(forContextWindow: context))
     }
 
     private static func providerConfig(

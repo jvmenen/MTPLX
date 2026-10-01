@@ -1186,8 +1186,8 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     public var depth: Int
     public var profile: DynamicObject
     public var contextWindow: Int
-    /// The conversation length this daemon executes and the answer share
-    /// inside it (`/health` `execution_window`); nil from older daemons.
+    /// The conversation length this daemon executes (`/health`
+    /// `execution_window`); nil from older daemons.
     public var executionWindow: ServedExecutionWindow?
     public var maxResponseTokens: Int?
     public var activeRequests: Int
@@ -1245,24 +1245,17 @@ public struct HealthPayload: Codable, Equatable, Sendable {
 }
 
 /// What `/health` publishes as `execution_window`: the conversation length,
-/// prompt plus answer, the daemon executes (`tokens`) and the longest answer
-/// a client should plan for inside it (`answerTokens`). Pi and OpenCode are
-/// configured from it instead of the raw window setting.
+/// prompt plus answer, the daemon executes (`tokens`). Pi and OpenCode are
+/// configured from it instead of the raw window setting, and it is Pi's
+/// answer ceiling (`ClientContextBudget`). The half-window `answer_tokens`
+/// that daemons built from 59288061 also send is not read.
 public struct ServedExecutionWindow: Codable, Equatable, Sendable {
     public var tokens: Int
-    public var answerTokens: Int?
     public var basis: String?
 
-    public init(tokens: Int, answerTokens: Int? = nil, basis: String? = nil) {
+    public init(tokens: Int, basis: String? = nil) {
         self.tokens = tokens
-        self.answerTokens = answerTokens
         self.basis = basis
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case tokens
-        case answerTokens = "answer_tokens"
-        case basis
     }
 }
 

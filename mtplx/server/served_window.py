@@ -2,11 +2,17 @@
 
 The app used to write the window from its settings (262,144) into Pi and
 OpenCode even when the engine could not serve a conversation that long
-(2026-09-29). ``served_execution_window`` is the one place that answers two
-questions for every client: how long a conversation, prompt plus answer, this
-server executes, and how much of it one answer may claim. ``/health``
+(2026-09-29). ``served_execution_window`` is the one place that answers how
+long a conversation, prompt plus answer, this server executes. ``/health``
 publishes the answer as ``execution_window`` and the app configures Pi and
 OpenCode from it.
+
+The window is also the answer ceiling clients advertise: Pi's ``maxTokens``
+is the whole window (Pi clamps each request to the room its prompt leaves),
+and the server caps each answer to the memory actually free (``_answer_room``
+in ``mtplx/server/openai.py``), so no fixed share of the window is held back
+from an answer. OpenCode's ``limit.output`` is its own reply reserve
+(``mtplx.opencode.opencode_output_limit``).
 
 Today the answer comes from what the server already computes: the resolved
 serving window, bounded by the memory planner's machine fit
@@ -20,31 +26,8 @@ from __future__ import annotations
 from typing import Any
 
 
-def answer_share_tokens(window_tokens: int) -> int:
-    """The longest answer a client should plan for inside ``window_tokens``.
-
-    Half the window. A client that advertises the whole window as its output
-    ceiling asks the engine to plan an answer as long as the conversation
-    itself while the history is still short, and leaves no room for the
-    history once the answer arrives. Half keeps answers far longer than real
-    coding answers on large windows (131,072 tokens of 262,144; the longest
-    answers measured on the founder's workload are 35,000 to 47,000 tokens)
-    and matches the 16,384 Pi itself assumes on a 32,768 window. Clients
-    still clamp each request to the room its prompt leaves (Pi: window minus
-    its prompt estimate minus 4,096), so prompt plus answer stays inside the
-    window as the history grows.
-
-    The app writes this pair into Pi and recognises its own pair by it
-    (``PiIntegration.windowFieldsWereWrittenByMTPLX`` and
-    ``ClientContextBudget.answerTokens`` in the Swift package): change both
-    sides together.
-    """
-
-    return max(1, int(window_tokens) // 2)
-
-
 def served_execution_window(state: Any) -> dict[str, Any]:
-    """The conversation length this server executes, and the answer share.
+    """The conversation length this server executes.
 
     ``tokens`` is the resolved window (``--context-window``, else the plan's
     default) bounded by the memory plan's machine fit, the largest window
@@ -67,7 +50,6 @@ def served_execution_window(state: Any) -> dict[str, Any]:
         basis = "machine_fit"
     return {
         "tokens": int(tokens),
-        "answer_tokens": answer_share_tokens(tokens) if tokens > 0 else 0,
         "basis": basis,
         "configured_tokens": int(configured),
         "machine_fit_tokens": int(fit) if fit > 0 else None,

@@ -387,6 +387,25 @@ def _fill_missing_deep(existing: dict[str, Any], defaults: dict[str, Any]) -> di
     return merged
 
 
+def _window_fields_written_by_mtplx(entry: dict[str, Any]) -> bool:
+    """Whether a model entry's ``contextWindow``/``maxTokens`` pair is MTPLX's.
+
+    Every MTPLX writer advertises ``maxTokens`` equal to the window. App
+    builds from 59288061 advertised half the window instead, so that pair is
+    MTPLX's too. Any other pair is a user edit and survives every sync
+    (#282). SYNC PAIR: ``PiIntegration.windowFieldsWereWrittenByMTPLX``.
+    """
+
+    window = entry.get("contextWindow")
+    max_tokens = entry.get("maxTokens")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (window, max_tokens)
+    ):
+        return False
+    return window > 0 and max_tokens in (window, window // 2)
+
+
 def merge_pi_provider_config(
     existing_provider: Any,
     fresh: dict[str, Any],
@@ -407,6 +426,11 @@ def merge_pi_provider_config(
     resolve the model dir"), a user-taught ``input`` survives like any other
     edit (#282): the user may proxy to a capable endpoint, and an engine
     "unknown" must never delete what a human wrote.
+
+    A ``contextWindow``/``maxTokens`` pair MTPLX wrote keeps its window and
+    answers up to all of it: the half-window ``maxTokens`` some app builds
+    wrote, which Pi sent as every answer's ceiling while the prompt was
+    short, gets the whole window back. A pair the user edited stays theirs.
     """
 
     if not isinstance(existing_provider, dict):
@@ -475,6 +499,8 @@ def merge_pi_provider_config(
                 fresh_input = fresh_model.get("input")
                 if isinstance(fresh_input, list) and "image" in fresh_input:
                     merged_model["input"] = fresh_input
+                if _window_fields_written_by_mtplx(entry):
+                    merged_model["maxTokens"] = entry["contextWindow"]
                 result_models[index] = merged_model
                 break
         else:

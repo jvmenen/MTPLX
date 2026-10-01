@@ -4494,7 +4494,6 @@ public final class MTPLXBackendStore: ObservableObject {
               let served = health?.executionWindow,
               served.tokens > 0
         else { return }
-        let answer = served.answerTokens ?? ClientContextBudget.answerTokens(forWindow: served.tokens)
         do {
             if target == .openCode {
                 let result = try openCodeIntegration.sync(
@@ -4503,7 +4502,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
                 if result.didChange {
                     await supervisor.logs.append(
-                        "OpenCode window set to the daemon's \(served.tokens) tokens, answers up to \(OpenCodeIntegration.outputLimit(forAnswerTokens: answer))",
+                        "OpenCode window set to the daemon's \(served.tokens) tokens, output limit \(OpenCodeIntegration.outputLimit(forContextWindow: served.tokens))",
                         stream: .system
                     )
                 }
@@ -4515,7 +4514,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
                 if result.didChange {
                     await supervisor.logs.append(
-                        "Pi window set to the daemon's \(served.tokens) tokens, answers up to \(answer)",
+                        "Pi window set to the daemon's \(served.tokens) tokens",
                         stream: .system
                     )
                 }
