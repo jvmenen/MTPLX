@@ -30,6 +30,7 @@ import pytest
 
 from mtplx import cli, default_models, hf_loader, thermal
 from mtplx.commands import public
+from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.profiles import (
     BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
@@ -88,9 +89,10 @@ def _answer(monkeypatch, *answers) -> list:
 
 @pytest.fixture()
 def mac(tmp_path, monkeypatch):
-    """A Mac with its own home folder, an empty MTPLX model library and a
-    pinned chip; ``mac.memory_gib`` picks the RAM tier. The default resolver
-    also probes fixed folders under the home, so the home moves too."""
+    """A Mac with its own home folder, an empty MTPLX model library, no
+    config.toml yet (``mac.config``) and a pinned chip; ``mac.memory_gib``
+    picks the RAM tier. The default resolver also probes fixed folders under
+    the home, so the home moves too."""
 
     home = (tmp_path / "home").resolve()
     library = home / ".mtplx" / "models"
@@ -98,6 +100,7 @@ def mac(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(library))
     monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(home / ".mtplx" / "quickstart.json"))
+    monkeypatch.setenv("MTPLX_CONFIG", str(home / ".mtplx" / "config.toml"))
     for name in (
         default_models.DEFAULT_MODEL_VARIANT_ENV,
         default_models.SPEED_MODEL_ENV,
@@ -107,7 +110,12 @@ def mac(tmp_path, monkeypatch):
         "MTPLX_MODEL_DIRS",
     ):
         monkeypatch.delenv(name, raising=False)
-    machine = SimpleNamespace(home=home, library=library, memory_gib=64.0)
+    machine = SimpleNamespace(
+        home=home,
+        library=library,
+        config=home / ".mtplx" / "config.toml",
+        memory_gib=64.0,
+    )
     monkeypatch.setattr(
         default_models,
         "detect_apple_silicon",
@@ -421,6 +429,45 @@ def test_a_configured_folder_is_used_as_configured(mac, monkeypatch, where):
 
     _answer(monkeypatch, "row:Use your configured model")
     assert onboarding.screen_model(configured=str(folder), installed=[]) == str(folder)
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative", "absolute"])
+def test_config_toml_loads_a_folder_named_like_the_old_built_in_default(
+    mac, start, monkeypatch, relative
+):
+    """A real config.toml read by `mtplx start --yes`. The folder carries the
+    name the CLI used as its own --model default until 2026-05-15, and this
+    Mac's default is installed, so a swap would load without a download."""
+
+    chosen = _model_folder(mac.home / DEFAULT_RUNTIME_MODEL_DIR)
+    _model_folder(mac.library / f"Youssofal--{DEFAULT_PACK}")
+    monkeypatch.chdir(mac.home)
+    ref = str(DEFAULT_RUNTIME_MODEL_DIR) if relative else str(chosen)
+    mac.config.write_text(f"model = {json.dumps(ref)}\n", encoding="utf-8")
+
+    assert start.run(argv=("--yes",)) == 0
+
+    # A relative setting stays relative, as typed: the same folder from here.
+    assert [Path(path).resolve() for path in start.launched] == [chosen]
+    assert start.downloads == []
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative", "absolute"])
+def test_config_toml_naming_a_missing_folder_asks_before_anything_loads(
+    mac, start, monkeypatch, capsys, relative
+):
+    missing = mac.home / DEFAULT_RUNTIME_MODEL_DIR
+    _model_folder(mac.library / f"Youssofal--{DEFAULT_PACK}")
+    monkeypatch.chdir(mac.home)
+    ref = str(DEFAULT_RUNTIME_MODEL_DIR) if relative else str(missing)
+    mac.config.write_text(f"model = {json.dumps(ref)}\n", encoding="utf-8")
+
+    # The start names the folder, then asks before downloading the default.
+    assert start.run("n", argv=("--yes",)) == 1
+
+    assert f"[1/4] Checking model: {ref}\n" in capsys.readouterr().out
+    assert start.launched == []
+    assert start.downloads == []
 
 
 def test_the_welcome_back_panel_shows_a_long_folder_path_whole(monkeypatch):

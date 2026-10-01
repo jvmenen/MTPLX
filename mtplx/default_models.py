@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.hardware import classify_apple_silicon_generation, detect_apple_silicon
 from mtplx.model_catalog import (
     LEGACY_TIER,
@@ -1056,7 +1055,9 @@ def verified_default_refs() -> set[str]:
     config.toml, and a start setup saved without a selection record may hold
     one too. Such a ref follows this Mac's default when it moves (an M1 or M2
     Mac gets the FP16 build). Flash-Next ids stay off: smaller Macs run those
-    packs by choice.
+    packs by choice. No path is listed: the relative `models/...` folder the
+    CLI used as its own --model default until 2026-05-15 reaches here today
+    only when a user types it.
     """
 
     return {
@@ -1068,7 +1069,6 @@ def verified_default_refs() -> set[str]:
         DEFAULT_MODEL_ID,
         OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-        str(DEFAULT_RUNTIME_MODEL_DIR),
     }
 
 
