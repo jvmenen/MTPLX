@@ -42,7 +42,7 @@ Reading the matrix: the MoE model gains most from MTP-head work (ranks 5, 10) an
 
 ## Ideas (30 Sep, from Jeroen)
 
-- **`mtplx frspec build`**: build an FR-Spec table from your own text (tokenizer from `--model`, always include special and byte tokens, fill up from the builtin, held-out coverage report, privacy notice and token exclusion). In progress on branch `feat/frspec-build-command`; pairs with the configured-route binding (branch `fix/frspec-configured-route`).
+- **`mtplx frspec build`**: build an FR-Spec table from your own text (tokenizer from `--model`, always include special and byte tokens, fill up from the builtin, held-out coverage report, privacy notice and token exclusion). PR [#580](https://github.com/youssofal/MTPLX/pull/580) (1 Oct), branch `feat/frspec-build-command`; pairs with the configured-route binding (branch `fix/frspec-configured-route`).
 - **Server-side learning table** (later): the server keeps anonymous per-token counts of generated output (no text) and can export a table ranked on real use, so FR-Spec improves the more the model is used. Needs the maker's buy-in; privacy notes as for the build command.
 - **Which models**: FR-Spec needs a quantized draft lm_head on a route that projects through `_mtplx_draft_lm_head` (Qwen3.5/3.6/3.8 dense and MoE, Apodex) or Flash-Next's native route. Not Gemma 4 (separate assistant drafter), not Bonsai (rotated head, refused). A table belongs to a tokenizer: Qwen3.5/3.6/3.8 share one. Expected gain grows with the draft head's share of a round (measured: 3.8-27B +7-9% on well-covered text, 3.6-35B-A3B +5%; small models such as 3.5-9B likely more, not measured).
 
