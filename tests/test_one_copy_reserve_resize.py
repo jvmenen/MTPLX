@@ -281,6 +281,30 @@ def test_a_bucket_drop_that_lands_on_the_held_rows_adopts_them(gather):
     assert plan.resize_rows == 0 and bank.reclaims == 0
 
 
+def test_pooled_keys_short_of_the_bank_are_a_billed_resize(gather):
+    """Keys, values and raw index keys at the bank's rows, the pooled index
+    keys short of its blocks (a suffix that completed no block): the bank
+    used to grow them as it was built, with the admission billing 0."""
+
+    rows = 155_648
+    short = _flash_next_cache(
+        [_flash_next_layer(rows, PROMPT, pooled=HELD // 4) for _ in range(12)]
+    )
+    fits, receipt, plan, bank = _gate(gather, held_cache=short, live=LIVE_RELEASED)
+    assert fits is True
+    assert receipt["promotion"] == "resized" and receipt["held_rows"] == rows
+    pooled_new, pooled_old = rows // 4 * 128 * 2, HELD // 4 * 128 * 2
+    assert receipt["promotion_bytes"] == 11 * (pooled_new - pooled_old) + pooled_new
+    assert receipt["promotion_bytes"] == 15_728_640
+    assert plan.resize_rows == rows and plan.bucket == 8192
+
+    # Every buffer held: adopted, and nothing is billed or allocated.
+    whole = _flash_next_cache([_flash_next_layer(rows, PROMPT) for _ in range(12)])
+    fits, receipt, plan, bank = _gate(gather, held_cache=whole, live=LIVE_RELEASED)
+    assert fits is True and receipt["promotion"] == "adopted"
+    assert receipt["promotion_bytes"] == 0 and plan.resize_rows == 0
+
+
 def test_growth_admission_ignores_the_held_cache(gather):
     """An installed bank's growth (the copying store's admit_growth) prices its rows."""
 
@@ -904,6 +928,47 @@ def test_index_keys_an_eager_turn_doubled_are_cut_for_a_bank_without_the_bucket(
     assert back_new.admission["promotion_bytes"] == new_layer == 258_048
     _same_rounds(back_new.rounds, back_parent.rounds)
     _same_turn(back_new, back_parent)
+
+
+@gpu
+def test_pooled_keys_a_suffix_left_short_are_resized_before_the_bank_adopts(tiny, lane):
+    """The review's counterexample: 508 held tokens and five more reach 513.
+    The prefill grew the keys, values and raw index keys to the bank's 1,024
+    rows; the pooled index keys still held every completed block in 128 and
+    stayed there, and the bank grew them as it was built, billed 0."""
+
+    pools: list[tuple] = []
+
+    def observe(patch):
+        real = TensorOffsetQSACache.from_qsa_cache.__func__
+
+        def made(cls, entry, **kwargs):
+            shape = tuple(entry.pooled.shape)
+            bank = real(cls, entry, **kwargs)
+            pools.append((shape, tuple(bank.pooled.shape), bank.pooled is entry.pooled))
+            return bank
+
+        patch.setattr(TensorOffsetQSACache, "from_qsa_cache", classmethod(made))
+
+    new, parent = _Session(tiny, lane), _Session(tiny, lane, parent=True)
+    for session in (new, parent):
+        session.opening()
+    turn_new = new.turn([5, 6, 7, 8, 9], patches=[observe])
+    turn_parent = parent.turn([5, 6, 7, 8, 9])
+
+    _compiled(turn_new)
+    _compiled(turn_parent)
+    assert turn_new.admission["promotion"] == "resized"
+    assert turn_new.admission["held_rows"] == 1024
+    # Pooled blocks are 32 x bf16: 256 new against 128 old, layer by layer.
+    assert turn_new.admission["promotion_bytes"] == 256 * 64 + (256 - 128) * 64 == 24_576
+    # The bank takes the resized pooled buffers as they are.
+    assert pools == [((1, 256, 32), (1, 256, 32), True)] * 2
+    assert turn_new.promotions == [("adopted", 1024)] * 2
+    # The parent's bank grew them itself: the same bits everywhere.
+    assert turn_parent.promotions == [("adopted", 1024)] * 2
+    _same_rounds(turn_new.rounds, turn_parent.rounds)
+    _same_turn(turn_new, turn_parent)
 
 
 @gpu

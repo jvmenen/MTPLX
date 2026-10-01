@@ -1082,7 +1082,9 @@ class TensorOffsetQSACache:
         None when a buffer is missing or the three row-indexed buffers
         (keys, values, raw index keys) disagree. The pooled buffer is not
         consulted: it is small, and a short suffix that completes no block
-        leaves it at its previous size.
+        leaves it at its previous size. The admission checks it separately
+        (``one_copy.qsa_buffers_short``) and resizes a short one before the
+        bank adopts the others.
         """
 
         kv = getattr(entry, "kv", None)

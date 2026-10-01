@@ -109,12 +109,13 @@ from .native_mlp import set_native_mlp_context
 from .one_copy import (
     hand_back_on_raise,
     held_qsa_rows,
+    layers_to_resize,
     lease_return as one_copy_lease_return,
     one_copy_runtime,
     prefill_rows_scope,
     prefill_rows_target,
     prompt_lease_fields,
-    layers_to_resize,
+    qsa_buffers_short,
     resize_bill,
     resize_qsa_buffers,
 )
@@ -779,14 +780,16 @@ def _qwen4_fixed_m4_bank_rows(
     return plan.rows(prompt_tokens, ratio, TensorOffsetQSACache.step)
 
 
-def _qwen4_fixed_m4_promotion_adopts(
+def _qwen4_fixed_m4_adoption_rows(
     rt: Any, prompt_tokens: int, plan: FixedM4CapacityPlan, bank_rows: int,
     held_rows: int,
-) -> bool:
-    """Whether the promotion adopts the stock buffers instead of copying them.
+) -> int | None:
+    """The rows the promotion adopts the stock buffers at, or None if it copies.
 
     The same rule the bank applies when it is built
-    (``TensorOffsetQSACache.adoptable_rows``), on this request's plan.
+    (``TensorOffsetQSACache.adoptable_rows``), on this request's plan. It
+    reads the keys, values and raw index keys; the pooled index keys are the
+    caller's to check (``one_copy.qsa_buffers_short``).
     """
 
     from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
@@ -797,42 +800,53 @@ def _qwen4_fixed_m4_promotion_adopts(
     return TensorOffsetQSACache.adoptable_capacity(
         held_rows, bank_rows, ratio=ratio, kv_step=TensorOffsetQSACache.step,
         rows_gather=rows_gather, bucket=int(plan.bucket or 0),
-    ) is not None
+    )
 
 
 def _qwen4_fixed_m4_promotion_bill(
     rt: Any, prompt_tokens: int, plan: FixedM4CapacityPlan, bank_rows: int,
     held_cache: Any | None, held_rows: int | None, per_token: int,
-) -> tuple[str, int]:
-    """How the fixed-M4 bank gets its ``bank_rows`` rows, and the bytes it takes.
+) -> tuple[str, int, int]:
+    """How the fixed-M4 bank gets its rows: (how, bytes it takes, rows it holds).
 
-    - ("adopted", 0): the one-copy store's buffers (``held_cache``) hold
-      rows the bank takes as they are.
-    - ("resized", peak): on the rows-gather lane, buffers at other rows are
-      resized to ``bank_rows`` one layer at a time before the bank adopts
-      them (one_copy.resize_bill), and the bank holds what a padded copy
-      would, at the same rows. The 2026-10-01 Pi turn of 147,396 tokens fit
-      its 147,456 held rows but not the 1,024-row reserve: the padded copy
-      of its 148,480-row bank was priced at 4.22 GB and refused, and that
-      turn and the 39 after it verified eagerly; resizing to the same rows
-      is 0.38 GB. The dense lane keeps its copy: its prefill does not size
-      the buffers for the bank, so every short turn would resize, and its
-      banks are small.
-    - ("copied", the whole padded bank): every other case, as before.
+    - ("adopted", 0, rows): the one-copy store's buffers (``held_cache``)
+      hold every row and pooled block the bank needs, and it takes them as
+      they are. Nothing is allocated.
+    - ("resized", peak, rows): buffers at other rows are resized one layer
+      at a time before the bank adopts them (one_copy.resize_bill), and the
+      bank holds what a padded copy would, at the same rows. Pooled index
+      keys a short suffix left short of the bank's blocks, beside keys,
+      values and raw index keys the bank adopts, are resized on either lane
+      (2026-10-01 review: the bank used to grow them as it was built,
+      unbilled). Whole layers are resized on the rows-gather lane: the
+      2026-10-01 Pi turn of 147,396 tokens fit its 147,456 held rows but not
+      the 1,024-row reserve, the padded copy of its 148,480-row bank was
+      priced at 4.22 GB and refused, and that turn and the 39 after it
+      verified eagerly; resizing to the same rows is 0.38 GB. The dense lane
+      keeps its copy there: its prefill does not size the buffers for the
+      bank, so every short turn would resize, and its banks are small.
+    - ("copied", the whole padded bank, bank_rows): every other case, as
+      before.
     """
 
     if held_cache is not None:
-        if held_rows is not None and _qwen4_fixed_m4_promotion_adopts(
-            rt, prompt_tokens, plan, bank_rows, held_rows
-        ):
-            return "adopted", 0
+        rows = (
+            _qwen4_fixed_m4_adoption_rows(rt, prompt_tokens, plan, bank_rows, held_rows)
+            if held_rows is not None else None
+        )
+        if rows is not None:
+            if not qsa_buffers_short(held_cache, rows):
+                return "adopted", 0, rows
+            peak = resize_bill(held_cache, rows)
+            if peak is not None:
+                return "resized", peak, rows
         from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
 
         if _qsa_gather_enabled() and int(prompt_tokens) >= _qsa_gather_min_context():
             peak = resize_bill(held_cache, bank_rows)
             if peak is not None:
-                return "resized", peak
-    return "copied", int(bank_rows) * per_token
+                return "resized", peak, int(bank_rows)
+    return "copied", int(bank_rows) * per_token, int(bank_rows)
 
 
 def _qwen4_qsa_layer_count(rt: Any) -> int:
@@ -1408,7 +1422,7 @@ def _qwen4_fixed_m4_lane_fits(
     if promotion_rows is not None:
         held_cache = None
     held_rows = held_qsa_rows(held_cache) if held_cache is not None else None
-    promotion, need = _qwen4_fixed_m4_promotion_bill(
+    promotion, need, resize_rows = _qwen4_fixed_m4_promotion_bill(
         rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
     )
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
@@ -1419,7 +1433,7 @@ def _qwen4_fixed_m4_lane_fits(
         # plan, including the admission decision to use the smaller bank.
         plan.bucket = 0
         bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
-        promotion, need = _qwen4_fixed_m4_promotion_bill(
+        promotion, need, resize_rows = _qwen4_fixed_m4_promotion_bill(
             rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
         )
     if promotion == "adopted":
@@ -1435,7 +1449,7 @@ def _qwen4_fixed_m4_lane_fits(
         return True
     if held_cache is not None:
         # Read by the request (_qwen4_fixed_m4_resize_held) once admitted.
-        plan.resize_rows = bank_rows if promotion == "resized" else 0
+        plan.resize_rows = resize_rows if promotion == "resized" else 0
     if receipt is not None:
         receipt.update(
             live_bytes_before=live,

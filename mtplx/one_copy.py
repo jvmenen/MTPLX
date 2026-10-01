@@ -84,6 +84,34 @@ def held_qsa_rows(cache: Any) -> int | None:
     return rows.pop() if len(rows) == 1 else None
 
 
+def qsa_buffers_short(cache: Any, rows: int) -> bool:
+    """Whether a QSA layer of ``cache`` has a buffer shorter than a ``rows``-row bank's.
+
+    Keys, values and raw index keys against ``rows``, the pooled index keys
+    against ``rows // ratio`` blocks. The bank grows a short buffer as it is
+    built; a suffix that completes no pooled block leaves the pooled buffer
+    at its old size while the prefill grew the others to the bank's rows.
+    """
+
+    rows = int(rows)
+    for entry in qsa_entries(cache):
+        kv = getattr(entry, "kv", None)
+        leaves = (
+            getattr(kv, "keys", None), getattr(kv, "values", None),
+            entry.raw_keys, entry.pooled,
+        )
+        if any(leaf is None for leaf in leaves):
+            return True
+        keys, values, raw, pooled = leaves
+        blocks = rows // max(1, int(entry.ratio))
+        if (
+            min(int(keys.shape[2]), int(values.shape[2]), int(raw.shape[1])) < rows
+            or int(pooled.shape[1]) < blocks
+        ):
+            return True
+    return False
+
+
 def resize_qsa_buffers(
     cache: Any, rows: int, *, admit: Callable[[int], bool] | None = None,
 ) -> int:
