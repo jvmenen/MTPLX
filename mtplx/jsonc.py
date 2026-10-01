@@ -31,8 +31,7 @@ def loads(text: str) -> Any:
     Raises ``json.JSONDecodeError`` positioned in the original text.
     SYNC: ``ClientConfigFile`` in the app."""
 
-    if text.startswith("\ufeff"):
-        text = text[1:]
+    text = text.removeprefix("\ufeff")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
