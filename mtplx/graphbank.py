@@ -22,6 +22,7 @@ import mlx.core as mx
 from .attention_context import attention_phase, compiled_dispatch
 from .compile_state import compiled_step_body
 from .demotions import note as _note_demotion, note_bank_fallback as _note_bank_fallback
+from .errors import is_allocation_failure
 from .gdn_capture import resolve_gdn_capture_backend
 from .rope_origin import RotaryOrigin, as_rope_delta, stamp_rope_delta
 
@@ -950,9 +951,11 @@ class TensorOffsetQSACache:
             return value[tuple(slices)]
         shape = list(value.shape)
         shape[axis] = capacity - current
-        return mx.concatenate(
-            [value, mx.zeros(tuple(shape), dtype=value.dtype)], axis=axis
-        )
+        # A broadcast zero is a view of one scalar: the concatenation writes
+        # the pad rows without allocating them first as a block of their own
+        # (the 2026-10-01 review measured that block on top of every growth).
+        zeros = mx.broadcast_to(mx.array(0, dtype=value.dtype), tuple(shape))
+        return mx.concatenate([value, zeros], axis=axis)
 
     @classmethod
     def from_qsa_cache(
@@ -1177,27 +1180,69 @@ class TensorOffsetQSACache:
             return keys, values
         return keys[:, :, :capacity], values[:, :, :capacity]
 
-    def ensure_capacity(self, needed: int) -> bool:
-        """Grow this installed QSA generation without changing its offset."""
+    def growth_rows(self, needed: int, *, bucket: int | None = None) -> int:
+        """Rows ``ensure_capacity(needed)`` gives this bank; its capacity if it holds them.
 
-        if int(needed) > self.dense_capacity:
-            self.dense_capacity = self._bank_capacity(
-                needed, self.ratio, self.kv.step, rows_gather=self.fixed_rows_gather
-            )
+        ``bucket`` overrides the bank's own capacity bucket (0: the
+        unbucketed width a refused growth checks next).
+        """
+
         if int(needed) <= self.capacity:
-            return False
-        raw_capacity = self._bank_capacity(
+            return self.capacity
+        return self._bank_capacity(
             needed,
             self.ratio,
             getattr(self.kv, "step", 256),
             rows_gather=self.fixed_rows_gather,
-            bucket=self.capacity_bucket,
+            bucket=self.capacity_bucket if bucket is None else int(bucket),
         )
+
+    def growth_bytes(self, rows: int) -> tuple[int, int]:
+        """(new, old) bytes of the banks growing to ``rows`` rows allocates and frees."""
+
+        new = old = 0
+        for leaf, axis, target in (
+            (self.kv.keys, 2, rows),
+            (self.kv.values, 2, rows),
+            (self.raw_keys, 1, rows),
+            (self.pooled, 1, int(rows) // self.ratio),
+        ):
+            if int(leaf.shape[axis]) >= int(target):
+                continue
+            row_bytes = int(leaf.nbytes) // max(1, int(leaf.shape[axis]))
+            new += row_bytes * int(target)
+            old += int(leaf.nbytes)
+        return new, old
+
+    def ensure_capacity(self, needed: int) -> bool:
+        """Grow this installed QSA generation without changing its offset.
+
+        The new banks are written beside the old ones and only then swapped
+        in, so an allocation that fails leaves this layer as it was, its
+        dense width included; the wait after the swap lets the old banks go
+        before anything else is allocated (``eval`` returns before the
+        command buffer that read them releases them).
+        """
+
+        dense_capacity = self.dense_capacity
+        if int(needed) > dense_capacity:
+            dense_capacity = self._bank_capacity(
+                needed, self.ratio, self.kv.step, rows_gather=self.fixed_rows_gather
+            )
+        if int(needed) <= self.capacity:
+            self.dense_capacity = dense_capacity
+            return False
+        raw_capacity = self.growth_rows(needed)
         pooled_capacity = raw_capacity // self.ratio
-        self.kv.keys = self._fixed_bank(self.kv.keys, raw_capacity, 2)
-        self.kv.values = self._fixed_bank(self.kv.values, raw_capacity, 2)
-        self.raw_keys = self._fixed_bank(self.raw_keys, raw_capacity, 1)
-        self.pooled = self._fixed_bank(self.pooled, pooled_capacity, 1)
+        keys = self._fixed_bank(self.kv.keys, raw_capacity, 2)
+        values = self._fixed_bank(self.kv.values, raw_capacity, 2)
+        raw = self._fixed_bank(self.raw_keys, raw_capacity, 1)
+        pooled = self._fixed_bank(self.pooled, pooled_capacity, 1)
+        mx.eval(keys, values, raw, pooled)
+        self.kv.keys, self.kv.values = keys, values
+        self.raw_keys, self.pooled = raw, pooled
+        self.dense_capacity = dense_capacity
+        mx.synchronize()
         self.kv._granted = True
         self.kv.growth_after_grant = False
         if self.fixed_rows_gather and self.fused_rows_gather_kv_m4:
@@ -2123,7 +2168,10 @@ class FixedM4CapacityPlan:
     ``resize_rows`` is the bank's rows when the admission priced resizing the
     conversation's held buffers to them before the bank adopts them
     (one_copy.resize_qsa_buffers); 0 when they are adopted or copied as they
-    are.
+    are. ``admit_growth(need)`` says whether ``need`` more bytes fit under the
+    lane's line now: an installed bank asks it for its growth's bill before
+    any leaf changes, then for each layer's new banks before that layer is
+    written (``CompiledVerifyBank.reserve_fixed_m4_window``).
     """
 
     reserve_tokens: int
@@ -2194,13 +2242,20 @@ class FixedM4GrowthRefused(MemoryError):
     """An installed fixed-M4 bank could not grow for the next write.
 
     Raised by ``reserve_fixed_m4_window`` when the memory admission refuses
-    the growth at both the bucketed and the unbucketed width, after the
-    session bank gave way (generation._qwen4_fixed_m4_growth_fits). No cache
-    leaf has changed, so the committed state is whole: a caller between
-    rounds can end the answer there instead of failing it.
+    the growth's bill at both the bucketed and the unbucketed width (no
+    cache leaf has changed), or refuses a layer partway, or the memory
+    refuses a layer's allocation while it is written: each layer is then at
+    its old capacity or its new one, whole. The admission is the session
+    bank's too (generation._qwen4_fixed_m4_layer_fits). The committed state
+    is whole either way: a caller between rounds can end the answer there
+    instead of failing it.
     """
 
-    def __init__(self, *, capacity: int, required_end: int, rows: int) -> None:
+    def __init__(
+        self, *, capacity: int, required_end: int, rows: int,
+        bill_bytes: int | None = None, layers_left: int | None = None,
+        allocation_error: str | None = None,
+    ) -> None:
         super().__init__("fixed-M4 bank growth exceeds memory admission")
         self.receipt = {
             "reason": "fixed_m4_growth_refused",
@@ -2208,6 +2263,41 @@ class FixedM4GrowthRefused(MemoryError):
             "required_tokens": int(required_end),
             "requested_rows": int(rows),
         }
+        if bill_bytes is not None:
+            self.receipt["bill_bytes"] = int(bill_bytes)
+        if layers_left is not None:
+            self.receipt["layers_left"] = int(layers_left)
+        if allocation_error is not None:
+            self.receipt["allocation_error"] = str(allocation_error)
+
+
+def _fixed_m4_growing(
+    entries: Any, needed: int, *, bucket: int | None = None,
+) -> list[tuple[int, TensorOffsetQSACache]]:
+    """(rows, bank) for each installed QSA bank that must grow to hold ``needed`` tokens."""
+
+    growing = []
+    for entry in entries:
+        rows = entry.growth_rows(needed, bucket=bucket)
+        if rows > entry.capacity:
+            growing.append((rows, entry))
+    return growing
+
+
+def _fixed_m4_growth_bill(growing: list[tuple[int, TensorOffsetQSACache]]) -> int:
+    """Bytes a layer-by-layer growth adds, at its peak, to what the banks hold.
+
+    The rows the layers grown before the peak gained, plus one layer's new
+    banks written beside its old ones, which are let go before the next
+    layer is admitted (``TensorOffsetQSACache.ensure_capacity``).
+    """
+
+    gained = peak = 0
+    for rows, entry in growing:
+        new, old = entry.growth_bytes(rows)
+        peak = max(peak, gained + new)
+        gained += new - old
+    return peak
 
 
 def _post_restore_eager_rounds() -> int:
@@ -3100,38 +3190,30 @@ class CompiledVerifyBank:
                 growth_tokens=int(dispatch["growth_tokens"]),
                 capacity_limit=dispatch["capacity_limit"],
             )
-            planned = [
-                entry._bank_capacity(next_capacity, entry.ratio, entry.kv.step,
-                                     rows_gather=entry.fixed_rows_gather,
-                                     bucket=entry.capacity_bucket)
-                for entry in qsa_entries
-            ]
             admit = self.capacity_plan.admit_growth if self.capacity_plan else None
-            growing = [
-                (rows, entry) for rows, entry in zip(planned, qsa_entries)
-                if rows > entry.capacity
-            ]
+            growing = _fixed_m4_growing(qsa_entries, next_capacity)
             if growing:
-                # The banks grow one layer at a time below, each old layer
-                # released as soon as its replacement is written, so the
-                # transition's peak is one layer's new buffers, not a second
-                # bank (the 09-29 refusals priced the whole new bank and were
-                # 0.51 GB short where one layer needed 0.22 GB). ``admit``
-                # takes the new rows and prices that one-layer transition
-                # (generation._qwen4_fixed_m4_growth_fits).
-                if admit is not None and not admit(max(planned)):
+                # The banks grow one layer at a time below: each layer's new
+                # banks are written beside its old ones, swapped in, and the
+                # old ones let go before the next layer is admitted, so the
+                # transition holds the layers already grown plus one layer's
+                # new banks, never a second bank (the 09-29 refusals priced
+                # the whole new bank and were 0.51 GB short where one layer
+                # needed 0.22 GB). That is the bill ``admit`` takes before
+                # any leaf changes; one layer's new banks alone (the price
+                # until the 2026-10-01 review) left out the rows the earlier
+                # layers kept.
+                if admit is not None and not admit(_fixed_m4_growth_bill(growing)):
                     # Check the unbucketed width before giving up the request.
                     # No cache leaf changes before this admission.
-                    planned = [
-                        entry._bank_capacity(next_capacity, entry.ratio, entry.kv.step,
-                                             rows_gather=entry.fixed_rows_gather)
-                        for entry in qsa_entries
-                    ]
-                    if not admit(max(planned)):
+                    growing = _fixed_m4_growing(qsa_entries, next_capacity, bucket=0)
+                    bill = _fixed_m4_growth_bill(growing)
+                    if not admit(bill):
                         raise FixedM4GrowthRefused(
                             capacity=int(dispatch["dense_capacity"]),
                             required_end=required_end,
-                            rows=max(planned),
+                            rows=max(rows for rows, _entry in growing),
+                            bill_bytes=bill,
                         )
                     for entry in qsa_entries:
                         entry.capacity_bucket = 0
@@ -3142,13 +3224,49 @@ class CompiledVerifyBank:
                 # the whole transition ends.
                 self._clear_shadow_leaf_refs()
                 self._held_state_refs.clear()
+            grown = 0
+            failure = None
             for entry in qsa_entries:
-                grew = entry.ensure_capacity(next_capacity)
-                if grew:
-                    # Write this layer's new banks now; its old banks go with
-                    # the last reference to them, before the next layer grows.
-                    mx.eval(*entry.state_leaves)
+                rows = entry.growth_rows(next_capacity)
+                if (
+                    rows > entry.capacity
+                    and admit is not None
+                    and not admit(entry.growth_bytes(rows)[0])
+                ):
+                    # Memory taken since the bill was admitted: stop between
+                    # layers, every one whole.
+                    raise FixedM4GrowthRefused(
+                        capacity=int(dispatch["dense_capacity"]),
+                        required_end=required_end,
+                        rows=rows,
+                        layers_left=len(growing) - grown,
+                    )
+                try:
+                    grew = entry.ensure_capacity(next_capacity)
+                except Exception as exc:
+                    # The memory refusing a layer's new banks while they are
+                    # written leaves that layer as it was: the answer ends
+                    # between rounds like a refused growth, its lease whole.
+                    # Anything else is not the growth's to absorb.
+                    if not is_allocation_failure(exc):
+                        raise
+                    failure = f"{type(exc).__name__}: {exc}"
+                    break
+                grown += int(grew)
                 capacity_changed = grew or capacity_changed
+            if failure is not None:
+                # The failed layer's new banks went with the exception: wait
+                # for the GPU to let go of what it was writing into them, then
+                # hand them back to the system.
+                mx.synchronize()
+                mx.clear_cache()
+                raise FixedM4GrowthRefused(
+                    capacity=int(dispatch["dense_capacity"]),
+                    required_end=required_end,
+                    rows=max(rows for rows, _entry in growing),
+                    layers_left=len(growing) - grown,
+                    allocation_error=failure,
+                )
             dispatch["dense_capacity"] = min(entry.dense_capacity for entry in qsa_entries)
             dispatch["growth_tokens"] = next_growth_tokens
         route_changed = False

@@ -31,7 +31,8 @@ def _generate(pack, lane, *, prompt, gather, round_reserve=True, grants=None):
     """One answer on the compiled fixed-M4 lane, its bank growing mid-answer.
 
     ``grants`` is how many growth admissions succeed before every later one
-    is refused (None: all succeed). Returns the result and the rows asked.
+    is refused (None: all succeed): each growth asks for its bill, then for
+    each layer's new banks. Returns the result and the bytes asked.
     """
 
     from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
@@ -53,11 +54,11 @@ def _generate(pack, lane, *, prompt, gather, round_reserve=True, grants=None):
                 lambda self, cache, **kwargs: None,
             )
 
-        def admit(_rt, rows, **_kwargs):
-            asked.append(int(rows))
+        def admit(_rt, need, **_kwargs):
+            asked.append(int(need))
             return grants is None or len(asked) <= grants
 
-        patch.setattr(generation, "_qwen4_fixed_m4_growth_fits", admit)
+        patch.setattr(generation, "_qwen4_fixed_m4_layer_fits", admit)
         result = generation.generate_mtpk(
             rt, list(prompt), max_tokens=MAX_TOKENS, sampler=NATIVE, draft_sampler=NATIVE,
             speculative_depth=3, seed=SEED, mtp_cache_policy="persistent",

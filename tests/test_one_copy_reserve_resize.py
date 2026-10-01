@@ -46,7 +46,7 @@ from mlx_lm.models.cache import ArraysCache
 import mtplx.generation as generation
 import mtplx.graphbank as graphbank
 from mtplx import demotions, one_copy, runtime_options
-from mtplx.graphbank import FixedM4CapacityPlan, TensorOffsetQSACache
+from mtplx.graphbank import FixedM4CapacityPlan, TensorOffsetKVCache, TensorOffsetQSACache
 from mtplx.models.qwen4_exp import QSACache
 from mtplx.one_copy import held_qsa_rows, resize_bill, resize_qsa_buffers
 from mtplx.sampling import SamplerConfig
@@ -305,21 +305,34 @@ def test_pooled_keys_short_of_the_bank_are_a_billed_resize(gather):
     assert receipt["promotion_bytes"] == 0 and plan.resize_rows == 0
 
 
-def test_growth_admission_ignores_the_held_cache(gather):
-    """An installed bank's growth (the copying store's admit_growth) prices its rows."""
+def _flash_next_bank(rows: int, offset: int):
+    """An installed Flash-Next QSA bank of ``rows`` rows (shapes only)."""
 
-    cache = _flash_next_cache([_flash_next_layer(HELD, PROMPT) for _ in range(12)])
-    gather.setattr(generation, "_mlx_live_memory_bytes", lambda: 10 * GB)
-    rt = _flash_next_rt()
-    plan = FixedM4CapacityPlan.for_request(92_660, runtime=rt)
-    receipt: dict = {}
-    assert generation._qwen4_fixed_m4_lane_fits(
-        rt, prompt_tokens=PROMPT, promotion_rows=163_840, capacity_plan=plan,
-        held_cache=cache, receipt=receipt,
+    kv = TensorOffsetKVCache(_Held(1, 2, rows, 256), _Held(1, 2, rows, 256), offset)
+    return TensorOffsetQSACache(
+        kv, _Held(1, rows, 128), _Held(1, rows // 4, 128), compress_ratio=4,
+        rows_gather=True, rows_gather_kv_m4=None, capacity_bucket=8192,
     )
-    assert receipt["promotion"] == "copied"
-    assert receipt["promotion_bytes"] == 163_840 * FN_ROW
-    assert plan.resize_rows == 0 and plan.bucket == 8192
+
+
+def test_an_installed_growth_is_billed_at_its_peak(gather):
+    """The banks the transition installed, growing by one 8,192-row bucket
+    during the answer: the layers grown before the last keep their gain and
+    the last is written beside its old banks. The admission used to price
+    one layer's new banks alone (generation._qwen4_fixed_m4_growth_fits,
+    until the 2026-10-01 review)."""
+
+    rows, grown = 155_648, 163_840
+    banks = [_flash_next_bank(rows, PROMPT) for _ in range(12)]
+    growing = graphbank._fixed_m4_growing(banks, rows + 1)
+    assert [target for target, _bank in growing] == [grown] * 12
+    layer_new, layer_old = grown * FN_ROW // 12, rows * FN_ROW // 12
+    assert banks[0].growth_bytes(grown) == (layer_new, layer_old) == (387_973_120, 368_574_464)
+    assert graphbank._fixed_m4_growth_bill(growing) == 11 * (layer_new - layer_old) + layer_new
+    assert graphbank._fixed_m4_growth_bill(growing) == 601_358_336
+    # Without the bucket the same answer grows to the rows it needs.
+    unbucketed = graphbank._fixed_m4_growing(banks, rows + 1, bucket=0)
+    assert [target for target, _bank in unbucketed] == [rows + 256] * 12
 
 
 # -- the resize -------------------------------------------------------------------

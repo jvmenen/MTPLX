@@ -238,26 +238,20 @@ def _resize_layer(entry: Any, rows: int) -> None:
     """One layer's new buffers, written, then swapped in for its old ones.
 
     Each holds the bank promotion's pad or cut (``TensorOffsetQSACache
-    ._fixed_bank``). A growth pads the rows with a broadcast zero, a view of
-    one scalar, where ``mx.zeros`` would allocate the pad as a block of its
-    own; a cut copies the rows, where a slice would be a view that keeps the
-    old buffer. Either way only the new buffers are allocated.
+    ._fixed_bank``, whose pad is a broadcast zero and never a block of its
+    own). A cut is copied, where the bank's slice would be a view that keeps
+    the old buffer. Either way only the new buffers are allocated.
     """
 
     import mlx.core as mx
 
+    from .graphbank import TensorOffsetQSACache
+
     resized = {}
     for name, buffer, axis, target in _resized_buffers(entry, rows):
-        current = int(buffer.shape[axis])
-        if current > target:
-            held = [slice(None)] * buffer.ndim
-            held[axis] = slice(0, target)
-            value = mx.asarray(buffer[tuple(held)], copy=True)
-        else:
-            shape = list(buffer.shape)
-            shape[axis] = target - current
-            zeros = mx.broadcast_to(mx.array(0, dtype=buffer.dtype), tuple(shape))
-            value = mx.concatenate([buffer, zeros], axis=axis)
+        value = TensorOffsetQSACache._fixed_bank(buffer, target, axis)
+        if int(buffer.shape[axis]) > target:
+            value = mx.asarray(value, copy=True)
         resized[name] = value
     mx.eval(*resized.values())
     if "keys" in resized:

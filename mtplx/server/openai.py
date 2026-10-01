@@ -21721,7 +21721,7 @@ def _answer_room(
     the served window) is priced against what the engine line leaves after
     the prefill, counting what the session bank would give back: the bank's
     other conversations are released only if the answer grows into their
-    room (generation._qwen4_fixed_m4_growth_fits), so an answer that stays
+    room (generation._qwen4_fixed_m4_layer_fits), so an answer that stays
     short evicts nothing.
 
     None when the answer fits. Otherwise a receipt with ``answer_token_cap``

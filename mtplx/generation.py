@@ -859,45 +859,24 @@ def _qwen4_qsa_layer_count(rt: Any) -> int:
     )
 
 
-def _qwen4_fixed_m4_growth_fits(
-    rt: Any, rows: int, *, session_bank: Any | None = None,
-    protect_ids: Sequence[int] | None = None,
-) -> bool:
-    """Admission for one growth step of an installed fixed-M4 bank.
-
-    The bank grows one QSA layer at a time and releases each old layer as
-    its replacement is written (graphbank ``reserve_fixed_m4_window``), so
-    the step needs one layer's new banks at ``rows`` rows, not a second
-    bank. Before refusing, the allocator's cached bytes are released and
-    idle session-bank entries give way (the running conversation is held by
-    this request, not by the bank; its own prompt entry is protected). The
-    request's answer was admitted with its whole budget, so a refusal here
-    means something outside the engine took the memory.
-    """
-
-    per_token = _qwen4_fixed_m4_promotion_bytes_per_token(rt)
-    layers = _qwen4_qsa_layer_count(rt)
-    if per_token <= 0 or layers <= 0:
-        return True
-    return _qwen4_fixed_m4_layer_fits(
-        rt, int(rows) * per_token // layers,
-        session_bank=session_bank, protect_ids=protect_ids,
-    )
-
-
 def _qwen4_fixed_m4_layer_fits(
     rt: Any, need: int, *, session_bank: Any | None = None,
     protect_ids: Sequence[int] | None = None,
 ) -> bool:
-    """Room under the lane's line for ``need`` new bytes of one QSA layer.
+    """Room under the lane's line for ``need`` more bytes of the QSA layers.
 
-    What a layer-at-a-time change of the conversation's buffers asks before
-    each layer: an installed bank's growth (``_qwen4_fixed_m4_growth_fits``)
-    and the resize of the held buffers before the bank adopts them
+    What a layer-at-a-time change of the conversation's buffers asks: an
+    installed bank's growth, for its bill before any leaf changes and then
+    for each layer's new banks (graphbank ``reserve_fixed_m4_window``,
+    through ``FixedM4CapacityPlan.admit_growth``), and the resize of the
+    held buffers before the bank adopts them, for each layer
     (``_qwen4_fixed_m4_resize_held``). The allocator's cached bytes are
-    released first (they include the old layers a resize already let go
-    of), then idle session-bank entries give way; the request's own prompt
-    entry is protected.
+    released first (they include the old layers a resize or a growth
+    already let go of), then idle session-bank entries give way: the
+    running conversation is held by this request, not by the bank, and its
+    own prompt entry is protected. The request's answer was admitted with
+    its whole budget, so a refusal during the answer means something
+    outside the engine took the memory.
     """
 
     limit = _metal_memory_limit_bytes(rt)
@@ -1372,7 +1351,6 @@ def _qwen4_fixed_m4_lane_fits(
     rt: Any, *, prompt_tokens: int, session_bank: Any | None = None,
     prompt_ids: list[int] | None = None, receipt: dict | None = None,
     capacity_plan: FixedM4CapacityPlan | None = None,
-    promotion_rows: int | None = None,
     held_cache: Any | None = None,
 ) -> bool:
     """Per-request memory gate for the strict fixed-M4 lane.
@@ -1415,19 +1393,14 @@ def _qwen4_fixed_m4_lane_fits(
     if limit <= 0:
         return True
     plan = capacity_plan or FixedM4CapacityPlan.for_request(None, runtime=rt)
-    bank_rows = (
-        _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
-        if promotion_rows is None else int(promotion_rows)
-    )
-    if promotion_rows is not None:
-        held_cache = None
+    bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
     held_rows = held_qsa_rows(held_cache) if held_cache is not None else None
     promotion, need, resize_rows = _qwen4_fixed_m4_promotion_bill(
         rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
     )
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
     live = 0 if promotion == "adopted" else _mlx_live_memory_bytes()
-    if live + need > line and plan.bucket and promotion_rows is None:
+    if live + need > line and plan.bucket:
         # A bucket must never evict an idle session or disable a compiled
         # lane whose original allocation fits. Allocation consumes this same
         # plan, including the admission decision to use the smaller bank.
@@ -1493,12 +1466,11 @@ def _qwen4_fixed_m4_lane_fits(
                            live_bytes_after=live)
         if live + need <= line:
             return True
-    if promotion_rows is None:
-        _announce_qwen4_fixed_m4_skip(
-            f"prompt {prompt_tokens} tokens: live {live / 1e9:.1f} GB + promotion "
-            f"{need / 1e9:.1f} GB over the {line / 1e9:.1f} GB line"
-            + (f" (allocator cache released: {released / 1e9:.1f} GB)" if released else "")
-        )
+    _announce_qwen4_fixed_m4_skip(
+        f"prompt {prompt_tokens} tokens: live {live / 1e9:.1f} GB + promotion "
+        f"{need / 1e9:.1f} GB over the {line / 1e9:.1f} GB line"
+        + (f" (allocator cache released: {released / 1e9:.1f} GB)" if released else "")
+    )
     return False
 
 
@@ -11193,8 +11165,8 @@ def generate_mtpk(
     )
     if qwen4_fixed_m4_compiled_verify:
         if one_copy_runtime(rt):
-            fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_growth_fits(
-                rt, rows, session_bank=session_bank, protect_ids=bank_commit_ids,
+            fixed_m4_capacity_plan.admit_growth = lambda need: _qwen4_fixed_m4_layer_fits(
+                rt, need, session_bank=session_bank, protect_ids=bank_commit_ids,
             )
             # Buffers the prefill left at other rows than the bank's become
             # the bank's own, one layer at a time, before it adopts them.
@@ -11203,8 +11175,8 @@ def generate_mtpk(
                 session_bank=session_bank, protect_ids=bank_commit_ids,
             )
         else:
-            fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(
-                rt, prompt_tokens=len(prompt_ids), promotion_rows=rows,
+            fixed_m4_capacity_plan.admit_growth = lambda need: _qwen4_fixed_m4_layer_fits(
+                rt, need,
             )
     _generic_compiled_verify = (
         verify_strategy in {"capture_commit", "graphbank_capture_commit"}

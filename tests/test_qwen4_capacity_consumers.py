@@ -345,7 +345,7 @@ def _grant_boundary_session(pack, patch, bucket, *, final_keep=4, deny_growth=Fa
 
         def install_with_no_growth(self, *args, **kwargs):
             install(self, *args, **kwargs)
-            self.capacity_plan.admit_growth = lambda rows: False
+            self.capacity_plan.admit_growth = lambda need: False
 
         patch.setattr(graphbank.CompiledVerifyBank, "install_fixed_m4", install_with_no_growth)
 
@@ -585,27 +585,56 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
     bank = graphbank.CompiledVerifyBank(rt, max_verify_len=4, request_max_tokens=1000,
                                         capacity_plan=plan)
     bank.install_fixed_m4(cache, prompt_ids=PROMPT, hidden_variant=None)
-    qsa = next(entry for entry in cache if isinstance(entry, graphbank.TensorOffsetQSACache))
-    refs = qsa.state_leaves
+    banks = [entry for entry in cache if isinstance(entry, graphbank.TensorOffsetQSACache)]
+    qsa = banks[0]
+    refs = [bank_.state_leaves for bank_ in banks]
     requests = []
 
-    def admit(rows):
-        assert qsa.capacity == 512 and qsa.dense_capacity == 256
-        assert all(a is b for a, b in zip(refs, qsa.state_leaves))
-        requests.append(rows)
-        return allow_step and rows == 768
+    def admit(need):
+        # Bytes asked, and how many layers had changed a leaf when asked.
+        changed = sum(
+            not all(a is b for a, b in zip(ref, bank_.state_leaves))
+            for ref, bank_ in zip(refs, banks)
+        )
+        requests.append((need, changed))
+        if len(requests) == 1:
+            return False  # the bucketed growth's bill
+        if len(requests) == 2:
+            return allow_step  # the unbucketed growth's bill
+        return True  # each layer's new banks
+
+    def bank_bytes(rows):
+        """One layer's banks at ``rows`` rows (pooled: one block per four)."""
+
+        per_row = sum(
+            int(leaf.nbytes) // int(leaf.shape[axis])
+            for leaf, axis in ((qsa.kv.keys, 2), (qsa.kv.values, 2), (qsa.raw_keys, 1))
+        )
+        per_block = int(qsa.pooled.nbytes) // int(qsa.pooled.shape[1])
+        return rows * per_row + rows // 4 * per_block
+
+    def bill(rows):
+        """The layers before the last keep their gain; the last is written beside its old banks."""
+
+        return (len(banks) - 1) * (bank_bytes(rows) - bank_bytes(512)) + bank_bytes(rows)
 
     plan.admit_growth = admit
+    assert qsa.capacity == 512 and qsa.dense_capacity == 256
     if allow_step:
         bank.reserve_fixed_m4_window(cache, committed_count=469)
         assert qsa.capacity == qsa.dense_capacity == 768
         assert plan.bucket == qsa.capacity_bucket == 0
+        # Then each layer's new banks, asked before that layer changed.
+        assert requests[2:] == [(bank_bytes(768), layer) for layer in range(len(banks))]
     else:
         with pytest.raises(MemoryError, match="growth exceeds memory admission"):
             bank.reserve_fixed_m4_window(cache, committed_count=469)
         assert qsa.capacity == 512 and qsa.dense_capacity == 256
-        assert all(a is b for a, b in zip(refs, qsa.state_leaves))
-    assert requests == [1024, 768]
+        assert all(a is b for a, b in zip(refs[0], qsa.state_leaves))
+        assert len(requests) == 2
+    # The bills at the bucketed width, then the unbucketed one, before any
+    # leaf changed.
+    assert requests[:2] == [(bill(1024), 0), (bill(768), 0)]
 
 
 @pytest.mark.parametrize("offset", [16_384, 63_000])
