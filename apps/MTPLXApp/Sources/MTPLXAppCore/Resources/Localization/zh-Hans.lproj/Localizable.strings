@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "正在读取 %@ 个新词元";
 "History changed at token %@" = "历史记录在第 %@ 个词元处发生了变化";
 "History changed from the start" = "历史记录从开头就发生了变化";
-"A different request in this conversation: only its first %@ tokens match the last one" = "此对话中的另一个请求：只有前 %@ 个词元与上一个请求一致";
+"Only the first %@ tokens match this conversation's saved state" = "只有前 %@ 个词元与此对话的已保存状态一致";
 "The screenshot at token %@ changed" = "第 %@ 个词元处的截图已更改";
 "New conversation or first turn since MTPLX started" = "新对话，或 MTPLX 启动后的第一轮";
 "No saved state for this conversation" = "此对话没有已保存的状态";

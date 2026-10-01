@@ -1047,14 +1047,14 @@ class TestPerChunkSupplyCheck:
         assert "the engine held 90.0 GiB" in error.detail["message"]
         assert "needs 7.0 GiB, past its 96.0 GiB limit" in error.detail["message"]
         assert "other apps" not in error.detail["message"]
-        # It says what it gave back, and never invites a retry that meets the
-        # same wall (2026-10-01: "released half of its session cache" with 0
-        # bytes released, then three identical refusals).
+        # It says what it gave back (2026-10-01: "released half of its
+        # session cache" with 0 bytes released), and that a retry is priced
+        # again before it starts rather than promising either outcome.
         assert "after finding nothing else it could give back" in error.detail["message"]
-        assert "a retry will stop here again" in error.detail["message"]
+        assert "A retry is priced again before it starts" in error.detail["message"]
         assert "half of its session cache" not in error.detail["message"]
-        assert error.detail["memory"]["retry_can_succeed"] is False
-        assert error.detail["memory"]["retry_when"] == "never_as_is"
+        assert error.detail["memory"]["retry_can_succeed"] is True
+        assert error.detail["memory"]["retry_when"] == "after_background_work_finishes"
 
     # The founder's 2026-10-01 refusals, in his engine's own numbers: a 32K Pi
     # turn after a compaction held 93.46 GB with a 2.79 GB lease of the
@@ -1080,47 +1080,36 @@ class TestPerChunkSupplyCheck:
         monkeypatch.setattr(srv, "_shed_after_allocation_failure", lambda state: {})
         return guard, box
 
-    def test_the_last_chunk_reports_one_token_short_and_ends_the_chunk_reserve(self, monkeypatch):
+    def test_the_last_chunks_progress_keeps_the_forward_reserved(self, monkeypatch):
+        # 32,408 of 32,409 is the last chunk's trunk, not the end: its draft
+        # history pass, its checkpoint and the final token's forward follow
+        # (the review of 425ffc58), so the forward stays reserved until the
+        # prefill completes. The founder's reading is 13 MB over with it.
         guard, _box = self._founder_guard(
             monkeypatch,
             self._HELD,
             chunk_reserve_bytes=self._CHUNK,
             after_prefill_reserve_bytes=115_642_384,
         )
-        # The chunked loops forward every token but the last: 32,408 of 32,409.
         guard.note_prefill_progress(
             {"phase": "chunk", "tokens_done": 32_408, "tokens_total": 32_409}
         )
-        assert guard() is False
-        assert guard.tripped is None
-        assert guard.prefill_done_by == "prefill_progress"
-
-    def test_before_the_fix_the_same_reading_tripped_on_a_chunk_that_never_came(self, monkeypatch):
-        guard, _box = self._founder_guard(
-            monkeypatch, self._HELD, chunk_reserve_bytes=self._CHUNK
-        )
-        # No progress note: the whole chunk is still reserved, 13 MB over.
+        assert guard.prefill_done_by is None
         assert guard() is True
         assert guard.tripped["reason"] == "engine_limit"
+        assert guard.tripped["chunk_reserve_bytes"] == self._CHUNK
 
-    def test_the_last_partial_chunk_reserves_only_its_rows(self, monkeypatch):
-        rows_priced = []
-
-        def reserve_for_rows(rows):
-            rows_priced.append(rows)
-            return rows * (self._CHUNK // 2048)
-
+    def test_completion_hands_over_to_the_after_prefill_reserve(self, monkeypatch):
         guard, _box = self._founder_guard(
             monkeypatch,
             self._HELD,
             chunk_reserve_bytes=self._CHUNK,
-            reserve_for_rows=reserve_for_rows,
+            after_prefill_reserve_bytes=115_642_384,
         )
-        guard.note_prefill_progress(
-            {"phase": "chunk", "tokens_done": 30_720, "tokens_total": 32_409}
-        )
+        guard.note_prefill_progress({"phase": "completed", "tokens_total": 32_409})
+        assert guard.prefill_done_by == "prefill_progress"
         assert guard() is False
-        assert rows_priced == [32_409 - 1 - 30_720]
+        assert guard.tripped is None
 
     def test_its_own_conversations_unusable_state_goes_before_a_refusal(self, monkeypatch):
         calls = []
@@ -1155,21 +1144,6 @@ class TestPerChunkSupplyCheck:
         assert guard() is True
         error = srv._prefill_system_abort_exception(SimpleNamespace(), guard.tripped)
         assert "after giving back 1.0 GiB of saved conversation state" in error.detail["message"]
-
-    def test_a_full_chunk_still_left_keeps_the_whole_chunk_reserve(self, monkeypatch):
-        rows_priced = []
-        guard, _box = self._founder_guard(
-            monkeypatch,
-            80 * GIB,
-            chunk_reserve_bytes=self._CHUNK,
-            reserve_for_rows=lambda rows: rows_priced.append(rows) or 0,
-            chunk_rows=2048,
-        )
-        guard.note_prefill_progress(
-            {"phase": "chunk", "tokens_done": 8_192, "tokens_total": 32_409}
-        )
-        assert guard() is False
-        assert rows_priced == []
 
     def test_the_receipt_names_the_closest_reading_to_the_line(self, monkeypatch):
         guard, box = self._founder_guard(
@@ -1233,9 +1207,25 @@ def test_a_refusal_queued_for_the_stream_holds_no_prefill_frames():
         kind, error = item
         assert kind == "error" and error.status_code == 507
         assert error.__traceback__ is None and error.__context__ is None
-        assert srv._is_memory_refusal(error) is True
     finally:
         gc.enable()
+
+
+def test_a_detached_refusal_drops_both_of_its_chained_exceptions():
+    """``raise ... from`` sets the cause while the exception being handled
+    stays the context: two branches, and each one's frames go."""
+
+    first = RuntimeError("context")
+    second = ValueError("cause")
+    top = KeyError("top")
+    top.__context__ = first
+    top.__cause__ = second
+    first.__context__ = OSError("deeper")
+
+    srv._detach_exception_frames(top)
+
+    assert top.__cause__ is None and top.__context__ is None
+    assert first.__context__ is None
 
 
 class _LoopBank:
@@ -1691,14 +1681,16 @@ class TestValidationTurn:
 
     def test_a_turn_clear_of_both_floors_only_narrows(self, monkeypatch):
         """With 0.5 GB more supply the 2,048-row chunk clears the shed floor
-        too: the narrower chunk is the whole answer, and the pool is not
-        touched."""
+        too: the engine's free pool goes first (it takes nothing from
+        anyone), then the narrower chunk is the whole answer and no state
+        is taken. The receipt names both steps in the order they ran."""
 
         receipt, manager, source = self._admit(
             monkeypatch, free=V_FREE + 500_000_000, file_backed=V_FILE_BACKED
         )
         assert receipt["prefill_chunk_tokens"] == 2048
-        assert receipt["reclamation_steps"] == ["narrower_prefill_chunk"]
+        assert receipt["reclamation_steps"] == ["allocator_pool", "narrower_prefill_chunk"]
+        assert receipt["early_pool_clear"]["cache_bytes_after"] == 0
         assert "cache_cleared" not in receipt
         assert source.token_ids in manager.bank._entries
 
@@ -1919,3 +1911,103 @@ class TestRepeatedWarnings:
         # A fresh loop on a Mac with room trims nothing.
         assert bank.calls == [(4 * GIB, "memory_pressure_warning")]
         assert bank.total_nbytes == 4 * GIB
+
+
+def _flash_next_speed_lane(monkeypatch):
+    """The Flash-Next speed profile's sparse prefill: forwards of 2,048 rows
+    or more go sparse from 16K of history, narrower ones from 32K."""
+
+    import mtplx.models.qwen4_exp as qwen4
+
+    monkeypatch.setattr(qwen4, "_qsa_prefill_enabled", lambda: True)
+    monkeypatch.setenv("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT", "16384")
+    monkeypatch.setenv("MTPLX_QWEN4_PREFILL_MIDLOOP_EVAL", "4")
+
+
+def _chunk_bill(state, rows: int, prompt_tokens: int) -> int:
+    geometry = srv._admission_geometry(state, prefill_width=rows)
+    scratch, _source = srv._admission_scratch_bytes(
+        state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
+    )
+    return srv._admission_chunk_bytes(geometry, rows, scratch)
+
+
+def test_a_narrower_last_chunk_that_costs_more_is_what_the_check_reserves(monkeypatch):
+    # The review of 425ffc58: 32,409 tokens at 2,048 rows leave a 1,688-row
+    # last chunk, which stays on the dense lane at 30,720 of history and is
+    # billed more than a full chunk. The 2026-10-01 replay measured it: the
+    # 1,536-row last chunk of a 32,257-token turn took the peak 0.95 GB past
+    # the full chunks' while the check reserved a full chunk.
+    manager = _manager()
+    _install(monkeypatch, _Machine(manager.bank, base_gib=84, cache_gib=0, host_gib=0))
+    state = _flash_next_state(manager)
+    _flash_next_speed_lane(monkeypatch)
+    full = _chunk_bill(state, 2048, 32_409)
+    last = _chunk_bill(state, 1688, 32_409)
+    assert last > full
+
+    bill = srv._prefill_forward_bill(
+        state, new_tokens=32_409, width=2048, prompt_tokens=32_409,
+        geometry=srv._admission_geometry(state, prefill_width=2048),
+    )
+    assert bill["rows"] == 1688 and bill["chunk_bytes"] == last
+
+    guard = srv.make_prefill_system_guard(state, prompt_tokens=32_409, chunk_tokens=2048, priced=None)
+    assert guard.chunk_reserve_bytes == last
+    guard.note_prefill_progress({"phase": "chunk", "tokens_done": 30_720, "tokens_total": 32_409})
+    assert guard._evaluate()["reserve"] == last
+
+
+def test_a_wide_chunk_keeps_its_own_bill_over_a_cheaper_last_chunk(monkeypatch):
+    # The founder's turn at 4,096 rows: its 3,585-row last chunk goes sparse
+    # like the others and costs less, so nothing changes for it.
+    manager = _manager()
+    _install(monkeypatch, _Machine(manager.bank, base_gib=84, cache_gib=0, host_gib=0))
+    state = _flash_next_state(manager)
+    _flash_next_speed_lane(monkeypatch)
+    bill = srv._prefill_forward_bill(
+        state, new_tokens=32_258, width=4096, prompt_tokens=32_258,
+        geometry=srv._admission_geometry(state, prefill_width=4096),
+    )
+    assert bill["rows"] == 4096
+    assert bill["chunk_bytes"] == _chunk_bill(state, 4096, 32_258)
+
+
+def test_prompt_scoring_keeps_its_reserve_until_the_last_token_is_scored(monkeypatch):
+    # The review of 425ffc58: 257 tokens score as 256 then 1; the first
+    # chunk's progress is not the end of the forwards.
+    manager = _manager()
+    _install(monkeypatch, _Machine(manager.bank, base_gib=20, cache_gib=0, host_gib=0))
+    state = _flash_next_state(manager)
+    guard = srv.make_prefill_system_guard(
+        state, prompt_tokens=257, chunk_tokens=256, priced=None, prompt_scoring=True,
+    )
+    guard.note_prefill_progress({"phase": "chunk", "tokens_done": 256, "tokens_total": 257})
+    assert guard.prefill_done_by is None
+    assert guard._evaluate()["reserve"] > 0
+    guard.note_prefill_progress({"phase": "chunk", "tokens_done": 257, "tokens_total": 257})
+    assert guard.prefill_done_by == "prefill_progress"
+
+
+def test_the_early_move_to_ssd_needs_an_ssd_cache_that_reads_back(tmp_path, monkeypatch):
+    # The review of 425ffc58: a write-only SSD cache publishes but never
+    # restores, so moving a conversation's entry there loses its only
+    # usable copy.
+    from mtplx.cache_bank.cold_tier import SessionBankColdTier
+
+    manager = _manager()
+    bank = manager.bank
+    entry = _put(bank, range(2000), session_id="pi", row_bytes=32, live_cache=True)
+    tier = SessionBankColdTier(base_dir=tmp_path / "bank", mode="write-only", min_prefix_tokens=1)
+    bank.cold_tier = tier
+    monkeypatch.setattr(tier, "_entry_in_manifest", lambda entry_id: True)
+    try:
+        assert bank.entry_is_durable(entry)
+        moved = srv._admission_move_own_durable_entries(
+            bank, session_id="pi", probe_ids=[9999] * 100,
+            restore_keys=set(), reused_tokens=0,
+        )
+        assert moved is None
+        assert entry.token_ids in bank._entries
+    finally:
+        tier.close()

@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "Lendo %@ tokens novos";
 "History changed at token %@" = "O histórico mudou no token %@";
 "History changed from the start" = "O histórico mudou desde o início";
-"A different request in this conversation: only its first %@ tokens match the last one" = "Uma solicitação diferente nesta conversa: só os primeiros %@ tokens coincidem com a anterior";
+"Only the first %@ tokens match this conversation's saved state" = "Só os primeiros %@ tokens coincidem com o estado salvo desta conversa";
 "The screenshot at token %@ changed" = "A captura de tela no token %@ mudou";
 "New conversation or first turn since MTPLX started" = "Conversa nova ou primeiro turno desde que o MTPLX foi iniciado";
 "No saved state for this conversation" = "Não há estado salvo para esta conversa";

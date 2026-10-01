@@ -769,36 +769,25 @@ def _detach_exception_frames(exc: BaseException) -> BaseException:
     retry met it (2026-10-01)."""
 
     seen: set[int] = set()
-    node: BaseException | None = exc
-    while node is not None and id(node) not in seen:
+    pending: list[BaseException] = [exc]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
         seen.add(id(node))
         node.__traceback__ = None
-        chained = node.__cause__ or node.__context__
+        pending.extend(
+            chained
+            for chained in (node.__cause__, node.__context__)
+            if chained is not None
+        )
         node.__cause__ = None
         node.__context__ = None
-        node = chained
     return exc
 
 
 def _stream_error_queue_item(exc: BaseException) -> tuple[str, BaseException]:
     return ("error", _detach_exception_frames(exc))
-
-
-def _is_memory_refusal(exc: BaseException | None) -> bool:
-    return isinstance(exc, HTTPException) and exc.status_code == 507
-
-
-def _release_after_memory_refusal() -> None:
-    """Once a refused request's frames are gone: collect what a cycle still
-    holds and hand the freed buffers back to macOS. Never raises."""
-
-    try:
-        gc.collect()
-        import mlx.core as _mx
-
-        _mx.clear_cache()
-    except Exception:
-        pass
 
 
 def _raise_if_stream_cancelled(
@@ -20378,8 +20367,9 @@ class _PrefillSystemGuard:
     after three critical ticks. A cold chunk adds 0.1 to 0.5 GiB a second,
     and the 2026-09-26 report's third freeze went from 5.7 GiB free to a
     stopped machine in about two seconds. So the prefill asks before each
-    chunk allocates (at most every 0.2 s), with that chunk's allocation
-    reserved (its rows at full width and its scratch):
+    chunk allocates (at most every 0.2 s), with the request's costliest
+    forward reserved (its rows at full width and its scratch; a narrower last
+    chunk's when that costs more, ``_prefill_forward_bill``):
 
       * the Mac's supply plus the engine's allocator pool, less the chunk,
         under the abort floor;
@@ -20429,17 +20419,10 @@ class _PrefillSystemGuard:
         after_prefill_reserve_bytes: int | None = None,
         forward_rows_bytes: int | None = None,
         restore_bytes: int = 0,
-        reserve_for_rows: Callable[[int], int] | None = None,
-        chunk_rows: int | None = None,
         own_session_shed: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
-        # What one forward of N rows allocates (the admission's own bill at
-        # that width): the reservation shrinks to the rows that are left.
-        self.reserve_for_rows = reserve_for_rows
-        self.chunk_rows = None if chunk_rows is None else max(1, int(chunk_rows))
-        self.rows_left: int | None = None
         self.tokens_done: int | None = None
         # The closest the engine came to its line (scalars only).
         self.engine_margin_min: dict[str, Any] | None = None
@@ -20504,19 +20487,14 @@ class _PrefillSystemGuard:
             done = int(payload.get("tokens_done") or 0)
         except (AttributeError, TypeError, ValueError):
             return
-        # The chunked loops forward every prompt token but the last, which
-        # the logits forward reads alone, so the last chunk reports
-        # total - 1. Waiting for total kept the whole-chunk reservation
-        # after the forwards were done (2026-10-01, a 32K Pi turn after a
-        # compaction: 93.46 GB held plus a 3.19 GB chunk that never came,
-        # refused 13 MB over the line four times while the Mac had 28 GB).
         if phase == "chunk":
             self.tokens_done = done
-        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total - 1):
+        # A chunk's progress is not the end of the forwards: its draft-history
+        # pass, its checkpoint and the final token's forward still follow
+        # (the review of 425ffc58), so the forward stays reserved to the end.
+        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total):
             if self.prefill_done_by is None:
                 self.prefill_done_by = "prefill_progress"
-        elif phase == "chunk" and total > 0:
-            self.rows_left = max(1, total - 1 - done)
 
     def __call__(self) -> bool:
         if self.tripped is not None:
@@ -20609,16 +20587,6 @@ class _PrefillSystemGuard:
                 self.prefill_done_by = "forward_rows_resident"
         if self.prefill_done_by is not None:
             reserve = self.after_prefill_reserve_bytes
-        elif (
-            self.rows_left is not None
-            and self.reserve_for_rows is not None
-            and (self.chunk_rows is None or self.rows_left < self.chunk_rows)
-        ):
-            # The last chunk runs only the rows that are left.
-            try:
-                reserve = min(reserve, max(0, int(self.reserve_for_rows(self.rows_left))))
-            except Exception:  # noqa: BLE001 - the whole chunk stays reserved
-                pass
         reason = None
         engine = None
         fields: dict[str, Any] = {}
@@ -20874,6 +20842,56 @@ def _admission_chunk_bytes(geometry: "_AdmissionGeometry", rows: int, scratch: i
     return max(0, int(rows)) * int(geometry.live_bytes_per_token) + max(0, int(scratch))
 
 
+def _prefill_last_chunk_rows(new_tokens: int, width: int | None) -> int:
+    """The rows of the last chunk when it is narrower than the others, else 0.
+
+    The chunked loops forward every new token but the last (the logits
+    forward reads that one alone) in ``width``-row spans, so the last span
+    holds what is left over."""
+
+    if width is None:
+        return 0
+    body = max(0, int(new_tokens) - 1)
+    width = max(1, int(width))
+    return body % width if body > width else 0
+
+
+def _prefill_forward_bill(
+    state: Any,
+    *,
+    new_tokens: int,
+    width: int | None,
+    prompt_tokens: int,
+    geometry: "_AdmissionGeometry",
+) -> dict[str, Any]:
+    """The costliest forward of a prefill of ``new_tokens`` at ``width`` rows.
+
+    A narrower last chunk can cost more than a full one: Flash-Next runs a
+    forward under 2,048 rows on the dense lane until 32K of history, where
+    the score matrix is written whole (2026-10-01, a 32,257-token Pi turn at
+    2,048 rows: its 1,536-row last chunk took the peak 0.95 GB past the full
+    chunks' while the reservation was a full chunk's). Both are priced and
+    the larger stands; a family whose bill grows with the rows always gets
+    the full chunk's."""
+
+    def priced(rows: int) -> dict[str, Any]:
+        scratch, source = _admission_scratch_bytes(
+            state, rows=rows, prompt_tokens=max(1, int(prompt_tokens)), geometry=geometry
+        )
+        chunk = _admission_chunk_bytes(geometry, rows, scratch)
+        return {"rows": rows, "scratch": scratch, "source": source, "chunk_bytes": chunk}
+
+    full = max(1, int(new_tokens) if width is None else min(int(new_tokens), int(width)))
+    bill = priced(full)
+    last = _prefill_last_chunk_rows(new_tokens, width)
+    if last:
+        narrower = priced(last)
+        if narrower["chunk_bytes"] > bill["chunk_bytes"]:
+            bill = narrower
+    bill["full_rows"] = full
+    return bill
+
+
 def _prefill_chunk_reserve_bytes(
     state: Any,
     *,
@@ -20895,12 +20913,15 @@ def _prefill_chunk_reserve_bytes(
     width = _admission_prefill_widths(
         getattr(state, "runtime", None), prompt_tokens, chunk_tokens
     )[0]
-    geometry = _admission_geometry(state, prefill_width=width)
-    rows = prompt_tokens if width is None else min(prompt_tokens, int(width))
-    scratch, _source = _admission_scratch_bytes(
-        state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
+    return int(
+        _prefill_forward_bill(
+            state,
+            new_tokens=prompt_tokens,
+            width=width,
+            prompt_tokens=prompt_tokens,
+            geometry=_admission_geometry(state, prefill_width=width),
+        )["chunk_bytes"]
     )
-    return _admission_chunk_bytes(geometry, rows, scratch)
 
 
 def _prefill_after_forward_plan(
@@ -21028,8 +21049,9 @@ def _prefill_system_abort_exception(
         )
     if reason == "engine_limit":
         # Say what was given back, from the shed's own receipt: the old text
-        # claimed half the session cache went while 0 bytes did, and invited a
-        # retry that met the same wall (2026-10-01).
+        # claimed half the session cache went while 0 bytes did (2026-10-01).
+        # A retry is priced again before its prefill, so it either fits what
+        # has come back by then or is refused at once.
         shed = tripped.get("shed_before_abort") or {}
         released = int(shed.get("released_bytes") or 0)
         gave_back = (
@@ -21040,9 +21062,9 @@ def _prefill_system_abort_exception(
         message = (
             "insufficient memory: this request needs more memory than the "
             f"engine may use ({cause}). The prefill stopped before that chunk, "
-            f"{gave_back}. The engine is still running. The same request needs "
-            "the same memory, so a retry will stop here again: start a new "
-            "chat or shorten the prompt."
+            f"{gave_back}. The engine is still running. A retry is priced again "
+            "before it starts, so it either fits or is refused at once; a new "
+            "chat or a shorter prompt needs less."
         )
     else:
         message = (
@@ -21061,10 +21083,11 @@ def _prefill_system_abort_exception(
                 {
                     **dict(tripped),
                     # The engine already gave back what it could before this
-                    # refusal; only the Mac's lines can clear without it.
-                    "retry_can_succeed": reason != "engine_limit",
+                    # refusal: its own line clears only as its queued writes
+                    # and other requests finish; the Mac's as other apps do.
+                    "retry_can_succeed": True,
                     "retry_when": (
-                        "never_as_is"
+                        "after_background_work_finishes"
                         if reason == "engine_limit"
                         else "after_other_apps_free_memory"
                     ),
@@ -22437,8 +22460,14 @@ def _admission_move_own_durable_entries(
     """This conversation's RAM entries that the SSD cache has published and
     the prompt neither restores from nor continues (``restore_plan`` keys and
     ``same_conversation_entries``), moved to the SSD cache: only RAM is
-    given up, a later restore reads them back. None when nothing moved."""
+    given up, a later restore reads them back. None when nothing moved.
 
+    Only while the SSD cache restores: a write-only one publishes but never
+    reads back, so there the RAM copy is the only one a later turn can use
+    (the review of 425ffc58)."""
+
+    if not bool(getattr(getattr(session_bank, "cold_tier", None), "restorable", False)):
+        return None
     keys_fn = getattr(session_bank, "session_entry_keys", None)
     move_fn = getattr(session_bank, "move_durable_entries_to_ssd", None)
     if not session_id or not callable(keys_fn) or not callable(move_fn):
@@ -22872,13 +22901,14 @@ def _run_prefill_admission(
         if prompt_scoring:
             return prompt_scoring_growth(state, prompt_tokens=prompt_tokens, width=width)
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
-        rows = miss if width is None else min(miss, width)
         at_width = geometry_at(width)
-        scratch, scratch_source = _admission_scratch_bytes(
-            state, rows=max(1, rows), prompt_tokens=prompt_tokens, geometry=at_width
+        forward = _prefill_forward_bill(
+            state, new_tokens=miss, width=width, prompt_tokens=prompt_tokens, geometry=at_width
         )
+        rows = int(forward["rows"])
+        scratch, scratch_source = int(forward["scratch"]), str(forward["source"])
         transient_per_token = _admission_context_transient_per_token(
-            geometry, rows=max(1, rows), scratch_source=scratch_source
+            geometry, rows=max(1, int(forward["full_rows"])), scratch_source=scratch_source
         )
         # What the restore copies of the source entry's windows: the entry's
         # own, which a wider chunk than this request's left larger.
@@ -22907,9 +22937,9 @@ def _run_prefill_admission(
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
         if calibration and scratch_source.startswith("geometry_calibrated"):
             model["scratch_calibration"] = str(calibration)
-        model["scratch_rows"] = int(max(1, rows))
+        model["scratch_rows"] = rows
         model["prefill_chunk_tokens"] = width
-        model["chunk_bytes"] = _admission_chunk_bytes(at_width, max(1, rows), scratch)
+        model["chunk_bytes"] = int(forward["chunk_bytes"])
         return model
 
     def settle(model: Mapping[str, Any]) -> None:
@@ -23112,13 +23142,14 @@ def _run_prefill_admission(
             early_pool_clear = {"error": repr(exc)}
             early_pool_clear_error = exc
     own_moved: dict[str, Any] | None = None
-    if chosen != widths[0]:
+    if chosen is not _ADMISSION_NO_FIT and chosen != widths[0]:
         # The same for this conversation's own entries that the prompt cannot
         # restore from and the SSD cache already holds: they leave RAM before
-        # the request gives up its chunk width or anyone else's state goes,
-        # and a later restore reads them from disk. A Pi turn after its
-        # compaction (2026-10-01) ran 2,048-row chunks beside the 2.79 GB
-        # lease of the compaction's summary prompt, 41 tokens in common.
+        # the request gives up its chunk width, and a later restore reads
+        # them from disk. A Pi turn after its compaction (2026-10-01) ran
+        # 2,048-row chunks beside the 2.79 GB lease of the compaction's
+        # summary prompt, 41 tokens in common. When no width fits, the same
+        # step runs after the pool, before anything is lost (below).
         own_moved = _admission_move_own_durable_entries(
             session_bank,
             session_id=session_id,
@@ -23192,6 +23223,9 @@ def _run_prefill_admission(
         )
         receipt["system_memory"] = now["system"].to_dict()
     steps: list[str] = []
+    if early_pool_clear is not None and early_pool_clear_error is None:
+        steps.append("allocator_pool")
+        receipt["early_pool_clear"] = dict(early_pool_clear)
     if own_moved is not None:
         steps.append("own_session_to_ssd")
         receipt["own_session_moved_to_ssd"] = own_moved
@@ -23295,14 +23329,43 @@ def _run_prefill_admission(
         steps.append("narrower_prefill_chunk")
     else:
         # 1. The allocator pool, when the Mac's line needs its pages (the
-        # engine line already leaves the pool out).
-        if now["cache"] > 0 and system_short(now, int(current["growth_bytes"]), "shed") > 0:
+        # engine line already leaves the pool out) and it was not cleared
+        # above.
+        if (
+            "allocator_pool" not in steps
+            and now["cache"] > 0
+            and system_short(now, int(current["growth_bytes"]), "shed") > 0
+        ):
             clear_pool()
             now = measure()
             steps.append("allocator_pool")
             receipt["projected_bytes_after_cache_clear"] = int(
                 now["engine"] + current["growth_bytes"]
             )
+
+        # 1b. This conversation's own entries that the prompt cannot restore
+        # from and the SSD cache has published: they leave RAM losing nothing
+        # (a later restore reads them from disk), before the steps below take
+        # anything that cannot come back.
+        if deficit(now) > 0:
+            try:
+                own_moved = _admission_move_own_durable_entries(
+                    session_bank,
+                    session_id=session_id,
+                    probe_ids=probe_ids,
+                    restore_keys=restore["keys"],
+                    reused_tokens=reused_tokens,
+                )
+            except Exception as exc:
+                receipt["own_session_to_ssd_error"] = repr(exc)
+                step_errors.append(exc)
+                own_moved = None
+            if own_moved is not None:
+                clear_pool()
+                now = measure()
+                steps.append("own_session_to_ssd")
+                receipt["own_session_moved_to_ssd"] = own_moved
+                replan("own_session_to_ssd", own_moved.get("entries"))
 
         # 2. The banked copy of this prompt, when it is what crosses the line.
         # Not the one-copy store's anchor: it is what lets a cancelled or
@@ -39739,7 +39802,6 @@ def create_app(state: ServerState) -> FastAPI:
                 ]
 
                 def worker() -> None:
-                    memory_refused = False
                     try:
                         _raise_if_stream_cancelled(cancel_event)
                         if session is None:
@@ -39990,7 +40052,6 @@ def create_app(state: ServerState) -> FastAPI:
                             commit_state["tail_outcome"] = {
                                 "error": f"{type(exc).__name__}: {exc}"
                             }
-                        memory_refused = _is_memory_refusal(exc)
                         queue.put(_stream_error_queue_item(exc))
                     else:
                         queue.put(("done", generated))
@@ -40003,8 +40064,6 @@ def create_app(state: ServerState) -> FastAPI:
                             tail_session.end_response_tail(
                                 tail, commit_state.get("tail_outcome")
                             )
-                        if memory_refused:
-                            _release_after_memory_refusal()
 
                 generation_future: Future = Future()
 
@@ -42504,7 +42563,6 @@ def create_app(state: ServerState) -> FastAPI:
                     _raise_if_stream_cancelled(cancel_event)
 
                 def worker() -> None:
-                    memory_refused = False
                     try:
                         result = _run_generation_dispatched(
                             state,
@@ -42529,12 +42587,9 @@ def create_app(state: ServerState) -> FastAPI:
                     except _StreamCancelled as exc:
                         queue.put(_stream_cancelled_queue_item(exc))
                     except BaseException as exc:
-                        memory_refused = _is_memory_refusal(exc)
                         queue.put(_stream_error_queue_item(exc))
                     else:
                         queue.put(("done", result))
-                    if memory_refused:
-                        _release_after_memory_refusal()
 
                 generation_future: Future = Future()
 

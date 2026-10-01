@@ -651,28 +651,38 @@ def decode_payload_prefix(
     return decoded
 
 
+def _collect_arrays(value: Any, arrays: list[Any]) -> None:
+    if isinstance(value, mx.array):
+        arrays.append(value)
+    elif isinstance(value, CacheSnapshot):
+        _collect_arrays(value.states, arrays)
+        _collect_arrays(value.meta_states, arrays)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_arrays(item, arrays)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_arrays(item, arrays)
+
+
 def _eval_decoded_arrays(decoded: DecodedPayload) -> None:
-    """Single batched evaluation of every decoded array (vs per-tensor eval)."""
+    """Single batched evaluation of every decoded array (vs per-tensor eval).
+
+    The walker is a module function, never a closure that calls itself: such
+    a closure is a reference cycle, and its list held every decoded tensor
+    until the cyclic collector next ran. A candidate the caller rejected
+    stayed resident through the cold prefill that followed (2026-10-01: a
+    4.17 GB decode still active a second after its last reference went).
+    """
     arrays: list[Any] = []
-
-    def collect(value: Any) -> None:
-        if isinstance(value, mx.array):
-            arrays.append(value)
-        elif isinstance(value, CacheSnapshot):
-            collect(value.states)
-            collect(value.meta_states)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                collect(item)
-
-    collect(decoded.cache_snapshot)
-    collect(decoded.logits)
-    collect(decoded.hidden)
-    collect(decoded.mtp_history_snapshot)
-    collect(decoded.gdn_boundaries)
+    for part in (
+        decoded.cache_snapshot,
+        decoded.logits,
+        decoded.hidden,
+        decoded.mtp_history_snapshot,
+        decoded.gdn_boundaries,
+    ):
+        _collect_arrays(part, arrays)
     if arrays:
         mx.eval(*arrays)
 
@@ -698,16 +708,6 @@ def decode_gdn_boundaries(
     interrupted.
     """
 
-    def collect(value: Any, arrays: list[Any]) -> None:
-        if isinstance(value, mx.array):
-            arrays.append(value)
-        elif isinstance(value, CacheSnapshot):
-            collect(value.states, arrays)
-            collect(value.meta_states, arrays)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect(item, arrays)
-
     def interrupted() -> bool:
         if should_abort is None:
             return False
@@ -729,7 +729,7 @@ def decode_gdn_boundaries(
             decode_tree(record.get("hidden_last") or {"kind": "none"}, read_tensor),
         )
         arrays: list[Any] = []
-        collect(decoded, arrays)
+        _collect_arrays(decoded, arrays)
         if arrays:
             mx.eval(*arrays)
         boundaries.append(decoded)

@@ -80,10 +80,11 @@ public enum CacheExplanation {
             return at > 0
                 ? tr("History changed at token %@", tokens(at))
                 : tr("History changed from the start")
-        case "different_request":
-            // Another request under the same session id (Pi's compaction
-            // summaries and the turn after them), not an edit of the history.
-            return tr("A different request in this conversation: only its first %@ tokens match the last one", tokens(at))
+        case "short_shared_prefix":
+            // Only the opening matches: Pi's compaction summaries and the turn
+            // after them share one session id, and an early edit looks the
+            // same, so the sentence states the overlap, never the intent.
+            return tr("Only the first %@ tokens match this conversation's saved state", tokens(at))
         case "screenshot_changed":
             return tr("The screenshot at token %@ changed", tokens(at))
         case "new_conversation":

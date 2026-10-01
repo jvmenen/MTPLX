@@ -2843,28 +2843,32 @@ def prefill_midloop_eval_setting() -> int:
         return _PREFILL_MIDLOOP_DEFAULT_LAYERS
 
 
+def _walk_arrays(node, found: list) -> None:
+    if isinstance(node, mx.array):
+        found.append(node)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _walk_arrays(item, found)
+    elif isinstance(node, dict):
+        for item in node.values():
+            _walk_arrays(item, found)
+
+
 def _midloop_state_arrays(entries) -> list:
     """The lazy arrays a finished layer group leaves on its cache entries:
     the recurrent states and any in-forward boundary captures. KV entries are
-    consumed by their own layer's attention and need no naming."""
+    consumed by their own layer's attention and need no naming.
+
+    The walker is a module function: a closure that calls itself is a
+    reference cycle, and it kept every group's list of states alive until
+    the cyclic collector ran (the SSD decoder's 4.17 GB, 2026-10-01)."""
 
     found: list = []
-
-    def walk(node) -> None:
-        if isinstance(node, mx.array):
-            found.append(node)
-        elif isinstance(node, (list, tuple)):
-            for item in node:
-                walk(item)
-        elif isinstance(node, dict):
-            for item in node.values():
-                walk(item)
-
     for entry in entries:
         if not isinstance(entry, ArraysCache):
             continue
-        walk(getattr(entry, "cache", None))
-        walk(getattr(entry, _BOUNDARY_CAPTURE_ATTR, None))
+        _walk_arrays(getattr(entry, "cache", None), found)
+        _walk_arrays(getattr(entry, _BOUNDARY_CAPTURE_ATTR, None), found)
     return found
 
 

@@ -171,16 +171,6 @@ def make_prefill_system_guard(
 ):
     from mtplx.server import openai as srv
 
-    def _reserve_for_rows(rows: int) -> int:
-        # One forward of ``rows`` rows, priced the way the admission prices
-        # its chunk: its rows at full width and the family's scratch.
-        rows = max(1, int(rows))
-        geometry = srv._admission_geometry(state, prefill_width=rows)
-        scratch, _source = srv._admission_scratch_bytes(
-            state, rows=rows, prompt_tokens=max(1, int(prompt_tokens)), geometry=geometry
-        )
-        return srv._admission_chunk_bytes(geometry, rows, scratch)
-
     after_forward: dict[str, Any] = {}
     try:
         if prompt_scoring and priced is None:
@@ -215,12 +205,9 @@ def make_prefill_system_guard(
             pass
     else:
         srv._note_guard_health(state, where="prefill_chunk_reserve", error=None)
-    chunk_rows = (priced or {}).get("prefill_chunk_tokens") or chunk_tokens
     return srv._PrefillSystemGuard(
         state,
         chunk_reserve_bytes=reserve,
-        reserve_for_rows=_reserve_for_rows,
-        chunk_rows=int(chunk_rows) if chunk_rows else None,
         own_session_shed=own_session_shed,
         **after_forward,
     )
@@ -276,7 +263,10 @@ def score_prompt_with_memory_policy(
             )
         scored["prefill_chunk_tokens"] = width
         return scored
-    except srv.PostcommitAbort:
+    except srv.PostcommitAbort as abort:
+        # The 507 below chains this abort; its traceback holds the scoring
+        # frames and their logits (generation's own abort site does the same).
+        abort.__traceback__ = None
         if guard.tripped is not None:
             if request_observability is not None:
                 request_observability["prefill_system_abort"] = dict(guard.tripped)

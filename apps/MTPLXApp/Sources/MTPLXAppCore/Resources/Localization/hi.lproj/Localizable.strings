@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "%@ नए टोकन पढ़े जा रहे हैं";
 "History changed at token %@" = "इतिहास टोकन %@ पर बदल गया";
 "History changed from the start" = "इतिहास शुरुआत से ही बदल गया";
-"A different request in this conversation: only its first %@ tokens match the last one" = "इस बातचीत में एक अलग अनुरोध: पिछले अनुरोध से केवल पहले %@ टोकन मेल खाते हैं";
+"Only the first %@ tokens match this conversation's saved state" = "इस बातचीत की सहेजी गई स्थिति से केवल पहले %@ टोकन मेल खाते हैं";
 "The screenshot at token %@ changed" = "टोकन %@ पर स्क्रीनशॉट बदल गया";
 "New conversation or first turn since MTPLX started" = "नई बातचीत या MTPLX शुरू होने के बाद का पहला टर्न";
 "No saved state for this conversation" = "इस बातचीत के लिए कोई सहेजी गई स्थिति नहीं है";

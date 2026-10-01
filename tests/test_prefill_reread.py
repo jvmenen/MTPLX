@@ -131,10 +131,11 @@ def test_a_changed_history_names_the_token_where_it_changed():
     assert explanation["text"].startswith("History changed at token 110. ")
 
 
-def test_another_request_under_the_same_session_is_not_a_changed_history():
+def test_a_prompt_that_shares_only_its_opening_says_so_without_naming_why():
     # 2026-10-01, Pi under one session id: the turn after a compaction shares
     # 41 tokens with the compaction's summary prompt, and the compaction's
-    # second summary shares 110 with its first. Neither is an edit.
+    # second summary shares 110 with its first. An early edit of a long chat
+    # looks the same, so the text states the overlap, never the intent.
     def explain(matched, cached, prompt):
         return explain_reread(
             {
@@ -148,13 +149,13 @@ def test_another_request_under_the_same_session_is_not_a_changed_history():
         )
 
     turn = explain(41, 47_765, 32_409)
-    assert turn["cause"] == "different_request"
+    assert turn["cause"] == "short_shared_prefix"
     assert turn["cause_at_token"] == 41
     assert turn["text"] == (
-        "A different request in this conversation: only its first 41 tokens "
-        "match the last one. Re-reading 32,409 tokens."
+        "Only the first 41 tokens match this conversation's saved state. "
+        "Re-reading 32,409 tokens."
     )
-    assert explain(110, 64_276, 46_267)["cause"] == "different_request"
+    assert explain(110, 64_276, 46_267)["cause"] == "short_shared_prefix"
     # Past the opening it is the same conversation, edited.
     assert explain(5_000, 40_000, 41_000)["cause"] == "history_changed"
     assert explain(1_500, 4_000, 4_100)["cause"] == "history_changed"

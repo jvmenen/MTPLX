@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "Membaca %@ token baru";
 "History changed at token %@" = "Riwayat berubah di token %@";
 "History changed from the start" = "Riwayat berubah sejak awal";
-"A different request in this conversation: only its first %@ tokens match the last one" = "Permintaan berbeda dalam percakapan ini: hanya %@ token pertamanya yang sama dengan permintaan terakhir";
+"Only the first %@ tokens match this conversation's saved state" = "Hanya %@ token pertama yang cocok dengan status tersimpan percakapan ini";
 "The screenshot at token %@ changed" = "Tangkapan layar di token %@ berubah";
 "New conversation or first turn since MTPLX started" = "Percakapan baru atau giliran pertama sejak MTPLX dimulai";
 "No saved state for this conversation" = "Tidak ada status tersimpan untuk percakapan ini";

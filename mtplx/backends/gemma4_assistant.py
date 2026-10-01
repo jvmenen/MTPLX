@@ -3221,7 +3221,10 @@ def _restore_or_prefill_gemma4_prompt(
                     # Boundary-true restores exist for recurrent entries.
                     # Gemma 4 caches are all trimmable attention KV; a bank
                     # that lands anywhere but the requested prefix is not
-                    # speaking this contract. Fail closed to the next one.
+                    # speaking this contract. Fail closed to the next one,
+                    # without this one's cache: these locals would otherwise
+                    # hold it through the cold prefill below.
+                    prefix_restore = cache = _history = boundary_hidden = None
                     continue
                 seed = restore_point - 1
                 output, _suffix_elapsed = forward(list(prompt_ids[seed:]), cache)

@@ -36,6 +36,9 @@ RUNTIME = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
 class _Tier:
     """Cold tier double: records encodes, publishes only what a test says."""
 
+    # The SSD cache in its normal mode: it reads back what it published.
+    restorable = True
+
     def __init__(self) -> None:
         self.encoded: list[tuple[int, ...]] = []
         self.published: set[tuple[int, ...]] = set()

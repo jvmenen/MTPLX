@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "Lecture de %@ nouveaux tokens";
 "History changed at token %@" = "L'historique a changé au token %@";
 "History changed from the start" = "L'historique a changé dès le début";
-"A different request in this conversation: only its first %@ tokens match the last one" = "Une requête différente dans cette conversation : seuls ses %@ premiers jetons correspondent à la précédente";
+"Only the first %@ tokens match this conversation's saved state" = "Seuls les %@ premiers tokens correspondent à l'état enregistré de cette conversation";
 "The screenshot at token %@ changed" = "La capture d'écran au token %@ a changé";
 "New conversation or first turn since MTPLX started" = "Nouvelle conversation ou premier tour depuis le démarrage de MTPLX";
 "No saved state for this conversation" = "Aucun état enregistré pour cette conversation";

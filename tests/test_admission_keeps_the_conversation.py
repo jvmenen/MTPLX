@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_idle_session_release import _Lane, _Tier
-from test_memguard_admission import (
+from test_memguard_admission import (  # noqa: F401 - _served_profile is autouse
     CONV,
     FN_ROW,
     GIB,
@@ -37,6 +37,7 @@ from test_memguard_admission import (
     _Machine,
     _manager,
     _put,
+    _served_profile,
 )
 
 import mtplx.server.openai as srv
@@ -383,6 +384,30 @@ class TestOwnPublishedStateGoesBeforeTheWidth:
             )
         finally:
             conversation.end_generation()
+
+    def test_when_no_width_fits_its_published_summary_goes_before_anyone_elses_state(
+        self, monkeypatch
+    ):
+        # 2 GiB more engine: even 2,048 rows cross the line beside the
+        # summary. Its RAM copy leaves losing nothing (the SSD cache holds
+        # it), so another conversation's idle state is never reached.
+        self.BASE_GIB = 88.5
+        manager, lane = _world(ssd=True)
+        summary = _flash_next_entry(manager.bank, self.SUMMARY)
+        other = _flash_next_entry(
+            manager.bank, list(range(6_000_000, 6_004_000)), session_id="other"
+        )
+        lane.run_all()
+        manager.bank.cold_tier.published.add(summary.token_ids)
+
+        receipt = self._admit_wide(monkeypatch, manager, lane)
+
+        assert receipt.get("refused") is not True
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert receipt["reclamation_steps"][0] == "own_session_to_ssd"
+        assert receipt["own_session_moved_to_ssd"]["entries"] == 1
+        assert summary.token_ids not in manager.bank._entries
+        assert manager.bank._entries.get(other.token_ids) is other
 
     def test_its_published_summary_leaves_ram_and_the_turn_keeps_its_width(self, monkeypatch):
         manager, lane = _world(ssd=True)

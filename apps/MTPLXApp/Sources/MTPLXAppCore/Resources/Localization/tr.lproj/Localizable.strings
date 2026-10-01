@@ -1633,7 +1633,7 @@
 "Reading %@ new tokens" = "%@ yeni token okunuyor";
 "History changed at token %@" = "Geçmiş %@. token'da değişti";
 "History changed from the start" = "Geçmiş en baştan değişti";
-"A different request in this conversation: only its first %@ tokens match the last one" = "Bu konuşmada farklı bir istek: yalnızca ilk %@ belirteç öncekiyle eşleşiyor";
+"Only the first %@ tokens match this conversation's saved state" = "Bu konuşmanın kayıtlı durumuyla yalnızca ilk %@ token eşleşiyor";
 "The screenshot at token %@ changed" = "%@. token'daki ekran görüntüsü değişti";
 "New conversation or first turn since MTPLX started" = "Yeni konuşma ya da MTPLX başladıktan sonraki ilk tur";
 "No saved state for this conversation" = "Bu konuşma için kayıtlı durum yok";
