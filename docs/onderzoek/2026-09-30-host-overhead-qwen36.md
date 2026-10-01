@@ -180,6 +180,34 @@ On the server the round drops from 25.95 to 24.68 ms (-4.9%) and decode rises fr
 - The earlier bimodal runs fit the same pattern: fast at first, then slower from some request onward (`on8_1`, `on8_3`, `on8_5`). The profiled runs were not systematically faster; their timing depended on machine temperature.
 - **No exact software fix closes this.** The kernels and their energy per token are unchanged; only the idle time is gone. The mitigation is cooling: the fan mode was not tested, because Bink runs `--fan-mode default` and fan control needs the SMC helper. For bursty agent traffic the machine is mostly at level 0, where the full gain applies.
 
+## 8. Regression on compiled-verify models, and the fix (1 October)
+
+**Finding.** On Qwen3.8-27B Optimized-Speed (4-bit, compiled verify normally on), `mtplx tune --depths 3` on `perf/definitief` (a40b636d, with the switch commit) gave 49.0 / 49.0 tok/s off and 45.9 / 45.7 on; verify 82.3 to 89.0 ms per call; acceptance identical.
+
+**Cause (measured).** The compiled verify bank (`graphbank.py`, `_compile_capture_length` and the shared verify step) traces the same `forward_with_gdn_capture` under `mx.compile`. Inside a trace `mx.async_eval` raises `ValueError: [async_eval] Not allowed inside a graph transformation`. The bank catches it, falls back to eager for that call, and after three failures goes permanently eager. Route counts in the in-process candidate (D3, 512 tokens, the 3.8 tools plus a route counter):
+
+| Code | Switch | Compiled | Eager | Permanent eager reason |
+|---|---|---|---|---|
+| before the fix (7467558b) | off | 104 | 0 | none |
+| before the fix (7467558b) | on | 0 | 104 | `exception_streak:ValueError` |
+| after the fix (063d77b5) | off | 104 | 0 | none |
+| after the fix (063d77b5) | on | 104 | 0 | none |
+
+The 7 context-copy rounds outside the bank are wider than 8 tokens, so the switch never acted on them.
+
+**Fix.** `_try_async_submit` in `gdn_capture.py` skips the submit when `compile_trace_active()` is set or when `async_eval` refuses with a graph-transformation error, and stops submitting for the rest of that forward. Other errors still raise. The traced graph is therefore exactly the one built with the switch off. Tests: a real `mx.compile` of the forward with the switch on matches it off bit for bit (and fails without the fix), a refusal stops further submits, the `compile_trace` marker suppresses them, other errors propagate.
+
+**Re-measured (M5 Pro, in-process, thermal pressure nominal):**
+
+| Model | Off tok/s | On tok/s | Tokens |
+|---|---|---|---|
+| Qwen3.8-27B Speed, D3, 512 tokens | 48.89 / 49.06 | 48.98 / 48.96 (old code: 45.85) | identical |
+| Qwen3.6-35B-A3B Balance-yb, D2, FR-Spec, reasoning 1,024 tokens | 93.13 / 93.22 | 102.38 / 102.56 (+10%) | identical |
+
+On Qwen3.6, 4 submits per round (1,712 in 428 eager rounds), as designed.
+
+Commits: `063d77b5` on `perf/verify-async-chunk` (PR [#579](https://github.com/youssofal/MTPLX/pull/579), description updated), `d0d077b2` on `perf/host-overlap-36`. Not applied to `perf/definitief`.
+
 ## Material
 
 `~/Dev/laya-nl/host36/`: `run1.zsh` (one tune run), `job.zsh` (GPU slot, port 8000 and swap checks), `prof_hook.py` (profiling hook, including the `PROF_LAYER_ASYNC` experiment and `PROF_THINKING`), `tl36.py` (per-round timeline), `summ.py`, `srv.zsh` + `bench36_8001.py` (server A/B on port 8001, with thermal and GPU sampling), `run_srv_prof.py` + `prof_srv.py` + `srvtl.py` (timeline inside the server), `gpusample.py` (per-process GPU time from `ioreg`), `cool.zsh`, `therm.py`, prompt suites `reason*.jsonl`, raw results in `res/` (`cand-*`, `prof-*`, `*.tl.json`, `*.pstats`, `srv-*.json`) and logs in `logs/`.
