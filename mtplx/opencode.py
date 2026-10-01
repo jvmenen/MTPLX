@@ -686,6 +686,95 @@ def _unique_backup(path: Path, reason: str) -> Path:
     return backup
 
 
+def _write_config_json(
+    config_path: Path, existing: dict[str, Any] | None, merged: dict[str, Any]
+) -> tuple[bool, Path | None]:
+    """Write ``merged`` unless it equals ``existing``; return (written, backup).
+
+    A file whose content already matches is left untouched, comments and
+    formatting included. When a rewrite is needed the previous file is kept
+    next to it and the copy's path is reported so every renderer can say so.
+    """
+
+    written = existing is None or merged != existing
+    backup_path: Path | None = None
+    if written:
+        if existing is not None:
+            backup_path = _unique_backup(config_path, "before-mtplx")
+            shutil.copy2(config_path, backup_path)
+        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    try:
+        config_path.chmod(0o600)
+    except OSError:
+        pass
+    return written, backup_path
+
+
+def _mtplx_model_entry(
+    config: dict[str, Any] | None, provider_id: str, model_id: str
+) -> dict[str, Any] | None:
+    providers = (config or {}).get("provider")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    models = provider.get("models") if isinstance(provider, dict) else None
+    model = models.get(str(model_id)) if isinstance(models, dict) else None
+    return model if isinstance(model, dict) else None
+
+
+def refresh_opencode_window(
+    model_id: str,
+    window: int,
+    *,
+    requested_output: int | None = None,
+    path: str | Path | None = None,
+    provider_id: str = OPENCODE_PROVIDER_ID,
+) -> dict[str, Any]:
+    """Give MTPLX's OpenCode model the window the server serves.
+
+    That window (``served_execution_window``) exists only once the model is
+    loaded, so the CLI's OpenCode handoff calls this after startup, as the
+    app re-syncs OpenCode once its daemon answers. ``limit.context`` becomes
+    the window and ``limit.output`` its reply reserve
+    (:func:`opencode_output_limit`); nothing else in the file changes.
+    """
+
+    config_path = opencode_config_path(path)
+    output = opencode_output_limit(window, requested_output)
+    result: dict[str, Any] = {
+        "config_path": str(config_path),
+        "context_window": int(window),
+        "output_limit": output,
+        "written": False,
+        "backup_path": None,
+    }
+    if int(window) <= 0 or not config_path.exists():
+        return result
+    existing, _existing_text = load_config_file(config_path)
+    model = _mtplx_model_entry(existing, provider_id, model_id)
+    if model is None:
+        return result
+    provider = existing["provider"][provider_id]
+    merged = {
+        **existing,
+        "provider": {
+            **existing["provider"],
+            provider_id: {
+                **provider,
+                "models": {
+                    **provider["models"],
+                    str(model_id): {
+                        **model,
+                        "limit": {"context": int(window), "output": output},
+                    },
+                },
+            },
+        },
+    }
+    written, backup_path = _write_config_json(config_path, existing, merged)
+    result["written"] = written
+    result["backup_path"] = str(backup_path) if backup_path is not None else None
+    return result
+
+
 def write_opencode_session_headers_plugin(
     path: str | Path | None = None,
 ) -> Path:
@@ -831,11 +920,19 @@ def write_opencode_config(
     reasoning_effort: str | None = None,
     reasoning_effort_levels: Sequence[str] | None = None,
     vision: bool = False,
+    keep_window: bool = False,
 ) -> dict[str, Any]:
-    """Write MTPLX into OpenCode config and return a handoff payload."""
+    """Write MTPLX into OpenCode config and return a handoff payload.
+
+    ``keep_window`` keeps the window (``limit.context``) this model already
+    has: the write before the server starts has only a guess at the window,
+    and the handoff then brings it to the served one
+    (``refresh_opencode_window``), so a launch never rewrites it twice.
+    ``limit.output`` follows the kept window and ``output_limit``, the cap
+    requested with ``--max-response-tokens``.
+    """
 
     config_path = opencode_config_path(path)
-    backup_path: Path | None = None
     existing: dict[str, Any] | None = None
     if config_path.exists():
         # OpenCode reads this file as JSONC (comments, trailing commas), so
@@ -861,6 +958,14 @@ def write_opencode_config(
         reasoning_effort_levels=reasoning_effort_levels,
         vision=vision,
     )
+    limit = fragment["provider"][OPENCODE_PROVIDER_ID]["models"][str(model_id)]["limit"]
+    kept = (_mtplx_model_entry(existing, provider_id, model_id) or {}).get("limit")
+    kept_window = kept.get("context") if isinstance(kept, dict) else None
+    if keep_window and isinstance(kept_window, int) and kept_window > 0:
+        limit.update(
+            context=kept_window,
+            output=opencode_output_limit(kept_window, output_limit),
+        )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     session_headers_plugin_path = write_opencode_session_headers_plugin(config_path)
     merged = merge_opencode_config(
@@ -869,19 +974,7 @@ def write_opencode_config(
         provider_id=provider_id,
         session_headers_plugin_path=session_headers_plugin_path,
     )
-    # A file whose content already matches is left untouched, comments and
-    # formatting included. When a rewrite is needed the previous file is kept
-    # next to it and the copy's path is reported so every renderer can say so.
-    written = existing is None or merged != existing
-    if written:
-        if existing is not None:
-            backup_path = _unique_backup(config_path, "before-mtplx")
-            shutil.copy2(config_path, backup_path)
-        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-    try:
-        config_path.chmod(0o600)
-    except OSError:
-        pass
+    written, backup_path = _write_config_json(config_path, existing, merged)
     reasoning_visibility = ensure_opencode_reasoning_summaries_visible()
     return {
         "config_path": str(config_path),
@@ -890,8 +983,8 @@ def write_opencode_config(
         "base_url": str(base_url).rstrip("/"),
         "model_id": model_id,
         "model_ref": opencode_model_ref(model_id, provider_id=provider_id),
-        "context_window": int(context_window),
-        "output_limit": opencode_output_limit(context_window, output_limit),
+        "context_window": int(limit["context"]),
+        "output_limit": int(limit["output"]),
         "chunk_timeout_ms": int(chunk_timeout_ms),
         "reasoning_field": "reasoning_content",
         "reasoning_effort": reasoning_effort,

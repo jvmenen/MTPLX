@@ -2510,6 +2510,43 @@ def _open_browser_later(url: str, *, delay_s: float = 1.0) -> None:
     timer.start()
 
 
+def _sync_launched_client_window(state: Any) -> None:
+    """Give the client this server opens the window it serves.
+
+    ``mtplx start pi`` and ``mtplx start opencode`` write the client's config
+    before the model loads, with only a guess at the window (the model's own
+    or ``--context-window``). Right before the client opens, its MTPLX entry
+    takes ``served_execution_window``, the value the app configures both
+    clients from once its daemon answers.
+    """
+
+    from mtplx.jsonc import InvalidConfigFile
+
+    args = state.args
+    window = int(served_execution_window(state).get("tokens") or 0)
+    if window <= 0:
+        return
+    model_id = str(args.model_id)
+    try:
+        if args.launch_pi:
+            from mtplx.pi import refresh_pi_models_window
+
+            if refresh_pi_models_window(model_id, window)["written"]:
+                _startup_line(f"Pi window set to the {window:,} tokens this server serves.")
+        if args.launch_opencode:
+            from mtplx.opencode import refresh_opencode_window
+
+            if refresh_opencode_window(
+                model_id, window, requested_output=args.max_response_tokens
+            )["written"]:
+                _startup_line(
+                    f"OpenCode window set to the {window:,} tokens this server serves."
+                )
+    except (InvalidConfigFile, OSError) as exc:
+        # The user's file stays exactly as it was; the client still opens.
+        _startup_line(f"warning: could not set the client window: {exc}")
+
+
 def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None:
     def open_pi() -> None:
         try:
@@ -44438,6 +44475,7 @@ def main(argv: list[str] | None = None) -> None:
         _startup_line("Live Dashboard: " + _startup_dashboard_url(args))
         _startup_line("Opening live dashboard in your browser...")
         _open_browser_later(_startup_browser_dashboard_url(args), delay_s=1.6)
+    _sync_launched_client_window(state)
     if args.launch_pi:
         command = str(args.pi_launch_command or "").strip()
         if command:

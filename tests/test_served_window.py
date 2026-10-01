@@ -65,6 +65,55 @@ def test_the_whole_window_is_the_answer_ceiling_at_the_boundaries():
         assert "answer_tokens" not in served
 
 
+def test_cli_handoff_gives_pi_and_opencode_the_served_window(tmp_path, monkeypatch):
+    """`mtplx start pi` and `mtplx start opencode` write the client's config
+    before the model loads, from the model's window or --context-window
+    (262,144 here). Right before the server opens the client, its MTPLX
+    entries take served_execution_window (32,768 on this machine fit), the
+    value the app configures both clients from, and the next launch's early
+    write keeps it instead of flipping back."""
+    import json
+
+    from mtplx.opencode import write_opencode_config
+    from mtplx.pi import write_pi_models_config
+    from mtplx.server.openai import _sync_launched_client_window
+
+    pi_path = tmp_path / "pi" / "models.json"
+    opencode_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(pi_path))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(opencode_path))
+    model_id = "mtplx-qwen38-27b-optimized-speed"
+    base_url = "http://127.0.0.1:8000/v1"
+
+    def early_writes():
+        write_pi_models_config(
+            base_url=base_url, model_id=model_id, context_window=262_144, keep_window=True
+        )
+        write_opencode_config(
+            base_url=base_url, model_id=model_id, context_window=262_144, keep_window=True
+        )
+
+    def client_windows():
+        pi = json.loads(pi_path.read_text())["providers"]["mtplx"]["models"][0]
+        limit = json.loads(opencode_path.read_text())["provider"]["mtplx"]["models"][
+            model_id
+        ]["limit"]
+        return (pi["contextWindow"], pi["maxTokens"]), limit
+
+    early_writes()
+    assert client_windows() == ((262_144, 262_144), {"context": 262_144, "output": 32_000})
+    state = _state(window=262_144, fit=32_768)
+    state.args = SimpleNamespace(
+        launch_pi=True, launch_opencode=True, model_id=model_id, max_response_tokens=None
+    )
+    _sync_launched_client_window(state)
+    served = served_execution_window(state)["tokens"]
+    assert served == 32_768
+    assert client_windows() == ((served, served), {"context": served, "output": 16_384})
+    early_writes()
+    assert client_windows() == ((served, served), {"context": served, "output": 16_384})
+
+
 def test_health_publishes_the_execution_window():
     from fastapi.testclient import TestClient
     from test_server_openai import _fake_state

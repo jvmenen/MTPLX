@@ -18,6 +18,7 @@ from mtplx.opencode import (
     merge_opencode_config,
     opencode_model_ref,
     opencode_session_headers_plugin_path,
+    refresh_opencode_window,
     repair_opencode_desktop_state,
     write_opencode_config,
     write_opencode_session_headers_plugin,
@@ -627,6 +628,54 @@ def test_opencode_plugin_strips_the_output_limit_mtplx_configured(tmp_path, wind
     assert results["user_cap"]["maxOutputTokens"] == 9_000
     assert "maxOutputTokens" not in results["absent"]
     assert results["chosen_limit"]["maxOutputTokens"] == 9_000
+
+
+def test_refresh_opencode_window_sets_the_served_limits_and_nothing_else(tmp_path):
+    config_path = tmp_path / "opencode.json"
+    write_opencode_config(
+        base_url="http://127.0.0.1:8000/v1",
+        model_id="mtplx-qwen",
+        path=config_path,
+        context_window=262_144,
+    )
+    before = json.loads(config_path.read_text())
+    result = refresh_opencode_window("mtplx-qwen", 32_768, path=config_path)
+    after = json.loads(config_path.read_text())
+    assert result["written"] is True and result["backup_path"]
+    model = after["provider"]["mtplx"]["models"]["mtplx-qwen"]
+    assert model.pop("limit") == {"context": 32_768, "output": 16_384}
+    before["provider"]["mtplx"]["models"]["mtplx-qwen"].pop("limit")
+    assert after == before
+    # --max-response-tokens still bounds limit.output, as in the CLI writer.
+    capped = refresh_opencode_window(
+        "mtplx-qwen", 32_768, requested_output=8_000, path=config_path
+    )
+    assert capped["output_limit"] == 8_000
+    assert refresh_opencode_window("mtplx-other", 32_768, path=config_path)["written"] is False
+    assert refresh_opencode_window("mtplx-qwen", 32_768, path=tmp_path / "none.json")["written"] is False
+
+
+def test_write_opencode_config_keep_window_keeps_the_served_limits(tmp_path):
+    """The write before the server starts has only a guess at the window;
+    with keep_window it keeps the window the last handoff set, so a launch
+    does not rewrite it twice, and a cap asked for with
+    --max-response-tokens still sets limit.output on that window."""
+    config_path = tmp_path / "opencode.json"
+    kwargs = {
+        "base_url": "http://127.0.0.1:8000/v1",
+        "model_id": "mtplx-qwen",
+        "path": config_path,
+        "context_window": 262_144,
+    }
+    write_opencode_config(**kwargs)
+    refresh_opencode_window("mtplx-qwen", 32_768, path=config_path)
+    kept = write_opencode_config(**kwargs, keep_window=True)
+    assert kept["written"] is False
+    assert (kept["context_window"], kept["output_limit"]) == (32_768, 16_384)
+    capped = write_opencode_config(**kwargs, output_limit=8_000, keep_window=True)
+    assert (capped["context_window"], capped["output_limit"]) == (32_768, 8_000)
+    fresh = write_opencode_config(**kwargs)
+    assert (fresh["context_window"], fresh["output_limit"]) == (262_144, 32_000)
 
 
 def test_repair_opencode_desktop_state_prunes_missing_workspace(tmp_path, monkeypatch):
