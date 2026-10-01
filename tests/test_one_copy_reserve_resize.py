@@ -45,7 +45,7 @@ from mlx_lm.models.cache import ArraysCache
 
 import mtplx.generation as generation
 import mtplx.graphbank as graphbank
-from mtplx import demotions, runtime_options
+from mtplx import demotions, one_copy, runtime_options
 from mtplx.graphbank import FixedM4CapacityPlan, TensorOffsetQSACache
 from mtplx.models.qwen4_exp import QSACache
 from mtplx.one_copy import held_qsa_rows, resize_bill, resize_qsa_buffers
@@ -992,6 +992,100 @@ def test_a_resize_that_fails_keeps_the_only_copy_and_the_retry_is_the_same_turn(
     _same_turn(retry, uninterrupted)
     after_new, after_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
     _same_turn(after_new, after_parent)
+
+
+def _second_layer_write_raises(error, calls):
+    """A patch: writing the second layer's new buffers raises ``error``
+    (after that layer was admitted, where an allocation fails)."""
+
+    def apply(patch):
+        real = one_copy._resize_layer
+
+        def resizing(entry, rows):
+            calls.append(rows)
+            if len(calls) != 2:
+                return real(entry, rows)
+
+            def failing(*arrays):
+                raise error
+
+            with patch.context() as inner:
+                inner.setattr(mx, "eval", failing)
+                return real(entry, rows)
+
+        patch.setattr(one_copy, "_resize_layer", resizing)
+
+    return apply
+
+
+@gpu
+def test_a_resize_the_memory_refuses_answers_on_the_eager_verifier(tiny, lane):
+    """The 2026-10-01 review: an allocation failure while the second layer's
+    buffers were written failed a request whose eager answer fits."""
+
+    calls: list[int] = []
+    new, parent = _Session(tiny, lane), _Session(tiny, lane, parent=True)
+    for session in (new, parent):
+        session.opening()
+    failed = new.turn([5, 6], patches=[_second_layer_write_raises(
+        RuntimeError("[metal::malloc] Unable to allocate 172032 bytes"), calls,
+    )])
+    snapshot = demotions.snapshot()
+    eager = parent.turn([5, 6], room=300_000)
+
+    assert calls == [1024, 1024]
+    _eager(failed)
+    assert failed.admission["promotion"] == "resized"
+    assert failed.admission["resize_layers_left"] == 1
+    assert "Unable to allocate" in failed.admission["resize_error"]
+    assert snapshot["counts"]["fixed_m4_lane_skipped"] == 1
+    assert "failed to allocate a layer (1 left to resize)" in (
+        snapshot["reasons"]["fixed_m4_lane_skipped"]
+    )
+    # The first layer kept its new buffers, the second its old ones, which
+    # the eager decode then grew its own way. The answer is the eager one.
+    assert failed.held == [(1024, 1024, 256), (766, 1024, 256)]
+    _same_turn(failed, eager, capacity=False)
+    # The next turn resizes the second layer and is compiled again.
+    back_new, back_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
+    _compiled(back_new)
+    assert back_new.promotions == [("adopted", 1024)] * 2
+    assert back_new.admission["promotion"] == "resized"
+    _same_rounds(back_new.rounds, back_parent.rounds)
+    _same_turn(back_new, back_parent)
+
+
+class _Cancelled(BaseException):
+    pass
+
+
+@gpu
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("[metal] shape mismatch"), ValueError("bad rows"), _Cancelled()],
+    ids=["runtime_error", "value_error", "cancellation"],
+)
+def test_other_failures_in_a_resize_reach_the_caller_and_the_retry_is_the_same_turn(
+    tiny, lane, error,
+):
+    calls: list[int] = []
+    new, parent = _Session(tiny, lane), _Session(tiny, lane, parent=True)
+    for session in (new, parent):
+        session.opening()
+    prompt = list(new.tokens) + [5, 6]
+    with pytest.raises(type(error)):
+        new.turn([5, 6], patches=[_second_layer_write_raises(error, calls)])
+    assert calls == [1024, 1024]
+    lease = new.bank.longest_prefix(prompt)
+    assert lease is not None and lease.prefix_len == len(prompt)
+    layers = [e for e in lease.cache_ref if isinstance(e, QSACache)]
+    assert [TensorOffsetQSACache.held_rows(e) for e in layers] == [1024, 512]
+    retry = new.turn([], prompt=prompt, seed=SEED + len(prompt))
+    uninterrupted = parent.turn([5, 6])
+    assert retry.stats.cached_tokens == len(prompt)
+    _compiled(retry)
+    _same_rounds(retry.rounds, uninterrupted.rounds)
+    _same_turn(retry, uninterrupted)
 
 
 PAD, IMAGE_TOKENS, GRID = 120, 16, (1, 8, 8)

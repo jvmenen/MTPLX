@@ -106,15 +106,25 @@ def resize_qsa_buffers(
     hold ``rows``.
     """
 
-    entries = _resizable(cache)
-    if entries is None:
-        raise ValueError("this cache has a QSA layer that cannot be resized in place")
-    pending = [entry for entry in entries if _layer_bytes(entry, rows)[0] > 0]
+    pending = _pending_layers(cache, rows)
     for done, entry in enumerate(pending):
         if admit is not None and not admit(_layer_bytes(entry, rows)[0]):
             return len(pending) - done
         _resize_layer(entry, rows)
     return 0
+
+
+def layers_to_resize(cache: Any, rows: int) -> int:
+    """How many QSA layers ``resize_qsa_buffers(cache, rows)`` would resize now."""
+
+    return len(_pending_layers(cache, rows))
+
+
+def _pending_layers(cache: Any, rows: int) -> list[Any]:
+    entries = _resizable(cache)
+    if entries is None:
+        raise ValueError("this cache has a QSA layer that cannot be resized in place")
+    return [entry for entry in entries if _layer_bytes(entry, rows)[0] > 0]
 
 
 def resize_bill(cache: Any, rows: int) -> int | None:

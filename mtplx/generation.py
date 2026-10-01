@@ -45,6 +45,7 @@ from .demotions import mark as _demotion_mark, note as _note_demotion, since as 
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
 )
+from .errors import is_allocation_failure
 from .progress_heartbeat import tick as _owner_progress_tick
 from .cache_state import (
     CacheSnapshot,
@@ -113,6 +114,7 @@ from .one_copy import (
     prefill_rows_scope,
     prefill_rows_target,
     prompt_lease_fields,
+    layers_to_resize,
     resize_bill,
     resize_qsa_buffers,
 )
@@ -917,21 +919,49 @@ def _qwen4_fixed_m4_resize_held(
 
     Each layer asks for its own new bytes before any of them is allocated
     (``_qwen4_fixed_m4_layer_fits``), so memory taken since the admission
-    stops the resize between layers. A stopped resize leaves every layer
-    whole, at its old rows or the bank's: the request verifies eagerly, as a
-    refused one always has, and the next request resizes the rest.
+    stops the resize between layers, and an allocation the memory refuses
+    stops it too. A stopped resize leaves every layer whole, at its old rows
+    or the bank's: the request verifies eagerly, as a refused one always
+    has, and the next request resizes the rest.
     """
 
     rows = int(plan.resize_rows or 0)
     if rows <= 0:
         return True
-    left = resize_qsa_buffers(
-        cache,
-        rows,
-        admit=lambda need: _qwen4_fixed_m4_layer_fits(
-            rt, need, session_bank=session_bank, protect_ids=protect_ids,
-        ),
-    )
+    failure = None
+    try:
+        left = resize_qsa_buffers(
+            cache,
+            rows,
+            admit=lambda need: _qwen4_fixed_m4_layer_fits(
+                rt, need, session_bank=session_bank, protect_ids=protect_ids,
+            ),
+        )
+    except Exception as exc:
+        # The memory refusing a layer's new buffers while they are written
+        # (an admission reads live bytes; it cannot promise the allocation)
+        # leaves that layer as it was: the request answers on the eager
+        # verifier, as a refused layer does. Anything else is not the
+        # resize's to absorb.
+        if not is_allocation_failure(exc):
+            raise
+        failure = f"{type(exc).__name__}: {exc}"
+    if failure is not None:
+        # The failed layer's new buffers went with the exception: wait for
+        # the GPU to let go of what it was writing into them, then hand them
+        # back to the system.
+        mx.synchronize()
+        _mlx_release_allocator_cache()
+        left = layers_to_resize(cache, rows)
+        receipt.update(
+            engaged=False, reason="memory_gate", resize_layers_left=int(left),
+            resize_error=failure,
+        )
+        _announce_qwen4_fixed_m4_skip(
+            f"resizing the conversation's QSA buffers to {rows} rows failed to "
+            f"allocate a layer ({left} left to resize): {failure}"
+        )
+        return False
     if left == 0:
         return True
     receipt.update(engaged=False, reason="memory_gate", resize_layers_left=int(left))
