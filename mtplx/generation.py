@@ -113,6 +113,8 @@ from .one_copy import (
     prefill_rows_scope,
     prefill_rows_target,
     prompt_lease_fields,
+    resize_bill,
+    resize_qsa_buffers,
 )
 from .mtp_history_cache_only import (
     mtp_history_cache_arrays,
@@ -412,7 +414,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
     prompt_ids: list[int] | None = None,
     receipt: dict | None = None,
     capacity_plan: FixedM4CapacityPlan | None = None,
-    held_rows: int | None = None,
+    held_cache: Any | None = None,
 ) -> bool:
     """Construction gate for the shape-specialized physical-M4 verifier.
 
@@ -481,7 +483,7 @@ def _qwen4_fixed_m4_compiled_verify_requested(
         rt, prompt_tokens=int(prompt_tokens), session_bank=session_bank,
         prompt_ids=prompt_ids, receipt=receipt,
         capacity_plan=capacity_plan or FixedM4CapacityPlan.for_request(max_tokens, runtime=rt),
-        held_rows=held_rows,
+        held_cache=held_cache,
     )
     if receipt is not None:
         receipt.update(engaged=fits, reason="admitted" if fits else "memory_gate")
@@ -670,7 +672,7 @@ def _qwen4_fixed_m4_admission(
     session_bank: Any | None,
     receipt: dict,
     capacity_plan: FixedM4CapacityPlan | None = None,
-    held_rows: int | None = None,
+    held_cache: Any | None = None,
 ) -> tuple[bool, int | None]:
     """Admit one request to the compiled fixed-M4 verify lane.
 
@@ -714,7 +716,7 @@ def _qwen4_fixed_m4_admission(
         prompt_ids=list(bank_key_ids),
         receipt=receipt,
         capacity_plan=capacity_plan,
-        held_rows=held_rows,
+        held_cache=held_cache,
     )
     return admitted, (vision["rope_delta"] if admitted else None)
 
@@ -796,6 +798,41 @@ def _qwen4_fixed_m4_promotion_adopts(
     ) is not None
 
 
+def _qwen4_fixed_m4_promotion_bill(
+    rt: Any, prompt_tokens: int, plan: FixedM4CapacityPlan, bank_rows: int,
+    held_cache: Any | None, held_rows: int | None, per_token: int,
+) -> tuple[str, int]:
+    """How the fixed-M4 bank gets its ``bank_rows`` rows, and the bytes it takes.
+
+    - ("adopted", 0): the one-copy store's buffers (``held_cache``) hold
+      rows the bank takes as they are.
+    - ("resized", peak): on the rows-gather lane, buffers at other rows are
+      resized to ``bank_rows`` one layer at a time before the bank adopts
+      them (one_copy.resize_bill), and the bank holds what a padded copy
+      would, at the same rows. The 2026-10-01 Pi turn of 147,396 tokens fit
+      its 147,456 held rows but not the 1,024-row reserve: the padded copy
+      of its 148,480-row bank was priced at 4.22 GB and refused, and that
+      turn and the 39 after it verified eagerly; resizing to the same rows
+      is 0.38 GB. The dense lane keeps its copy: its prefill does not size
+      the buffers for the bank, so every short turn would resize, and its
+      banks are small.
+    - ("copied", the whole padded bank): every other case, as before.
+    """
+
+    if held_cache is not None:
+        if held_rows is not None and _qwen4_fixed_m4_promotion_adopts(
+            rt, prompt_tokens, plan, bank_rows, held_rows
+        ):
+            return "adopted", 0
+        from .models.qwen4_exp import _qsa_gather_enabled, _qsa_gather_min_context
+
+        if _qsa_gather_enabled() and int(prompt_tokens) >= _qsa_gather_min_context():
+            peak = resize_bill(held_cache, bank_rows)
+            if peak is not None:
+                return "resized", peak
+    return "copied", int(bank_rows) * per_token
+
+
 def _qwen4_qsa_layer_count(rt: Any) -> int:
     """QSA (full-attention) layers of the served Flash-Next geometry, or 0."""
 
@@ -824,10 +861,33 @@ def _qwen4_fixed_m4_growth_fits(
 
     per_token = _qwen4_fixed_m4_promotion_bytes_per_token(rt)
     layers = _qwen4_qsa_layer_count(rt)
-    limit = _metal_memory_limit_bytes(rt)
-    if per_token <= 0 or layers <= 0 or limit <= 0:
+    if per_token <= 0 or layers <= 0:
         return True
-    need = int(rows) * per_token // layers
+    return _qwen4_fixed_m4_layer_fits(
+        rt, int(rows) * per_token // layers,
+        session_bank=session_bank, protect_ids=protect_ids,
+    )
+
+
+def _qwen4_fixed_m4_layer_fits(
+    rt: Any, need: int, *, session_bank: Any | None = None,
+    protect_ids: Sequence[int] | None = None,
+) -> bool:
+    """Room under the lane's line for ``need`` new bytes of one QSA layer.
+
+    What a layer-at-a-time change of the conversation's buffers asks before
+    each layer: an installed bank's growth (``_qwen4_fixed_m4_growth_fits``)
+    and the resize of the held buffers before the bank adopts them
+    (``_qwen4_fixed_m4_resize_held``). The allocator's cached bytes are
+    released first (they include the old layers a resize already let go
+    of), then idle session-bank entries give way; the request's own prompt
+    entry is protected.
+    """
+
+    limit = _metal_memory_limit_bytes(rt)
+    if limit <= 0:
+        return True
+    need = int(need)
     line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
     if _mlx_live_memory_bytes() + need <= line:
         return True
@@ -846,6 +906,39 @@ def _qwen4_fixed_m4_growth_fits(
         _mlx_release_allocator_cache()
         if _mlx_live_memory_bytes() + need <= line:
             return True
+    return False
+
+
+def _qwen4_fixed_m4_resize_held(
+    rt: Any, cache: Any, plan: FixedM4CapacityPlan, receipt: dict, *,
+    session_bank: Any | None, protect_ids: Sequence[int],
+) -> bool:
+    """Resize the held QSA buffers the admission priced, or keep the request eager.
+
+    Each layer asks for its own new bytes before any of them is allocated
+    (``_qwen4_fixed_m4_layer_fits``), so memory taken since the admission
+    stops the resize between layers. A stopped resize leaves every layer
+    whole, at its old rows or the bank's: the request verifies eagerly, as a
+    refused one always has, and the next request resizes the rest.
+    """
+
+    rows = int(plan.resize_rows or 0)
+    if rows <= 0:
+        return True
+    left = resize_qsa_buffers(
+        cache,
+        rows,
+        admit=lambda need: _qwen4_fixed_m4_layer_fits(
+            rt, need, session_bank=session_bank, protect_ids=protect_ids,
+        ),
+    )
+    if left == 0:
+        return True
+    receipt.update(engaged=False, reason="memory_gate", resize_layers_left=int(left))
+    _announce_qwen4_fixed_m4_skip(
+        f"resizing the conversation's QSA buffers to {rows} rows stopped with "
+        f"layers left to resize ({left}): the next layer is over the line"
+    )
     return False
 
 
@@ -1236,7 +1329,7 @@ def _qwen4_fixed_m4_lane_fits(
     prompt_ids: list[int] | None = None, receipt: dict | None = None,
     capacity_plan: FixedM4CapacityPlan | None = None,
     promotion_rows: int | None = None,
-    held_rows: int | None = None,
+    held_cache: Any | None = None,
 ) -> bool:
     """Per-request memory gate for the strict fixed-M4 lane.
 
@@ -1247,10 +1340,12 @@ def _qwen4_fixed_m4_lane_fits(
     507 while plain main ran. A skipped request constructs no bank and is
     byte-for-byte the plain eager batched path.
 
-    ``held_rows`` is what the request's stock QSA buffers already hold (the
-    one-copy store sizes them for the bank during the prefill). A promotion
-    that adopts them allocates nothing, so it is admitted without a price:
-    the compiled lane no longer competes with the conversation it serves.
+    ``held_cache`` is the request's cache when the one-copy store keeps the
+    conversation in it, and the promotion is priced on what the bank does
+    with its QSA buffers (``_qwen4_fixed_m4_promotion_bill``): adopting
+    buffers the prefill sized for it allocates nothing, and resizing buffers
+    at other rows costs the rows they gain plus one layer's new buffers.
+    The compiled lane no longer competes with the conversation it serves.
 
     MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT is an operator belt in prompt tokens;
     0 or unset leaves the live gate alone in charge: live allocator bytes
@@ -1280,11 +1375,24 @@ def _qwen4_fixed_m4_lane_fits(
         _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
         if promotion_rows is None else int(promotion_rows)
     )
-    if (
-        promotion_rows is None
-        and held_rows is not None
-        and _qwen4_fixed_m4_promotion_adopts(rt, prompt_tokens, plan, bank_rows, held_rows)
-    ):
+    if promotion_rows is not None:
+        held_cache = None
+    held_rows = held_qsa_rows(held_cache) if held_cache is not None else None
+    promotion, need = _qwen4_fixed_m4_promotion_bill(
+        rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
+    )
+    line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
+    live = 0 if promotion == "adopted" else _mlx_live_memory_bytes()
+    if live + need > line and plan.bucket and promotion_rows is None:
+        # A bucket must never evict an idle session or disable a compiled
+        # lane whose original allocation fits. Allocation consumes this same
+        # plan, including the admission decision to use the smaller bank.
+        plan.bucket = 0
+        bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
+        promotion, need = _qwen4_fixed_m4_promotion_bill(
+            rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
+        )
+    if promotion == "adopted":
         if receipt is not None:
             receipt.update(
                 promotion_bytes=0,
@@ -1295,16 +1403,9 @@ def _qwen4_fixed_m4_lane_fits(
                 promotion="adopted",
             )
         return True
-    need = bank_rows * per_token
-    live = _mlx_live_memory_bytes()
-    line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
-    if live + need > line and plan.bucket and promotion_rows is None:
-        # A bucket must never evict an idle session or disable a compiled
-        # lane whose original allocation fits. Allocation consumes this same
-        # plan, including the admission decision to use the smaller bank.
-        plan.bucket = 0
-        bank_rows = _qwen4_fixed_m4_bank_rows(rt, prompt_tokens, plan)
-        need = bank_rows * per_token
+    if held_cache is not None:
+        # Read by the request (_qwen4_fixed_m4_resize_held) once admitted.
+        plan.resize_rows = bank_rows if promotion == "resized" else 0
     if receipt is not None:
         receipt.update(
             live_bytes_before=live,
@@ -1313,7 +1414,10 @@ def _qwen4_fixed_m4_lane_fits(
             capacity_bucket=plan.bucket,
             reserve_tokens=plan.reserve_tokens,
             threshold_bytes=line,
+            promotion=promotion,
         )
+        if held_cache is not None:
+            receipt["held_rows"] = held_rows
     if live + need <= line:
         return True
     # The allocator cache is free memory the allocator is holding; only
@@ -11041,14 +11145,18 @@ def generate_mtpk(
         session_bank=session_bank,
         receipt=fixed_m4_admission,
         capacity_plan=fixed_m4_capacity_plan,
-        held_rows=(
-            held_qsa_rows(prompt_state.trunk_cache) if one_copy_runtime(rt) else None
-        ),
+        held_cache=prompt_state.trunk_cache if one_copy_runtime(rt) else None,
     )
     if qwen4_fixed_m4_compiled_verify:
         if one_copy_runtime(rt):
             fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_growth_fits(
                 rt, rows, session_bank=session_bank, protect_ids=bank_commit_ids,
+            )
+            # Buffers the prefill left at other rows than the bank's become
+            # the bank's own, one layer at a time, before it adopts them.
+            qwen4_fixed_m4_compiled_verify = _qwen4_fixed_m4_resize_held(
+                rt, cache, fixed_m4_capacity_plan, fixed_m4_admission,
+                session_bank=session_bank, protect_ids=bank_commit_ids,
             )
         else:
             fixed_m4_capacity_plan.admit_growth = lambda rows: _qwen4_fixed_m4_lane_fits(

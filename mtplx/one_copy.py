@@ -12,6 +12,10 @@ The one-copy store keeps a single set of buffers per conversation:
 - the prefill sizes the QSA buffers once to the rows the verifier's bank will
   have (``qwen4_exp.qsa_rows_target``), so the bank adopts them instead of
   copying (``graphbank.TensorOffsetQSACache.adoptable_rows``);
+- buffers a turn left at other rows (the prompt fits them and the bank's
+  reserve does not, or a turn on the eager verifier grew them its own way)
+  are resized to the bank's rows one layer at a time before the bank adopts
+  them (``resize_qsa_buffers``);
 - the bank hands the same buffers back at the end of the request
   (``demote(keep_capacity=True)``);
 - the session bank keeps the conversation as a reference lease with its
@@ -24,6 +28,7 @@ at the widths it read them.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 _DISABLE_VALUES = {"0", "false", "no", "off"}
@@ -57,7 +62,8 @@ def held_qsa_rows(cache: Any) -> int | None:
     """Rows every stock QSA layer of ``cache`` already holds, or None.
 
     None when the cache has no QSA layer or its layers disagree (then the
-    verifier's promotion pads and copies, as it always did).
+    buffers are resized to the bank's rows or the promotion copies them; see
+    ``resize_qsa_buffers``).
     """
 
     from .graphbank import TensorOffsetQSACache
@@ -76,6 +82,160 @@ def held_qsa_rows(cache: Any) -> int | None:
             return None
         rows.add(int(held))
     return rows.pop() if len(rows) == 1 else None
+
+
+def resize_qsa_buffers(
+    cache: Any, rows: int, *, admit: Callable[[int], bool] | None = None,
+) -> int:
+    """Give every stock QSA layer of ``cache`` buffers of exactly ``rows`` rows.
+
+    For a conversation whose held buffers are not ones its fixed-M4 bank can
+    adopt: the prompt fits them but the bank's reserve does not (the
+    2026-10-01 Pi session at 147,396 tokens in 147,456 rows, against a
+    1,024-row reserve), or a turn on the eager verifier, or a resize that
+    stopped, left the layers at other or unequal rows. Each buffer gets what
+    the bank's promotion would have padded or cut it into (its rows, then
+    zeros) in an allocation of its own, which the bank then adopts.
+
+    One layer at a time: ``admit`` is asked for the layer's new bytes before
+    any of them is allocated, the new buffers are written, and only then do
+    they replace the old ones, which go with their last reference. A refusal,
+    or an allocation that fails while a layer is written, leaves every layer
+    whole, at its old rows or at ``rows``, so the conversation's only copy
+    stays good. Returns how many layers are still at other rows: 0 when all
+    hold ``rows``.
+    """
+
+    entries = _resizable(cache)
+    if entries is None:
+        raise ValueError("this cache has a QSA layer that cannot be resized in place")
+    pending = [entry for entry in entries if _layer_bytes(entry, rows)[0] > 0]
+    for done, entry in enumerate(pending):
+        if admit is not None and not admit(_layer_bytes(entry, rows)[0]):
+            return len(pending) - done
+        _resize_layer(entry, rows)
+    return 0
+
+
+def resize_bill(cache: Any, rows: int) -> int | None:
+    """Bytes ``resize_qsa_buffers(cache, rows)`` adds, at its peak, to what ``cache`` holds.
+
+    The rows the layers resized before the peak gained, plus one layer's new
+    buffers written beside its old ones. On the 2026-10-01 turn (12 layers
+    of 147,456 rows, a 148,480-row bank) that is 0.38 GB, where the padded
+    copy of the same bank was priced at 4.22 GB. None when a QSA layer of
+    ``cache`` cannot be resized (a promoted bank, a missing buffer): the
+    promotion then copies, as it always did.
+    """
+
+    entries = _resizable(cache)
+    if entries is None:
+        return None
+    gained = peak = 0
+    for entry in entries:
+        new, old = _layer_bytes(entry, rows)
+        peak = max(peak, gained + new)
+        gained += new - old
+    return peak
+
+
+def _resizable(cache: Any) -> list[Any] | None:
+    """The QSA layers of ``cache`` when every one is stock with all its buffers."""
+
+    from .models.qwen4_exp import QSACache
+
+    entries = qsa_entries(cache)
+    if not entries:
+        return None
+    for entry in entries:
+        if not isinstance(entry, QSACache) or any(
+            leaf is None
+            for leaf in (entry.kv.keys, entry.kv.values, entry.raw_keys, entry.pooled)
+        ):
+            return None
+    return entries
+
+
+def _resized_buffers(entry: Any, rows: int) -> list[tuple[str, Any, int, int]]:
+    """(name, buffer, row axis, rows) for each buffer of ``entry`` not at the bank's rows.
+
+    Keys, values and raw index keys take ``rows`` rows and the pooled index
+    keys one block per ``ratio`` of them, as in the bank. A resize never cuts
+    into the rows a layer holds.
+    """
+
+    rows = int(rows)
+    offset = int(entry.kv.offset)
+    wanted = (
+        ("keys", entry.kv.keys, 2, rows, offset),
+        ("values", entry.kv.values, 2, rows, offset),
+        ("raw_keys", entry.raw_keys, 1, rows, offset),
+        ("pooled", entry.pooled, 1, rows // max(1, int(entry.ratio)), int(entry.pooled_len)),
+    )
+    resized = []
+    for name, buffer, axis, target, held in wanted:
+        if int(buffer.shape[axis]) == target:
+            continue
+        if target < held:
+            raise ValueError(f"QSA {name} hold {held} rows; resizing to {target} would cut them")
+        resized.append((name, buffer, axis, target))
+    return resized
+
+
+def _layer_bytes(entry: Any, rows: int) -> tuple[int, int]:
+    """(new, old) bytes of the buffers resizing ``entry`` to ``rows`` replaces."""
+
+    new = old = 0
+    for _name, buffer, axis, target in _resized_buffers(entry, rows):
+        row_bytes = int(buffer.dtype.size)
+        for dim, extent in enumerate(buffer.shape):
+            if dim != axis:
+                row_bytes *= int(extent)
+        new += row_bytes * target
+        old += int(buffer.nbytes)
+    return new, old
+
+
+def _resize_layer(entry: Any, rows: int) -> None:
+    """One layer's new buffers, written, then swapped in for its old ones.
+
+    Each holds the bank promotion's pad or cut (``TensorOffsetQSACache
+    ._fixed_bank``). A growth pads the rows with a broadcast zero, a view of
+    one scalar, where ``mx.zeros`` would allocate the pad as a block of its
+    own; a cut copies the rows, where a slice would be a view that keeps the
+    old buffer. Either way only the new buffers are allocated.
+    """
+
+    import mlx.core as mx
+
+    resized = {}
+    for name, buffer, axis, target in _resized_buffers(entry, rows):
+        current = int(buffer.shape[axis])
+        if current > target:
+            held = [slice(None)] * buffer.ndim
+            held[axis] = slice(0, target)
+            value = mx.asarray(buffer[tuple(held)], copy=True)
+        else:
+            shape = list(buffer.shape)
+            shape[axis] = target - current
+            zeros = mx.broadcast_to(mx.array(0, dtype=buffer.dtype), tuple(shape))
+            value = mx.concatenate([buffer, zeros], axis=axis)
+        resized[name] = value
+    mx.eval(*resized.values())
+    if "keys" in resized:
+        entry.kv.keys = resized["keys"]
+    if "values" in resized:
+        entry.kv.values = resized["values"]
+    if "raw_keys" in resized:
+        entry.raw_keys = resized["raw_keys"]
+    if "pooled" in resized:
+        entry.pooled = resized["pooled"]
+        # Derived from ``pooled``; rebuilt on the next stock read.
+        entry.pooled_f32_t = None
+    # The old buffers are let go when the command buffer that read them
+    # completes, which ``eval`` does not wait for: without this the next
+    # layer is admitted and allocated beside them (two layers at once).
+    mx.synchronize()
 
 
 def prefill_rows_target(rt: Any, prompt_tokens: int, plan: Any) -> int:

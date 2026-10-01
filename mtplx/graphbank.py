@@ -2118,12 +2118,17 @@ class FixedM4CapacityPlan:
 
     Admission may remove the bucket when only the parent's allocation fits.
     It never changes the reserve or the parent's dense reduction width.
+    ``resize_rows`` is the bank's rows when the admission priced resizing the
+    conversation's held buffers to them before the bank adopts them
+    (one_copy.resize_qsa_buffers); 0 when they are adopted or copied as they
+    are.
     """
 
     reserve_tokens: int
     bucket: int
     indexer_budget: int = 2048
     admit_growth: Callable[[int], bool] | None = field(default=None, repr=False, compare=False)
+    resize_rows: int = 0
 
     @classmethod
     def for_request(cls, max_tokens: int | None, *, width: int = 4, runtime: Any = None):
