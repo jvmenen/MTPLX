@@ -207,6 +207,14 @@ final class ClientWindowTests: XCTestCase {
             ]
             var chosen = model
             chosen["limit"] = ["context": context, "output": 9_000]
+            // What the CLI writes for --max-response-tokens: the cap as
+            // limit.output and as the model's header, here equal to the
+            // reserve and above OpenCode's 32,000 ceiling.
+            var atReserve = model
+            atReserve["headers"] = ["x-mtplx-max-response-tokens": String(output)]
+            var aboveCeiling = model
+            aboveCeiling["limit"] = ["context": context, "output": 50_000]
+            aboveCeiling["headers"] = ["x-mtplx-max-response-tokens": "50000"]
             let results = try chatParamsAfterHook(
                 plugin: URL(fileURLWithPath: result.sessionHeadersPluginPath),
                 cases: [
@@ -214,6 +222,8 @@ final class ClientWindowTests: XCTestCase {
                     "userCap": (["model": model], ["maxOutputTokens": 9_000]),
                     "absent": (["model": model], [:]),
                     "chosenLimit": (["model": chosen], ["maxOutputTokens": 9_000]),
+                    "atReserve": (["model": atReserve], ["maxOutputTokens": min(output, 32_000)]),
+                    "aboveCeiling": (["model": aboveCeiling], ["maxOutputTokens": 32_000]),
                 ]
             )
             // JSON.stringify drops undefined-valued keys.
@@ -221,6 +231,8 @@ final class ClientWindowTests: XCTestCase {
             XCTAssertEqual(results["userCap"]?["maxOutputTokens"] as? Int, 9_000, "window \(tokens)")
             XCTAssertNil(results["absent"]?["maxOutputTokens"], "window \(tokens)")
             XCTAssertEqual(results["chosenLimit"]?["maxOutputTokens"] as? Int, 9_000, "window \(tokens)")
+            XCTAssertEqual(results["atReserve"]?["maxOutputTokens"] as? Int, output, "window \(tokens)")
+            XCTAssertEqual(results["aboveCeiling"]?["maxOutputTokens"] as? Int, 50_000, "window \(tokens)")
         }
     }
 

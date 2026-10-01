@@ -2539,9 +2539,7 @@ def _sync_launched_client_window(state: Any) -> None:
         if args.launch_opencode:
             from mtplx.opencode import refresh_opencode_window
 
-            if refresh_opencode_window(
-                model_id, window, requested_output=args.max_response_tokens
-            )["written"]:
+            if refresh_opencode_window(model_id, window)["written"]:
                 _startup_line(
                     f"OpenCode window set to the {window:,} tokens this server serves."
                 )

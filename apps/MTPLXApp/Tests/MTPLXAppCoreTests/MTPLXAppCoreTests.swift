@@ -5517,14 +5517,16 @@ final class MTPLXAppCoreTests: XCTestCase {
             )
         )
         // The plugin file is managed in place: stale content is replaced
-        // with the template that strips exactly OpenCode's injected 32,000
-        // output cap and the <=1.18.20 qwen sampler pair.
+        // with the template that replaces exactly OpenCode's own output
+        // default, min(limit.output, 32,000), and strips the <=1.18.20 qwen
+        // sampler pair.
         let pluginSource = try XCTUnwrap(
             String(data: Data(contentsOf: managedPluginURL), encoding: .utf8)
         )
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedOutputCap = 32000;"))
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedQwenTemperature = 0.55;"))
-        XCTAssertTrue(pluginSource.contains("output.maxOutputTokens === mtplxInjectedOutputCap"))
+        XCTAssertTrue(pluginSource.contains("if (output.maxOutputTokens === opencodeDefault)"))
+        XCTAssertTrue(pluginSource.contains("const mtplxRequestedOutputHeader = \"x-mtplx-max-response-tokens\";"))
         XCTAssertTrue(pluginSource.contains("x-mtplx-session-id"))
 
         // Repeat sync with unchanged configuration: no rewrite churn.

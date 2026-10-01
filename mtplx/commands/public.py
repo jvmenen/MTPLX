@@ -9770,7 +9770,7 @@ def cmd_serve_public(args: Any) -> int:
                     "opencode",
                     health,
                     model_id=str(model_id),
-                    requested_output=getattr(args, "max_response_tokens", None),
+                    requested_output=_explicit_max_response_tokens(args),
                 )
                 _quickstart_launch_opencode_now()
                 _print_serve_start_line(
@@ -12884,7 +12884,10 @@ def _quickstart_opencode_payload(
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
     )
     opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
-    output_limit = opencode_output_limit(context_window, opencode_max_response_tokens)
+    # Only a cap the user typed reaches OpenCode's config; a pack's default
+    # cap is the server's to apply, and the reply reserve stays the default.
+    requested_output = _explicit_max_response_tokens(args)
+    output_limit = opencode_output_limit(context_window, requested_output)
     max_response_suffix = (
         f"--max-response-tokens {int(opencode_max_response_tokens)} "
         if opencode_max_response_tokens is not None
@@ -12931,7 +12934,7 @@ def _quickstart_opencode_payload(
         model_name=f"MTPLX {model_id}",
         api_key=getattr(args, "api_key", None),
         context_window=context_window,
-        output_limit=output_limit,
+        output_limit=requested_output,
         enable_thinking=enable_thinking,
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
@@ -13009,9 +13012,7 @@ def _quickstart_opencode_payload(
                 model_name=f"MTPLX {model_id}",
                 api_key=getattr(args, "api_key", None),
                 context_window=context_window,
-                # The cap the user asked for; the writer bounds it by the
-                # window it keeps or writes.
-                output_limit=opencode_max_response_tokens,
+                output_limit=requested_output,
                 enable_thinking=enable_thinking,
                 top_p=float(getattr(args, "top_p", 0.95)),
                 top_k=int(getattr(args, "top_k", 20)),
@@ -13270,6 +13271,21 @@ def _quickstart_print_opencode_handoff(
     _quickstart_line()
 
 
+def _explicit_max_response_tokens(args: Any) -> int | None:
+    """The answer cap the user typed with --max-response-tokens, if any.
+
+    A pack can also set ``max_response_tokens`` as its default
+    (``default_max_response_tokens``); the server applies that one itself,
+    so it is not the user's choice to write into a client's config.
+    """
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    value = getattr(args, "max_response_tokens", None)
+    if "max-response-tokens" not in cli_flags or value is None or int(value) <= 0:
+        return None
+    return int(value)
+
+
 def _quickstart_sync_client_window(
     client: str,
     health: dict[str, Any],
@@ -13283,6 +13299,9 @@ def _quickstart_sync_client_window(
     ``/health`` ``execution_window`` is the server's
     ``served_execution_window``, the value the app configures both clients
     from; a server too old to publish it leaves the config as written.
+    ``requested_output`` is the answer cap the user typed for this launch
+    (OpenCode only): the running server was started without it, so only
+    OpenCode's request can carry it.
     """
 
     served = health.get("execution_window")

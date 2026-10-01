@@ -88,12 +88,14 @@ public struct OpenCodeIntegration: Sendable {
     /// the reply reserve `outputLimit(forContextWindow:)` writes) and the
     /// qwen-keyed sampler OpenCode <= 1.18.20 sends. MTPLX then owns the
     /// uncapped generation contract while every explicit client choice
-    /// passes through untouched.
+    /// passes through untouched, and an answer cap the user gave the CLI
+    /// (the model's `x-mtplx-max-response-tokens` header) is sent whole.
     private static let sessionHeadersPluginSource = """
     const mtplxProviderID = (input) =>
       input?.model?.providerID || input?.provider?.id;
 
     const mtplxInjectedOutputCap = 32000;
+    const mtplxRequestedOutputHeader = "x-mtplx-max-response-tokens";
     const mtplxInjectedQwenTemperature = 0.55;
     const mtplxInjectedQwenTopP = 1;
 
@@ -111,24 +113,31 @@ public struct OpenCodeIntegration: Sendable {
         const providerID = mtplxProviderID(input);
         if (providerID && providerID !== "mtplx") return;
         // OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
-        // request and hands this hook the model with its limit. MTPLX writes
-        // limit.output as OpenCode's reply reserve, half the window and at most
-        // 32,000 (#480), so the injected value is 32,000 on large windows and
-        // that reserve on small ones. Strip exactly that injected default so
-        // MTPLX owns the uncapped generation contract; an explicit client cap
-        // (any other value, or a limit.output the user chose) passes through
-        // untouched.
+        // request and hands this hook the model with its limit and headers.
+        // MTPLX writes limit.output as OpenCode's reply reserve, half the window
+        // and at most 32,000 (#480), so by default that value is OpenCode's own
+        // and is stripped: the server's own limits apply. An answer cap the user
+        // asked MTPLX for (--max-response-tokens) is the model's
+        // x-mtplx-max-response-tokens header and is sent whole, past OpenCode's
+        // 32,000 ceiling; a limit.output that is not MTPLX's reserve is sent the
+        // same way. Any other value is a cap set in OpenCode itself and passes
+        // through untouched.
+        const positive = (value) => (Number.isInteger(value) && value > 0 ? value : null);
         const limit = input?.model?.limit;
-        const mtplxReserve = Number.isInteger(limit?.context) && limit.context > 0
-          ? Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(limit.context / 2)))
-          : null;
-        if (
-          output.maxOutputTokens === mtplxInjectedOutputCap
-          || (mtplxReserve !== null
-            && limit.output === mtplxReserve
-            && output.maxOutputTokens === mtplxReserve)
-        ) {
-          output.maxOutputTokens = undefined;
+        const configuredOutput = positive(limit?.output);
+        const opencodeDefault = configuredOutput === null
+          ? mtplxInjectedOutputCap
+          : Math.min(configuredOutput, mtplxInjectedOutputCap);
+        if (output.maxOutputTokens === opencodeDefault) {
+          const context = positive(limit?.context);
+          const mtplxReserve = context === null
+            ? null
+            : Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(context / 2)));
+          const requested = positive(Number(input?.model?.headers?.[mtplxRequestedOutputHeader]));
+          output.maxOutputTokens = requested
+            ?? (configuredOutput !== null && configuredOutput !== mtplxReserve
+              ? configuredOutput
+              : undefined);
         }
         // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
         // sampler (temperature 0.55, topP 1) for any model id containing

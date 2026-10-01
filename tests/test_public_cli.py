@@ -9896,8 +9896,8 @@ def test_opencode_pre_start_write_keeps_the_window_and_applies_a_requested_cap(
 ):
     """`mtplx start opencode` writes OpenCode's config before the server
     starts. It keeps the window the last handoff set, and a
-    --max-response-tokens cap still sets limit.output on that window (a
-    server already running may be too old to publish its window)."""
+    --max-response-tokens cap the user typed still sets limit.output on that
+    window (a server already running may be too old to publish its window)."""
     import mtplx.opencode
     from mtplx.opencode import refresh_opencode_window
 
@@ -9920,7 +9920,12 @@ def test_opencode_pre_start_write_keeps_the_window_and_applies_a_requested_cap(
     refresh_opencode_window(model_id, 32_768)
     public._quickstart_opencode_payload(args, write_config=True)
     assert limit() == {"context": 32_768, "output": 16_384}
+    # A pack's default cap is not the user's: the reserve stays.
     args.max_response_tokens = 9_000
+    public._quickstart_opencode_payload(args, write_config=True)
+    assert limit() == {"context": 32_768, "output": 16_384}
+    # A cap the user typed is written on the kept window.
+    args._cli_flags = {"max-response-tokens"}
     public._quickstart_opencode_payload(args, write_config=True)
     assert limit() == {"context": 32_768, "output": 9_000}
 

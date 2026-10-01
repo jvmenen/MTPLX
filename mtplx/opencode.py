@@ -35,10 +35,17 @@ OPENCODE_DEFAULT_CHUNK_TIMEOUT_MS = 900_000
 # all showing request_max_tokens=32000. The earlier 32_768 guess never
 # matched the wire, so the guard silently stripped nothing.
 OPENCODE_INJECTED_OUTPUT_CAP = 32_000
+# The answer cap a user asked for with --max-response-tokens, written as the
+# MTPLX model's own request header. OpenCode hands the model, headers
+# included, to the plugin, which sends this cap as the request's max_tokens:
+# it reaches a server that was started without the flag, and it can never be
+# mistaken for the reply reserve MTPLX writes as limit.output. OpenCode also
+# sends the header on every request; the server ignores it.
+OPENCODE_REQUESTED_OUTPUT_HEADER = "x-mtplx-max-response-tokens"
 
 
 def opencode_output_limit(context_window: int, requested: int | None = None) -> int:
-    """The reply budget OpenCode may plan around, never the whole window.
+    """``limit.output`` for the MTPLX model: OpenCode's reply reserve.
 
     OpenCode 1.18.29 keeps ``min(limit.output, 32_000)`` of ``limit.context``
     for the reply and compacts the moment a turn's total tokens reach the
@@ -46,17 +53,33 @@ def opencode_output_limit(context_window: int, requested: int | None = None) -> 
     context into ``limit.output`` therefore left a zero-token conversation
     window on any context <= 32K (8,192 on a 32 GB seat), and the compaction
     agent ran after every reply (issue #480: 48 summaries in 98 turns, no
-    turn past 7,801 tokens). Reserve at most half the window, capped at the
-    32,000 OpenCode injects on large windows. OpenCode also sends this
-    reserve as every request's max_tokens; the session-headers plugin strips
-    it there (``mtplxReserve``), so the server's own limits apply at every
-    window. SYNC: ``OpenCodeIntegration.outputLimit(forContextWindow:)``.
+    turn past 7,801 tokens). By default reserve at most half the window,
+    capped at the 32,000 OpenCode injects on large windows. OpenCode also
+    sends this reserve as every request's max_tokens; the session-headers
+    plugin strips it there (``mtplxReserve``), so the server's own limits
+    apply at every window. SYNC:
+    ``OpenCodeIntegration.outputLimit(forContextWindow:)``.
+
+    ``requested`` is an answer cap the user asked for (--max-response-tokens)
+    and is written as is: OpenCode then keeps that much of the window for
+    each reply, the user's own trade against compaction.
     """
-    context = max(1, int(context_window))
-    cap = max(1, min(OPENCODE_INJECTED_OUTPUT_CAP, context // 2))
     if requested is not None and int(requested) > 0:
-        return max(1, min(int(requested), cap))
-    return cap
+        return int(requested)
+    context = max(1, int(context_window))
+    return max(1, min(OPENCODE_INJECTED_OUTPUT_CAP, context // 2))
+
+
+def opencode_requested_output(model: Any) -> int | None:
+    """The answer cap recorded on an MTPLX model entry, if the user set one."""
+
+    headers = model.get("headers") if isinstance(model, dict) else None
+    value = headers.get(OPENCODE_REQUESTED_OUTPUT_HEADER) if isinstance(headers, dict) else None
+    try:
+        cap = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
 # OpenCode <= 1.18.20 (including Desktop 1.18.18) injects a qwen-keyed
 # sampler for any model id containing "qwen" (provider/transform.ts
 # `temperature()`/`topP()` at v1.18.18); 1.18.21 removed the rule. The plugin
@@ -87,6 +110,7 @@ OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE = (
   input?.model?.providerID || input?.provider?.id;
 
 const mtplxInjectedOutputCap = __MTPLX_INJECTED_OUTPUT_CAP__;
+const mtplxRequestedOutputHeader = "__MTPLX_REQUESTED_OUTPUT_HEADER__";
 const mtplxInjectedQwenTemperature = __MTPLX_INJECTED_QWEN_TEMPERATURE__;
 const mtplxInjectedQwenTopP = __MTPLX_INJECTED_QWEN_TOP_P__;
 
@@ -107,24 +131,31 @@ export const MTPLXSessionHeaders = async () => ({
     const providerID = mtplxProviderID(input);
     if (providerID && providerID !== "mtplx") return;
     // OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
-    // request and hands this hook the model with its limit. MTPLX writes
-    // limit.output as OpenCode's reply reserve, half the window and at most
-    // 32,000 (#480), so the injected value is 32,000 on large windows and
-    // that reserve on small ones. Strip exactly that injected default so
-    // MTPLX owns the uncapped generation contract; an explicit client cap
-    // (any other value, or a limit.output the user chose) passes through
-    // untouched.
+    // request and hands this hook the model with its limit and headers.
+    // MTPLX writes limit.output as OpenCode's reply reserve, half the window
+    // and at most 32,000 (#480), so by default that value is OpenCode's own
+    // and is stripped: the server's own limits apply. An answer cap the user
+    // asked MTPLX for (--max-response-tokens) is the model's
+    // x-mtplx-max-response-tokens header and is sent whole, past OpenCode's
+    // 32,000 ceiling; a limit.output that is not MTPLX's reserve is sent the
+    // same way. Any other value is a cap set in OpenCode itself and passes
+    // through untouched.
+    const positive = (value) => (Number.isInteger(value) && value > 0 ? value : null);
     const limit = input?.model?.limit;
-    const mtplxReserve = Number.isInteger(limit?.context) && limit.context > 0
-      ? Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(limit.context / 2)))
-      : null;
-    if (
-      output.maxOutputTokens === mtplxInjectedOutputCap
-      || (mtplxReserve !== null
-        && limit.output === mtplxReserve
-        && output.maxOutputTokens === mtplxReserve)
-    ) {
-      output.maxOutputTokens = undefined;
+    const configuredOutput = positive(limit?.output);
+    const opencodeDefault = configuredOutput === null
+      ? mtplxInjectedOutputCap
+      : Math.min(configuredOutput, mtplxInjectedOutputCap);
+    if (output.maxOutputTokens === opencodeDefault) {
+      const context = positive(limit?.context);
+      const mtplxReserve = context === null
+        ? null
+        : Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(context / 2)));
+      const requested = positive(Number(input?.model?.headers?.[mtplxRequestedOutputHeader]));
+      output.maxOutputTokens = requested
+        ?? (configuredOutput !== null && configuredOutput !== mtplxReserve
+          ? configuredOutput
+          : undefined);
     }
     // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
     // sampler (temperature 0.55, topP 1) for any model id containing
@@ -145,6 +176,7 @@ export const MTPLXSessionHeaders = async () => ({
 export default MTPLXSessionHeaders;
 """
     .replace("__MTPLX_INJECTED_OUTPUT_CAP__", str(OPENCODE_INJECTED_OUTPUT_CAP))
+    .replace("__MTPLX_REQUESTED_OUTPUT_HEADER__", OPENCODE_REQUESTED_OUTPUT_HEADER)
     .replace(
         "__MTPLX_INJECTED_QWEN_TEMPERATURE__",
         str(OPENCODE_INJECTED_QWEN_TEMPERATURE),
@@ -334,7 +366,11 @@ def build_opencode_provider_config(
     """Build the OpenCode provider/config fragment MTPLX owns.
 
     OpenCode's `limit` object is model metadata, not a server-side generation
-    cap. We intentionally do not write hidden maxTokens/maxOutput caps.
+    cap. We intentionally do not write hidden maxTokens/maxOutput caps:
+    ``output_limit`` is an answer cap the user asked for
+    (--max-response-tokens), written as ``limit.output`` and as the model's
+    ``x-mtplx-max-response-tokens`` header, which the session-headers plugin
+    sends as the request's cap.
 
     ``reasoning``/``temperature`` are declared capable so OpenCode round-trips
     assistant reasoning_content (preserve_thinking) and transmits explicit
@@ -378,6 +414,8 @@ def build_opencode_provider_config(
             "output": ["text"],
         },
     }
+    if output_limit is not None and int(output_limit) > 0:
+        model["headers"] = {OPENCODE_REQUESTED_OUTPUT_HEADER: str(int(output_limit))}
     if enable_thinking:
         if reasoning_effort:
             model["options"] = {"reasoningEffort": str(reasoning_effort)}
@@ -733,16 +771,17 @@ def refresh_opencode_window(
     That window (``served_execution_window``) exists only once the model is
     loaded, so the CLI's OpenCode handoff calls this after startup, as the
     app re-syncs OpenCode once its daemon answers. ``limit.context`` becomes
-    the window and ``limit.output`` its reply reserve
-    (:func:`opencode_output_limit`); nothing else in the file changes.
+    the window and ``limit.output`` its reply reserve, or the answer cap the
+    user asked for: ``requested_output`` when this launch was given one
+    (recorded as the model's header), else the one the entry records
+    (:func:`opencode_requested_output`). Nothing else in the file changes.
     """
 
     config_path = opencode_config_path(path)
-    output = opencode_output_limit(window, requested_output)
     result: dict[str, Any] = {
         "config_path": str(config_path),
         "context_window": int(window),
-        "output_limit": output,
+        "output_limit": opencode_output_limit(window),
         "written": False,
         "backup_path": None,
     }
@@ -752,6 +791,15 @@ def refresh_opencode_window(
     model = _mtplx_model_entry(existing, provider_id, model_id)
     if model is None:
         return result
+    typed = None
+    if requested_output is not None and int(requested_output) > 0:
+        typed = int(requested_output)
+    output = opencode_output_limit(window, typed or opencode_requested_output(model))
+    result["output_limit"] = output
+    refreshed = {**model, "limit": {"context": int(window), "output": output}}
+    if typed is not None:
+        headers = model.get("headers") if isinstance(model.get("headers"), dict) else {}
+        refreshed["headers"] = {**headers, OPENCODE_REQUESTED_OUTPUT_HEADER: str(typed)}
     provider = existing["provider"][provider_id]
     merged = {
         **existing,
@@ -759,13 +807,7 @@ def refresh_opencode_window(
             **existing["provider"],
             provider_id: {
                 **provider,
-                "models": {
-                    **provider["models"],
-                    str(model_id): {
-                        **model,
-                        "limit": {"context": int(window), "output": output},
-                    },
-                },
+                "models": {**provider["models"], str(model_id): refreshed},
             },
         },
     }
