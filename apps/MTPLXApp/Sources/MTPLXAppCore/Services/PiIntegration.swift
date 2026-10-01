@@ -306,7 +306,10 @@ public struct PiIntegration: Sendable {
         )
         var backupURL: URL?
 
-        var root = try loadRoot()
+        // A file Pi accepts (comments, trailing commas) is merged; one that
+        // does not parse throws before anything is written (#282).
+        let existingRoot = try loadRoot()
+        var root = existingRoot ?? [:]
         var providers = root["providers"]?.objectValue ?? [:]
         providers[Self.providerID] = .object(
             Self.mergedProviderConfig(
@@ -345,8 +348,9 @@ public struct PiIntegration: Sendable {
             source: Self.settingsExtensionSource()
         )
 
-        let existingData = try? Data(contentsOf: configURL)
-        if existingData == nextData {
+        // A file that already says this is left exactly as the user wrote
+        // it, comments and formatting included.
+        if let existingRoot, existingRoot == root {
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
             return PiConfigResult(
                 configPath: configURL.path,
@@ -358,7 +362,7 @@ public struct PiIntegration: Sendable {
             )
         }
 
-        if existingData != nil {
+        if fileManager.fileExists(atPath: configURL.path) {
             let backup = uniqueBackupURL(reason: "bak")
             try fileManager.copyItem(at: configURL, to: backup)
             backupURL = backup
@@ -710,22 +714,13 @@ public struct PiIntegration: Sendable {
         ]
     }
 
-    private func loadRoot() throws -> [String: JSONValue] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: configURL.path) else {
-            return [:]
-        }
-        let data = try Data(contentsOf: configURL)
-        guard !data.isEmpty else {
-            return [:]
-        }
-        do {
-            return try JSONDecoder().decode([String: JSONValue].self, from: data)
-        } catch {
-            let backup = uniqueBackupURL(reason: "invalid")
-            try fileManager.moveItem(at: configURL, to: backup)
-            return [:]
-        }
+    /// The current `models.json`, read as Pi reads it, or nil when there is
+    /// none. A file that does not parse is left in place and reported
+    /// (`ClientConfigFileError`); it used to be moved aside and replaced by
+    /// MTPLX's provider alone, which dropped every other provider and any
+    /// window pair the user set.
+    private func loadRoot() throws -> [String: JSONValue]? {
+        try ClientConfigFile.readObject(at: configURL)
     }
 
     private func uniqueBackupURL(reason: String) -> URL {

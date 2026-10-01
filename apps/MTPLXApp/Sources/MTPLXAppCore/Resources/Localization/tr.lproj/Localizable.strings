@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX yalnızca eksik bir model klasörü buldu. Bu model başlayabilmeden önce ağırlıkların tamamı indirilmeli.";
 "MTPLX healthy." = "MTPLX sağlıklı.";
 "MTPLX hero gauge" = "MTPLX ana göstergesi";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "%@ okunamadığı için MTPLX dosyayı değiştirmedi (%@). Dosyayı düzeltin veya taşıyın, sonra yeniden başlatın.";
 "MTPLX is already running." = "MTPLX zaten çalışıyor.";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX Apple Silicon için tasarlandı. Denemek isterseniz yerel bir klasör kullanın.";
 "MTPLX is loading" = "MTPLX yükleniyor";

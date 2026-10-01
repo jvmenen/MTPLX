@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX hanya menemukan sebagian folder model. Bobot lengkap perlu diunduh sebelum model ini dapat dimulai.";
 "MTPLX healthy." = "MTPLX sehat.";
 "MTPLX hero gauge" = "Indikator utama MTPLX";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "MTPLX membiarkan %@ tanpa perubahan karena file tersebut tidak dapat dibaca (%@). Perbaiki atau pindahkan file itu, lalu mulai lagi.";
 "MTPLX is already running." = "MTPLX sudah berjalan.";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX dibangun untuk Apple Silicon. Gunakan folder lokal jika Anda ingin bereksperimen.";
 "MTPLX is loading" = "MTPLX sedang memuat";

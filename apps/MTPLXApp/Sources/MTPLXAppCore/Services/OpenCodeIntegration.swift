@@ -199,7 +199,10 @@ public struct OpenCodeIntegration: Sendable {
             .appendingPathComponent(Self.sessionHeadersPluginName)
         var backupURL: URL?
 
-        var root = try loadRoot()
+        // A file OpenCode accepts (comments, trailing commas) is merged; one
+        // that does not parse throws before anything is written.
+        let existingRoot = try loadRoot()
+        var root = existingRoot ?? [:]
         var providers = root["provider"]?.objectValue ?? [:]
         let limits = Self.modelLimits(
             configuration: configuration,
@@ -243,8 +246,9 @@ public struct OpenCodeIntegration: Sendable {
             at: sessionHeadersPluginURL
         )
 
-        let existingData = try? Data(contentsOf: configURL)
-        if existingData == nextData {
+        // A file that already says this is left exactly as the user wrote
+        // it, comments and formatting included.
+        if let existingRoot, existingRoot == root {
             let visibility = try ensureReasoningSummariesVisible()
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
             return OpenCodeConfigResult(
@@ -260,7 +264,7 @@ public struct OpenCodeIntegration: Sendable {
             )
         }
 
-        if existingData != nil {
+        if fileManager.fileExists(atPath: configURL.path) {
             let backup = uniqueBackupURL(reason: "bak")
             try fileManager.copyItem(at: configURL, to: backup)
             backupURL = backup
@@ -651,22 +655,12 @@ public struct OpenCodeIntegration: Sendable {
         return Self.repairDeadWorkspaceState(globalStoreURL: globalStoreURL)
     }
 
-    private func loadRoot() throws -> [String: JSONValue] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: configURL.path) else {
-            return [:]
-        }
-        let data = try Data(contentsOf: configURL)
-        guard !data.isEmpty else {
-            return [:]
-        }
-        do {
-            return try JSONDecoder().decode([String: JSONValue].self, from: data)
-        } catch {
-            let backup = uniqueBackupURL(reason: "invalid")
-            try fileManager.moveItem(at: configURL, to: backup)
-            return [:]
-        }
+    /// The current `opencode.json`, read as OpenCode reads it (JSON with
+    /// comments and trailing commas), or nil when there is none. A file that
+    /// does not parse is left in place and reported (`ClientConfigFileError`);
+    /// it used to be moved aside and replaced by MTPLX's provider alone.
+    private func loadRoot() throws -> [String: JSONValue]? {
+        try ClientConfigFile.readObject(at: configURL)
     }
 
     /// Register the managed plugin in the config's `plugin` list, replacing

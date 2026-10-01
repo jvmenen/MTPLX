@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX n'a trouvé qu'un dossier de modèle partiel. Tous les poids doivent être téléchargés avant que ce modèle ne puisse démarrer.";
 "MTPLX healthy." = "MTPLX opérationnel.";
 "MTPLX hero gauge" = "Jauge principale MTPLX";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "MTPLX a laissé %@ inchangé, car le fichier n'a pas pu être lu (%@). Corrigez ou déplacez ce fichier, puis relancez.";
 "MTPLX is already running." = "MTPLX est déjà en cours d'exécution.";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX est conçu pour Apple Silicon. Utilisez un dossier local si vous souhaitez faire des essais.";
 "MTPLX is loading" = "MTPLX est en cours de chargement";

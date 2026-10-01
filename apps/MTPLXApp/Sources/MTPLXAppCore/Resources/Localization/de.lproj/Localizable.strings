@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX hat nur einen unvollständigen Modellordner gefunden. Die vollständigen Gewichte müssen heruntergeladen werden, bevor dieses Modell starten kann.";
 "MTPLX healthy." = "MTPLX fehlerfrei.";
 "MTPLX hero gauge" = "MTPLX-Hauptanzeige";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "MTPLX hat %@ unverändert gelassen, weil die Datei nicht gelesen werden konnte (%@). Korrigiere oder verschiebe die Datei und starte dann erneut.";
 "MTPLX is already running." = "MTPLX läuft bereits.";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX ist für Apple Silicon entwickelt. Verwende einen lokalen Ordner, wenn du experimentieren möchtest.";
 "MTPLX is loading" = "MTPLX lädt";

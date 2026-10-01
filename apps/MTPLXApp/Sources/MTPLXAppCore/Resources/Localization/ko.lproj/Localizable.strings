@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX가 일부 모델 폴더만 발견했습니다. 이 모델을 시작하려면 전체 가중치를 다운로드해야 합니다.";
 "MTPLX healthy." = "MTPLX 정상 동작 중.";
 "MTPLX hero gauge" = "MTPLX 히어로 게이지";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "%@ 파일을 읽을 수 없어(%@) MTPLX가 변경하지 않았습니다. 파일을 수정하거나 옮긴 다음 다시 시작하십시오.";
 "MTPLX is already running." = "MTPLX가 이미 실행 중입니다.";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX는 Apple Silicon에 맞춰 구축되었습니다. 실험해 보려면 로컬 폴더를 사용하십시오.";
 "MTPLX is loading" = "MTPLX 로드 중";

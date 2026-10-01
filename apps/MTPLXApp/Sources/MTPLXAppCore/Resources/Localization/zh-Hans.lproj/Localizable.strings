@@ -835,6 +835,7 @@
 "MTPLX found only a partial model folder. The full weights need to download before this model can start." = "MTPLX 仅发现部分模型文件夹。必须下载完整权重后此模型才能启动。";
 "MTPLX healthy." = "MTPLX 运行正常。";
 "MTPLX hero gauge" = "MTPLX 主速度表";
+"MTPLX left %@ unchanged because it could not be read (%@). Fix or move that file, then start again." = "无法读取 %@（%@），MTPLX 未做任何更改。请修复或移走该文件，然后重新启动。";
 "MTPLX is already running." = "MTPLX 已在运行。";
 "MTPLX is built for Apple Silicon. Use a local folder if you want to experiment." = "MTPLX 专为 Apple Silicon 构建。若要进行试验，请使用本地文件夹。";
 "MTPLX is loading" = "MTPLX 正在加载";

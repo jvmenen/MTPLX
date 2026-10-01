@@ -26,9 +26,13 @@ class InvalidConfigFile(ValueError):
 
 
 def loads(text: str) -> Any:
-    """Parse JSON, also accepting ``//`` and ``/* */`` comments and trailing
-    commas. Raises ``json.JSONDecodeError`` positioned in the original text."""
+    """Parse JSON, also accepting ``//`` and ``/* */`` comments, trailing
+    commas and a leading byte order mark (Pi strips one before parsing).
+    Raises ``json.JSONDecodeError`` positioned in the original text.
+    SYNC: ``ClientConfigFile`` in the app."""
 
+    if text.startswith("\ufeff"):
+        text = text[1:]
     try:
         return json.loads(text)
     except json.JSONDecodeError:
