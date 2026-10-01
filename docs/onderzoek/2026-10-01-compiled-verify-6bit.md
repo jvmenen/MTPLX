@@ -54,3 +54,24 @@ Same harness and server arguments, 4-bit Qwen3.6-35B-A3B Speed-yb, tree `perf/ve
 - Greedy, 32 streams: eager against eager + async 8 32 of 32 identical; compiled against compiled + async 8 32 of 32 identical; compiled against eager 31 of 32 (same Dutch prompt, token 116 of 254, as in the control above).
 - Swap before/after per run between 7.8 GB and 4.7 GB used of 8 GB, never growing more than 0.04 GB; guard at +2 GB never fired.
 
+
+## Addendum: fair re-measurement, 6-bit eager + async chunk against compiled + async chunk (1 Oct)
+
+Question: the first table showed eager + async 8 (101.3 / 101.8) ahead of compiled + async 8 (96.2 / 96.8), but the compiled runs came while the Mac was at thermal level 1-2. Was that gap heat?
+
+Setup: Qwen3.6-35B-A3B Balance-yb, depth 2, FR-Spec, same server arguments, env and prompts as above. Tree: `perf/verify-async-chunk` (063d77b5) plus the two `perf/compiled-verify-6bit` commits (temporary worktree, removed afterwards). Variant A: `MTPLX_COMPILED_VERIFY=0` + `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8`. Variant B: `MTPLX_COMPILED_VERIFY_ALLOW_BITS=6` + the same async setting. Order A B B A A B. Before every run the thermal pressure level had to be 0 for at least 60 s (it was, every time). Fresh server (model load) per run for both variants. AC power for all six runs, no sleep (load sampler never saw a gap above 4 s), swap flat (3.69 to 3.52 GB used, falling).
+
+| Run | Variant | Overall tok/s | Code | English | Dutch | Round ms | Thermal at start / end / max during | Compiled share |
+|---|---|---|---|---|---|---|---|---|
+| 1 | A | 98.4 | 109.8 | 96.9 | 92.8 | 23.82 | 0 / 0 / 0 | 0% |
+| 2 | B | 96.7 | 107.6 | 96.3 | 91.8 | 24.67 | 0 / 0 / 0 | ~70% |
+| 3 | B | 95.0 | 107.3 | 93.9 | 90.9 | 24.78 | 0 / 2 / 2 | ~66% |
+| 4 | A | 100.2 | 112.5 | 99.1 | 95.6 | 23.60 | 0 / 1 / 1 | 0% |
+| 5 | A | 102.4 | 115.1 | 99.6 | 98.2 | 23.36 | 0 / 1 / 1 | 0% |
+| 6 | B | 95.0 | 100.8 | 93.0 | 95.0 | 25.17 | 0 / 2 / 1 | ~67% |
+
+Overall tok/s = generated tokens over decode time, summed over the 11 requests. Mean A: 100.3 tok/s (round 23.59 ms). Mean B: 95.6 tok/s (round 24.87 ms). A is +5.0% (4.8 tok/s, 1.28 ms per round). The ranges do not overlap (A 98.4 to 102.4, B 95.0 to 96.7) and run 2 (B, thermal level 0 throughout) is still below both neighbouring A runs 1 and 4. The B runs saw slightly more heat (level 2 in two of three), which may cost B 1 to 2%; that does not explain 5%.
+
+Correction to the route claim: B is not all compiled on 800 to 1200 token requests. Per request about 300 of 470 verify calls ran compiled; the rest fell back to eager after `growth_budget_exhausted` (one demotion per request). The earlier 3115/3115 came from the short correctness streams. So B here is a mix, which if anything helps B; a fully compiled run would need `MTPLX_COMPILED_VERIFY_GROWTH_RESERVE` raised (not tried). A had zero compiled calls, as intended.
+
+Conclusion: the earlier lead of eager + async over compiled + async on 6-bit is real, not heat noise. Recommendation unchanged: keep the async chunk, leave the 6-bit gate alone.
