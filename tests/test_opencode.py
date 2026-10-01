@@ -553,6 +553,82 @@ console.log(JSON.stringify(results));
     assert results["foreign"]["topP"] == 1
 
 
+def _chat_params_after_hook(tmp_path: Path, plugin: Path, cases: dict) -> dict:
+    """Run the plugin's chat.params hook under node on each (input, output)."""
+
+    harness = tmp_path / "chat-params-harness.mjs"
+    harness.write_text(
+        f"""
+import plugin from {json.dumps(str(plugin))};
+const hooks = await plugin();
+const cases = {json.dumps(cases)};
+const results = {{}};
+for (const [name, [input, output]] of Object.entries(cases)) {{
+  await hooks["chat.params"](input, output);
+  results[name] = output;
+}}
+console.log(JSON.stringify(results));
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(harness)], capture_output=True, text=True, check=True
+    )
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+@pytest.mark.parametrize("window", [20_480, 32_768, 65_536, 262_144])
+def test_opencode_plugin_strips_the_output_limit_mtplx_configured(tmp_path, window):
+    """OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
+    request and hands the hook the model with its limit (provider/transform.ts
+    maxOutputTokens; CLI 1.18.29 and Desktop 1.18.31). Below a 64K window the
+    limit.output MTPLX configures is half the window (#480), and a hook that
+    stripped only 32,000 left every answer capped there: 16,384 on 32,768.
+    The generated plugin runs on the request OpenCode builds from the config
+    MTPLX wrote: the injected value goes at every window, a user cap stays,
+    and so does a limit.output the user chose (--max-response-tokens)."""
+
+    def written_model(config_path, **kwargs):
+        write_opencode_config(
+            base_url="http://127.0.0.1:8000/v1",
+            model_id="mtplx-qwen",
+            path=config_path,
+            context_window=window,
+            **kwargs,
+        )
+        limit = json.loads(config_path.read_text())["provider"]["mtplx"]["models"][
+            "mtplx-qwen"
+        ]["limit"]
+        return {"providerID": "mtplx", "id": "mtplx-qwen", "limit": limit}
+
+    config_path = tmp_path / "opencode.json"
+    model = written_model(config_path)
+    assert model["limit"] == {"context": window, "output": min(32_000, window // 2)}
+    chosen = written_model(tmp_path / "chosen" / "opencode.json", output_limit=9_000)
+    assert chosen["limit"] == {"context": window, "output": 9_000}
+
+    def sent(model):
+        # What OpenCode puts in the request before the hook runs.
+        return {"maxOutputTokens": min(model["limit"]["output"], OPENCODE_INJECTED_OUTPUT_CAP)}
+
+    results = _chat_params_after_hook(
+        tmp_path,
+        opencode_session_headers_plugin_path(config_path) / "index.js",
+        {
+            "injected": [{"model": model}, sent(model)],
+            "user_cap": [{"model": model}, {"maxOutputTokens": 9_000}],
+            "absent": [{"model": model}, {}],
+            "chosen_limit": [{"model": chosen}, sent(chosen)],
+        },
+    )
+    # JSON.stringify drops undefined-valued keys.
+    assert "maxOutputTokens" not in results["injected"]
+    assert results["user_cap"]["maxOutputTokens"] == 9_000
+    assert "maxOutputTokens" not in results["absent"]
+    assert results["chosen_limit"]["maxOutputTokens"] == 9_000
+
+
 def test_repair_opencode_desktop_state_prunes_missing_workspace(tmp_path, monkeypatch):
     app_support = tmp_path / "OpenCodeSupport"
     app_support.mkdir()

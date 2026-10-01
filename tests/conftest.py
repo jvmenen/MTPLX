@@ -60,8 +60,15 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # else writes into this scratch file.
     monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(isolated / "opencode.json"))
     # Pi's models.json and the extensions MTPLX installs beside it get the
-    # same treatment: ~/.pi/agent is never written by the suite.
+    # same treatment: ~/.pi/agent is never written by the suite. So do the
+    # OpenCode Desktop stores the OpenCode writer and launcher edit on macOS.
     monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(isolated / "pi" / "models.json"))
+    monkeypatch.setenv(
+        "MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(isolated / "opencode-desktop.dat")
+    )
+    monkeypatch.setenv(
+        "MTPLX_OPENCODE_DESKTOP_APP_SUPPORT", str(isolated / "opencode-desktop")
+    )
     # The system memory guard reads how much memory the kernel can still hand
     # out. On a developer machine that figure depends on what else is open,
     # so the suite sees "unknown" (the guard takes no action) unless a test

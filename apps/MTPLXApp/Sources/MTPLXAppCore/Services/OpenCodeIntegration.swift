@@ -78,14 +78,16 @@ public struct OpenCodeIntegration: Sendable {
     private static let desktopGlobalStoreName = "opencode.global.dat"
     private static let sessionHeadersPluginName = "mtplx-session-headers.js"
 
-    /// The managed OpenCode plugin both writers install (byte-identical to
-    /// `mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`; both compare
-    /// content before rewriting, so the lanes never fight). It carries the
-    /// session headers and strips exactly the client-injected values —
-    /// OpenCode's 32,000 output ceiling (provider/transform.ts
-    /// OUTPUT_TOKEN_MAX, min'd against limit.output on every request) and
-    /// the qwen-keyed sampler OpenCode <= 1.18.20 injects — so MTPLX owns
-    /// the uncapped generation contract while every explicit client choice
+    /// The managed OpenCode plugin the app installs, with the same
+    /// `chat.params` rules as the CLI's package plugin
+    /// (`mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`); both writers
+    /// compare content before rewriting, so the lanes never fight. It carries
+    /// the session headers and strips exactly the values OpenCode injects:
+    /// its output ceiling (provider/transform.ts maxOutputTokens,
+    /// min(limit.output, 32,000) on every request, which on a small window is
+    /// the reply reserve `outputLimit(forContextWindow:)` writes) and the
+    /// qwen-keyed sampler OpenCode <= 1.18.20 sends. MTPLX then owns the
+    /// uncapped generation contract while every explicit client choice
     /// passes through untouched.
     private static let sessionHeadersPluginSource = """
     const mtplxProviderID = (input) =>
@@ -108,12 +110,24 @@ public struct OpenCodeIntegration: Sendable {
       "chat.params": async (input, output) => {
         const providerID = mtplxProviderID(input);
         if (providerID && providerID !== "mtplx") return;
-        // OpenCode injects maxOutputTokens = min(limit.output, 32000) on every
-        // request even when the configured model advertises a larger native
-        // context. Strip exactly that injected default so MTPLX owns the
-        // uncapped generation contract; an explicit client cap (any other
-        // value) passes through untouched.
-        if (output.maxOutputTokens === mtplxInjectedOutputCap) {
+        // OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
+        // request and hands this hook the model with its limit. MTPLX writes
+        // limit.output as OpenCode's reply reserve, half the window and at most
+        // 32,000 (#480), so the injected value is 32,000 on large windows and
+        // that reserve on small ones. Strip exactly that injected default so
+        // MTPLX owns the uncapped generation contract; an explicit client cap
+        // (any other value, or a limit.output the user chose) passes through
+        // untouched.
+        const limit = input?.model?.limit;
+        const mtplxReserve = Number.isInteger(limit?.context) && limit.context > 0
+          ? Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(limit.context / 2)))
+          : null;
+        if (
+          output.maxOutputTokens === mtplxInjectedOutputCap
+          || (mtplxReserve !== null
+            && limit.output === mtplxReserve
+            && output.maxOutputTokens === mtplxReserve)
+        ) {
           output.maxOutputTokens = undefined;
         }
         // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
@@ -937,6 +951,10 @@ public struct OpenCodeIntegration: Sendable {
     /// 1.18.29). Mirroring the context into the output limit left a zero-token
     /// conversation window on small seats, so every reply was summarised
     /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
+    /// OpenCode also sends this reserve as every request's max_tokens; the
+    /// managed plugin strips it there (`mtplxReserve`), so the server's own
+    /// limits apply at every window. SYNC: mtplx/opencode.py
+    /// `opencode_output_limit`.
     static func outputLimit(forContextWindow context: Int) -> Int {
         min(32_000, max(1, context / 2))
     }

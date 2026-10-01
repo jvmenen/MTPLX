@@ -180,7 +180,93 @@ final class ClientWindowTests: XCTestCase {
         XCTAssertEqual(try openCodeLimit(at: url)["context"]?.intValue, 40_000)
     }
 
+    func testOpenCodePluginStripsTheReplyReserveMTPLXConfigured() throws {
+        // OpenCode sends maxOutputTokens = min(limit.output, 32,000) with every
+        // request and hands the plugin the model with its limit (CLI 1.18.29,
+        // Desktop 1.18.31). Below a 64K window limit.output is half the window
+        // (#480), and a plugin that stripped only 32,000 left every answer
+        // capped there: 16,384 on 32,768. The generated plugin runs on the
+        // request OpenCode builds from the config the app wrote: the injected
+        // value goes at every window; a user cap and a limit.output the user
+        // chose reach the server.
+        for tokens in [20_480, 32_768, 65_536, 262_144] {
+            let url = temporaryDirectory().appendingPathComponent("opencode.json")
+            let result = try openCode(url).sync(
+                configuration: MTPLXAppConfiguration(model: flashNext, port: 8000, contextWindow: 262_144),
+                servedWindow: ServedExecutionWindow(tokens: tokens)
+            )
+            let limit = try openCodeLimit(at: url)
+            let context = try XCTUnwrap(limit["context"]?.intValue)
+            let output = try XCTUnwrap(limit["output"]?.intValue)
+            XCTAssertEqual(context, tokens)
+            XCTAssertEqual(output, min(32_000, tokens / 2))
+            let model: [String: Any] = [
+                "providerID": "mtplx",
+                "id": OpenCodeIntegration.modelID(for: flashNext),
+                "limit": ["context": context, "output": output],
+            ]
+            var chosen = model
+            chosen["limit"] = ["context": context, "output": 9_000]
+            let results = try chatParamsAfterHook(
+                plugin: URL(fileURLWithPath: result.sessionHeadersPluginPath),
+                cases: [
+                    "injected": (["model": model], ["maxOutputTokens": min(output, 32_000)]),
+                    "userCap": (["model": model], ["maxOutputTokens": 9_000]),
+                    "absent": (["model": model], [:]),
+                    "chosenLimit": (["model": chosen], ["maxOutputTokens": 9_000]),
+                ]
+            )
+            // JSON.stringify drops undefined-valued keys.
+            XCTAssertNil(results["injected"]?["maxOutputTokens"], "window \(tokens)")
+            XCTAssertEqual(results["userCap"]?["maxOutputTokens"] as? Int, 9_000, "window \(tokens)")
+            XCTAssertNil(results["absent"]?["maxOutputTokens"], "window \(tokens)")
+            XCTAssertEqual(results["chosenLimit"]?["maxOutputTokens"] as? Int, 9_000, "window \(tokens)")
+        }
+    }
+
     // MARK: Helpers
+
+    /// Runs the generated plugin's chat.params hook under node on each
+    /// (input, output) pair and returns the outputs; skips without node.
+    private func chatParamsAfterHook(
+        plugin: URL,
+        cases: [String: (input: [String: Any], output: [String: Any])]
+    ) throws -> [String: [String: Any]] {
+        let searchPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        guard let node = searchPath.split(separator: ":")
+            .map({ URL(fileURLWithPath: String($0)).appendingPathComponent("node") })
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+        else { throw XCTSkip("node is not installed") }
+        let directory = temporaryDirectory()
+        // A .mjs copy loads as a module on every node version.
+        try FileManager.default.copyItem(at: plugin, to: directory.appendingPathComponent("plugin.mjs"))
+        let payload = try JSONSerialization.data(
+            withJSONObject: cases.mapValues { [$0.input, $0.output] }
+        )
+        let harness = directory.appendingPathComponent("harness.mjs")
+        try """
+        import plugin from "./plugin.mjs";
+        const hooks = await plugin();
+        const cases = \(String(decoding: payload, as: UTF8.self));
+        const results = {};
+        for (const [name, [input, output]] of Object.entries(cases)) {
+          await hooks["chat.params"](input, output);
+          results[name] = output;
+        }
+        console.log(JSON.stringify(results));
+        """.write(to: harness, atomically: true, encoding: .utf8)
+        let process = Process()
+        process.executableURL = node
+        process.arguments = [harness.path]
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        try process.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Any]])
+    }
+
 
     private func openCode(_ url: URL) -> OpenCodeIntegration {
         OpenCodeIntegration(

@@ -26,8 +26,10 @@ OPENCODE_NPM_PACKAGE = "@ai-sdk/openai-compatible"
 OPENCODE_DEFAULT_CONTEXT_WINDOW = 262_144
 OPENCODE_DEFAULT_CHUNK_TIMEOUT_MS = 900_000
 # OpenCode's own injected output ceiling when the user never set a cap. The
-# plugin strips exactly this value: anything else is a deliberate client cap
-# and must reach MTPLX intact. Receipts: sst/opencode v1.18.21
+# plugin strips exactly this value, and below a 64K window the smaller reply
+# reserve MTPLX writes as limit.output (opencode_output_limit): anything
+# else is a deliberate client cap and must reach MTPLX intact.
+# Receipts: sst/opencode v1.18.21
 # provider/transform.ts `OUTPUT_TOKEN_MAX = 32_000` (min'd against
 # limit.output on every request), and request-log-8002.jsonl records 313-327
 # all showing request_max_tokens=32000. The earlier 32_768 guess never
@@ -45,8 +47,10 @@ def opencode_output_limit(context_window: int, requested: int | None = None) -> 
     window on any context <= 32K (8,192 on a 32 GB seat), and the compaction
     agent ran after every reply (issue #480: 48 summaries in 98 turns, no
     turn past 7,801 tokens). Reserve at most half the window, capped at the
-    32,000 OpenCode injects on large windows (which the session-headers
-    plugin strips, so the server's own defaults still apply there).
+    32,000 OpenCode injects on large windows. OpenCode also sends this
+    reserve as every request's max_tokens; the session-headers plugin strips
+    it there (``mtplxReserve``), so the server's own limits apply at every
+    window. SYNC: ``OpenCodeIntegration.outputLimit(forContextWindow:)``.
     """
     context = max(1, int(context_window))
     cap = max(1, min(OPENCODE_INJECTED_OUTPUT_CAP, context // 2))
@@ -102,12 +106,24 @@ export const MTPLXSessionHeaders = async () => ({
   "chat.params": async (input, output) => {
     const providerID = mtplxProviderID(input);
     if (providerID && providerID !== "mtplx") return;
-    // OpenCode injects maxOutputTokens = min(limit.output, 32000) on every
-    // request even when the configured model advertises a larger native
-    // context. Strip exactly that injected default so MTPLX owns the
-    // uncapped generation contract; an explicit client cap (any other
-    // value) passes through untouched.
-    if (output.maxOutputTokens === mtplxInjectedOutputCap) {
+    // OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
+    // request and hands this hook the model with its limit. MTPLX writes
+    // limit.output as OpenCode's reply reserve, half the window and at most
+    // 32,000 (#480), so the injected value is 32,000 on large windows and
+    // that reserve on small ones. Strip exactly that injected default so
+    // MTPLX owns the uncapped generation contract; an explicit client cap
+    // (any other value, or a limit.output the user chose) passes through
+    // untouched.
+    const limit = input?.model?.limit;
+    const mtplxReserve = Number.isInteger(limit?.context) && limit.context > 0
+      ? Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(limit.context / 2)))
+      : null;
+    if (
+      output.maxOutputTokens === mtplxInjectedOutputCap
+      || (mtplxReserve !== null
+        && limit.output === mtplxReserve
+        && output.maxOutputTokens === mtplxReserve)
+    ) {
       output.maxOutputTokens = undefined;
     }
     // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
