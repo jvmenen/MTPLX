@@ -459,9 +459,11 @@ def _verify_async_chunk_layers() -> int:
     ``mx.async_eval`` on the residual stream every N layers, so the GPU starts
     on layers 0..N-1 while the host is still building the graph for the rest.
     Same kernels, same inputs, only the submit points move: the output is
-    bit-identical. Measured on Qwen3.6-35B-A3B (6-bit, eager verify) at depth
-    2: the host spends ~2 ms per round building the verify graph with the GPU
-    idle; N=8 cut the round from ~26 to ~23.7 ms (M5 Pro, 2026-09-30).
+    bit-identical. Inside a graph transformation (the compiled verify trace)
+    nothing is submitted, so the compiled path is unchanged. Measured on
+    Qwen3.6-35B-A3B (6-bit, eager verify) at depth 2: the host spends ~2 ms
+    per round building the verify graph with the GPU idle; N=8 cut the round
+    from ~26 to ~23.7 ms (M5 Pro, 2026-09-30).
     Default off.
     """
 
@@ -472,6 +474,30 @@ def _verify_async_chunk_layers() -> int:
         return max(0, int(raw))
     except ValueError:
         return 0
+
+
+def _try_async_submit(array: mx.array) -> bool:
+    """``mx.async_eval(array)`` unless a graph transformation is tracing.
+
+    The chunked submit only belongs on the eager verify path. Inside an
+    ``mx.compile`` trace (the compiled verify bank, a compiled forward) an
+    ``async_eval`` raises, and the bank would count that as a trace failure
+    and demote the whole verify to eager. Returns False when tracing, so the
+    caller stops submitting for the rest of the forward and the traced graph
+    is exactly the one built with the switch off.
+    """
+
+    from .compile_state import compile_trace_active
+
+    if compile_trace_active():
+        return False
+    try:
+        mx.async_eval(array)
+    except ValueError as exc:
+        if "graph transformation" not in str(exc):
+            raise
+        return False
+    return True
 
 
 def _make_linear_conv1d_kernel():
@@ -3120,8 +3146,10 @@ def forward_with_gdn_capture(
             async_chunk
             and (layer_idx + 1) % async_chunk == 0
             and layer_idx != last_layer_idx
+            and not _try_async_submit(hidden_states)
         ):
-            mx.async_eval(hidden_states)
+            # Tracing (compiled verify): submit nothing for the rest.
+            async_chunk = 0
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
