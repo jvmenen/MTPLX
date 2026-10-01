@@ -35,3 +35,22 @@ Qwen3.6-35B-A3B Balance-yb, depth 2, FR-Spec, thinking, 11 requests of 800 to 12
 ## Recommendation
 
 Do not enable compiled verify for 6-bit in production; keep the async chunk. The gate stays as it is, the opt-in lives in the fork branch only.
+
+## Addendum: 4-bit Speed-yb, eager + async chunk against compiled (1 Oct)
+
+Same harness and server arguments, 4-bit Qwen3.6-35B-A3B Speed-yb, tree `perf/verify-async-chunk` (063d77b5, temporary worktree, removed afterwards). Run 2 in reversed order so heat hits every variant alike. Mean of two runs, tok/s.
+
+| Variant | Code | English | Dutch | Dutch no-think | Overall | Run 1 / 2 overall | Round ms | Compiled calls | Thermal level seen |
+|---|---|---|---|---|---|---|---|---|---|
+| eager | 123.5 | 107.9 | 105.9 | 99.8 | 110.6 | 110.8 / 110.5 | 21.5 / 21.6 | 0 | 0 / 1 |
+| eager + async 8 | 134.0 | 117.1 | 115.8 | 105.3 | 120.0 | 117.1 / 123.0 | 20.4 / 19.3 | 0 | 0-2 / 1 |
+| compiled | 123.0 | 107.6 | 108.8 | 100.5 | 111.6 | 112.3 / 111.0 | 21.0 / 21.4 | 293/293 | 2 / 1 |
+| compiled + async 8 | 131.7 | 117.1 | 116.1 | 98.5 | 118.8 | 119.1 / 118.6 | 20.0 / 20.1 | 295/295 | 1-2 / 1 |
+| eager + async 4 (1 run) | 136.2 | 124.6 | 123.5 | 111.0 | 126.1 | 126.1 | 18.9 | 0 | 1 |
+| eager + async 12 (1 run) | 136.2 | 119.2 | 117.2 | 103.9 | 121.6 | 121.6 | 19.4 | 0 | 1 |
+
+- Eager + async 8 beats compiled by 7.5%; compiled + async 8 is equal to it within noise. Compiled alone is +0.9% over eager, so the earlier single-run +3.5% was noise. The async chunk is what counts, as on 6-bit; the dense 27B remains the exception where compiled wins.
+- Chunk 4, 8 and 12 are within noise of each other; the 4 and 12 runs came at the end, with swap already down to 4.7 GB from 7.5 GB (the Mac had freed memory by then, as did run 2 of other variants), so only the comparison with run 2 of eager + async 8 (123.0) is fair.
+- Greedy, 32 streams: eager against eager + async 8 32 of 32 identical; compiled against compiled + async 8 32 of 32 identical; compiled against eager 31 of 32 (same Dutch prompt, token 116 of 254, as in the control above).
+- Swap before/after per run between 7.8 GB and 4.7 GB used of 8 GB, never growing more than 0.04 GB; guard at +2 GB never fired.
+
