@@ -111,3 +111,81 @@ def test_async_chunk_skips_prefill_sized_windows(monkeypatch) -> None:
 def test_env_parsing(monkeypatch, raw, expected) -> None:
     monkeypatch.setenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", raw)
     assert gdn_capture._verify_async_chunk_layers() == expected
+
+
+def _compiled_forward(model):
+    def fn(ids):
+        logits, hidden, _captures = gdn_capture.forward_with_gdn_capture(
+            model, ids, cache=None, return_hidden=True
+        )
+        return logits, hidden
+
+    return mx.compile(fn)
+
+
+def test_compiled_trace_is_untouched_by_the_switch(monkeypatch) -> None:
+    # The compiled verify bank traces this forward under mx.compile, where
+    # async_eval raises. The switch must not break the trace (the bank would
+    # demote to eager) and must not change the traced graph.
+    model = _tiny_model()
+    ids = mx.array([[21, 7, 99]])
+    monkeypatch.delenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", raising=False)
+    ref_logits, ref_hidden = _compiled_forward(model)(ids)
+    mx.eval(ref_logits, ref_hidden)
+    monkeypatch.setenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "2")
+    logits, hidden = _compiled_forward(model)(ids)
+    mx.eval(logits, hidden)
+    assert np.array_equal(np.array(ref_logits), np.array(logits))
+    assert np.array_equal(np.array(ref_hidden), np.array(hidden))
+
+
+def test_submits_stop_after_a_graph_transformation_refusal(monkeypatch) -> None:
+    model = _tiny_model()
+    monkeypatch.setenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "2")
+    calls = {"n": 0}
+
+    def refusing_async_eval(*arrays):
+        calls["n"] += 1
+        raise ValueError("[async_eval] Not allowed inside a graph transformation.")
+
+    monkeypatch.setattr(gdn_capture.mx, "async_eval", refusing_async_eval)
+    logits, hidden, _ = gdn_capture.forward_with_gdn_capture(
+        model, mx.array([[21, 7, 99]]), cache=None, return_hidden=True
+    )
+    mx.eval(logits, hidden)
+    assert calls["n"] == 1
+
+
+def test_no_submit_while_compile_trace_marker_is_active(monkeypatch) -> None:
+    from mtplx.compile_state import compile_trace
+
+    model = _tiny_model()
+    monkeypatch.setenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "2")
+    calls = {"n": 0}
+    real_async_eval = mx.async_eval
+
+    def counting_async_eval(*arrays):
+        calls["n"] += 1
+        return real_async_eval(*arrays)
+
+    monkeypatch.setattr(gdn_capture.mx, "async_eval", counting_async_eval)
+    with compile_trace():
+        logits, hidden, _ = gdn_capture.forward_with_gdn_capture(
+            model, mx.array([[21, 7, 99]]), cache=None, return_hidden=True
+        )
+    mx.eval(logits, hidden)
+    assert calls["n"] == 0
+
+
+def test_other_async_eval_errors_propagate(monkeypatch) -> None:
+    model = _tiny_model()
+    monkeypatch.setenv("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "2")
+
+    def broken_async_eval(*arrays):
+        raise ValueError("something else")
+
+    monkeypatch.setattr(gdn_capture.mx, "async_eval", broken_async_eval)
+    with pytest.raises(ValueError, match="something else"):
+        gdn_capture.forward_with_gdn_capture(
+            model, mx.array([[21, 7, 99]]), cache=None, return_hidden=True
+        )
