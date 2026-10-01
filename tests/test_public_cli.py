@@ -9891,6 +9891,148 @@ def test_already_running_server_window_reaches_pi_and_opencode(
     assert "OpenCode window set to the 32,768 tokens this server serves." in out
 
 
+def test_attach_to_a_server_running_another_model_sets_the_client_up_for_it(
+    tmp_path, monkeypatch, capsys
+):
+    """`mtplx start pi|opencode` writes the client's config for the model it
+    picked, then finds a server already running another model, and the
+    client opens on the served one. Pi used to open on a model id its config
+    did not list, and OpenCode stayed on the picked model and its window.
+    Now each client's own writer registers the served model with the window
+    that server serves, OpenCode selects it, a typed answer cap still
+    reaches OpenCode, and the user's other providers and models stay. A
+    config that cannot be written stops the handoff before the client
+    opens."""
+    from mtplx.opencode import OPENCODE_REQUESTED_OUTPUT_HEADER, write_opencode_config
+    from mtplx.pi import pi_request_policy_extension_path, write_pi_models_config
+
+    pi_path = tmp_path / "pi" / "models.json"
+    opencode_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(pi_path))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(opencode_path))
+    picked = "mtplx-qwen38-27b-optimized-speed"
+    served = "mtplx-flash-next-optimized-speed"
+    base_url = "http://127.0.0.1:8000/v1"
+    # What the write before the attach leaves: the picked model, beside a
+    # provider of the user's own and a model they added to MTPLX's provider.
+    write_pi_models_config(base_url=base_url, model_id=picked, context_window=262_144)
+    other_pi = {"baseUrl": "http://example.invalid/v1", "models": [{"id": "theirs"}]}
+    user_row = {"id": "my-proxy-model", "contextWindow": 8_192, "maxTokens": 4_096}
+    pi_config = json.loads(pi_path.read_text())
+    pi_config["providers"]["mtplx"]["models"].append(user_row)
+    pi_config["providers"]["other"] = other_pi
+    pi_path.write_text(json.dumps(pi_config))
+    write_opencode_config(base_url=base_url, model_id=picked, context_window=262_144)
+    other_opencode = {"name": "Other", "options": {"baseURL": "http://example.invalid/v1"}}
+    opencode_config = json.loads(opencode_path.read_text())
+    opencode_config["provider"]["other"] = other_opencode
+    opencode_path.write_text(json.dumps(opencode_config))
+
+    health = {
+        "ok": True,
+        "model": served,
+        "execution_window": {"tokens": 32_768, "basis": "machine_fit"},
+        "vision": {"enabled": True},
+    }
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: True)
+    monkeypatch.setattr(
+        public, "_http_json", lambda url, timeout=15.0, **_kwargs: dict(health)
+    )
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (_ for _ in ()).throw(
+            AssertionError("an attach must not resolve or load a model")
+        ),
+    )
+    launched = []
+    monkeypatch.setattr(
+        public,
+        "_quickstart_launch_pi_now",
+        lambda **kwargs: launched.append(("pi", kwargs["model_id"])),
+    )
+    monkeypatch.setattr(
+        public, "_quickstart_launch_opencode_now", lambda: launched.append(("opencode",))
+    )
+
+    def start(client, **flags):
+        args = SimpleNamespace(
+            # The local folder of the picked model: serve derives the same id.
+            model="models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+            model_id=picked,
+            cache_dir=None,
+            profile="performance-cold",
+            unsafe_force_unverified=False,
+            yes=True,
+            host="127.0.0.1",
+            port=8000,
+            depth=3,
+            api_key=None,
+            rate_limit=0,
+            stream_interval=1,
+            max_response_tokens=None,
+            temperature=1.0,
+            top_p=0.95,
+            reasoning_parser="qwen3",
+            stats_footer=False,
+            warmup_tokens=16,
+            strict_warmup=False,
+            strict_fast_path=False,
+            quickstart_pi=client == "pi",
+            quickstart_opencode=client == "opencode",
+            max=False,
+        )
+        for name, value in flags.items():
+            setattr(args, name, value)
+        return public.cmd_serve_public(args)
+
+    assert start("pi") == 0
+    pi_after = json.loads(pi_path.read_text())
+    rows = {row["id"]: row for row in pi_after["providers"]["mtplx"]["models"]}
+    # The picked model's row is MTPLX's own and goes, as on any model switch.
+    assert set(rows) == {served, "my-proxy-model"}
+    assert rows[served]["contextWindow"] == rows[served]["maxTokens"] == 32_768
+    assert rows[served]["input"] == ["text", "image"]
+    assert rows["my-proxy-model"] == user_row
+    assert pi_after["providers"]["other"] == other_pi
+    assert launched == [("pi", served)]
+    # Pi's request bridge follows the model it now opens on.
+    assert json.dumps(served) in pi_request_policy_extension_path(pi_path).read_text()
+
+    assert start("opencode", max_response_tokens=9_000, _cli_flags={"max-response-tokens"}) == 0
+    opencode_after = json.loads(opencode_path.read_text())
+    assert opencode_after["model"] == opencode_after["small_model"] == f"mtplx/{served}"
+    assert list(opencode_after["provider"]["mtplx"]["models"]) == [served]
+    entry = opencode_after["provider"]["mtplx"]["models"][served]
+    assert entry["limit"] == {"context": 32_768, "output": 9_000}
+    assert entry["headers"] == {OPENCODE_REQUESTED_OUTPUT_HEADER: "9000"}
+    assert entry["modalities"]["input"] == ["text", "image"]
+    flash_next = public.reasoning_policy_for_model(model_ref=served)
+    assert flash_next.supported
+    assert entry["reasoning"] is True
+    assert entry["options"] == {"reasoningEffort": flash_next.agent_effort}
+    assert opencode_after["provider"]["other"] == other_opencode
+    assert launched[-1] == ("opencode",)
+    out = capsys.readouterr().out
+    for label in ("Pi", "OpenCode"):
+        assert (
+            f"It serves {served}, not {picked}, so {label} is set up for that "
+            "model with the 32,768 tokens it serves."
+        ) in out
+
+    # A config that cannot be written stops the handoff: nothing opens and
+    # the file stays exactly as it was.
+    for client, path in (("pi", pi_path), ("opencode", opencode_path)):
+        broken = '{"providers": oops\n'
+        path.write_text(broken)
+        with pytest.raises(SystemExit) as refused:
+            start(client)
+        label = "Pi" if client == "pi" else "OpenCode"
+        assert str(refused.value.code).startswith(f"{label} config left unchanged:")
+        assert path.read_text() == broken
+    assert len(launched) == 2
+
+
 def test_opencode_pre_start_write_keeps_the_window_and_applies_a_requested_cap(
     tmp_path, monkeypatch
 ):

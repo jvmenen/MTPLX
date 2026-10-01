@@ -561,6 +561,30 @@ def _write_models_json(
     return written, backup_path
 
 
+def pi_lists_model(
+    model_id: str,
+    *,
+    path: str | Path | None = None,
+    provider_id: str = PI_PROVIDER_ID,
+) -> bool:
+    """Whether Pi's config lists ``model_id`` under MTPLX's provider.
+
+    Raises ``InvalidConfigFile`` for a file Pi could not read either.
+    """
+
+    config_path = pi_models_json_path(path)
+    if not config_path.exists():
+        return False
+    existing, _existing_text = load_config_file(config_path)
+    providers = existing.get("providers")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    models = provider.get("models") if isinstance(provider, dict) else None
+    return isinstance(models, list) and any(
+        isinstance(entry, dict) and str(entry.get("id")) == str(model_id)
+        for entry in models
+    )
+
+
 def refresh_pi_models_window(
     model_id: str,
     window: int,
