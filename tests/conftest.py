@@ -38,6 +38,10 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(isolated / "models"))
+    # `mtplx start` saves its setup to ~/.mtplx/quickstart.json and offers it
+    # again on the next start; a test that reaches save_state without its own
+    # path must not rewrite the developer's.
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(isolated / "quickstart.json"))
     # A real ~/.mtplx/config.toml outranks MTPLX_MODEL_DIR: its `model` changed
     # the default-model and bench dry runs, and its `model_dir` sent forge
     # builds into the user's real model cache. Tests that exercise the config

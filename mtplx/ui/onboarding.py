@@ -132,6 +132,19 @@ def _verified_default_label() -> str:
     return _verified_default_selection().label
 
 
+def _default_selection_record(model: str) -> dict | None:
+    """The ``model_selection`` saved with a model the user chose.
+
+    The verified default's selection when ``model`` is that default, and
+    ``None`` for any other pick: a local folder, another catalog pack or a
+    custom repo stays exactly as chosen on every later start, even when its
+    name matches a default (see ``_follows_verified_default``).
+    """
+
+    selection = _verified_default_selection()
+    return selection.to_dict() if model == selection.model else None
+
+
 def _optimized_quality_label() -> str:
     return f"{OPTIMIZED_QUALITY_LABEL}  ·  {OPTIMIZED_QUALITY_DESCRIPTION}"
 
@@ -864,7 +877,9 @@ def _print_summary(
         return
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", justify="right", no_wrap=True)
-    table.add_column(no_wrap=False)
+    # Fold a long folder path onto the next line instead of cutting off
+    # the pack name at the end.
+    table.add_column(no_wrap=False, overflow="fold")
     table.add_row("Model", model_display)
     table.add_row("Mode", mode_label(state))
     table.add_row("Interface", interface_label(state.get("target")))
@@ -1436,8 +1451,7 @@ def run_onboarding_screens(
         # the one-shot legacy migration never mistakes a real pick for the
         # old wizard default.
         state["profile_explicit"] = True
-    if is_verified_default_model_ref(model):
-        state["model_selection"] = _verified_default_selection().to_dict()
+    state["model_selection"] = _default_selection_record(model)
     return state
 
 
@@ -1489,8 +1503,7 @@ def run_serve_onboarding_screens(
     }
     if profile != PROFILE_AUTO:
         state["profile_explicit"] = True
-    if is_verified_default_model_ref(model):
-        state["model_selection"] = _verified_default_selection().to_dict()
+    state["model_selection"] = _default_selection_record(model)
     return state
 
 
@@ -1667,18 +1680,39 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
     return model.startswith(("/", "~", "./", "../", "models/"))
 
 
+def _follows_verified_default(state: dict) -> bool:
+    """Whether a saved model is the verified default the user took.
+
+    Setup saves the default's selection with the model when the user took
+    the default and ``None`` for any other pick, so only a selection naming
+    the saved model itself follows the default. Older setups also stamped a
+    selection on picks whose name matched a default (a local copy of the
+    default pack, another catalog pack); that selection names a different
+    model, so those picks are kept too. A state saved before setup recorded
+    the selection at all is judged by its ref.
+    """
+
+    if "model_selection" in state:
+        selection = state["model_selection"]
+        if not isinstance(selection, dict):
+            return False
+        return selection.get("model") == state.get("model")
+    return is_verified_default_model_ref(state.get("model"))
+
+
 def _normalize_quickstart_state(last: dict) -> dict:
-    """Refresh saved verified-default refs while preserving custom models.
+    """Refresh a saved verified default while preserving every other pick.
 
     A user whose last run used the verified default follows the default when
     it moves; that is how the default lane upgrades. When it does move, the
     model they actually ran last time is kept under ``previous_default_model``
     so the "Welcome back" panel states the change instead of labeling the new
     default as last time's model. The note is shown once: the key is dropped
-    again as soon as the saved model and the current default agree.
+    again as soon as the saved model and the current default agree. Any other
+    saved model loads exactly as chosen (``_follows_verified_default``).
     """
 
-    if not is_verified_default_model_ref(last.get("model")):
+    if not _follows_verified_default(last):
         return last
     selection = _verified_default_selection()
     refreshed = dict(last)
@@ -1714,6 +1748,22 @@ def _migrate_legacy_default_profile(last: dict) -> tuple[dict, bool]:
         migrated["profile"] = PROFILE_AUTO
         return migrated, True
     return last, False
+
+
+def _missing_local_model(state: dict) -> str | None:
+    """The saved model when it is a local folder that is no longer there.
+
+    The launch applies the same test: a ref that is not on disk and is not a
+    Hugging Face repo id cannot load, and reusing it ends in an offer to
+    download the verified default instead, a different model.
+    """
+
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    model = str(state.get("model") or "").strip()
+    if not model or Path(model).expanduser().exists():
+        return None
+    return None if repo_id_from_model_ref(model) else model
 
 
 def _default_moved_note(last: dict) -> str | None:
@@ -1762,7 +1812,9 @@ def confirm_same_as_last(last: dict) -> bool:
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", justify="right", no_wrap=True)
-    table.add_column(no_wrap=False)
+    # Fold a long folder path onto the next line instead of cutting off
+    # the pack name at the end.
+    table.add_column(no_wrap=False, overflow="fold")
     table.add_row("Model", model_display)
     if moved_note:
         table.add_row("", Text(moved_note, style="dim"))
@@ -1965,7 +2017,20 @@ def run_quickstart_flow(
                 state["open_dashboard"] = bool(open_dashboard_override)
             return state
 
-        if last and not fresh:
+        missing_model = _missing_local_model(last) if last and not fresh else None
+        if missing_model:
+            # Setup replaces the saved folder only once a new pick completes,
+            # so Ctrl-C here keeps it for when the drive is back.
+            print()
+            print(
+                "  The model folder from last time is not available: "
+                f"{_pretty_path(missing_model)}"
+            )
+            print(
+                "  Connect the drive it is on and start again, "
+                "or choose a model now."
+            )
+        elif last and not fresh:
             decision = _returning_user_decision(
                 last, app_model=_app_settings_model()
             )
@@ -1974,8 +2039,9 @@ def run_quickstart_flow(
             if decision == "app":
                 app_state = dict(last)
                 app_state["model"] = str(_app_settings_model())
-                # The selection metadata described the previous model.
-                app_state.pop("model_selection", None)
+                app_state["model_selection"] = _default_selection_record(
+                    app_state["model"]
+                )
                 save_state(app_state)
                 refreshed_default_state = False
                 return reuse_state(app_state)

@@ -426,18 +426,29 @@ def test_first_run_callers_exit_cleanly_on_refusal(monkeypatch, capsys):
 
 
 def test_verified_default_refs_include_speed_and_fp16():
+    from mtplx.hf_loader import model_cache_dir
+
+    library = model_cache_dir()
     assert is_verified_default_model_ref(DEFAULT_HF_MODEL_ID)
     assert is_verified_default_model_ref(DEFAULT_FP16_HF_MODEL_ID)
     assert not is_verified_default_model_ref(
         "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized"
     )
     assert is_verified_default_model_ref(
-        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
+        str(library / "Qwen3.6-27B-MTPLX-Optimized-Speed-V2")
     )
     assert not is_verified_default_model_ref(
         "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"
     )
     assert is_verified_default_model_ref(
+        str(library / "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16")
+    )
+    # The same names outside MTPLX's model library are folders the user
+    # chose, never this Mac's default (#573).
+    assert not is_verified_default_model_ref(
+        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
+    )
+    assert not is_verified_default_model_ref(
         "/Users/example/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
     )
     assert not is_verified_default_model_ref("someone/custom-model")

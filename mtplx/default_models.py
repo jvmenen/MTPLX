@@ -195,7 +195,9 @@ _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES = (
 )
 # Flash-Next packs stay off this set and verified_default_refs(), although
 # Optimized Speed is the 256 GiB default: smaller Macs run them by choice, and
-# a listed ref is swapped for the machine's own default on the next start.
+# a listed ref saved with no record of how it was picked (a config.toml model,
+# an older saved start setup) is swapped for the machine's own default on the
+# next start.
 _VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
     {
         Path(BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID).name,
@@ -1103,6 +1105,21 @@ def verified_default_refs() -> set[str]:
     return {ref for ref in refs if ref}
 
 
+def _in_model_library(path: Path) -> bool:
+    """Whether ``path`` sits directly in one of MTPLX's model libraries.
+
+    Those are the folders the default resolver searches and downloads fill,
+    so a default-named folder there is the default's own copy. The same name
+    anywhere else (another app's model folder, another drive) is a copy the
+    user chose, and treating it as the default swapped it for a download
+    (#573).
+    """
+
+    from mtplx.hf_loader import model_library_roots
+
+    return path.parent.resolve(strict=False) in model_library_roots()
+
+
 def is_verified_default_model_ref(model: str | Path | None) -> bool:
     if model is None:
         return True
@@ -1114,7 +1131,7 @@ def is_verified_default_model_ref(model: str | Path | None) -> bool:
         return True
     if text.startswith(("~", "/", "./", "../")):
         path = Path(text).expanduser()
-        if path.name in _VERIFIED_DEFAULT_LOCAL_NAMES:
+        if path.name in _VERIFIED_DEFAULT_LOCAL_NAMES and _in_model_library(path):
             return True
         try:
             expanded = str(path.resolve())
