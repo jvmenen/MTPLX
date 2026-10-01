@@ -30,7 +30,10 @@ dependencies = [
   # (2026-08-26, MEASUREMENTS 07:20) measured 0.32.0 -> 0.32.2 at +29%
   # decode / +41% prefill @88.4k and +31% @16k — same wheel, same flags,
   # only mlx differs. A 0.32.0 venv silently forfeits that; converge it.
-  "mlx>=0.32.2,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # Pinned to exactly 0.32.2 (2026-09-29): 0.32.3 decodes at the same speed,
+  # but its output is not bit-identical to 0.32.2 on Flash-Next, and the app
+  # bundles 0.32.2, so pip and Homebrew now install what the app runs.
+  "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name

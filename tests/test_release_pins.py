@@ -96,9 +96,9 @@ def test_operator_compiled_verify_ceiling_survives_profile_apply():
 
 def _pyproject_mlx_floor() -> tuple[int, ...]:
     text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
-    match = re.search(r'"mlx>=([0-9.]+),<', text)
+    match = re.search(r'"mlx(?:>=([0-9.]+),<|==([0-9.]+);)', text)
     assert match, "pyproject no longer declares an mlx floor requirement"
-    return tuple(int(part) for part in match.group(1).split("."))
+    return tuple(int(part) for part in (match.group(1) or match.group(2)).split("."))
 
 
 def test_pyproject_mlx_floor_is_the_receipted_version():
