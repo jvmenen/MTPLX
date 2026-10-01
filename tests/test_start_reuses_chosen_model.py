@@ -7,7 +7,10 @@ another app, a folder on another drive) and catalog packs that are, or once
 were, a default somewhere (Bare Speed, Bonsai, the 27B on a 256 GB Mac). The
 choice was swapped for this Mac's default, the Welcome back panel showed that
 repo id, and Yes started a 20 GB download of a model already on disk. Only a
-user who took the verified default follows it when it moves.
+user who took the row marked as this Mac's verified default, for the copy the
+default resolver loads, follows it when it moves; the same model reached
+another way (Local folder, a catalog row, a custom repo, the app's model,
+config.toml, a copy in another folder) stays as chosen.
 
 These tests run `mtplx start` through `mtplx.cli.main` up to the launch,
 with the Hugging Face preflight and pull, the busy-port probe, the fan-pin
@@ -150,12 +153,12 @@ def start(monkeypatch):
     monkeypatch.setattr(public, "_quickstart_apply_tuned_depth", lambda *a, **k: None)
     monkeypatch.setattr(public, "_quickstart_run_openwebui", launch)
 
-    def run(*answers) -> int:
+    def run(*answers, argv=()) -> int:
         left = _answer(monkeypatch, *answers)
         # An interactive terminal, set on the streams capsys has installed.
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-        code = cli.main(["start"])
+        code = cli.main(["start", *argv])
         assert left == [], f"prompts never asked: {left}"
         return code
 
@@ -240,6 +243,59 @@ def test_taking_the_verified_default_still_follows_the_default_when_it_moves(
     assert saved["model"] == saved["model_selection"]["model"] == str(flash_next)
 
 
+def test_a_local_folder_pick_of_the_defaults_own_copy_keeps_that_copy(mac, start):
+    """Local folder lands on the very folder the default row would: still a
+    pick, so a new default for this Mac does not replace it."""
+
+    chosen = _model_folder(mac.library / f"Youssofal--{DEFAULT_PACK}")
+    assert start.run(
+        "row:Local folder", str(chosen), "row:Auto", "row:Web UI", "row:No"
+    ) == 0
+    assert onboarding.load_state()["model_selection"] is None
+
+    mac.memory_gib = 256.0
+    _model_folder(mac.library / "Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed")
+    assert start.run("Y") == 0
+
+    assert start.launched == [str(chosen)] * 2
+    assert start.downloads == []
+
+
+def test_the_default_row_for_a_copy_the_resolver_cannot_see_keeps_that_copy(
+    mac, start, capsys
+):
+    """A --model-search-dir folder (or config.toml's model_dirs) fills the
+    picker but not the default resolver, so the verified default row there
+    shows a copy that following would replace with a download."""
+
+    shelf = mac.home / "Models"
+    copy = _model_folder(shelf / f"Youssofal--{DEFAULT_PACK}")
+    argv = ("--model-search-dir", str(shelf))
+    assert start.run(
+        "row:verified default", "row:Auto", "row:Web UI", "row:No", argv=argv
+    ) == 0
+    assert onboarding.load_state()["model_selection"] is None
+
+    capsys.readouterr()
+    assert start.run("Y", argv=argv) == 0
+
+    assert f"Model:     ~/Models/Youssofal--{DEFAULT_PACK}\n" in capsys.readouterr().out
+    assert start.launched == [str(copy)] * 2
+    assert start.downloads == []
+
+
+def test_accepting_the_default_repo_id_as_a_custom_repo_is_a_pick(mac, monkeypatch):
+    # Enter at the repo prompt accepts the suggested id, this Mac's default.
+    _answer(monkeypatch, "row:Custom Hugging Face repo", "", "row:Auto", "row:CLI")
+    first = onboarding.run_quickstart_flow(fresh=True)
+    assert first["model"] == QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
+    assert first["model_selection"] is None
+
+    mac.memory_gib = 256.0  # the default moves to Flash-Next
+    _answer(monkeypatch, "Y")
+    assert onboarding.run_quickstart_flow()["model"] == QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
+
+
 @pytest.mark.parametrize(
     "memory_gib,row,installed,expected",
     [
@@ -310,27 +366,56 @@ def test_a_missing_saved_folder_is_named_and_never_swapped_for_a_download(
     assert start.downloads == []
 
 
-def test_a_default_named_folder_is_the_default_only_in_the_model_library(mac):
-    in_library = mac.library / f"Youssofal--{DEFAULT_PACK}"
-    assert default_models.is_verified_default_model_ref(str(in_library))
-    # A former default's folder still counts after it is deleted.
-    gone = mac.library / "Qwen3.8-27B-MTPLX-Bare-Speed"
-    assert default_models.is_verified_default_model_ref(str(gone))
+def test_a_missing_library_folder_picked_by_hand_is_named(mac, start, capsys):
+    chosen = _model_folder(mac.library / f"Youssofal--{DEFAULT_PACK}")
+    assert start.run(
+        "row:Local folder", str(chosen), "row:Auto", "row:Web UI", "row:No"
+    ) == 0
+    chosen.rename(mac.home / "moved-away")
+    capsys.readouterr()
+    assert start.run(KeyboardInterrupt) == 130
 
-    for elsewhere in (
+    out = capsys.readouterr().out
+    assert (
+        "The model folder from last time is not available: "
+        f"~/.mtplx/models/Youssofal--{DEFAULT_PACK}"
+    ) in out
+    assert "Last time you used:" not in out
+    assert start.downloads == []
+    assert onboarding.load_state()["model"] == str(chosen)
+
+
+def test_a_folder_is_never_taken_for_the_default_by_its_name(mac):
+    own_copy = _model_folder(mac.library / f"Youssofal--{DEFAULT_PACK}")
+    assert default_models.select_default_model().model == str(own_copy)
+
+    for folder in (
+        own_copy,
+        # A former default's folder, still installed or long gone.
+        mac.library / "Qwen3.8-27B-MTPLX-Bare-Speed",
         mac.home / "AI" / "models" / "Youssofal" / DEFAULT_PACK,
         Path("/Volumes/T7") / f"Youssofal--{DEFAULT_PACK}",
     ):
-        assert not default_models.is_verified_default_model_ref(str(elsewhere))
+        assert not default_models.is_verified_default_model_ref(str(folder))
+    # The repo id `mtplx setup` writes into config.toml still follows.
+    assert default_models.is_verified_default_model_ref(QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID)
 
 
-def test_a_configured_folder_named_like_the_default_is_used_as_configured(
-    mac, monkeypatch
-):
+@pytest.mark.parametrize(
+    "where",
+    [
+        ("AI", "models", "Youssofal", DEFAULT_PACK),
+        (".mtplx", "models", "Youssofal--Qwen3.8-27B-MTPLX-Bare-Speed"),
+        (".mtplx", "models", f"Youssofal--{DEFAULT_PACK}"),
+    ],
+)
+def test_a_configured_folder_is_used_as_configured(mac, monkeypatch, where):
     """`mtplx config set model <folder>`: start without the wizard (--yes, no
-    terminal) loads the folder, and the wizard offers it as a choice."""
+    terminal) loads the folder, and the wizard offers it as a choice. MTPLX
+    writes a default into config.toml only as a repo id, so a folder there
+    is the user's."""
 
-    folder = _model_folder(mac.home / "AI" / "models" / "Youssofal" / DEFAULT_PACK)
+    folder = _model_folder(mac.home.joinpath(*where))
     args = SimpleNamespace(model=str(folder), _model_explicit=False)
     assert public._quickstart_current_model(args) == str(folder)
 

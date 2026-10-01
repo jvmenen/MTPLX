@@ -132,19 +132,6 @@ def _verified_default_label() -> str:
     return _verified_default_selection().label
 
 
-def _default_selection_record(model: str) -> dict | None:
-    """The ``model_selection`` saved with a model the user chose.
-
-    The verified default's selection when ``model`` is that default, and
-    ``None`` for any other pick: a local folder, another catalog pack or a
-    custom repo stays exactly as chosen on every later start, even when its
-    name matches a default (see ``_follows_verified_default``).
-    """
-
-    selection = _verified_default_selection()
-    return selection.to_dict() if model == selection.model else None
-
-
 def _optimized_quality_label() -> str:
     return f"{OPTIMIZED_QUALITY_LABEL}  ·  {OPTIMIZED_QUALITY_DESCRIPTION}"
 
@@ -968,6 +955,27 @@ def screen_model(
     keep an old model as the speed lane.
     """
 
+    return _screen_model_choice(
+        configured=configured, installed=installed, app_model=app_model
+    )[0]
+
+
+def _screen_model_choice(
+    *,
+    configured: str | None = None,
+    installed: list[Any] | None = None,
+    app_model: str | None = None,
+) -> tuple[str, dict | None]:
+    """``screen_model``'s pick and the row it came from.
+
+    The second value is the verified default's selection when the user took
+    the row marked as this Mac's verified default that holds the default's
+    own ref, and ``None`` for every other pick. Setup saves it as
+    ``model_selection``, and only that pick follows the default when it
+    moves: a local folder, a catalog row or a custom repo stays as chosen
+    even when it lands on the default's own copy (#573).
+    """
+
     verified_selection = _verified_default_selection()
     verified_default = verified_selection.model
     verified_label = verified_selection.label
@@ -982,6 +990,7 @@ def screen_model(
     rows: list[tuple[str, str, str]] = []
     app_row_index: int | None = None
     verified_row_index: int | None = None
+    default_rows: set[int] = set()
     verified_covered_by_install = False
     tier = (LEGACY_TIER if verified_selection.variant == "fp16"
             else chip_tier_for_generation(verified_selection.chip_generation))
@@ -1004,6 +1013,8 @@ def screen_model(
             app_row_index = len(rows) - 1
         if covers_verified and verified_row_index is None:
             verified_row_index = len(rows) - 1
+        if covers_verified:
+            default_rows.add(len(rows) - 1)
     if show_configured and not any(
         str(item.path) == str(configured) for item in installed_rows
     ):
@@ -1013,6 +1024,7 @@ def screen_model(
     if not verified_covered_by_install:
         rows.append((f"{verified_selection.display_name}  ·  verified default", verified_label, verified_default))
         verified_row_index = len(rows) - 1
+        default_rows.add(verified_row_index)
     for pack in available:
         if pack.hf_model_id == verified_selection.hf_model or pack.hf_model_id in covered_hf_ids:
             continue
@@ -1044,12 +1056,21 @@ def screen_model(
     _step_panel(step=1, total=3, title="Choose your model", options=options)
     valid_choices = [option[0] for option in options]
     choice = _prompt_choice("Select", valid_choices, default=default_choice)
-    value = rows[int(choice) - 1][2]
+    index = int(choice) - 1
+    value = rows[index][2]
     if value == "__hf__":
-        return _prompt_hf_repo_id(default=verified_default)
+        return _prompt_hf_repo_id(default=verified_default), None
     if value == "__local__":
-        return _pick_local_model(default=str(configured) if show_configured else None)
-    return value
+        folder = _pick_local_model(default=str(configured) if show_configured else None)
+        return folder, None
+    # Following re-resolves the default on every start, so only the copy the
+    # resolver itself loads can follow. Another copy of the default pack (a
+    # second library folder, one under a --model-search-dir folder the
+    # resolver does not search) is kept as chosen: following it would load a
+    # different folder or download the pack again.
+    if index not in default_rows or value != verified_default:
+        return value, None
+    return value, verified_selection.to_dict()
 
 
 def _pick_local_model(*, default: str | None) -> str:
@@ -1418,7 +1439,7 @@ def run_onboarding_screens(
     ``True``/``False`` skip the question; ``None`` (default) asks.
     """
 
-    model = screen_model(
+    model, model_selection = _screen_model_choice(
         configured=configured_model,
         installed=_installed_models_for_screen(
             cache_dir=cache_dir,
@@ -1451,7 +1472,7 @@ def run_onboarding_screens(
         # the one-shot legacy migration never mistakes a real pick for the
         # old wizard default.
         state["profile_explicit"] = True
-    state["model_selection"] = _default_selection_record(model)
+    state["model_selection"] = model_selection
     return state
 
 
@@ -1466,7 +1487,7 @@ def run_serve_onboarding_screens(
 ) -> dict:
     """Walk the advanced server setup screens and return the chosen state."""
 
-    model = screen_model(
+    model, model_selection = _screen_model_choice(
         configured=configured_model,
         installed=_installed_models_for_screen(
             cache_dir=cache_dir,
@@ -1503,7 +1524,7 @@ def run_serve_onboarding_screens(
     }
     if profile != PROFILE_AUTO:
         state["profile_explicit"] = True
-    state["model_selection"] = _default_selection_record(model)
+    state["model_selection"] = model_selection
     return state
 
 
@@ -1683,13 +1704,13 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
 def _follows_verified_default(state: dict) -> bool:
     """Whether a saved model is the verified default the user took.
 
-    Setup saves the default's selection with the model when the user took
-    the default and ``None`` for any other pick, so only a selection naming
-    the saved model itself follows the default. Older setups also stamped a
-    selection on picks whose name matched a default (a local copy of the
-    default pack, another catalog pack); that selection names a different
-    model, so those picks are kept too. A state saved before setup recorded
-    the selection at all is judged by its ref.
+    Setup saves the default's selection only when the user took the verified
+    default row, and ``None`` for any other pick (``_screen_model_choice``).
+    Older setups stamped a selection on any pick whose ref matched a default
+    (a local copy, another catalog pack); that selection names a different
+    model unless the pick was the default's own path, so the saved selection
+    must name the saved model. A state with no record at all is judged by
+    its ref: only a default's repo id follows.
     """
 
     if "model_selection" in state:
@@ -2039,9 +2060,8 @@ def run_quickstart_flow(
             if decision == "app":
                 app_state = dict(last)
                 app_state["model"] = str(_app_settings_model())
-                app_state["model_selection"] = _default_selection_record(
-                    app_state["model"]
-                )
+                # The app's model is a pick like any other: kept as chosen.
+                app_state["model_selection"] = None
                 save_state(app_state)
                 refreshed_default_state = False
                 return reuse_state(app_state)

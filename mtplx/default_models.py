@@ -193,30 +193,6 @@ _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official4-CyanKiwiMTP-CleanRecipe",
     "~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
 )
-# Flash-Next packs stay off this set and verified_default_refs(), although
-# Optimized Speed is the 256 GiB default: smaller Macs run them by choice, and
-# a listed ref saved with no record of how it was picked (a config.toml model,
-# an older saved start setup) is swapped for the machine's own default on the
-# next start.
-_VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
-    {
-        Path(BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID).name,
-        BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID.replace("/", "--"),
-        BONSAI_LEGACY_LOCAL_NAME,
-        "Qwen3.8-27B-MTPLX-Optimized-Speed",
-        "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
-        "Qwen3.8-27B-MTPLX-Bare-Speed",
-        "Youssofal--Qwen3.8-27B-MTPLX-Bare-Speed",
-        "Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
-        "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
-        "Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
-        "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
-        "Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
-        "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
-    }
-)
-
-
 class DefaultModelUnavailable(RuntimeError):
     """No verified default model can run on this machine.
 
@@ -303,10 +279,6 @@ class DefaultModelSelection:
             "display_name": self.display_name,
             "label": self.label,
         }
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
 
 
 def _is_complete_local_model(path: Path) -> bool:
@@ -1078,11 +1050,16 @@ def select_default_model(
 
 
 def verified_default_refs() -> set[str]:
-    root = _repo_root()
-    local_qwen38_os = qwen38_optimized_speed_model_ref()
-    local_qwen38_bare = qwen38_bare_speed_model_ref()
-    local_speed = optimized_speed_model_ref()
-    refs = {
+    """Model ids that name this Mac's verified default by themselves.
+
+    `mtplx setup` and `mtplx init` write the default repo id into
+    config.toml, and a start setup saved without a selection record may hold
+    one too. Such a ref follows this Mac's default when it moves (an M1 or M2
+    Mac gets the FP16 build). Flash-Next ids stay off: smaller Macs run those
+    packs by choice.
+    """
+
+    return {
         BONSAI_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         BONSAI_LEGACY_PUBLIC_MODEL_ID,
         BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
@@ -1090,52 +1067,23 @@ def verified_default_refs() -> set[str]:
         DEFAULT_FP16_HF_MODEL_ID,
         DEFAULT_MODEL_ID,
         OPTIMIZED_SPEED_V2_HF_MODEL_ID,
-        local_speed,
+        QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         str(DEFAULT_RUNTIME_MODEL_DIR),
-        str((root / DEFAULT_RUNTIME_MODEL_DIR).resolve()),
     }
-    if local_qwen38_os != QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID:
-        refs.add(local_qwen38_os)
-    if local_qwen38_bare != QWEN38_BARE_SPEED_HF_MODEL_ID:
-        refs.add(local_qwen38_bare)
-    refs.add(QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID)
-    local_qwen38_os_fp16 = qwen38_optimized_speed_fp16_model_ref()
-    if local_qwen38_os_fp16 != QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID:
-        refs.add(local_qwen38_os_fp16)
-    return {ref for ref in refs if ref}
-
-
-def _in_model_library(path: Path) -> bool:
-    """Whether ``path`` sits directly in one of MTPLX's model libraries.
-
-    Those are the folders the default resolver searches and downloads fill,
-    so a default-named folder there is the default's own copy. The same name
-    anywhere else (another app's model folder, another drive) is a copy the
-    user chose, and treating it as the default swapped it for a download
-    (#573).
-    """
-
-    from mtplx.hf_loader import model_library_roots
-
-    return path.parent.resolve(strict=False) in model_library_roots()
 
 
 def is_verified_default_model_ref(model: str | Path | None) -> bool:
+    """Whether a model ref with no record of how it was picked follows this
+    Mac's verified default.
+
+    Only the ids in ``verified_default_refs`` do. Any other folder path
+    never does, even one named like a default pack or holding the default's
+    own copy: MTPLX writes the default into config.toml only as a repo id,
+    and start setup records when a folder pick was the default, so an
+    unrecorded folder is one the user pointed at (#573).
+    """
+
     if model is None:
         return True
     text = str(model).strip()
-    if not text:
-        return True
-    refs = verified_default_refs()
-    if text in refs:
-        return True
-    if text.startswith(("~", "/", "./", "../")):
-        path = Path(text).expanduser()
-        if path.name in _VERIFIED_DEFAULT_LOCAL_NAMES and _in_model_library(path):
-            return True
-        try:
-            expanded = str(path.resolve())
-        except OSError:
-            expanded = str(path)
-        return expanded in refs
-    return False
+    return not text or text in verified_default_refs()
