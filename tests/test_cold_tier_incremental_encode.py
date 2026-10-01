@@ -1,10 +1,14 @@
-"""Incremental SSD encode (MTPLX_SSD_INCREMENTAL_ENCODE, on by default).
+"""Incremental SSD encode (MTPLX_SSD_INCREMENTAL_ENCODE, opt-in).
 
 The switch must leave the store byte-identical to a full encode: the same
 payload spec, the same tensor names, the same blob digests and the same blob
 bytes. Only the work changes: KV blocks (and large whole tensors) whose
 content key matches the session's previous completed write are referenced
 instead of evaluated, copied to the host and hashed again.
+
+It stays off by default until the content key is a content identity: two
+float32 sign flips leave the fingerprint unchanged (the collision tests
+below), so a changed tensor could borrow its predecessor's blob.
 """
 
 from __future__ import annotations
@@ -121,17 +125,9 @@ def test_fingerprint_sees_every_bit():
     assert content_fingerprints(a, rows=256)[0] != content_fingerprints(b, rows=256)[0]
 
 
-def test_switch_is_on_by_default_and_zero_restores_the_full_encode(
-    tmp_path, monkeypatch
-):
+def test_switch_is_off_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("MTPLX_SSD_INCREMENTAL_ENCODE", raising=False)
     tier = _tier(tmp_path / "default")
-    try:
-        assert tier.stats()["incremental_encode"] is True
-    finally:
-        tier.close()
-    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
-    tier = _tier(tmp_path / "off")
     try:
         turn1, turn2 = _turns()
         _write(tier, turn1)
@@ -143,6 +139,72 @@ def test_switch_is_on_by_default_and_zero_restores_the_full_encode(
         assert tier._block_memos == {}
     finally:
         tier.close()
+
+
+def _two_signs_flipped(turn):
+    """``turn`` with the signs of two elements of its float32 recurrent state
+    flipped. Every fingerprint weight is odd, so each flip adds 2**31 to the
+    linear sum and the pair cancels modulo 2**32; (x + 2**31)**2 equals x**2
+    modulo 2**32, so the squared sum cannot see a flip at all."""
+    (gdn,) = turn.cache_snapshot.states[1]
+    flat = np.array(gdn.reshape(-1))
+    flat[[5, 77]] *= -1.0
+    flipped = mx.array(flat).reshape(gdn.shape)
+    turn.cache_snapshot = CacheSnapshot(
+        states=(turn.cache_snapshot.states[0], (flipped,)),
+        meta_states=turn.cache_snapshot.meta_states,
+    )
+    return gdn, flipped
+
+
+def test_default_store_restores_a_state_whose_fingerprint_collides(tmp_path, monkeypatch):
+    """The reason the switch is off: turn 2's recurrent state differs from
+    turn 1's in two signs and shares its fingerprint. The default (full)
+    encode still stores and restores turn 2's own bytes."""
+    turn1, turn2 = _turns()
+    gdn, flipped = _two_signs_flipped(turn2)
+    assert not _bits_equal(gdn, flipped)
+    assert content_fingerprints(gdn) == content_fingerprints(flipped)
+
+    monkeypatch.delenv("MTPLX_SSD_INCREMENTAL_ENCODE", raising=False)
+    tier = _tier(tmp_path / "store")
+    try:
+        _write(tier, turn1)
+        _write(tier, turn2)
+        record = tier.lookup(
+            list(turn2.token_ids) + [7, 7], model_path=MODEL, mtp_enabled=True
+        )
+        assert record is not None
+        assert record.token_ids == turn2.token_ids
+        (restored,) = record.cache_snapshot.states[1]
+        assert _bits_equal(restored, flipped)
+    finally:
+        tier.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the incremental content key is not collision-proof: two float32 "
+    "sign flips borrow the predecessor's blob; keep the switch opt-in until "
+    "this passes",
+)
+def test_incremental_store_is_full_encode_when_the_fingerprint_collides(
+    tmp_path, monkeypatch
+):
+    turn1, turn2 = _turns()
+    _two_signs_flipped(turn2)
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    full = _tier(tmp_path / "full")
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    incremental = _tier(tmp_path / "incremental")
+    try:
+        for entry in (turn1, turn2):
+            entry_id = _write(full, entry)
+            assert _write(incremental, entry) == entry_id
+            assert _payload(incremental, entry_id) == _payload(full, entry_id)
+    finally:
+        full.close()
+        incremental.close()
 
 
 def _session_turns(dtype, seed):
@@ -208,10 +270,10 @@ def _session_turns(dtype, seed):
 def test_every_turn_shape_stores_what_the_full_encode_stores(
     tmp_path, monkeypatch, dtype, seed
 ):
-    """The default-on proof: across dtypes, seeds and every turn shape an
-    agent session produces, each incremental write is the full encode's
-    payload (spec, names, digests) and the store holds the same blob bytes;
-    the one-bit and rewritten blocks were captured, not borrowed."""
+    """Across dtypes, seeds and every turn shape an agent session produces,
+    each incremental write is the full encode's payload (spec, names,
+    digests) and the store holds the same blob bytes; the one-bit and
+    rewritten blocks were captured, not borrowed."""
 
     monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
     full = _tier(tmp_path / "full")
