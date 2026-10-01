@@ -131,6 +131,35 @@ def test_a_changed_history_names_the_token_where_it_changed():
     assert explanation["text"].startswith("History changed at token 110. ")
 
 
+def test_another_request_under_the_same_session_is_not_a_changed_history():
+    # 2026-10-01, Pi under one session id: the turn after a compaction shares
+    # 41 tokens with the compaction's summary prompt, and the compaction's
+    # second summary shares 110 with its first. Neither is an edit.
+    def explain(matched, cached, prompt):
+        return explain_reread(
+            {
+                "prompt_tokens": prompt,
+                "history_matched_tokens": matched,
+                "restore_point_tokens": 0,
+                "session_cached_tokens": cached,
+                "source": "none",
+            },
+            session_served_before=True,
+        )
+
+    turn = explain(41, 47_765, 32_409)
+    assert turn["cause"] == "different_request"
+    assert turn["cause_at_token"] == 41
+    assert turn["text"] == (
+        "A different request in this conversation: only its first 41 tokens "
+        "match the last one. Re-reading 32,409 tokens."
+    )
+    assert explain(110, 64_276, 46_267)["cause"] == "different_request"
+    # Past the opening it is the same conversation, edited.
+    assert explain(5_000, 40_000, 41_000)["cause"] == "history_changed"
+    assert explain(1_500, 4_000, 4_100)["cause"] == "history_changed"
+
+
 def test_an_ssd_restore_names_the_ssd():
     bank = _bank()
     _put(bank, IDS[:100], "s")

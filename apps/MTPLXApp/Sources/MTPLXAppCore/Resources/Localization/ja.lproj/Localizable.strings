@@ -1633,6 +1633,7 @@
 "Reading %@ new tokens" = "新しい%@トークンを読み込み中";
 "History changed at token %@" = "履歴がトークン%@で変わりました";
 "History changed from the start" = "履歴が最初から変わりました";
+"A different request in this conversation: only its first %@ tokens match the last one" = "この会話の別のリクエストです: 前回と一致するのは最初の%@トークンだけです";
 "The screenshot at token %@ changed" = "トークン%@のスクリーンショットが変わりました";
 "New conversation or first turn since MTPLX started" = "新しい会話、またはMTPLX起動後の最初のターン";
 "No saved state for this conversation" = "この会話の保存済み状態はありません";

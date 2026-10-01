@@ -27,6 +27,14 @@ from typing import Any, Iterable
 
 # Why the cache did not cover the prompt (None: the prompt only extends it).
 CAUSE_HISTORY_CHANGED = "history_changed"
+# The prompt shares only its opening (under _DIFFERENT_REQUEST_MAX_SHARED
+# tokens, and under a tenth of the saved history) with the conversation's
+# saved state: another request under the same session id, not an edit of its
+# history. Pi sends its compaction's two summaries and the turn after them
+# under one session id; they share 110 and 41 tokens with what came before
+# (2026-10-01), and "History changed at token 41" read as a bug.
+CAUSE_DIFFERENT_REQUEST = "different_request"
+_DIFFERENT_REQUEST_MAX_SHARED = 2048
 CAUSE_SCREENSHOT_CHANGED = "screenshot_changed"
 CAUSE_NEW_CONVERSATION = "new_conversation"
 CAUSE_NOT_CACHED = "not_cached"
@@ -198,6 +206,9 @@ def explain_reread(
         if image is not None:
             cause = CAUSE_SCREENSHOT_CHANGED
             cause_at = int(image)
+        elif matched < _DIFFERENT_REQUEST_MAX_SHARED and matched * 10 < cached:
+            cause = CAUSE_DIFFERENT_REQUEST
+            cause_at = matched
         else:
             cause = CAUSE_HISTORY_CHANGED
             cause_at = matched
@@ -279,6 +290,11 @@ def reread_text(explanation: dict[str, Any], eta_s: float | None = None) -> str:
     if cause == CAUSE_HISTORY_CHANGED:
         parts.append(
             "History changed from the start" if at <= 0 else f"History changed at token {at:,}"
+        )
+    elif cause == CAUSE_DIFFERENT_REQUEST:
+        parts.append(
+            "A different request in this conversation: only its first "
+            f"{at:,} tokens match the last one"
         )
     elif cause == CAUSE_SCREENSHOT_CHANGED:
         parts.append(f"The screenshot at token {at:,} changed")

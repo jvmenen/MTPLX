@@ -1633,6 +1633,7 @@
 "Reading %@ new tokens" = "새 토큰 %@개를 읽는 중";
 "History changed at token %@" = "기록이 토큰 %@에서 바뀌었습니다";
 "History changed from the start" = "기록이 처음부터 바뀌었습니다";
+"A different request in this conversation: only its first %@ tokens match the last one" = "이 대화의 다른 요청입니다: 이전 요청과 처음 %@개 토큰만 일치합니다";
 "The screenshot at token %@ changed" = "토큰 %@의 스크린샷이 바뀌었습니다";
 "New conversation or first turn since MTPLX started" = "새 대화이거나 MTPLX 시작 후 첫 턴입니다";
 "No saved state for this conversation" = "이 대화에 저장된 상태가 없습니다";

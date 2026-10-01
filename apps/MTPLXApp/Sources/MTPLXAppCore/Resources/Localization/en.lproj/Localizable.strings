@@ -1633,6 +1633,7 @@
 "Reading %@ new tokens" = "Reading %@ new tokens";
 "History changed at token %@" = "History changed at token %@";
 "History changed from the start" = "History changed from the start";
+"A different request in this conversation: only its first %@ tokens match the last one" = "A different request in this conversation: only its first %@ tokens match the last one";
 "The screenshot at token %@ changed" = "The screenshot at token %@ changed";
 "New conversation or first turn since MTPLX started" = "New conversation or first turn since MTPLX started";
 "No saved state for this conversation" = "No saved state for this conversation";

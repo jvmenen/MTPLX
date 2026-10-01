@@ -167,8 +167,19 @@ def make_prefill_system_guard(
     chunk_tokens: int | None,
     priced: Mapping[str, Any] | None,
     prompt_scoring: bool = False,
+    own_session_shed: Any = None,
 ):
     from mtplx.server import openai as srv
+
+    def _reserve_for_rows(rows: int) -> int:
+        # One forward of ``rows`` rows, priced the way the admission prices
+        # its chunk: its rows at full width and the family's scratch.
+        rows = max(1, int(rows))
+        geometry = srv._admission_geometry(state, prefill_width=rows)
+        scratch, _source = srv._admission_scratch_bytes(
+            state, rows=rows, prompt_tokens=max(1, int(prompt_tokens)), geometry=geometry
+        )
+        return srv._admission_chunk_bytes(geometry, rows, scratch)
 
     after_forward: dict[str, Any] = {}
     try:
@@ -204,8 +215,14 @@ def make_prefill_system_guard(
             pass
     else:
         srv._note_guard_health(state, where="prefill_chunk_reserve", error=None)
+    chunk_rows = (priced or {}).get("prefill_chunk_tokens") or chunk_tokens
     return srv._PrefillSystemGuard(
-        state, chunk_reserve_bytes=reserve, **after_forward
+        state,
+        chunk_reserve_bytes=reserve,
+        reserve_for_rows=_reserve_for_rows,
+        chunk_rows=int(chunk_rows) if chunk_rows else None,
+        own_session_shed=own_session_shed,
+        **after_forward,
     )
 
 

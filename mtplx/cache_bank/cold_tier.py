@@ -313,6 +313,11 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     return (matched // block) * block
 
 
+# Ranked SSD rows a prefix lookup opens before it gives up: each refusal
+# costs only its payload.json read.
+_PREFIX_BOUNDARY_ROWS_TRIED = 4
+
+
 def _payload_boundary_at_or_below(
     payload_spec: dict[str, Any], prefix_len: int
 ) -> int | None:
@@ -1171,8 +1176,7 @@ class SessionBankColdTier:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
             )
-            best: tuple[sqlite3.Row, int, str, int] | None = None
-            best_key: tuple[int, int, int] | None = None
+            ranked: list[tuple[tuple[int, int, int], sqlite3.Row, int, str, int]] = []
             for row in rows:
                 prefix = tuple(int(token) for token in json.loads(str(row["token_ids_json"])))
                 if not prefix:
@@ -1200,15 +1204,21 @@ class SessionBankColdTier:
                     restore_kind = "block_prefix"
                 else:
                     continue
-                candidate_key = (candidate_matched, int(matched), len(prefix))
-                if best_key is None or candidate_key > best_key:
-                    best = (row, candidate_matched, restore_kind, len(prefix))
-                    best_key = candidate_key
-            if best is None:
+                ranked.append(
+                    (
+                        (candidate_matched, int(matched), len(prefix)),
+                        row,
+                        candidate_matched,
+                        restore_kind,
+                        len(prefix),
+                    )
+                )
+            if not ranked:
                 self._inc("restore_misses")
                 self._set_last_miss("ssd_prefix_miss")
                 return None
-            if int(min_useful_matched_tokens) > 0 and best[1] < int(
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            if int(min_useful_matched_tokens) > 0 and ranked[0][2] < int(
                 min_useful_matched_tokens
             ):
                 # The caller's best RAM candidate already matches more
@@ -1222,52 +1232,68 @@ class SessionBankColdTier:
                 self._inc("prefix_lookups_not_better_than_ram")
                 self._set_last_miss("ssd_prefix_not_better_than_ram")
                 return None
-            if resident_duplicates:
-                dup = resident_duplicates.get(str(best[0]["token_hash"]))
-                if dup is not None and int(dup.get("prefix_len") or -1) == int(
-                    best[3]
+            # Best first; a row that cannot serve (a hybrid entry with no
+            # recurrent boundary at or below its match, a format or epoch
+            # mismatch) is refused by _restore_row before any tensor is read,
+            # and the next one is tried: a new conversation shares its system
+            # prompt with every older one, and the longest of them is often a
+            # conversation without a boundary there.
+            for _key, row, candidate_matched, restore_kind, prefix_len in ranked[
+                :_PREFIX_BOUNDARY_ROWS_TRIED
+            ]:
+                if candidate_matched < int(min_useful_matched_tokens):
+                    # Ranked best first: this row and every later one are
+                    # under the caller's RAM match.
+                    self._inc("prefix_lookups_not_better_than_ram")
+                    self._set_last_miss("ssd_prefix_not_better_than_ram")
+                    return None
+                if resident_duplicates and self._shadowed_by_resident_duplicate(
+                    row, prefix_len, resident_duplicates
                 ):
-                    try:
-                        row_caps = {
-                            str(c)
-                            for c in json.loads(
-                                str(best[0]["capabilities_json"] or "[]")
-                            )
-                        }
-                    except Exception:
-                        # Unknown capabilities: assume the row is maximal so
-                        # only a fully-covered resident twin may shadow it.
-                        row_caps = {"mtp_full"}
-                    row_has_mtp = (
-                        "mtp_full" in row_caps
-                        or best[0]["mtp_snapshot_epoch"] is not None
+                    self._inc("prefix_lookups_shadowed_by_ram")
+                    self._set_last_miss("ssd_prefix_shadowed_by_resident_duplicate")
+                    return None
+                record = self._restore_row(
+                    row,
+                    tokens,
+                    started_s=started,
+                    require_exact_prefix=False,
+                    include_gdn_boundaries=True,
+                    prefix_restore_tokens=int(candidate_matched),
+                )
+                if record is not None:
+                    return ColdPrefixRestoreRecord(
+                        record=record,
+                        matched_tokens=int(candidate_matched),
+                        restore_kind=str(restore_kind),
                     )
-                    if (not row_has_mtp) or bool(dup.get("has_mtp_history")):
-                        self._inc("prefix_lookups_shadowed_by_ram")
-                        self._set_last_miss(
-                            "ssd_prefix_shadowed_by_resident_duplicate"
-                        )
-                        return None
-            record = self._restore_row(
-                best[0],
-                tokens,
-                started_s=started,
-                require_exact_prefix=False,
-                include_gdn_boundaries=True,
-                prefix_restore_tokens=int(best[1]),
-            )
-            if record is None:
-                return None
-            return ColdPrefixRestoreRecord(
-                record=record,
-                matched_tokens=int(best[1]),
-                restore_kind=str(best[2]),
-            )
+            return None
         except Exception as exc:
             self._inc("restore_failures")
             self._set_last_miss(f"ssd_restore_error:{type(exc).__name__}")
             logger.warning("SessionBank SSD prefix-boundary restore failed: %s: %s", type(exc).__name__, exc)
             return None
+
+    @staticmethod
+    def _shadowed_by_resident_duplicate(
+        row: sqlite3.Row,
+        prefix_len: int,
+        resident_duplicates: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Whether a RAM entry the caller can serve holds this row's tokens
+        and at least its committed-MTP coverage (``lookup_prefix_boundary``)."""
+
+        dup = resident_duplicates.get(str(row["token_hash"]))
+        if dup is None or int(dup.get("prefix_len") or -1) != int(prefix_len):
+            return False
+        try:
+            row_caps = {str(c) for c in json.loads(str(row["capabilities_json"] or "[]"))}
+        except Exception:
+            # Unknown capabilities: assume the row is maximal so only a
+            # fully-covered resident twin may shadow it.
+            row_caps = {"mtp_full"}
+        row_has_mtp = "mtp_full" in row_caps or row["mtp_snapshot_epoch"] is not None
+        return (not row_has_mtp) or bool(dup.get("has_mtp_history"))
 
     def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
         """The stats() aggregate, opening the manifest only when it changed.
@@ -2679,12 +2705,25 @@ class SessionBankColdTier:
             boundary_prefix = _payload_boundary_at_or_below(
                 payload_spec, requested_prefix
             )
-            # Preserve the established tiny-gap behavior for hybrid entries
-            # without an interior capture.  SessionBank decides whether that
-            # full snapshot can serve the requested match; rejecting it here
-            # would turn tokenizer-boundary drift into an avoidable cold
-            # prefill.  Likewise, cache types whose metadata couples rolling
-            # state to their tensors must use the exact decoder plus trim.
+            if has_recurrent and boundary_prefix is None:
+                from mtplx.session_bank import _boundary_true_restore_enabled
+
+                if _boundary_true_restore_enabled():
+                    # A hybrid entry restores only at a stored recurrent
+                    # boundary at or below the match, tiny gaps included
+                    # (SessionBank.restore_entry_prefix_cache, since
+                    # 2026-09-08). With none, decoding the whole entry only
+                    # fed a candidate the restore refuses: on 2026-10-01 a
+                    # Pi turn sharing its tool definitions with a 131,735-
+                    # token conversation decoded that entry's 4.17 GB on
+                    # every attempt, and it stayed resident through the cold
+                    # prefill that followed, which the engine then refused.
+                    self._inc("prefix_restores_without_boundary")
+                    self._set_last_miss("ssd_prefix_no_recurrent_boundary")
+                    return None
+            # Cache types whose metadata couples rolling state to their
+            # tensors must use the exact decoder plus trim; so does a hybrid
+            # entry without a boundary when boundary-true restores are off.
             if (
                 (has_recurrent and boundary_prefix is None)
                 or not payload_supports_prefix_decode(payload_spec)

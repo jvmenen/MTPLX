@@ -339,3 +339,84 @@ class TestBank:
         assert bank._entries.get(kept.token_ids) is kept
         assert sibling.token_ids not in bank._entries
         assert "ssd_cold:conv" in lane.pending
+
+
+class TestOwnPublishedStateGoesBeforeTheWidth:
+    """2026-10-01: a 32K Pi turn after its compaction ran 2,048-row chunks
+    beside the lease of the compaction's summary prompt (the same Pi session
+    id, 41 tokens in common). This conversation's own entries that the prompt
+    neither restores from nor continues, once the SSD cache has published
+    them, leave RAM before the request gives up its chunk width; one not on
+    disk yet stays, and so does the conversation's same-conversation entry."""
+
+    PROMPT = list(range(4_000_000, 4_032_409))
+    # The compaction's summary prompt: 41 tokens shared with the turn.
+    SUMMARY = PROMPT[:41] + list(range(5_000_000, 5_047_724))
+    # 86.5 GiB of engine: the 4,096-row bill (5.98 GiB) crosses the 0.97
+    # line with the summary's 1.44 GiB resident and fits without it.
+    BASE_GIB = 86.5
+
+    def _admit_wide(self, monkeypatch, manager, lane):
+        monkeypatch.setattr(
+            srv,
+            "_admission_scratch_bytes",
+            lambda state, *, rows, prompt_tokens, geometry: (
+                5 * GIB if rows > 2048 else 3 * GIB,
+                "qsa_itemized",
+            ),
+        )
+        machine = _Machine(
+            manager.bank, base_gib=self.BASE_GIB, cache_gib=0.0, host_gib=0.0, lane=lane
+        )
+        _install(monkeypatch, machine)
+        state = _flash_next_state(manager)
+        conversation = manager.get_or_create("pi")
+        assert conversation.try_begin_generation()
+        try:
+            return srv._prefill_admission_shed(
+                state,
+                prompt_ids=self.PROMPT,
+                session_bank=manager.bank,
+                session_id="pi",
+                prefill_chunk_tokens=4096,
+                restore_mode="clone",
+            )
+        finally:
+            conversation.end_generation()
+
+    def test_its_published_summary_leaves_ram_and_the_turn_keeps_its_width(self, monkeypatch):
+        manager, lane = _world(ssd=True)
+        summary = _flash_next_entry(manager.bank, self.SUMMARY)
+        lane.run_all()
+        manager.bank.cold_tier.published.add(summary.token_ids)
+
+        receipt = self._admit_wide(monkeypatch, manager, lane)
+
+        assert receipt["prefill_chunk_tokens"] == 4096
+        assert receipt["reclamation_steps"] == ["own_session_to_ssd"]
+        assert receipt["own_session_moved_to_ssd"]["entries"] == 1
+        assert summary.token_ids not in manager.bank._entries
+
+    def test_an_unpublished_summary_stays_and_the_chunk_narrows(self, monkeypatch):
+        manager, lane = _world(ssd=True)
+        summary = _flash_next_entry(manager.bank, self.SUMMARY)
+
+        receipt = self._admit_wide(monkeypatch, manager, lane)
+
+        assert receipt["prefill_chunk_tokens"] == 2048
+        assert "own_session_to_ssd" not in receipt["reclamation_steps"]
+        assert manager.bank._entries.get(summary.token_ids) is summary
+        assert "ssd_cold:pi" in lane.pending
+
+    def test_the_conversations_own_newest_state_stays_even_when_published(self, monkeypatch):
+        manager, lane = _world(ssd=True)
+        # The conversation itself: most of the prompt, then a tail the turn
+        # re-encoded (no recurrent checkpoint, so it restores nothing).
+        same = _flash_next_entry(manager.bank, self.PROMPT[:30_000] + [7] * 2_000)
+        lane.run_all()
+        manager.bank.cold_tier.published.add(same.token_ids)
+
+        receipt = self._admit_wide(monkeypatch, manager, lane)
+
+        assert manager.bank._entries.get(same.token_ids) is same
+        assert "own_session_to_ssd" not in (receipt or {}).get("reclamation_steps", [])

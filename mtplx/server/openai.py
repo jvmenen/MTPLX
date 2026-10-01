@@ -759,6 +759,48 @@ def _stream_cancelled_queue_item(exc: _StreamCancelled) -> tuple[str, str]:
     return ("cancelled", reason)
 
 
+def _detach_exception_frames(exc: BaseException) -> BaseException:
+    """``exc`` without the frames that raised it, nor any exception chained
+    to it: what the consumers read is its type and fields.
+
+    A traceback owns its frames' locals. A 507 raised while handling the
+    prefill's abort chains that abort, whose traceback held the prefill's
+    caches; queued as raised it kept 4.95 GB active after a refusal, and the
+    retry met it (2026-10-01)."""
+
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        node.__traceback__ = None
+        chained = node.__cause__ or node.__context__
+        node.__cause__ = None
+        node.__context__ = None
+        node = chained
+    return exc
+
+
+def _stream_error_queue_item(exc: BaseException) -> tuple[str, BaseException]:
+    return ("error", _detach_exception_frames(exc))
+
+
+def _is_memory_refusal(exc: BaseException | None) -> bool:
+    return isinstance(exc, HTTPException) and exc.status_code == 507
+
+
+def _release_after_memory_refusal() -> None:
+    """Once a refused request's frames are gone: collect what a cycle still
+    holds and hand the freed buffers back to macOS. Never raises."""
+
+    try:
+        gc.collect()
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+    except Exception:
+        pass
+
+
 def _raise_if_stream_cancelled(
     cancel_event: Event, message: str = "stream client disconnected"
 ) -> None:
@@ -20285,6 +20327,27 @@ def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
 _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
 
+def _generation_call_site(max_depth: int = 12) -> str | None:
+    """``function:line`` of the generation frame that asked the per-chunk
+    check, for its receipt; None outside one."""
+
+    try:
+        frame = sys._getframe(1)
+    except ValueError:
+        return None
+    for _ in range(max_depth):
+        if frame is None:
+            return None
+        code = frame.f_code
+        if (
+            code.co_filename.endswith("generation.py")
+            and code.co_name != "_check_postcommit_abort"
+        ):
+            return f"{code.co_name}:{frame.f_lineno}"
+        frame = frame.f_back
+    return None
+
+
 _COMPRESSOR_EPISODE_LOCK = threading.Lock()
 
 
@@ -20332,14 +20395,16 @@ class _PrefillSystemGuard:
         under-priced the request stops here instead of past the limit.
 
     Before any of them stops the request, the engine gives back its own
-    reusable memory once (``_shed_reusable_memory``: the allocator pool and
-    the RAM state of every conversation that is not generating, conversations
-    already on SSD first) and reads the Mac again; only a line still crossed
+    reusable memory once (``_shed_reusable_memory``: the allocator pool, the
+    RAM state of every conversation that is not generating, conversations
+    already on SSD first, then this conversation's own entries the request
+    cannot restore from) and reads the Mac again; only a line still crossed
     after that stops the request with a 507 before the chunk (the E2d agent
     replay, 2026-09-29: a request was refused while idle session snapshots
     and the pool were still held). An unreadable machine skips the Mac's
     lines, ``--allow-swap`` skips all of them, and the trip belongs to this
-    request only.
+    request only. The engine's limit stays a hard line: past it MLX allocates
+    anyway, and a 128 GB Mac 2.3 GB past it kernel-panicked four times (#450).
 
     Once the prefill's forwards are done, the check reserves only what the
     request still allocates (``after_prefill_reserve_bytes``: the repage's
@@ -20364,9 +20429,23 @@ class _PrefillSystemGuard:
         after_prefill_reserve_bytes: int | None = None,
         forward_rows_bytes: int | None = None,
         restore_bytes: int = 0,
+        reserve_for_rows: Callable[[int], int] | None = None,
+        chunk_rows: int | None = None,
+        own_session_shed: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        # What one forward of N rows allocates (the admission's own bill at
+        # that width): the reservation shrinks to the rows that are left.
+        self.reserve_for_rows = reserve_for_rows
+        self.chunk_rows = None if chunk_rows is None else max(1, int(chunk_rows))
+        self.rows_left: int | None = None
+        self.tokens_done: int | None = None
+        # The closest the engine came to its line (scalars only).
+        self.engine_margin_min: dict[str, Any] | None = None
+        # Gives back this request's own conversation's entries that it does
+        # not restore from (the admission's step 7 and 8), before a refusal.
+        self.own_session_shed = own_session_shed
         self.after_prefill_reserve_bytes = (
             self.chunk_reserve_bytes
             if after_prefill_reserve_bytes is None
@@ -20425,9 +20504,19 @@ class _PrefillSystemGuard:
             done = int(payload.get("tokens_done") or 0)
         except (AttributeError, TypeError, ValueError):
             return
-        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total):
+        # The chunked loops forward every prompt token but the last, which
+        # the logits forward reads alone, so the last chunk reports
+        # total - 1. Waiting for total kept the whole-chunk reservation
+        # after the forwards were done (2026-10-01, a 32K Pi turn after a
+        # compaction: 93.46 GB held plus a 3.19 GB chunk that never came,
+        # refused 13 MB over the line four times while the Mac had 28 GB).
+        if phase == "chunk":
+            self.tokens_done = done
+        if phase == "completed" or (phase == "chunk" and total > 0 and done >= total - 1):
             if self.prefill_done_by is None:
                 self.prefill_done_by = "prefill_progress"
+        elif phase == "chunk" and total > 0:
+            self.rows_left = max(1, total - 1 - done)
 
     def __call__(self) -> bool:
         if self.tripped is not None:
@@ -20520,6 +20609,16 @@ class _PrefillSystemGuard:
                 self.prefill_done_by = "forward_rows_resident"
         if self.prefill_done_by is not None:
             reserve = self.after_prefill_reserve_bytes
+        elif (
+            self.rows_left is not None
+            and self.reserve_for_rows is not None
+            and (self.chunk_rows is None or self.rows_left < self.chunk_rows)
+        ):
+            # The last chunk runs only the rows that are left.
+            try:
+                reserve = min(reserve, max(0, int(self.reserve_for_rows(self.rows_left))))
+            except Exception:  # noqa: BLE001 - the whole chunk stays reserved
+                pass
         reason = None
         engine = None
         fields: dict[str, Any] = {}
@@ -20552,7 +20651,7 @@ class _PrefillSystemGuard:
                     reason = "compressor_full"
                 elif int(reading.available_bytes) + pool - reserve < abort_floor:
                     reason = "under_abort_floor"
-        return {
+        verdict = {
             "reason": reason,
             "reserve": reserve,
             "engine": engine,
@@ -20561,6 +20660,55 @@ class _PrefillSystemGuard:
             "reading": reading,
             "base": base,
             "abort_floor": abort_floor,
+        }
+        self._note_engine_margin(verdict)
+        return verdict
+
+    def _note_engine_margin(self, verdict: Mapping[str, Any]) -> None:
+        """Keep the reading closest to the engine's line, with where the
+        prefill was: the receipt that names a trip site (the 2026-10-01
+        refusals left only a check count)."""
+
+        engine = verdict.get("engine")
+        if engine is None or self.limit <= 0:
+            return
+        margin = int(self.limit) - int(engine) - int(verdict["reserve"])
+        if os.environ.get("MTPLX_PREFILL_GUARD_TRACE", "").strip() == "1":
+            try:
+                import mlx.core as _mx
+
+                peak = int(_mx.get_peak_memory())
+            except Exception:
+                peak = None
+            _safe_stdout_print(
+                "[mtplx] prefill guard check "
+                + json.dumps(
+                    {
+                        "check": int(self.checks),
+                        "site": _generation_call_site(),
+                        "tokens_done": self.tokens_done,
+                        "engine_bytes": int(engine),
+                        "pool_bytes": int(verdict["pool"]),
+                        "peak_bytes": peak,
+                        "reserve_bytes": int(verdict["reserve"]),
+                        "margin_bytes": margin,
+                        "reason": verdict["reason"],
+                    }
+                )
+            )
+        if self.engine_margin_min is not None and margin >= int(
+            self.engine_margin_min["margin_bytes"]
+        ):
+            return
+        self.engine_margin_min = {
+            "margin_bytes": margin,
+            "engine_bytes": int(engine),
+            "reserve_bytes": int(verdict["reserve"]),
+            "pool_bytes": int(verdict["pool"]),
+            "tokens_done": self.tokens_done,
+            "after_prefill": self.prefill_done_by is not None,
+            "check": int(self.checks),
+            "site": _generation_call_site(),
         }
 
     def _note_trajectory(self, reading: Any, earlier: Any, episode_base: Any) -> None:
@@ -20615,6 +20763,9 @@ class _PrefillSystemGuard:
             "episode_growth_max_bytes": self._episode_growth_max,
             "free_min_bytes": self._free_min,
             "swap_growth_bytes": delta("swap_used_bytes"),
+            "engine_margin_min": (
+                dict(self.engine_margin_min) if self.engine_margin_min else None
+            ),
         }
 
     def _shed_reusable_memory(self, verdict: Mapping[str, Any]) -> dict[str, Any]:
@@ -20689,6 +20840,30 @@ class _PrefillSystemGuard:
                 _mx.clear_cache()
             except Exception:
                 pass
+        # This request's own conversation is in flight, so the release above
+        # skips all of it. What it holds that this request cannot restore
+        # from goes too (the admission's last steps before a refusal): a Pi
+        # compaction's summary prompt shares 41 tokens with the turn after
+        # it, and its 2.79 GB lease sat in RAM while that turn was refused.
+        own = self.own_session_shed
+        short = target is None or int(receipt["released_bytes"]) < int(target)
+        if own is not None and short:
+            try:
+                own_receipt = own("prefill_shed_before_abort_own_session") or {}
+            except Exception as exc:  # noqa: BLE001
+                own_receipt = getattr(exc, "receipt", None) or {}
+                receipt["own_session_error"] = repr(exc)
+            own_bytes = int(own_receipt.get("held_bytes") or 0)
+            receipt["own_session_released_bytes"] = own_bytes
+            receipt["own_session_released_entries"] = int(own_receipt.get("entries") or 0)
+            receipt["released_bytes"] = int(receipt["released_bytes"]) + own_bytes
+            if own_bytes > 0:
+                try:
+                    import mlx.core as _mx
+
+                    _mx.clear_cache()
+                except Exception:
+                    pass
         return receipt
 
 
@@ -20852,12 +21027,22 @@ def _prefill_system_abort_exception(
             f"leave less than the {_gib_text(floor)} floor"
         )
     if reason == "engine_limit":
+        # Say what was given back, from the shed's own receipt: the old text
+        # claimed half the session cache went while 0 bytes did, and invited a
+        # retry that met the same wall (2026-10-01).
+        shed = tripped.get("shed_before_abort") or {}
+        released = int(shed.get("released_bytes") or 0)
+        gave_back = (
+            f"after giving back {_gib_text(released)} of saved conversation state"
+            if released > 0
+            else "after finding nothing else it could give back"
+        )
         message = (
             "insufficient memory: this request needs more memory than the "
-            f"engine may use ({cause}). The prefill stopped before that chunk; "
-            "the engine released half of its session cache and stays up. A "
-            "retry is priced again against what is left: try again, or "
-            "shorten the prompt."
+            f"engine may use ({cause}). The prefill stopped before that chunk, "
+            f"{gave_back}. The engine is still running. The same request needs "
+            "the same memory, so a retry will stop here again: start a new "
+            "chat or shorten the prompt."
         )
     else:
         message = (
@@ -20875,9 +21060,11 @@ def _prefill_system_abort_exception(
             "memory": _json_safe(
                 {
                     **dict(tripped),
-                    "retry_can_succeed": True,
+                    # The engine already gave back what it could before this
+                    # refusal; only the Mac's lines can clear without it.
+                    "retry_can_succeed": reason != "engine_limit",
                     "retry_when": (
-                        "after_engine_sheds_cache"
+                        "never_as_is"
                         if reason == "engine_limit"
                         else "after_other_apps_free_memory"
                     ),
@@ -22239,6 +22426,84 @@ def _admission_kept_rows(
     return [best]
 
 
+def _admission_move_own_durable_entries(
+    session_bank: Any | None,
+    *,
+    session_id: str | None,
+    probe_ids: Sequence[int],
+    restore_keys: Any,
+    reused_tokens: int,
+) -> dict[str, Any] | None:
+    """This conversation's RAM entries that the SSD cache has published and
+    the prompt neither restores from nor continues (``restore_plan`` keys and
+    ``same_conversation_entries``), moved to the SSD cache: only RAM is
+    given up, a later restore reads them back. None when nothing moved."""
+
+    keys_fn = getattr(session_bank, "session_entry_keys", None)
+    move_fn = getattr(session_bank, "move_durable_entries_to_ssd", None)
+    if not session_id or not callable(keys_fn) or not callable(move_fn):
+        return None
+    keep = {tuple(key) for key in (restore_keys or ())}
+    same_conversation_fn = getattr(session_bank, "same_conversation_entries", None)
+    if callable(same_conversation_fn):
+        keep.update(
+            tuple(row["key"])
+            for row in _admission_kept_rows(
+                same_conversation_fn(session_id, list(probe_ids)) or (),
+                reused_tokens=reused_tokens,
+            )
+        )
+    keys = [key for key in keys_fn(session_id) if tuple(key) not in keep]
+    if not keys:
+        return None
+    moved = move_fn(keys, reason="prefill_admission_own_session_to_ssd")
+    if not int((moved or {}).get("entries") or 0):
+        return None
+    return dict(moved)
+
+
+def _release_own_unusable_entries(
+    *,
+    session_bank: Any | None,
+    session_id: str | None,
+    prompt_ids: Sequence[int],
+    vision_splice: Any | None,
+    restore_identity: Mapping[str, Any] | None,
+    reason: str,
+) -> dict[str, Any] | None:
+    """The admission's step 7 for a request already past it: this request's
+    own conversation's RAM entries that it does not restore from, other than
+    its same-conversation entry. Called from the request's own thread, which
+    holds the session's slot (no ownership hold)."""
+
+    release = getattr(session_bank, "release_sessions", None)
+    if session_bank is None or not session_id or not callable(release):
+        return None
+    probe_ids = list(prompt_ids)
+    if vision_splice is not None:
+        from mtplx.vision.splice import vision_bank_key_ids
+
+        keyed_ids = vision_bank_key_ids(list(prompt_ids), vision_splice)
+        if keyed_ids is None:
+            return None
+        probe_ids = list(keyed_ids)
+    kwargs: dict[str, Any] = {
+        "only_session_ids": {str(session_id)},
+        "protect_tokens": probe_ids,
+        "restore_identity": dict(restore_identity or {}),
+        "reason": reason,
+    }
+    same_conversation_fn = getattr(session_bank, "same_conversation_entries", None)
+    if callable(same_conversation_fn):
+        kept = _admission_kept_rows(
+            same_conversation_fn(session_id, probe_ids) or (), reused_tokens=0
+        )
+        kept_keys = {tuple(row["key"]) for row in kept}
+        if kept_keys:
+            kwargs["protect_keys"] = kept_keys
+    return release(None, **kwargs)
+
+
 def _kept_conversation_retry_verdict(
     receipt: dict[str, Any],
     kept_resident: list[Mapping[str, Any]],
@@ -22846,16 +23111,52 @@ def _run_prefill_admission(
             # the guard's health), never dropped: the review of 4c9da1ba.
             early_pool_clear = {"error": repr(exc)}
             early_pool_clear_error = exc
+    own_moved: dict[str, Any] | None = None
+    if chosen != widths[0]:
+        # The same for this conversation's own entries that the prompt cannot
+        # restore from and the SSD cache already holds: they leave RAM before
+        # the request gives up its chunk width or anyone else's state goes,
+        # and a later restore reads them from disk. A Pi turn after its
+        # compaction (2026-10-01) ran 2,048-row chunks beside the 2.79 GB
+        # lease of the compaction's summary prompt, 41 tokens in common.
+        own_moved = _admission_move_own_durable_entries(
+            session_bank,
+            session_id=session_id,
+            probe_ids=probe_ids,
+            restore_keys=restore["keys"],
+            reused_tokens=reused_tokens,
+        )
+        if own_moved is not None and int(own_moved.get("entries") or 0) > 0:
+            try:
+                import mlx.core as _mx
+
+                _mx.clear_cache()
+            except Exception:
+                pass
+            now = measure()
+            chosen = widest_fit(now, models)
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         settle(models[chosen])
-        if early_pool_clear is not None:
+        if early_pool_clear is not None or own_moved is not None:
+            steps0 = ["allocator_pool"] if early_pool_clear is not None else []
+            if own_moved is not None:
+                steps0.append("own_session_to_ssd")
             return {
-                "action": "prefill_admission_pool_clear",
+                "action": (
+                    "prefill_admission_pool_clear"
+                    if early_pool_clear is not None
+                    else "prefill_admission_own_session_to_ssd"
+                ),
                 "prompt_tokens": int(prompt_tokens),
                 "prefill_chunk_requested": widths[0],
                 "prefill_chunk_tokens": widths[0],
-                "reclamation_steps": ["allocator_pool"],
-                **early_pool_clear,
+                "reclamation_steps": steps0,
+                **(early_pool_clear or {}),
+                **(
+                    {"own_session_moved_to_ssd": own_moved}
+                    if own_moved is not None
+                    else {}
+                ),
             }
         return None
     narrow = widths[-1]
@@ -22891,6 +23192,9 @@ def _run_prefill_admission(
         )
         receipt["system_memory"] = now["system"].to_dict()
     steps: list[str] = []
+    if own_moved is not None:
+        steps.append("own_session_to_ssd")
+        receipt["own_session_moved_to_ssd"] = own_moved
     # A reclamation step that raises is recorded in the receipt and must not
     # cost the request, but it must not pass silently either: the guard's
     # health reports it (_note_guard_health) until a later admission gets
@@ -30683,6 +30987,18 @@ def _run_generation(
                 )
             admission_pricing: dict[str, Any] = {}
             answer_room: dict[str, Any] | None = None
+            admission_restore_identity = {
+                "model_path": (
+                    str(getattr(state.runtime, "model_path", "") or "") or None
+                ),
+                "mtp_enabled": getattr(state.runtime, "mtp_enabled", None),
+                "template_hash": session_template_hash,
+                "mtp_history_policy": (
+                    "cycle" if effective_mode == "ar" else _bank_history_policy(state)
+                ),
+                "draft_head_identity": session_draft_head_identity,
+                "policy_fingerprint": session_policy_fingerprint,
+            }
             admission_shed = _prefill_admission_shed(
                 state,
                 prompt_ids=prompt_ids,
@@ -30696,18 +31012,7 @@ def _run_generation(
                 commit_prompt_prefix=bool(
                     commit_prompt_prefix_to_bank and effective_mode != "ar"
                 ),
-                restore_identity={
-                    "model_path": (
-                        str(getattr(state.runtime, "model_path", "") or "") or None
-                    ),
-                    "mtp_enabled": getattr(state.runtime, "mtp_enabled", None),
-                    "template_hash": session_template_hash,
-                    "mtp_history_policy": (
-                        "cycle" if effective_mode == "ar" else _bank_history_policy(state)
-                    ),
-                    "draft_head_identity": session_draft_head_identity,
-                    "policy_fingerprint": session_policy_fingerprint,
-                },
+                restore_identity=admission_restore_identity,
                 pricing=admission_pricing,
                 wide_prefill_rungs=wide_prefill_rungs,
             )
@@ -30772,9 +31077,20 @@ def _run_generation(
                 mtp_depth=effective_depth,
             )
             request_env = dict(dynamic_kv_reservation["env"])
+            def _own_session_shed(reason: str) -> dict[str, Any] | None:
+                return _release_own_unusable_entries(
+                    session_bank=session_bank,
+                    session_id=session_id,
+                    prompt_ids=prompt_ids,
+                    vision_splice=vision_splice,
+                    restore_identity=admission_restore_identity,
+                    reason=reason,
+                )
+
             prefill_system_guard = make_prefill_system_guard(
                 state, prompt_tokens=len(prompt_ids), chunk_tokens=prefill_chunk_tokens,
                 priced=admission_pricing.get("growth"),
+                own_session_shed=_own_session_shed,
             )
 
             def _prefill_abort_check() -> bool:
@@ -30961,13 +31277,17 @@ def _run_generation(
                         ),
                         store_prefix_snapshot=store_prefix_snapshot,
                     )
-        except PostcommitAbort:
+        except PostcommitAbort as _prefill_abort:
             # abort_check tripped inside the prefill. Three arms share it: a
             # client disconnect reuses the exact cancellation path decode
             # disconnects take, while the per-chunk supply check and the
             # guard loop's sustained-critical pressure abort (#393) are
             # engine-health refusals the client must SEE — those map to the
             # honest 507 (which also sheds caches) instead of a silent cancel.
+            # The abort's traceback owns the prefill's frames and their
+            # caches; carried as the context of the 507 through the response
+            # queue it kept 4.95 GB active after a refusal (2026-10-01).
+            _prefill_abort.__traceback__ = None
             client_cancelled = cancel_event is not None and cancel_event.is_set()
             if prefill_system_guard.tripped is not None and not client_cancelled:
                 if request_observability is not None:
@@ -39419,6 +39739,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ]
 
                 def worker() -> None:
+                    memory_refused = False
                     try:
                         _raise_if_stream_cancelled(cancel_event)
                         if session is None:
@@ -39669,7 +39990,8 @@ def create_app(state: ServerState) -> FastAPI:
                             commit_state["tail_outcome"] = {
                                 "error": f"{type(exc).__name__}: {exc}"
                             }
-                        queue.put(("error", exc))
+                        memory_refused = _is_memory_refusal(exc)
+                        queue.put(_stream_error_queue_item(exc))
                     else:
                         queue.put(("done", generated))
                     finally:
@@ -39681,6 +40003,8 @@ def create_app(state: ServerState) -> FastAPI:
                             tail_session.end_response_tail(
                                 tail, commit_state.get("tail_outcome")
                             )
+                        if memory_refused:
+                            _release_after_memory_refusal()
 
                 generation_future: Future = Future()
 
@@ -39688,7 +40012,7 @@ def create_app(state: ServerState) -> FastAPI:
                     try:
                         worker()
                     except BaseException as exc:
-                        queue.put(("error", exc))
+                        queue.put(_stream_error_queue_item(exc))
                         if not generation_future.done():
                             generation_future.set_exception(exc)
                     else:
@@ -42180,6 +42504,7 @@ def create_app(state: ServerState) -> FastAPI:
                     _raise_if_stream_cancelled(cancel_event)
 
                 def worker() -> None:
+                    memory_refused = False
                     try:
                         result = _run_generation_dispatched(
                             state,
@@ -42204,9 +42529,12 @@ def create_app(state: ServerState) -> FastAPI:
                     except _StreamCancelled as exc:
                         queue.put(_stream_cancelled_queue_item(exc))
                     except BaseException as exc:
-                        queue.put(("error", exc))
+                        memory_refused = _is_memory_refusal(exc)
+                        queue.put(_stream_error_queue_item(exc))
                     else:
                         queue.put(("done", result))
+                    if memory_refused:
+                        _release_after_memory_refusal()
 
                 generation_future: Future = Future()
 
@@ -42214,7 +42542,7 @@ def create_app(state: ServerState) -> FastAPI:
                     try:
                         worker()
                     except BaseException as exc:
-                        queue.put(("error", exc))
+                        queue.put(_stream_error_queue_item(exc))
                         if not generation_future.done():
                             generation_future.set_exception(exc)
                     else:

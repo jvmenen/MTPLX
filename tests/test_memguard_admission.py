@@ -1047,7 +1047,195 @@ class TestPerChunkSupplyCheck:
         assert "the engine held 90.0 GiB" in error.detail["message"]
         assert "needs 7.0 GiB, past its 96.0 GiB limit" in error.detail["message"]
         assert "other apps" not in error.detail["message"]
-        assert error.detail["memory"]["retry_when"] == "after_engine_sheds_cache"
+        # It says what it gave back, and never invites a retry that meets the
+        # same wall (2026-10-01: "released half of its session cache" with 0
+        # bytes released, then three identical refusals).
+        assert "after finding nothing else it could give back" in error.detail["message"]
+        assert "a retry will stop here again" in error.detail["message"]
+        assert "half of its session cache" not in error.detail["message"]
+        assert error.detail["memory"]["retry_can_succeed"] is False
+        assert error.detail["memory"]["retry_when"] == "never_as_is"
+
+    # The founder's 2026-10-01 refusals, in his engine's own numbers: a 32K Pi
+    # turn after a compaction held 93.46 GB with a 2.79 GB lease of the
+    # compaction prompt (same Pi session id, shares 41 tokens), the chunk
+    # reserve was 3.19 GB and the line 96.64 GB.
+    _HELD = 93_460_615_364
+    _CHUNK = 3_190_364_976
+    _LIMIT = 96_636_764_160
+
+    def _founder_guard(self, monkeypatch, active, **guard_kwargs):
+        box = {"active": int(active)}
+        guard = self._guard(
+            monkeypatch,
+            [self._reading(available_gib=26, free_gib=3, compressor_gib=2.5, at_s=0.0)],
+            limit_gib=self._LIMIT / GIB,
+            **guard_kwargs,
+        )
+        monkeypatch.setattr(
+            srv,
+            "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": box["active"], "cache_memory_bytes": 0},
+        )
+        monkeypatch.setattr(srv, "_shed_after_allocation_failure", lambda state: {})
+        return guard, box
+
+    def test_the_last_chunk_reports_one_token_short_and_ends_the_chunk_reserve(self, monkeypatch):
+        guard, _box = self._founder_guard(
+            monkeypatch,
+            self._HELD,
+            chunk_reserve_bytes=self._CHUNK,
+            after_prefill_reserve_bytes=115_642_384,
+        )
+        # The chunked loops forward every token but the last: 32,408 of 32,409.
+        guard.note_prefill_progress(
+            {"phase": "chunk", "tokens_done": 32_408, "tokens_total": 32_409}
+        )
+        assert guard() is False
+        assert guard.tripped is None
+        assert guard.prefill_done_by == "prefill_progress"
+
+    def test_before_the_fix_the_same_reading_tripped_on_a_chunk_that_never_came(self, monkeypatch):
+        guard, _box = self._founder_guard(
+            monkeypatch, self._HELD, chunk_reserve_bytes=self._CHUNK
+        )
+        # No progress note: the whole chunk is still reserved, 13 MB over.
+        assert guard() is True
+        assert guard.tripped["reason"] == "engine_limit"
+
+    def test_the_last_partial_chunk_reserves_only_its_rows(self, monkeypatch):
+        rows_priced = []
+
+        def reserve_for_rows(rows):
+            rows_priced.append(rows)
+            return rows * (self._CHUNK // 2048)
+
+        guard, _box = self._founder_guard(
+            monkeypatch,
+            self._HELD,
+            chunk_reserve_bytes=self._CHUNK,
+            reserve_for_rows=reserve_for_rows,
+        )
+        guard.note_prefill_progress(
+            {"phase": "chunk", "tokens_done": 30_720, "tokens_total": 32_409}
+        )
+        assert guard() is False
+        assert rows_priced == [32_409 - 1 - 30_720]
+
+    def test_its_own_conversations_unusable_state_goes_before_a_refusal(self, monkeypatch):
+        calls = []
+
+        def own_session_shed(reason):
+            calls.append(reason)
+            box["active"] -= 2_793_632_912
+            return {"held_bytes": 2_793_632_912, "entries": 1}
+
+        guard, box = self._founder_guard(
+            monkeypatch,
+            self._HELD,
+            chunk_reserve_bytes=self._CHUNK,
+            own_session_shed=own_session_shed,
+        )
+        assert guard() is False
+        assert guard.tripped is None
+        assert calls == ["prefill_shed_before_abort_own_session"]
+        assert guard.shed["own_session_released_bytes"] == 2_793_632_912
+        assert guard.shed["request_continued"] is True
+
+    def test_a_refusal_after_giving_back_says_how_much(self, monkeypatch):
+        def own_session_shed(reason):
+            return {"held_bytes": 1 * GIB, "entries": 1}
+
+        guard, _box = self._founder_guard(
+            monkeypatch,
+            self._HELD + 4 * GIB,
+            chunk_reserve_bytes=self._CHUNK,
+            own_session_shed=own_session_shed,
+        )
+        assert guard() is True
+        error = srv._prefill_system_abort_exception(SimpleNamespace(), guard.tripped)
+        assert "after giving back 1.0 GiB of saved conversation state" in error.detail["message"]
+
+    def test_a_full_chunk_still_left_keeps_the_whole_chunk_reserve(self, monkeypatch):
+        rows_priced = []
+        guard, _box = self._founder_guard(
+            monkeypatch,
+            80 * GIB,
+            chunk_reserve_bytes=self._CHUNK,
+            reserve_for_rows=lambda rows: rows_priced.append(rows) or 0,
+            chunk_rows=2048,
+        )
+        guard.note_prefill_progress(
+            {"phase": "chunk", "tokens_done": 8_192, "tokens_total": 32_409}
+        )
+        assert guard() is False
+        assert rows_priced == []
+
+    def test_the_receipt_names_the_closest_reading_to_the_line(self, monkeypatch):
+        guard, box = self._founder_guard(
+            monkeypatch, 86_000_000_000, chunk_reserve_bytes=self._CHUNK
+        )
+        guard.note_prefill_progress(
+            {"phase": "chunk", "tokens_done": 2_048, "tokens_total": 32_409}
+        )
+        assert guard() is False
+        box["active"] = 92_000_000_000
+        guard.note_prefill_progress(
+            {"phase": "chunk", "tokens_done": 14_336, "tokens_total": 32_409}
+        )
+        assert guard() is False
+        box["active"] = 88_000_000_000
+        assert guard() is False
+        closest = guard.trajectory()["engine_margin_min"]
+        assert closest["tokens_done"] == 14_336
+        assert closest["engine_bytes"] == 92_000_000_000
+        assert closest["margin_bytes"] == self._LIMIT - 92_000_000_000 - self._CHUNK
+        assert closest["check"] == 2
+
+
+def test_a_refusal_queued_for_the_stream_holds_no_prefill_frames():
+    """The 507 raised while handling the prefill's abort chains that abort,
+    and the abort's traceback holds the prefill's frames and caches: queued
+    as raised, 4.95 GB stayed active after a refusal (2026-10-01). Queued
+    detached, the prefill's arrays go with the frames, no collection
+    needed."""
+
+    import gc
+    import weakref
+
+    from fastapi import HTTPException
+
+    from mtplx.generation import PostcommitAbort
+
+    class Cache:
+        pass
+
+    held = {}
+
+    def prefill():
+        cache = Cache()
+        held["ref"] = weakref.ref(cache)
+        raise PostcommitAbort("foreground_preempted_postcommit")
+
+    def run_generation():
+        try:
+            prefill()
+        except PostcommitAbort:
+            raise HTTPException(status_code=507, detail={"message": "refused"})
+
+    gc.disable()
+    try:
+        try:
+            run_generation()
+        except HTTPException as exc:
+            item = srv._stream_error_queue_item(exc)
+        assert held["ref"]() is None
+        kind, error = item
+        assert kind == "error" and error.status_code == 507
+        assert error.__traceback__ is None and error.__context__ is None
+        assert srv._is_memory_refusal(error) is True
+    finally:
+        gc.enable()
 
 
 class _LoopBank:

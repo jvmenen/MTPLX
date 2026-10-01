@@ -80,6 +80,10 @@ public enum CacheExplanation {
             return at > 0
                 ? tr("History changed at token %@", tokens(at))
                 : tr("History changed from the start")
+        case "different_request":
+            // Another request under the same session id (Pi's compaction
+            // summaries and the turn after them), not an edit of the history.
+            return tr("A different request in this conversation: only its first %@ tokens match the last one", tokens(at))
         case "screenshot_changed":
             return tr("The screenshot at token %@ changed", tokens(at))
         case "new_conversation":
@@ -198,6 +202,10 @@ public enum CacheExplanation {
             return tr("No saved state for this conversation in memory or on the SSD")
         case "ssd_prefix_not_better_than_ram", "ssd_prefix_shadowed_by_resident_duplicate":
             return tr("The copy in memory was as good as the one on the SSD")
+        case "ssd_prefix_no_recurrent_boundary":
+            // An older conversation on the SSD shares the start, but has no
+            // saved checkpoint inside the shared part to resume from.
+            return bankSentence("no_snapshot_coverage")
         case "ssd_format_mismatch", "ssd_mtp_epoch_mismatch", "legacy_ssd_cache_archived":
             return tr("The SSD copy was saved by a different MTPLX version or model setup")
         case "ssd_payload_missing", "ssd_missing_mtp_generation_state", "ssd_missing_mtp_history":

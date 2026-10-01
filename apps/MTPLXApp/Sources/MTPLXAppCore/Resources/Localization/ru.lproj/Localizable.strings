@@ -1633,6 +1633,7 @@
 "Reading %@ new tokens" = "Чтение новых токенов: %@";
 "History changed at token %@" = "История изменилась на токене %@";
 "History changed from the start" = "История изменилась с самого начала";
+"A different request in this conversation: only its first %@ tokens match the last one" = "Другой запрос в этом разговоре: с предыдущим совпадают только первые %@ токенов";
 "The screenshot at token %@ changed" = "Снимок экрана на токене %@ изменился";
 "New conversation or first turn since MTPLX started" = "Новый разговор или первая реплика после запуска MTPLX";
 "No saved state for this conversation" = "Для этого разговора нет сохранённого состояния";

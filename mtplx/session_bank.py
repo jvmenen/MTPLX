@@ -4146,6 +4146,17 @@ class SessionBank:
             entry.session_id == session_id for entry in list(self._entries.values())
         )
 
+    def session_entry_keys(self, session_id: str | None) -> list[tuple[int, ...]]:
+        """The keys of ``session_id``'s RAM entries."""
+
+        if not session_id:
+            return []
+        return [
+            key
+            for key, entry in list(self._entries.items())
+            if entry.session_id == session_id
+        ]
+
     def session_coverage_tokens(
         self, session_id: str | None, prompt_tokens: list[int] | tuple[int, ...]
     ) -> int:
