@@ -55,23 +55,19 @@ final class ClientWindowTests: XCTestCase {
         }
     }
 
-    func testPiGivesTheHalfWindowPairMTPLXWroteTheWholeWindowBack() throws {
+    func testPiPairMTPLXWroteFollowsTheServedWindow() throws {
         let url = temporaryDirectory().appendingPathComponent("models.json")
         let integration = PiIntegration(configURL: url)
-        let configuration = MTPLXAppConfiguration(model: flashNext, port: 8000, contextWindow: 262_144)
+        let configuration = MTPLXAppConfiguration(model: qwen36, port: 8000, contextWindow: 131_072)
 
-        // What builds from 59288061 left in the founder's models.json. The
-        // write before the daemon starts keeps the window and gives the
-        // answer ceiling back.
-        try writePiModel(at: url, contextWindow: 262_144, maxTokens: 131_072)
+        // The write before the daemon starts: the setting, whole.
         _ = try integration.sync(configuration: configuration)
         var model = try piModel(at: url)
-        XCTAssertEqual(model["contextWindow"]?.intValue, 262_144)
-        XCTAssertEqual(model["maxTokens"]?.intValue, 262_144)
+        XCTAssertEqual(model["contextWindow"]?.intValue, 131_072)
+        XCTAssertEqual(model["maxTokens"]?.intValue, 131_072)
 
-        // Once the daemon publishes its window, the pair follows it whole.
+        // Once the daemon publishes its window, MTPLX's pair follows it whole.
         let served = ServedExecutionWindow(tokens: 98_304)
-        try writePiModel(at: url, contextWindow: 262_144, maxTokens: 131_072)
         XCTAssertTrue(try integration.sync(configuration: configuration, servedWindow: served).didChange)
         model = try piModel(at: url)
         XCTAssertEqual(model["contextWindow"]?.intValue, 98_304)
@@ -90,24 +86,44 @@ final class ClientWindowTests: XCTestCase {
     }
 
     func testPiKeepsAWindowPairTheUserChose() throws {
-        // #282: a pair that is not MTPLX's (maxTokens equal to the window or
-        // to half of it) is the user's, before and after the daemon answers,
-        // and so is a maxTokens set on an entry without its own window (the
-        // sync fills in the 65,536 setting beside it).
+        // #282: only maxTokens equal to the window is MTPLX's pair. Any other
+        // pair is the user's before and after the daemon answers, half the
+        // window included (only internal builds from 59288061 wrote that, so
+        // anywhere else it is a user edit), and so is a maxTokens set on an
+        // entry without its own window (the sync fills in the 65,536 setting
+        // beside it).
         let url = temporaryDirectory().appendingPathComponent("models.json")
         let integration = PiIntegration(configURL: url)
         let configuration = MTPLXAppConfiguration(model: qwen36, port: 8000, contextWindow: 65_536)
         let pairs: [(window: Int?, maxTokens: Int)] = [
-            (65_536, 20_000), (262_144, 65_536), (32_768, 16_385), (nil, 20_000),
+            (65_536, 20_000), (262_144, 65_536), (32_768, 16_385),
+            (262_144, 131_072), (98_305, 49_152), (nil, 20_000), (nil, 32_768),
         ]
         for pair in pairs {
             try writePiModel(at: url, model: qwen36, contextWindow: pair.window, maxTokens: pair.maxTokens)
-            for served in [nil, ServedExecutionWindow(tokens: 98_304)] {
+            for served in [nil, ServedExecutionWindow(tokens: 98_304), nil] {
                 _ = try integration.sync(configuration: configuration, servedWindow: served)
                 let model = try piModel(at: url)
                 XCTAssertEqual(model["contextWindow"]?.intValue, pair.window ?? 65_536)
                 XCTAssertEqual(model["maxTokens"]?.intValue, pair.maxTokens)
             }
+        }
+    }
+
+    func testPiKeepsAMaxTokensTheUserSetWithoutAWindow() throws {
+        // The review's case: the user set only maxTokens 65,536; the first
+        // sync fills in the 131,072 setting beside it, and the pair it makes
+        // (half the window) stays theirs through repeated syncs, before and
+        // after the daemon publishes its window.
+        let url = temporaryDirectory().appendingPathComponent("models.json")
+        let integration = PiIntegration(configURL: url)
+        let configuration = MTPLXAppConfiguration(model: qwen36, port: 8000, contextWindow: 131_072)
+        try writePiModel(at: url, model: qwen36, contextWindow: nil, maxTokens: 65_536)
+        for served in [nil, nil, ServedExecutionWindow(tokens: 98_304), nil] {
+            _ = try integration.sync(configuration: configuration, servedWindow: served)
+            let model = try piModel(at: url)
+            XCTAssertEqual(model["contextWindow"]?.intValue, 131_072)
+            XCTAssertEqual(model["maxTokens"]?.intValue, 65_536)
         }
     }
 
@@ -117,9 +133,11 @@ final class ClientWindowTests: XCTestCase {
         }
         // Every MTPLX writer advertises the whole window.
         XCTAssertTrue(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(262_144, 262_144)))
-        // Builds from 59288061 wrote half of it, rounded down.
-        XCTAssertTrue(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(262_144, 131_072)))
-        XCTAssertTrue(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(98_305, 49_152)))
+        XCTAssertTrue(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(98_304, 98_304)))
+        // Half the window is a user pair: 2.12.0 only ever wrote the whole one.
+        XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(262_144, 131_072)))
+        XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(98_305, 49_152)))
+        XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(131_072, 65_536)))
         XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(131_072, 20_000)))
         XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(entry(262_144, 65_536)))
         XCTAssertFalse(PiIntegration.windowFieldsWereWrittenByMTPLX(["contextWindow": .number(8_192)]))

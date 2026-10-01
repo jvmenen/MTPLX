@@ -9551,49 +9551,47 @@ def _write_pi_model_entry(config_path, **entry):
     )
 
 
-def _pi_model_entry_after_sync(config_path):
+def _pi_model_entry_after_sync(config_path, window=131_072, **kwargs):
     from mtplx.pi import write_pi_models_config
 
     write_pi_models_config(
         base_url="http://127.0.0.1:8000/v1",
         model_id="mtplx-test-model",
         path=config_path,
-        context_window=131_072,
+        context_window=window,
+        **kwargs,
     )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     return payload["providers"]["mtplx"]["models"][0]
 
 
-def test_pi_models_config_gives_the_half_window_pair_mtplx_wrote_the_whole_window(
-    tmp_path,
-):
-    """App builds from 59288061 wrote maxTokens as half the window, and Pi
-    sends maxTokens as every answer's ceiling while the prompt is short
-    (131,072 of 262,144 in the founder's models.json). That pair is MTPLX's
-    own, so a sync gives it the whole window back, the ceiling every MTPLX
-    writer advertises. The window itself is kept, as for any existing pair."""
+def test_pi_models_config_refreshes_the_window_mtplx_wrote(tmp_path):
+    """MTPLX's own pair (maxTokens equal to contextWindow) takes a newly
+    supplied window; it used to keep the first window it ever wrote."""
     config_path = tmp_path / "models.json"
-    for window in (262_144, 98_305, 32_768):
-        _write_pi_model_entry(config_path, contextWindow=window, maxTokens=window // 2)
-        model = _pi_model_entry_after_sync(config_path)
-        assert (model["contextWindow"], model["maxTokens"]) == (window, window)
+    model = _pi_model_entry_after_sync(config_path, 131_072)
+    assert (model["contextWindow"], model["maxTokens"]) == (131_072, 131_072)
+    model = _pi_model_entry_after_sync(config_path, 32_768)
+    assert (model["contextWindow"], model["maxTokens"]) == (32_768, 32_768)
 
 
 def test_pi_models_config_keeps_a_window_pair_the_user_chose(tmp_path):
-    """#282: a pair that is not MTPLX's (maxTokens equal to the window or to
-    half of it) is a user edit and survives every sync untouched, and so does
-    a maxTokens the user set on an entry without its own contextWindow (the
-    first sync fills in the 131,072 window beside it)."""
+    """#282: only maxTokens equal to contextWindow is MTPLX's pair. Any other
+    pair, a half-window one included, is the user's and survives every sync,
+    including one that supplies a new window; so does a maxTokens the user
+    set on an entry without its own contextWindow, after the first sync
+    fills in the window beside it."""
     config_path = tmp_path / "models.json"
     for entry in (
-        {"contextWindow": 262_144, "maxTokens": 65_536},
+        {"contextWindow": 262_144, "maxTokens": 131_072},
+        {"contextWindow": 131_072, "maxTokens": 65_536},
         {"contextWindow": 131_072, "maxTokens": 20_000},
         {"contextWindow": 32_768, "maxTokens": 16_385},
-        {"maxTokens": 20_000},
+        {"maxTokens": 65_536},
     ):
         _write_pi_model_entry(config_path, **entry)
-        for _sync in range(2):
-            model = _pi_model_entry_after_sync(config_path)
+        for window in (131_072, 131_072, 32_768):
+            model = _pi_model_entry_after_sync(config_path, window)
             assert model["maxTokens"] == entry["maxTokens"]
             assert model["contextWindow"] == entry.get("contextWindow", 131_072)
 

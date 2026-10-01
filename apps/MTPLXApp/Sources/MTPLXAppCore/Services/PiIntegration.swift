@@ -283,9 +283,8 @@ public struct PiIntegration: Sendable {
     /// `servedWindow` is the window the running daemon published
     /// (`/health` `execution_window`). With it, the window fields MTPLX wrote
     /// earlier are brought to what the engine executes; without it (the write
-    /// before the daemon starts) an existing window is left alone, so a
-    /// launch never rewrites it twice. Either way the answer ceiling of
-    /// MTPLX's own pair is its whole window.
+    /// before the daemon starts) existing window fields are left alone, so a
+    /// launch never rewrites them twice.
     @discardableResult
     public func sync(
         configuration: MTPLXAppConfiguration,
@@ -571,9 +570,9 @@ public struct PiIntegration: Sendable {
     /// x-mtplx-client header — because ports move between launches. Every
     /// other key the user edited wins; model entries merge by id, and
     /// user-added models or fields (vision input, custom thinkingLevelMap,
-    /// explicit maxTokens) survive a sync untouched. A contextWindow/maxTokens
-    /// pair MTPLX wrote (`windowFieldsWereWrittenByMTPLX`) answers up to its
-    /// whole window, and with `refreshManagedWindow` takes the served window.
+    /// explicit maxTokens) survive a sync untouched. With
+    /// `refreshManagedWindow`, a contextWindow/maxTokens pair MTPLX wrote
+    /// (`windowFieldsWereWrittenByMTPLX`) takes the served window.
     static func mergedProviderConfig(
         existing: JSONValue?,
         fresh: [String: JSONValue],
@@ -622,14 +621,11 @@ public struct PiIntegration: Sendable {
                 if freshObject["input"]?.arrayValue?.contains(.string("image")) == true {
                     entry["input"] = freshObject["input"]
                 }
-                if Self.windowFieldsWereWrittenByMTPLX(existingEntry) {
+                if refreshManagedWindow, Self.windowFieldsWereWrittenByMTPLX(existingEntry) {
                     // The engine's executed window is engine truth, like
-                    // `input` above, and MTPLX's pair answers up to all of
-                    // it; a pair the user edited stays theirs.
-                    if refreshManagedWindow {
-                        entry["contextWindow"] = freshObject["contextWindow"]
-                    }
-                    entry["maxTokens"] = entry["contextWindow"]
+                    // `input` above; a pair the user edited stays theirs.
+                    entry["contextWindow"] = freshObject["contextWindow"]
+                    entry["maxTokens"] = freshObject["maxTokens"]
                 }
                 resultModels[index] = .object(entry)
             } else {
@@ -641,16 +637,15 @@ public struct PiIntegration: Sendable {
     }
 
     /// Whether a model entry's `contextWindow`/`maxTokens` pair is one MTPLX
-    /// wrote: `maxTokens` equal to the window, what every MTPLX writer
-    /// advertises, or to half of it, what app builds from 59288061
-    /// advertised. Any other pair is a user edit and survives every sync
-    /// (#282). SYNC PAIR: mtplx/pi.py `_window_fields_written_by_mtplx`.
+    /// wrote: `maxTokens` equal to the window. Any other pair is a user edit
+    /// and survives every sync (#282). SYNC PAIR: mtplx/pi.py
+    /// `_window_fields_written_by_mtplx`.
     static func windowFieldsWereWrittenByMTPLX(_ entry: [String: JSONValue]) -> Bool {
         guard let window = entry["contextWindow"]?.intValue,
               let maxTokens = entry["maxTokens"]?.intValue,
               window > 0
         else { return false }
-        return maxTokens == window || maxTokens == window / 2
+        return maxTokens == window
     }
 
     private static func providerConfig(
