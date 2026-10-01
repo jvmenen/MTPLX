@@ -2610,3 +2610,32 @@ def test_extended_warmup_env_and_packed_prewarm(monkeypatch):
     assert _prewarm_gqa_packed_pipelines() is False  # kernel env off
     monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
     assert _prewarm_gqa_packed_pipelines() in (True, False)  # metal-dependent
+
+
+def test_compiled_verify_allow_bits_env(monkeypatch):
+    """MTPLX_COMPILED_VERIFY_ALLOW_BITS widens only the bits allowlist."""
+    from types import SimpleNamespace
+
+    from mtplx.graphbank import CompiledVerifyBank, _compiled_verify_bits_gate_ok
+
+    def runtime_with_bits(bits):
+        layer = SimpleNamespace(self_attn=SimpleNamespace(q_proj=SimpleNamespace(bits=bits)))
+        return SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(layers=[layer])))
+
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY_FORCE", raising=False)
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY_ALLOW_BITS", raising=False)
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(6)) is False
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_ALLOW_BITS", "6")
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(6)) is True
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(3)) is False
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(4)) is True
+    assert CompiledVerifyBank(runtime_with_bits(6)).permanent_eager is False
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_ALLOW_BITS", " 3 , 6;x")
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(3)) is True
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(6)) is True
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_ALLOW_BITS", "garbage")
+    assert _compiled_verify_bits_gate_ok(runtime_with_bits(6)) is False
+    assert CompiledVerifyBank(runtime_with_bits(6)).permanent_eager is True

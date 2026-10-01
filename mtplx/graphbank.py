@@ -1875,6 +1875,23 @@ def _prism_ternary_fp16_loaded(runtime: Any) -> bool:
     )
 
 
+def _compiled_verify_extra_allowed_bits() -> frozenset[int]:
+    """Opt-in extra trunk bit widths from MTPLX_COMPILED_VERIFY_ALLOW_BITS.
+
+    Comma-separated integers (``6`` or ``6,3``). Unlike
+    ``MTPLX_COMPILED_VERIFY_FORCE`` it only widens the bits allowlist; the
+    Prism and parity paths stay as they are. Invalid tokens are ignored.
+    """
+
+    raw = os.environ.get("MTPLX_COMPILED_VERIFY_ALLOW_BITS", "")
+    allowed: set[int] = set()
+    for token in raw.replace(";", ",").split(","):
+        token = token.strip()
+        if token.isdigit():
+            allowed.add(int(token))
+    return frozenset(allowed)
+
+
 def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     if _env_enabled("MTPLX_COMPILED_VERIFY_FORCE"):
         return True
@@ -1885,6 +1902,8 @@ def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     # ternary 2-bit trunk (Ternary Bonsai 2) engages after its loader's
     # float16 checks: parity2 and speed receipts in the Bonsai night report.
     if bits == 2 and _prism_ternary_fp16_loaded(runtime):
+        return True
+    if bits is not None and bits in _compiled_verify_extra_allowed_bits():
         return True
     return bits is None or bits in (4, 8)
 
