@@ -4,6 +4,20 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.12.2] - 2026-10-03
+
+### Fixed
+
+- **Macs with 8, 16 and 32 GB serve ordinary prompts again.** 2.12.1 refused prompts that 2.12.0 served on these Macs with the model the app picks for them. On an M5 Max set up as each Mac (its engine limit, its free-memory floors and a fixed free-memory reading), 2.12.1 refused an 18-token prompt to Qwen 3.5 4B on 8 GB with 3 GiB free, 2,600 to 7,800-token prompts and an agent's first turn to Ternary Bonsai 2 27B on 16 GB, and 6,800 and 7,800-token prompts and an agent's third turn to Qwen 3.8 27B Optimized Speed on 32 GB; GitHub's 7 GB M1 test machine refused a one-line request with a 507. 2.12.2 serves all of them (October 3), and the M1 test machine passes. Three changes:
+  - A dense model's prompt is priced at what it was measured to use through `mtplx serve`: the 4B 0.19 GiB for a 59-token prompt and 1.55 to 1.65 GiB per 2,048-token chunk, Bonsai 2 27B 0.45 GiB for a 98-token prompt, Bonsai and the 27B 2.5 to 2.7 GiB per 2,048-token chunk, plus a margin of 0.09 to 0.25 GiB. 2.12.1 charged every model the 27B's 3 GiB per 2,048-token chunk and about 2 GiB for a one-line prompt. Models with routed experts, Flash-Next and Gemma 4 keep their 2.12.1 prices.
+  - A prompt that does not fit in 2,048-token chunks runs in 1,024-token chunks, or 512-token chunks for prompts up to about 8,000 tokens, before it is refused (not Flash-Next or Gemma 4, which keep their own chunk widths). A narrower chunk is used only where it saves at least 128 MiB. A 1,024-token chunk uses about 1 GiB less on the 27B models; a 7,000-token Bonsai prompt took 9.5 s at 2,048, 9.6 s at 1,024 and 9.7 s at 512 tokens a chunk (single runs).
+  - Memory outside the GPU allocator is charged only past 4 GiB on Macs under 64 GB. 2.12.1 charged it past a sixteenth of RAM (1 GiB on 16 GB, 2 GiB on 32 GB), while a healthy engine holds 2.1 to 2.9 GiB there with Bonsai and 2.3 to 4.0 GiB with the 27B. Macs with 64 GB or more are unchanged.
+- **#499's 99,355-token 27B turn on a 48 GB Mac runs in 1,024-token chunks**, priced at 34.87 GiB against the 36 GiB limit, where 2.12.1 refused it (tests with the reporter's numbers).
+
+### Changed
+
+- **Dependencies.** urllib3 2.8.0 (#582 by @dependabot).
+
 ## [2.12.1] - 2026-10-02
 
 ### Added
