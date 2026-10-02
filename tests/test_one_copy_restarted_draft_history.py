@@ -137,7 +137,11 @@ def test_a_restarted_history_trimmed_behind_its_lease_is_still_refused(monkeypat
 
 # -- generation on the tiny Flash-Next pack ---------------------------------------
 
-_RESTART = {"MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "8"}
+# The bound counts the rows the commits append, not the rows the drafts
+# staged (most of them, with the capture commit): a 40-token answer made six
+# appends and never reached a bound of 8. A bound of 4 over 60 tokens restarts
+# the history (the precondition the test asserts first).
+_RESTART = {"MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "4"}
 
 
 def _commit_like_the_server(run, prompt: list[int], bank: SessionBank, session_id: str):
@@ -173,7 +177,7 @@ def _two_turns(pack, monkeypatch, *, one_copy: bool):
     monkeypatch.setenv("MTPLX_ONE_COPY", "1" if one_copy else "0")
     bank = SessionBank()
     first = _generate(
-        pack, monkeypatch, max_tokens=40, env=_RESTART, session_bank=bank,
+        pack, monkeypatch, max_tokens=60, env=_RESTART, session_bank=bank,
         session_id="s", session_restore_mode="reference",
         commit_prompt_state_to_bank=True,
     )
