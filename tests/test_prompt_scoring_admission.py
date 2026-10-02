@@ -56,14 +56,19 @@ def scoring_admission(monkeypatch):
 def test_default_generic_scoring_admits_the_27b_request_that_fits(scoring_admission):
     state, client = scoring_admission
     prompt = [7] * 8192
-    # The generation bill reproduces the review's refusal at serving width.
+    # The generation bill at serving width reproduced the review's refusal
+    # (24.63 GiB on the 24 GiB limit at 2,048 rows, 2.12.1). With the bill
+    # measured on the 27B (2026-10-02: 1.52 GiB at 1,024 rows, 2.55 at
+    # 2,048) it runs at 1,024 rows, under the limit.
     priced = {}
     previous = srv._prefill_admission_shed(
         state, prompt_ids=prompt, session_bank=None, session_id=None,
         max_new_tokens=0, mtp_depth=0, prefill_chunk_tokens=2048, pricing=priced,
     )
-    assert previous["refused"]
-    assert previous["projected_bytes_after"] / GIB == pytest.approx(24.63125, abs=1e-6)
+    assert not previous.get("refused")
+    assert previous["prefill_chunk_requested"] == 2048
+    assert previous["prefill_chunk_tokens"] == 1024
+    assert 23.28 * GIB < previous["projected_bytes_after"] < 24 * GIB
 
     response = client.post("/v1/completions", json={
         "prompt": prompt, "echo": True, "logprobs": 2, "max_tokens": 0,

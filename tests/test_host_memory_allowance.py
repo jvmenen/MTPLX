@@ -23,6 +23,12 @@ MTPLX_MEMORY_LIMIT_BYTES did not lower it, and 14 GiB of leaked host memory
 ceiling (12 GiB limit + 8) past its RAM. The seats that motivated the old
 rule stay quiet: 48 GB / 27B with 3 GiB of host memory, 96 GB / Flash-Next
 with 5.
+
+2026-10-02: never under 4 GiB. A sixteenth of a small Mac is less than what
+a healthy daemon of that Mac's own model holds outside MLX (2.1 to 2.9 GiB
+for Bonsai 2 27B at the 16 GB limit, 2.3 to 4.0 GiB for the 27B at the 32
+GB limit), so 2.12.1 charged ordinary memory as a leak and refused prompts
+2.12.0 served. 8 to 64 GB: 4 GiB, 96 GB: 6, 128 GB and up: 8.
 """
 
 from __future__ import annotations
@@ -89,13 +95,15 @@ def _served_prefill_is_chunked(monkeypatch):
 
 @pytest.mark.parametrize(
     "ram_gib, allowance_gib",
-    [(16, 1), (48, 3), (96, 6), (128, 8), (512, 8)],
+    [(8, 4), (16, 4), (32, 4), (48, 4), (64, 4), (96, 6), (128, 8), (512, 8)],
 )
 def test_the_allowance_is_sized_to_the_seat(ram_gib, allowance_gib):
-    """A sixteenth of the machine, capped at the 8 GiB measured on 128 GB.
+    """A sixteenth of the machine between 4 GiB and the 8 GiB measured on
+    128 GB.
 
     A flat 8 GiB put a 16 GB Mac's process ceiling (12 GiB limit + 8) past
-    its RAM; the 2026-09-27 review of this change caught it."""
+    its RAM; the 2026-09-27 review of this change caught it. A sixteenth
+    alone (1 GiB on 16 GB) charged a healthy daemon's own host memory."""
 
     state = _state(total_gib=ram_gib, limit_gib=ram_gib * 0.75)
     assert srv._host_memory_allowance_bytes(state) == allowance_gib * GIB
@@ -103,8 +111,10 @@ def test_the_allowance_is_sized_to_the_seat(ram_gib, allowance_gib):
 
 def test_a_simulated_seat_gets_its_own_allowance():
     # --memory-budget 48G on a 128 GB Mac plans (and guards) a 48 GB seat.
+    state = _state(total_gib=128, limit_gib=36, budget_gib=96)
+    assert srv._host_memory_allowance_bytes(state) == 6 * GIB
     state = _state(total_gib=128, limit_gib=36, budget_gib=48)
-    assert srv._host_memory_allowance_bytes(state) == 3 * GIB
+    assert srv._host_memory_allowance_bytes(state) == 4 * GIB
 
 
 def test_an_unknown_machine_gets_the_cap():
@@ -241,12 +251,12 @@ def test_admission_does_not_refuse_a_request_the_plan_sized_to_fit(monkeypatch):
 
 
 def test_a_leak_on_a_48gb_seat_is_charged_not_forgiven(monkeypatch):
-    """10 GiB outside MLX on a 48 GB Mac. This test used to admit it: the old
-    allowance (8 GiB on this seat) charged 2 GiB. The seat's 3 GiB allowance
+    """11 GiB outside MLX on a 48 GB Mac. This test used to admit 10: the old
+    allowance (8 GiB on this seat) charged 2 GiB. The seat's 4 GiB allowance
     charges 7, and the same request no longer fits the 36 GiB limit."""
 
     state = _state(total_gib=48, limit_gib=36)
-    _pin(monkeypatch, allocator_gib=28, footprint_gib=38)
+    _pin(monkeypatch, allocator_gib=28, footprint_gib=39)
     receipt = srv._prefill_admission_shed(
         state, prompt_ids=list(range(8192)), session_bank=_EmptyBank(), session_id="pi"
     )
@@ -275,3 +285,48 @@ def test_the_admission_receipt_explains_what_it_charged(monkeypatch):
     # Still over the limit after reclamation, on the footprint alone.
     assert receipt["refused"] is True
     assert receipt["host_overhang_charged_bytes_after"] == 32 * GIB
+
+
+# --------------------------------------------------------------------------
+# Small Macs (2.12.2)
+# --------------------------------------------------------------------------
+
+
+MIB = 1024**2
+
+
+@pytest.mark.parametrize(
+    "ram_gib, limit_gib, allocator_mib, footprint_mib, charged_mib",
+    [
+        # Bonsai 2 27B at the 16 GB limit: 2.9 GiB outside MLX after a prompt
+        # (2.12.1 charged 1.9 GiB of it).
+        (16, 12, 7782, 10772, 0),
+        # The 27B at the 32 GB limit before its prefill: 2.3 GiB.
+        (32, 24, 20470, 22820, 0),
+        # The same daemon right after a prefill chunk, its freed buffers not
+        # yet given back: 4.015 GiB, of which 2.12.1 charged 2.015.
+        (32, 24, 21064, 25175, 15),
+    ],
+)
+def test_a_small_macs_own_model_is_not_charged(
+    monkeypatch, ram_gib, limit_gib, allocator_mib, footprint_mib, charged_mib
+):
+    """The readings 2.12.1 refused on (2026-10-02, at the 16 and 32 GB limits)."""
+
+    state = _state(total_gib=ram_gib, limit_gib=limit_gib)
+    _pin(monkeypatch, allocator_gib=allocator_mib / 1024, footprint_gib=footprint_mib / 1024)
+    live, fields = srv._footprint_floor(
+        state, limit=int(limit_gib * GIB), allocator_bytes=allocator_mib * MIB
+    )
+    assert fields["host_allowance_bytes"] == 4 * GIB
+    assert fields["host_overhang_charged_bytes"] == charged_mib * MIB
+    assert live == (allocator_mib + charged_mib) * MIB
+
+
+def test_a_leak_on_a_16gb_seat_is_still_charged(monkeypatch):
+    # 6 GiB outside MLX on a 16 GB Mac: 2 GiB past its 4 GiB allowance.
+    state = _state(total_gib=16, limit_gib=12)
+    _pin(monkeypatch, allocator_gib=9, footprint_gib=15)
+    _live, fields = srv._footprint_floor(state, limit=12 * GIB, allocator_bytes=9 * GIB)
+    assert fields["host_allowance_bytes"] == 4 * GIB
+    assert fields["host_overhang_charged_bytes"] == 2 * GIB

@@ -574,13 +574,15 @@ class Test499FortyEightGigSeat:
         assert receipt.get("refused") is not True
         assert receipt["projected_bytes_after"] <= 36 * GIB
 
-    def test_with_the_heads_history_the_turn_is_refused_at_the_limit(self, monkeypatch):
+    def test_with_the_heads_history_the_turn_runs_at_a_narrower_chunk(self, monkeypatch):
         """The plan now carries the MTP head's committed history (4,096 B a
         token on the 27B). Priced with it the turn projects 39.47 GiB, the
-        trace's measured 39.5 GiB peak, and even without the banked prompt
-        copy it needs 36.03 GiB against the 36 GiB limit: a structured 507
-        before prefill, where 2.12.0 ran it past the limit and produced no
-        tokens before the client gave up."""
+        trace's measured 39.5 GiB peak, where 2.12.0 ran it past the limit and
+        produced no tokens before the client gave up. Without the banked
+        prompt copy it needed 36.03 GiB at 2,048 rows and was refused (2.12.1);
+        at 1,024 rows, whose measured working memory is 1.1 GiB less
+        (2026-10-02: 1.52 against 2.55 GiB on the 27B), it needs 34.87 GiB,
+        under the 0.97 line of the 36 GiB limit, and runs."""
 
         plan = self._plan()
         plan.mtp_history_bytes_per_token = 4_096
@@ -609,13 +611,10 @@ class Test499FortyEightGigSeat:
             session.end_generation()
         assert 39.4 * GIB < receipt["projected_bytes"] < 39.5 * GIB
         assert receipt["prompt_publish_skipped"] is True
-        assert receipt["refused"] is True
-        assert receipt["refusal_reason"] == "projected_over_limit_after_reclamation"
-        assert 0 < receipt["projected_bytes_after"] - 36 * GIB < 0.05 * GIB
-        # What is left is this conversation's own restore source, which the
-        # turn needs: a shorter prompt, not a retry, fits.
-        assert receipt["retry_can_succeed"] is False
-        assert receipt["retry_when"] == "not_without_a_shorter_prompt"
+        assert "refused" not in receipt
+        assert receipt["prefill_chunk_requested"] == 2048
+        assert receipt["prefill_chunk_tokens"] == 1024
+        assert 34.8 * GIB < receipt["projected_bytes_after"] < 0.97 * 36 * GIB
 
     def test_the_banked_prompt_copy_is_priced_while_it_fits_the_cap(self, monkeypatch):
         plan = self._plan()
@@ -705,15 +704,15 @@ class TestGrowthModel:
     def test_the_27b_is_priced_from_its_geometry(self):
         """#525 point A: a family without a QSA indexer is billed rows times
         what a row holds plus a fixed part, never 0 and never a flat figure
-        that ignores the rows. The 27B's GDN layer is its widest (136 KiB a
-        row); at the default 2,048-row chunk the bill is the measured 3 GiB
-        reserve, a 195-token turn still pays the fixed part (the old share
-        was 0.29 GiB), and a 4,096-row chunk pays the reserve per 2,048
-        rows."""
+        that ignores the rows. The 27B is a dense family, billed what was
+        measured on it (2026-10-02, the 27B and Bonsai 2 27B through mtplx
+        serve: 0.45 to 0.74 GiB for 98 to 195 rows, 1.52 to 1.72 at 1,024,
+        2.52 to 2.72 at 2,048): 0.75 GiB plus ten MLP rows a row (1.09 MiB).
+        2.12.1 charged 3 GiB at 2,048 rows and 2.04 GiB for a 195-token turn."""
 
         args = _q27_text_args()
-        per_row = srv._ADMISSION_LIVE_LAYERS * srv._forward_row_bytes(args)
         assert srv._forward_row_bytes(args) == 139_264
+        mlp_row = 2 * (5_120 + 3 * 17_408)
         state = SimpleNamespace(runtime=_q27_runtime())
         geometry = self._geometry(live_bytes_per_token=Q27_KV)
 
@@ -721,14 +720,17 @@ class TestGrowthModel:
             scratch, source = srv._admission_scratch_bytes(
                 state, rows=rows, prompt_tokens=prompt_tokens, geometry=geometry
             )
-            assert source == "geometry"
+            assert source == "geometry_measured"
             return scratch
 
-        fixed = 3 * GIB - 2048 * per_row
-        assert bill(2048) == 3 * GIB
-        assert bill(195) == fixed + 195 * per_row
-        assert 2.0 * GIB < bill(195) < 2.1 * GIB
-        assert bill(4096) == 6 * GIB
+        assert bill(2048) == 0.75 * GIB + 10 * mlp_row * 2048
+        assert 2.72 * GIB < bill(2048) < 2.95 * GIB
+        assert 1.72 * GIB < bill(1024) < 1.85 * GIB
+        # Short prompts are on the steeper line: 0.25 GiB plus 36 MLP rows.
+        assert bill(98) == 0.25 * GIB + 36 * mlp_row * 98
+        assert 0.45 * GIB < bill(98) < 0.65 * GIB
+        assert 0.74 * GIB < bill(195) < 0.97 * GIB
+        assert bill(4096) == 0.75 * GIB + 10 * mlp_row * 4096
         # Fused attention: no term grows with the keys (the QSA bill would
         # charge 11 GB of scores at 99K keys).
         assert bill(2048, prompt_tokens=1_000) == bill(2048, prompt_tokens=262_144)
@@ -1485,8 +1487,10 @@ class Test525SixtyFourGigSeat:
         assert growth["live_prefill_bytes"] == 250_000 * Q27_KV
         assert growth["repage_copy_bytes"] == (250_000 + 16_386) * R525_Q4
         assert growth["growth_bytes"] == growth["repage_bytes"]
-        assert growth["scratch_source"] == "geometry"
-        assert growth["scratch_bytes"] == 3 * GIB
+        assert growth["scratch_source"] == "geometry_measured"
+        # The 27B's measured 2,048-row bill (2.52 to 2.72 GiB measured).
+        assert growth["scratch_bytes"] == srv._dense_prefill_bill(_q27_text_args(), 2048)
+        assert 2.72 * GIB < growth["scratch_bytes"] < 2.95 * GIB
         # The old projection, the q4 width and the flat reserve (7.6 GiB),
         # missed 12.6 GiB of it.
         old_growth = 250_000 * R525_Q4 + 3 * GIB

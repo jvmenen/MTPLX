@@ -79,7 +79,9 @@ class TestTheHostAllowance:
     def test_the_default_limit_keeps_the_seats_share(self):
         assert srv._host_memory_allowance_bytes(_caps(96, "default")) == 8 * GIB
 
-    @pytest.mark.parametrize("limit_gib, allowance_gib", [(96, 8), (90, 7.5), (48, 4), (6, 1)])
+    # Never under the 4 GiB a small seat's own model holds outside MLX
+    # (2026-10-02): a 6 GiB limit lowers the share, not the daemon's floor.
+    @pytest.mark.parametrize("limit_gib, allowance_gib", [(96, 8), (90, 7.5), (48, 4), (6, 4)])
     def test_an_explicit_limit_bounds_it(self, limit_gib, allowance_gib):
         assert srv._host_memory_allowance_bytes(_caps(limit_gib, "env")) == int(
             allowance_gib * GIB

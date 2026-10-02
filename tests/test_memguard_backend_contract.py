@@ -902,6 +902,9 @@ class TestThe4B:
         )
         manager = _manager()
         _roomy(monkeypatch, manager)
+        # The 4B's own seat: its weights and a few GiB of headroom under the
+        # 12 GiB limit, so the request is admitted at the profile's chunk.
+        _install(monkeypatch, _Machine(manager.bank, base_gib=2.6, cache_gib=0.0, host_gib=1.0))
         state = _state(manager, plan=plan, runtime=self._runtime(), limit_gib=12, total_gib=16)
         pricing: dict = {}
         srv._prefill_admission_shed(
@@ -914,10 +917,17 @@ class TestThe4B:
             pricing=pricing,
         )
         growth = pricing["growth"]
-        per_row = srv._ADMISSION_LIVE_LAYERS * 100_352
-        fixed = max(srv._ADMISSION_FIXED_FLOOR_BYTES, 3 * GIB - per_row * 2048)
+        # A dense family: what was measured on it (2026-10-02, the 4B
+        # through mtplx serve: 1.55 to 1.65 GiB at 2,048 rows from 7K to 49K
+        # of context), 0.75 GiB plus ten MLP rows (2 x (2,560 + 3 x 9,216))
+        # a row at this width: 1.90 GiB. 2.12.1 charged the 27B's 3 GiB.
+        args = srv._runtime_text_args(self._runtime())
         assert growth["prefill_chunk_tokens"] == 2048
         assert growth["scratch_rows"] == 2048
-        assert growth["scratch_source"] == "geometry"
-        assert growth["scratch_bytes"] == max(fixed + per_row * 2048, 3 * GIB)
+        assert growth["scratch_source"] == "geometry_measured"
+        assert growth["scratch_bytes"] == srv._dense_prefill_bill(args, 2048)
+        assert growth["scratch_bytes"] == 0.75 * GIB + 10 * 2 * (2_560 + 3 * 9_216) * 2048
+        assert 1.65 * GIB < growth["scratch_bytes"] < 1.91 * GIB
+        # A 59-token prompt (0.19 GiB measured; 2.12.1 charged 2.26 GiB).
+        assert 0.19 * GIB < srv._dense_prefill_bill(args, 59) < 0.4 * GIB
         assert growth["publish_copy_bytes"] == 20_000 * kv

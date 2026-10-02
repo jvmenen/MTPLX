@@ -20891,6 +20891,15 @@ def _prefill_forward_bill(
         scratch, source = _admission_scratch_bytes(
             state, rows=rows, prompt_tokens=max(1, int(prompt_tokens)), geometry=geometry
         )
+        if (
+            source.startswith("geometry_measured")
+            and width is not None
+            and int(width) < _DENSE_PREFILL_FLAT_WIDTH
+        ):
+            # Under 1,024 rows a dense family's chunks also hold about a live
+            # row per token of context (_ADMISSION_NARROW_PREFILL_WIDTHS).
+            scratch += max(1, int(prompt_tokens)) * int(geometry.live_bytes_per_token)
+            source += "+context"
         chunk = _admission_chunk_bytes(geometry, rows, scratch)
         return {"rows": rows, "scratch": scratch, "source": source, "chunk_bytes": chunk}
 
@@ -21135,10 +21144,15 @@ def _vision_bank_session_id(bank: Any, prompt_ids: list[int], splice: Any) -> st
 # allowance is that measurement plus headroom on the large seats, and a
 # sixteenth of the machine below 128 GB: 8 GiB outside Metal on a 16 GB Mac
 # (limit 12 GiB) would put the guard's process ceiling past the RAM itself.
-# 16 GB: 1 GiB, 48 GB: 3 GiB, 96 GB: 6 GiB, 128 GB and up: 8 GiB.
+# It never goes under what a healthy daemon of a small seat's own model
+# holds: 2.1 to 2.9 GiB for Bonsai 2 27B and 2.3 to 4.0 GiB for the 27B
+# (2026-10-02, at the 16 and 32 GB limits; the 4.0 right after a prefill
+# chunk, its freed buffers not yet given back). 2.12.1's sixteenth (1 GiB on
+# 16 GB, 2 on 32) charged that as a leak and refused prompts 2.12.0 served.
+# 8 to 64 GB: 4 GiB, 96 GB: 6 GiB, 128 GB and up: 8 GiB.
 # MTPLX_HOST_MEMORY_ALLOWANCE_BYTES overrides it.
 _HOST_MEMORY_ALLOWANCE_CAP_BYTES = 8 * 1024**3
-_HOST_MEMORY_ALLOWANCE_MIN_BYTES = 1 * 1024**3
+_HOST_MEMORY_ALLOWANCE_MIN_BYTES = 4 * 1024**3
 _HOST_MEMORY_ALLOWANCE_RAM_DIVISOR = 16
 
 
@@ -21471,6 +21485,80 @@ _ADMISSION_LIVE_LAYERS = 4
 # Flash-Next (generation._WIDE_PREFILL_FIXED_BYTES).
 _ADMISSION_FIXED_FLOOR_BYTES = 1 * 1024**3
 
+# A dense family's prefill working memory (no routed experts, no QSA
+# indexer: the 27B, Bonsai 2 27B, the 4B and 9B), measured 2026-10-02 on an
+# M5 Max through ``mtplx serve``: MLX's peak over what a chunk leaves
+# resident, with the peak reset before each fresh prompt, in GiB.
+#
+#   rows            59-195     308-345   606-641   1,024       2,048
+#   Qwen 3.5 4B     0.19-0.38  0.69      0.93      1.06-1.24   1.55-1.65
+#   Bonsai 2 27B    0.45-0.74  0.93      1.30      1.70-1.72   2.69-2.72
+#   Qwen 3.8 27B                                   1.52-1.54   2.52-2.55
+#
+# At 1,024 and 2,048 rows it stays flat from 2K to 49K tokens of context. It
+# climbs steeply over the first couple of hundred rows and then by about ten
+# MLP rows (2 x (hidden + 3 x intermediate)) a row, so the bill is the lower
+# of two lines in MLP rows: 0.25 GiB plus 36 a row, and 0.75 GiB plus 10 a
+# row. That covers every reading by 0.09 to 0.25 GiB: 0.37 GiB for a
+# 59-token 4B prompt, 1.84 and 2.94 GiB at 1,024 and 2,048 rows on the 27B
+# geometry, 1.33 and 1.90 on the 4B. 2.12.1 charged every family the 27B's
+# whole-request reserve per 2,048 rows with a 1.9 to 2.2 GiB floor (3.0 GiB
+# at 2,048 rows, 2.3 for a 64-token 4B prompt), which refused short prompts
+# on 8 GB Macs. A family with routed experts keeps that bill until it is
+# measured.
+_DENSE_PREFILL_SHORT_FIXED_BYTES = 256 * 1024**2
+_DENSE_PREFILL_SHORT_MLP_ROWS = 36
+_DENSE_PREFILL_FIXED_BYTES = 768 * 1024**2
+_DENSE_PREFILL_MLP_ROWS = 10
+
+# The chunk widths the admission may narrow a prefill to before it refuses
+# (``_admission_narrow_widths``). From 1,024 rows up a dense family's chunk
+# does not grow with the context. At 512 rows it holds about one more live
+# row per token of context (the 4B: 0.94 GiB at 7K, 1.68 at 32K, 2.22 at
+# 49K; Bonsai 2 27B: 1.21 at 2.4K, 1.53 at 8K), which
+# ``_prefill_forward_bill`` adds, so a 512-row chunk costs less than a
+# 1,024-row one only for short and medium prompts. The admission keeps a
+# narrower width only where it costs less than the width above it. A
+# 7K-token Bonsai prompt took 9.5 s at 2,048 rows, 9.6 s at 1,024 and 9.7 s
+# at 512; a 16K-token 4B prompt 3.4, 3.6 and 4.1 s.
+_ADMISSION_NARROW_PREFILL_WIDTHS = (1024, 512)
+_DENSE_PREFILL_FLAT_WIDTH = 1024
+# A narrower chunk runs slower; one that saves less than this over a wider
+# one is not run in its place when nothing fits.
+_NARROW_CHUNK_MIN_SAVING_BYTES = 128 * 1024**2
+
+
+def _dense_prefill_bill(args: Any, rows: int) -> int | None:
+    """What a prefill forward of ``rows`` rows of a dense family holds at its
+    peak (``_DENSE_PREFILL_FIXED_BYTES``). None for a config without a dense
+    MLP, or with routed experts."""
+
+    def value(name: str) -> int:
+        try:
+            return int(getattr(args, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    hidden = value("hidden_size")
+    intermediate = value("intermediate_size")
+    if hidden <= 0 or intermediate <= 0:
+        return None
+    if (
+        value("num_experts_per_tok")
+        or value("top_k_experts")
+        or value("moe_topk")
+        or value("num_experts")
+        or value("n_routed_experts")
+        or value("num_local_experts")
+    ):
+        return None
+    mlp_row = 2 * (hidden + 3 * intermediate)
+    rows = max(1, int(rows))
+    return min(
+        _DENSE_PREFILL_SHORT_FIXED_BYTES + _DENSE_PREFILL_SHORT_MLP_ROWS * mlp_row * rows,
+        _DENSE_PREFILL_FIXED_BYTES + _DENSE_PREFILL_MLP_ROWS * mlp_row * rows,
+    )
+
 
 def _forward_row_bytes(args: Any) -> int | None:
     """Bytes one row holds at the peak of one layer's forward, for the
@@ -21574,6 +21662,10 @@ def _admission_scratch_bytes(
     materializes below the sparse crossover, and a fixed part; about 3.5 GiB
     at 2,048 rows for a 74K prompt.
 
+    A dense family (no routed experts) is charged what was measured on it
+    (``_DENSE_PREFILL_FIXED_BYTES``): 1.84 and 2.94 GiB at 1,024 and 2,048
+    rows on the 27B, 1.33 and 1.90 on the 4B, 0.37 GiB for a 59-token prompt.
+
     Every other family is charged from its geometry: the rows the forward
     runs times what a row holds across the live layers
     (``_forward_row_bytes``), plus a fixed part. The one measurement on the
@@ -21632,6 +21724,10 @@ def _admission_scratch_bytes(
         # describe it; its activations, the fixed part and its measured
         # attention do.
         return fixed + per_row * rows + attention, "geometry_calibrated" + suffix
+    dense = _dense_prefill_bill(_runtime_text_args(runtime), rows)
+    if dense:
+        # Measured on this family (``_DENSE_PREFILL_FIXED_BYTES``).
+        return dense + attention, "geometry_measured" + suffix
     return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
 
 
@@ -22740,6 +22836,31 @@ def _admission_prefill_widths(
     return prefill_forward_widths(runtime, prompt_tokens, requested)
 
 
+def _admission_narrow_widths(runtime: Any, widths: Sequence[int | None]) -> list[int]:
+    """The narrower chunks the admission may run a family this module chunks
+    (the 27B, Bonsai, the 4B and 9B) at, below its ladder
+    (``_ADMISSION_NARROW_PREFILL_WIDTHS``): a chunk's working memory grows
+    with its rows, so a Mac that cannot fit the profile's chunk runs a
+    narrower one instead of being refused (2.12.1 refused ordinary prompts on
+    16 and 32 GB Macs that a 1,024-row chunk fits). None for Flash-Next,
+    which keeps its own ladder, a backend that answers for its own widths,
+    or a prompt forwarded whole; 1,024 only for a family with routed
+    experts, whose 512-row chunks were not measured."""
+
+    if (
+        runtime is None
+        or not widths
+        or widths[-1] is None
+        or callable(getattr(runtime, "prefill_forward_widths", None))
+        or _runtime_has_qsa_indexer(runtime)
+    ):
+        return []
+    rungs = _ADMISSION_NARROW_PREFILL_WIDTHS
+    if _dense_prefill_bill(_runtime_text_args(runtime), 1) is None:
+        rungs = tuple(w for w in rungs if w >= _DENSE_PREFILL_FLAT_WIDTH)
+    return [w for w in rungs if w < int(widths[-1])]
+
+
 def _run_prefill_admission(
     state: "ServerState",
     *,
@@ -22842,6 +22963,11 @@ def _run_prefill_admission(
         # at 2,048 rows because the wide gate refused before a reclamation
         # that left room for 4,096).
         widths = sorted({*(int(rung) for rung in wide_prefill_rungs), *widths}, reverse=True)
+    # The narrower chunks a tight Mac may fall back to (the 27B, Bonsai, the
+    # 4B and 9B); ``cheapest`` below keeps them from running slower for
+    # nothing.
+    narrow_rungs = [] if prompt_scoring else _admission_narrow_widths(runtime, widths)
+    widths = list(widths) + narrow_rungs
     output_tokens = int(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
@@ -23119,6 +23245,22 @@ def _run_prefill_admission(
                 return w
         return _ADMISSION_NO_FIT
 
+    def cheapest(models: Mapping[Any, Any]) -> Any:
+        # The width reclamation prices and a request that fits nowhere runs
+        # at. With the narrower rungs, the widest one within
+        # _NARROW_CHUNK_MIN_SAVING_BYTES of the least growth: when the
+        # request's peak is its repage or the start of its answer, or a
+        # 512-row chunk's context outgrows the 1,024-row one, a narrower
+        # chunk costs no less and only runs slower. Without them, the
+        # ladder's last width, as before.
+        if not narrow_rungs:
+            return widths[-1]
+        least = min(int(models[w]["growth_bytes"]) for w in widths)
+        for w in widths:
+            if int(models[w]["growth_bytes"]) <= least + _NARROW_CHUNK_MIN_SAVING_BYTES:
+                return w
+        return widths[-1]
+
     models = price()
     chosen = widest_fit(now, models)
     early_pool_clear: dict[str, Any] | None = None
@@ -23203,7 +23345,7 @@ def _run_prefill_admission(
                 ),
             }
         return None
-    narrow = widths[-1]
+    narrow = cheapest(models)
     current = models[narrow if chosen is _ADMISSION_NO_FIT else chosen]
     receipt: dict[str, Any] = {
         "action": "prefill_admission_shed",
@@ -23310,12 +23452,13 @@ def _run_prefill_admission(
     def replan(step: str, evicted: Any) -> None:
         # A step that evicted anything may have changed what the restore
         # reads: ask again and price the request on the answer.
-        nonlocal restore, models, current
+        nonlocal restore, models, current, narrow
         if not evicted:
             return
         before = restore
         restore = plan_restore()
         models = price()
+        narrow = cheapest(models)
         current = models[narrow]
         if (
             restore["reused_tokens"] != before["reused_tokens"]
@@ -23387,8 +23530,9 @@ def _run_prefill_admission(
         if not one_copy and deficit(now) > 0 and current["publish_copy_bytes"] > 0:
             flags["skip_publish"] = True
             unpublished = price()
-            if unpublished[narrow]["growth_bytes"] < current["growth_bytes"]:
+            if unpublished[cheapest(unpublished)]["growth_bytes"] < current["growth_bytes"]:
                 models = unpublished
+                narrow = cheapest(models)
                 current = models[narrow]
                 receipt["prompt_publish_skipped"] = True
                 steps.append("prompt_publish")
