@@ -39,6 +39,12 @@ from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
 )
 from .progress_heartbeat import tick as _owner_progress_tick
+from .prompt_lookup import (
+    PromptLookupDrafter,
+    greedy_pld_eligible,
+    prompt_lookup_config_from_env,
+    verify_draft,
+)
 from .cache_state import (
     CacheSnapshot,
     detach_array_leaf,
@@ -8203,6 +8209,35 @@ def score_prompt_logprobs(
     }
 
 
+def _prompt_lookup_drafter(
+    rt: MTPLXRuntime,
+    sampler: SamplerConfig,
+    prompt_ids: Sequence[int],
+    cache: Any,
+    *,
+    guarded: bool,
+    sync_eval: bool,
+) -> PromptLookupDrafter | None:
+    """Prompt-lookup drafter for this AR request, or None when not applicable."""
+    config = prompt_lookup_config_from_env()
+    if not config.enabled or rt.mtp_enabled:
+        return None
+    trimmable = bool(cache) and all(
+        hasattr(entry, "offset") and callable(getattr(entry, "trim", None))
+        for entry in cache
+    )
+    if not greedy_pld_eligible(
+        config,
+        temperature=sampler.temperature,
+        penalized=bool(sampler.presence_penalty or sampler.frequency_penalty),
+        guarded=guarded,
+        sync_eval=sync_eval,
+        cache_trimmable=trimmable,
+    ):
+        return None
+    return PromptLookupDrafter(config, prompt_ids)
+
+
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8457,6 +8492,17 @@ def generate_ar(
         in ("1", "true", "yes", "on")
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
+    _pld = _prompt_lookup_drafter(
+        rt, sampler, prompt_ids, cache,
+        guarded=(
+            constraint is not None
+            or _loop_guard is not None
+            or _thinking_guard is not None
+            or ar_return_hidden
+        ),
+        sync_eval=_ar_sync_eval,
+    )
+
     for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
@@ -8510,6 +8556,8 @@ def generate_ar(
             penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
         )
         tokens.append(token)
+        if _pld is not None:
+            _pld.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})
         if constraint is not None:
@@ -8535,8 +8583,48 @@ def generate_ar(
                 }
             )
             break
-        if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
+        if len(tokens) >= max_tokens or _is_stop(token, stop_token_ids):
             break
+
+        if _pld is not None:
+            _pld_draft = _pld.propose(max_tokens - len(tokens) - 1)
+            if _pld_draft:
+                _pld_started = time.perf_counter()
+                _pld_accepted, _pld_stopped, logits = verify_draft(
+                    lambda ids: rt.forward_ar(ids, cache=cache, return_hidden=False),
+                    lambda keep: _trim_cache_to_offset(cache, keep),
+                    int(cache[0].offset),
+                    token,
+                    _pld_draft,
+                    stop_token_ids,
+                )
+                target_decode_time += time.perf_counter() - _pld_started
+                verify_calls += 1
+                _pld.record(len(_pld_draft), _pld_accepted)
+                for _drafted_token in _pld_draft[:_pld_accepted]:
+                    tokens.append(_drafted_token)
+                    _pld.append(_drafted_token)
+                    emit_token(_drafted_token)
+                    events.append({"step": step, "token": _drafted_token})
+                    repetition_result = _trim_repeated_suffix(
+                        tokens, repetition_config, repetition_long_cycle
+                    )
+                    if repetition_result is not None:
+                        events.append(
+                            {
+                                "step": step,
+                                "repetition_stop": {
+                                    "reason": repetition_result.reason,
+                                    "block_tokens": repetition_result.block_tokens,
+                                    "repeats": repetition_result.repeats,
+                                    "trimmed_tokens": repetition_result.repeated_tokens,
+                                },
+                            }
+                        )
+                        break
+                if repetition_result is not None or _pld_stopped:
+                    break
+                continue
 
         started = time.perf_counter()
         profiler = _ar_forward_profiler(step)
@@ -8576,6 +8664,8 @@ def generate_ar(
         verify_calls += 1
         logits = logits_next[:, -1, :]
 
+    if _pld is not None:
+        events.append({"prompt_lookup": _pld.summary()})
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
         # flush the held tail in full (no trim) or the post-trim remainder.
