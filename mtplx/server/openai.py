@@ -24979,7 +24979,13 @@ def _live_frontier_envelope_fields(
         request_observability.get("committed_reasoning_canonicalization") or {}
     )
     committed_len = canonicalization.get("committed_len")
-    cached = request_observability.get("cached_tokens")
+    # The caller passes the envelope's count (request_observability never
+    # carries one), so a partial restore reads as not extended.
+    cached = (
+        cached_tokens
+        if cached_tokens is not None
+        else request_observability.get("cached_tokens")
+    )
     if committed_len is not None and cached is not None:
         # live_frontier_hit is a legacy any-hit bool; this is the honest
         # signal — did the reusable prefix actually reach the committed

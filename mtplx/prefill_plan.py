@@ -161,7 +161,6 @@ def _add_bank_facts(
         rows = list(held())
     own = [row for row in rows if session_id and row.get("session_id") == session_id]
     own_longest = max((int(row.get("longest_prefix_tokens") or 0) for row in own), default=0)
-    facts["session_cached_tokens"] = own_longest
     facts["other_sessions_cached"] = any(
         row.get("session_id") != session_id for row in rows
     )
@@ -172,6 +171,25 @@ def _add_bank_facts(
         shared = getattr(session_bank, "longest_shared_prefix_tokens", None)
         if callable(shared):
             matched = max(matched, int(shared(bank_ids, session_id=session_id)))
+    diagnostic = getattr(session_bank, "last_prefix_diagnostic", None)
+    refused = (
+        int(diagnostic.get("ram_refused_prefix_len") or 0)
+        if isinstance(diagnostic, dict)
+        else 0
+    )
+    if (
+        session_id
+        and restore_point < refused <= len(bank_ids)
+        and diagnostic.get("ram_refused_session_id") == session_id
+    ):
+        # The restore refused this conversation's longest saved state, a
+        # prefix of this prompt (SessionBank.restore), and resumed earlier;
+        # a cold restore may have released it since. The history matched
+        # that far, and the refusal says why the state resumes before it.
+        facts["ram_miss_reason"] = str(diagnostic.get("ram_miss_reason") or "")
+        own_longest = max(own_longest, refused)
+        matched = max(matched, refused)
+    facts["session_cached_tokens"] = own_longest
     facts["history_matched_tokens"] = min(matched, len(bank_ids))
     if session_id and not own:
         eviction_log = getattr(session_bank, "eviction_log", None) or ()
@@ -254,7 +272,7 @@ def explain_reread(
     }
     # The raw codes behind the cause, for receipts and logs (the app shows
     # its own sentence for the cause, never these).
-    for key in ("miss_reason", "session_eviction_reason"):
+    for key in ("miss_reason", "ram_miss_reason", "session_eviction_reason"):
         if facts.get(key):
             explanation[key] = str(facts[key])
     explanation["text"] = reread_text(explanation)

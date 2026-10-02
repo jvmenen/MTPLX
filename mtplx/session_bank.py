@@ -2330,8 +2330,27 @@ class SessionBank:
         self.last_miss_reason = None
         self._purge_expired()
         self._touch_session(session_id)
+        if isinstance(self.last_prefix_diagnostic, dict):
+            # A refusal is this lookup's to report, never an earlier one's.
+            self.last_prefix_diagnostic.pop("ram_refused_prefix_len", None)
+            self.last_prefix_diagnostic.pop("ram_refused_session_id", None)
+        refused: SessionBankEntry | None = None
 
         def cold_fallback() -> SessionBankRestore | None:
+            # Past the lookup, a fallback is the RAM lane refusing the longest
+            # prefix it holds. The refusal stays on the record whatever the
+            # cold tier serves next (prefill_plan.reread_facts reads it): the
+            # cold restore also releases a refused lease of the session, and
+            # without this the turn read as if nothing longer had been saved.
+            ram_refusal = (
+                None
+                if refused is None
+                else {
+                    "ram_miss_reason": self.last_miss_reason,
+                    "ram_refused_prefix_len": int(refused.prefix_len),
+                    "ram_refused_session_id": refused.session_id,
+                }
+            )
             return self._restore_cold(
                 runtime,
                 token_ids,
@@ -2341,6 +2360,7 @@ class SessionBank:
                 mtp_history_policy=mtp_history_policy,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
+                ram_refusal=ram_refusal,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -2353,6 +2373,7 @@ class SessionBank:
             if self.last_prefix_diagnostic is not None:
                 self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
             return cold_fallback()
+        refused = entry
         if entry.model_path != str(runtime.model_path):
             self.last_miss_reason = CacheMissReason.MODEL_MISMATCH.value
             return cold_fallback()
@@ -3397,7 +3418,20 @@ class SessionBank:
         mtp_history_policy: str | None,
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
+        ram_refusal: dict[str, Any] | None = None,
     ) -> SessionBankRestore | None:
+        # ram_refusal: restore() refused this lookup's longest RAM prefix
+        # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
+        # It stays in the diagnostic whatever this lookup finds.
+        if ram_refusal is not None:
+            self.last_prefix_diagnostic = {
+                "prompt_len": len(token_ids),
+                "session_id": ram_refusal.get("ram_refused_session_id"),
+                "stored_prefix_len": int(ram_refusal.get("ram_refused_prefix_len") or 0),
+                "miss_reason": ram_refusal.get("ram_miss_reason"),
+                "restore_kind": "exact_prefix_refused",
+                **ram_refusal,
+            }
         if self.cold_tier is None:
             self._note_oversized_miss(session_id, token_ids)
             return None
@@ -3514,6 +3548,7 @@ class SessionBank:
             "new_prefill_tokens": max(0, lookup_len - entry.prefix_len),
             "miss_reason": None,
             "restore_kind": "ssd_prefix",
+            **(ram_refusal or {}),
         }
         return SessionBankRestore(
             entry=entry,
