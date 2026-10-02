@@ -14,7 +14,7 @@ All numbers: M5 Pro 64 GB, turbo profile, depth 2, compared with the same body c
 
 MTPLX drafts with the model's native MTP layer. Published packs often ship that head quantized to int4 to save ~1 GB. On MoE models this costs a lot of acceptance: Qwen3.6 Balance went from 0.77 / 0.42 (int4) to 0.91 / 0.72 (BF16) mean acceptance at D2. Speculative decoding with exact acceptance keeps the output distribution, so a better head is pure speed; the only cost is memory (+0.6 to +1.1 GB).
 
-Check first: a dense model's pack may already keep the head in BF16 (Qwen3.8-27B does: `mtp_policy keep_bf16` in `mtplx_runtime.json`, acceptance 0.96 / 0.87 / 0.76). Look at `forge_provenance.forge_recipe.mtp_policy` and the size of `mtp.safetensors`.
+Check first what the pack really ships: the `mtp_policy` label is not enough. The Qwen3.8-27B Optimized-Speed pack says `keep_bf16` in `mtplx_runtime.json`, but its `mtp.safetensors` holds a 4-bit g64 head (239 MB, `U32` payload with scales, `mtplx_mtp_quantization.prequantized: true` in `config.json`). Look at the size of `mtp.safetensors` and its dtypes. On that dense model a BF16 head did not help (2 to 8% slower, equal acceptance; see [qwen38-speed-options](2026-10-02-qwen38-speed-options.md)), so the gain from a BF16 head is model-specific: measure it.
 
 ## Step 1: find a source that still has the MTP layer
 
