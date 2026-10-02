@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import sys
 import time
 import weakref
 from dataclasses import asdict, dataclass, field
@@ -2242,7 +2243,7 @@ class FixedM4GrowthRefused(MemoryError):
     """An installed fixed-M4 bank could not grow for the next write.
 
     Raised by ``reserve_fixed_m4_window`` when the memory admission refuses
-    the growth's bill at both the bucketed and the unbucketed width (no
+    the growth's bill at the bucketed, unbucketed and minimum width (no
     cache leaf has changed), or refuses a layer partway, or the memory
     refuses a layer's allocation while it is written: each layer is then at
     its old capacity or its new one, whole. The admission is the session
@@ -3184,91 +3185,121 @@ class CompiledVerifyBank:
         capacity_changed = False
         next_growth_tokens = int(dispatch["growth_tokens"])
         if capacity_needed:
-            next_capacity, next_growth_tokens = _fixed_m4_capacity_growth(
-                capacity=int(dispatch["dense_capacity"]),
-                required_end=required_end,
-                growth_tokens=int(dispatch["growth_tokens"]),
-                capacity_limit=dispatch["capacity_limit"],
-            )
-            admit = self.capacity_plan.admit_growth if self.capacity_plan else None
-            growing = _fixed_m4_growing(qsa_entries, next_capacity)
-            if growing:
-                # The banks grow one layer at a time below: each layer's new
-                # banks are written beside its old ones, swapped in, and the
-                # old ones let go before the next layer is admitted, so the
-                # transition holds the layers already grown plus one layer's
-                # new banks, never a second bank (the 09-29 refusals priced
-                # the whole new bank and were 0.51 GB short where one layer
-                # needed 0.22 GB). That is the bill ``admit`` takes before
-                # any leaf changes; one layer's new banks alone (the price
-                # until the 2026-10-01 review) left out the rows the earlier
-                # layers kept.
-                if admit is not None and not admit(_fixed_m4_growth_bill(growing)):
-                    # Check the unbucketed width before giving up the request.
-                    # No cache leaf changes before this admission.
-                    growing = _fixed_m4_growing(qsa_entries, next_capacity, bucket=0)
-                    bill = _fixed_m4_growth_bill(growing)
-                    if not admit(bill):
+            try:
+                next_capacity, next_growth_tokens = _fixed_m4_capacity_growth(
+                    capacity=int(dispatch["dense_capacity"]),
+                    required_end=required_end,
+                    growth_tokens=int(dispatch["growth_tokens"]),
+                    capacity_limit=dispatch["capacity_limit"],
+                )
+                admit = self.capacity_plan.admit_growth if self.capacity_plan else None
+                growing = _fixed_m4_growing(qsa_entries, next_capacity)
+                if growing:
+                    # The banks grow one layer at a time below: each layer's new
+                    # banks are written beside its old ones, swapped in, and the
+                    # old ones let go before the next layer is admitted, so the
+                    # transition holds the layers already grown plus one layer's
+                    # new banks, never a second bank (the 09-29 refusals priced
+                    # the whole new bank and were 0.51 GB short where one layer
+                    # needed 0.22 GB). That is the bill ``admit`` takes before
+                    # any leaf changes; one layer's new banks alone (the price
+                    # until the 2026-10-01 review) left out the rows the earlier
+                    # layers kept.
+                    if admit is not None and not admit(_fixed_m4_growth_bill(growing)):
+                        # Check the unbucketed width before giving up the request.
+                        # No cache leaf changes before this admission.
+                        growing = _fixed_m4_growing(qsa_entries, next_capacity, bucket=0)
+                        bill = _fixed_m4_growth_bill(growing)
+                        if growing and not admit(bill):
+                            # The reserve is a convenience, not a minimum answer
+                            # length. Try just the required write, still rounded
+                            # by each cache's layout and billed at its full peak.
+                            growing = _fixed_m4_growing(qsa_entries, required_end, bucket=0)
+                            bill = _fixed_m4_growth_bill(growing)
+                            if growing and not admit(bill):
+                                raise FixedM4GrowthRefused(
+                                    capacity=int(dispatch["dense_capacity"]),
+                                    required_end=required_end,
+                                    rows=max(rows for rows, _entry in growing),
+                                    bill_bytes=bill,
+                                )
+                            next_capacity = required_end
+                        for entry in qsa_entries:
+                            entry.capacity_bucket = 0
+                        self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0
+                        dispatch["capacity_bucket"] = 0
+                    # Nothing compiled may still hold an old leaf: a shadow twin or
+                    # a retained input list would keep every old layer alive until
+                    # the whole transition ends.
+                    self._clear_shadow_leaf_refs()
+                    self._held_state_refs.clear()
+                grown = 0
+                failure = None
+                for entry in qsa_entries:
+                    rows = entry.growth_rows(next_capacity)
+                    if (
+                        rows > entry.capacity
+                        and admit is not None
+                        and not admit(entry.growth_bytes(rows)[0])
+                    ):
+                        # Memory taken since the bill was admitted: stop between
+                        # layers, every one whole.
                         raise FixedM4GrowthRefused(
                             capacity=int(dispatch["dense_capacity"]),
                             required_end=required_end,
-                            rows=max(rows for rows, _entry in growing),
-                            bill_bytes=bill,
+                            rows=rows,
+                            layers_left=len(growing) - grown,
                         )
-                    for entry in qsa_entries:
-                        entry.capacity_bucket = 0
-                    self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0
-                    dispatch["capacity_bucket"] = 0
-                # Nothing compiled may still hold an old leaf: a shadow twin or
-                # a retained input list would keep every old layer alive until
-                # the whole transition ends.
-                self._clear_shadow_leaf_refs()
-                self._held_state_refs.clear()
-            grown = 0
-            failure = None
-            for entry in qsa_entries:
-                rows = entry.growth_rows(next_capacity)
-                if (
-                    rows > entry.capacity
-                    and admit is not None
-                    and not admit(entry.growth_bytes(rows)[0])
-                ):
-                    # Memory taken since the bill was admitted: stop between
-                    # layers, every one whole.
+                    try:
+                        grew = entry.ensure_capacity(next_capacity)
+                    except Exception as exc:
+                        # The memory refusing a layer's new banks while they are
+                        # written leaves that layer as it was: the answer ends
+                        # between rounds like a refused growth, its lease whole.
+                        # Anything else is not the growth's to absorb.
+                        if not is_allocation_failure(exc):
+                            raise
+                        failure = f"{type(exc).__name__}: {exc}"
+                        break
+                    grown += int(grew)
+                    capacity_changed = grew or capacity_changed
+                if failure is not None:
+                    # The failed layer's new banks went with the exception: wait
+                    # for the GPU to let go of what it was writing into them, then
+                    # hand them back to the system.
+                    mx.synchronize()
+                    mx.clear_cache()
                     raise FixedM4GrowthRefused(
                         capacity=int(dispatch["dense_capacity"]),
                         required_end=required_end,
-                        rows=rows,
+                        rows=max(rows for rows, _entry in growing),
                         layers_left=len(growing) - grown,
+                        allocation_error=failure,
                     )
+                dispatch["dense_capacity"] = min(entry.dense_capacity for entry in qsa_entries)
+                dispatch["growth_tokens"] = next_growth_tokens
+            except FixedM4GrowthRefused:
+                # The caller ends at a committed boundary and performs the
+                # normal final capture and demotion.
+                raise
+            except BaseException:
+                # Growth publishes one complete layer at a time. Even an
+                # interrupted allocation leaves every layer's prefix valid;
+                # return stock containers so the prompt lease can rewind it.
                 try:
-                    grew = entry.ensure_capacity(next_capacity)
-                except Exception as exc:
-                    # The memory refusing a layer's new banks while they are
-                    # written leaves that layer as it was: the answer ends
-                    # between rounds like a refused growth, its lease whole.
-                    # Anything else is not the growth's to absorb.
-                    if not is_allocation_failure(exc):
-                        raise
-                    failure = f"{type(exc).__name__}: {exc}"
-                    break
-                grown += int(grew)
-                capacity_changed = grew or capacity_changed
-            if failure is not None:
-                # The failed layer's new banks went with the exception: wait
-                # for the GPU to let go of what it was writing into them, then
-                # hand them back to the system.
-                mx.synchronize()
-                mx.clear_cache()
-                raise FixedM4GrowthRefused(
-                    capacity=int(dispatch["dense_capacity"]),
-                    required_end=required_end,
-                    rows=max(rows for rows, _entry in growing),
-                    layers_left=len(growing) - grown,
-                    allocation_error=failure,
-                )
-            dispatch["dense_capacity"] = min(entry.dense_capacity for entry in qsa_entries)
-            dispatch["growth_tokens"] = next_growth_tokens
+                    # Convert references first, without copying tensor data.
+                    # If a second error interrupts demotion, the original
+                    # adapters still mark the whole lease as unavailable.
+                    restored = list(cache)
+                    self.demote(restored, compact=False, keep_capacity=True)
+                    cache[:] = restored
+                except Exception as error:
+                    print(
+                        f"[mtplx] cache hand-back after interrupted growth failed ({error}); "
+                        "the original error is preserved",
+                        file=sys.stderr,
+                    )
+                raise
         route_changed = False
         if route_needed:
             for entry in qsa_entries:

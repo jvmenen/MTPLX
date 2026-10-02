@@ -13523,6 +13523,23 @@ def generate_mtpk(
                     _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
             if _cb_block:
                 _cb_T = 1 + len(_cb_block)
+                if compiled_verify_bank is not None:
+                    try:
+                        compiled_verify_bank.reserve_fixed_m4_window(
+                            cache,
+                            committed_count=len(tokens) - 1,
+                            window_tokens=_cb_T,
+                        )
+                    except FixedM4GrowthRefused as exc:
+                        # The primary was emitted, but no row of this copy
+                        # window has run. The round's existing grant holds
+                        # this one token: let final capture commit it before
+                        # handing the conversation back to the session bank.
+                        pending_primary = int(primary)
+                        memory_stop = {**exc.receipt, "completion_tokens": len(tokens)}
+                        event["memory_stop"] = memory_stop
+                        emit_round(event)
+                        break
                 if qsa_mtp_precompute_active:
                     started_indexer_stage = time.perf_counter()
                     target_indexer_plans = precompute_and_stage_qsa_replay_caches(
@@ -13550,18 +13567,9 @@ def generate_mtpk(
                     if family_capture_commit_active
                     else contextlib.nullcontext()
                 )
-                # Reserve the block's rows before the forward: the fixed-M4
-                # bank's window for its QSA entries, and the dense fixed
-                # buffers for everything else. A restored entry carries only
-                # its step rounding as slack, and the first rounds after a
-                # restore can be copy rounds, so the block used to overrun
-                # the buffer (clamped silently before the in-place write).
-                if compiled_verify_bank is not None:
-                    compiled_verify_bank.reserve_fixed_m4_window(
-                        cache,
-                        committed_count=len(tokens) - 1,
-                        window_tokens=_cb_T,
-                    )
+                # The QSA window was reserved before staging the copy. Grow
+                # any remaining dense buffers before the forward too: a
+                # restored entry may carry only its step rounding as slack.
                 _cb_grown = ensure_eager_window_capacity(cache, _cb_T)
                 if _cb_grown:
                     ccopy_capacity_growths += 1

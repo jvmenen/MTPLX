@@ -601,6 +601,8 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
             return False  # the bucketed growth's bill
         if len(requests) == 2:
             return allow_step  # the unbucketed growth's bill
+        if not allow_step:
+            return False  # the minimum write must be admitted too
         return True  # each layer's new banks
 
     def bank_bytes(rows):
@@ -631,7 +633,8 @@ def test_growth_is_admitted_before_any_leaf_changes(pack, lane, allow_step):
             bank.reserve_fixed_m4_window(cache, committed_count=469)
         assert qsa.capacity == 512 and qsa.dense_capacity == 256
         assert all(a is b for a, b in zip(refs[0], qsa.state_leaves))
-        assert len(requests) == 2
+        assert len(requests) == 3
+        assert requests[2][1] == 0  # no leaf changed before the minimum bill
     # The bills at the bucketed width, then the unbucketed one, before any
     # leaf changed.
     assert requests[:2] == [(bill(1024), 0), (bill(768), 0)]
