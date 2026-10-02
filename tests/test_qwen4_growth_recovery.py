@@ -173,3 +173,53 @@ def test_partial_handback_is_never_published(tiny, lane):
     assert lease is None or _cache_kv_offset(lease.cache_ref) is None, (
         "partially converted cache looks reusable"
     )
+
+
+class _Cancelled(Exception):
+    """The client's cancel, raised out of the token callback."""
+
+
+def test_a_cancel_whose_hand_back_fails_never_publishes_a_partial_lease(tiny, lane):
+    """The client-cancel twin of the case above (one_copy.hand_back_on_raise).
+
+    Converted in place, the layers before a failed demotion became stock
+    containers while the rest stayed adapters, and the session bank read the
+    stock layers' offset as the whole lease's: a half-converted conversation
+    looked reusable.
+    """
+    session = _Session(tiny, lane)
+    session.opening()
+    suffix = [9, 10, 11, 12]
+    prompt = list(session.tokens) + suffix
+    real_demote = graphbank.TensorOffsetQSACache.demote
+    real_generate = generation.generate_mtpk
+    calls = []
+
+    def fail_second(entry, **kwargs):
+        calls.append(entry)
+        if len(calls) == 2:
+            raise RuntimeError("GPU unavailable while returning cache")
+        return real_demote(entry, **kwargs)
+
+    def cancel_after_six_tokens(*args, **kwargs):
+        streamed = []
+
+        def callback(tokens):
+            streamed.extend(tokens)
+            if len(streamed) >= 6:
+                raise _Cancelled()
+
+        kwargs["token_callback"] = callback
+        return real_generate(*args, **kwargs)
+
+    def inject(patch):
+        patch.setattr(generation, "generate_mtpk", cancel_after_six_tokens)
+        patch.setattr(graphbank.TensorOffsetQSACache, "demote", fail_second)
+
+    with pytest.raises(_Cancelled):
+        session.turn(suffix, patches=[inject])
+    assert len(calls) == 2
+    [lease] = [
+        entry for key, entry in session.bank._entries.items() if len(key) == len(prompt)
+    ]
+    assert _cache_kv_offset(lease.cache_ref) is None, "partially converted cache looks reusable"

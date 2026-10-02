@@ -481,6 +481,11 @@ def hand_back_on_raise(callback, bank, live_cache):
     when every buffer is whole; a raise inside a round leaves the adapters,
     and the bank refuses a lease it cannot read (``session_bank._lease_advance``).
     ``live_cache`` returns the trunk cache the answer is decoding into.
+
+    The containers are converted on a copy of that list and published in one
+    step. Converted in place, a demotion that failed halfway left stock layers
+    beside adapters, and the bank read the stock layers' offset as the whole
+    lease's; now a failure leaves every adapter, and the lease is refused.
     """
 
     def emit(tokens):
@@ -488,7 +493,10 @@ def hand_back_on_raise(callback, bank, live_cache):
             callback(tokens)
         except BaseException:
             try:
-                bank.demote(live_cache(), compact=False, keep_capacity=True)
+                live = live_cache()
+                restored = list(live)
+                bank.demote(restored, compact=False, keep_capacity=True)
+                live[:] = restored
             except Exception as exc:  # the raise below is the caller's news
                 import sys
 
