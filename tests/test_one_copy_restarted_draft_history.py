@@ -20,8 +20,8 @@ Pinned here:
   answer decoded past is rewound to it;
 - a history trimmed behind its own lease is still refused and the lease kept;
 - on the tiny Flash-Next pack, banked through the server's own
-  generation-final helpers, the next turn resumes the whole answer and decodes
-  what the copying store decodes;
+  generation-final helpers, the next turn resumes the whole answer, proposes
+  the same drafts and decodes what the copying store decodes;
 - when the RAM lane refuses a conversation's saved state, the re-read says how
   far the history matched, where it resumed and why, and the frontier receipt
   says that a partial restore did not reach the committed stream.
@@ -210,6 +210,19 @@ def test_the_turn_after_an_answer_that_restarted_its_history_resumes_it(
     assert not copy_lease and copy_snapshot is not None
     assert copy_banked == banked
     assert copy.out.stats.cached_tokens == len(banked)
+    # Both stores resume the same draft history, so the draft head proposes
+    # the same drafts from it: a restored history with other rows, or other
+    # positions, would change what is drafted and accepted before it changed
+    # any committed token.
+    assert warm.out.stats.drafted_tokens > 0
+    for key in (
+        "drafted_tokens",
+        "accepted_drafts",
+        "accepted_by_depth",
+        "mtp_history_position_base",
+    ):
+        ours, theirs = getattr(warm.out.stats, key), getattr(copy.out.stats, key)
+        assert ours == theirs, (key, ours, theirs)
     # Both stores resume the same history and decode the same turn.
     assert list(warm.out.tokens) == list(copy.out.tokens)
     assert _same_bits(
