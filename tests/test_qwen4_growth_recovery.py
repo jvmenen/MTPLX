@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 
-import numpy as np
 import pytest
 
 import mtplx.generation as generation
@@ -17,57 +16,7 @@ import mtplx.graphbank as graphbank
 from mtplx.session_bank import _cache_kv_offset
 from test_one_copy_reserve_resize import SEED, _Session, _same_turn, _walk
 from test_one_copy_reserve_resize import lane as lane, tiny as tiny
-from test_qwen4_fixed_m4_capacity_bucket import _bits
-from test_qwen4_fixed_m4_growth_layerwise import (
-    NEW, _Done, _installed, _second_growth_write_raises, _verify_bank,
-)
-from test_qwen4_fixed_m4_growth_layerwise import gathering as gathering
-
-
-@pytest.mark.parametrize("bucket", [0, 8192])
-def test_refused_reserve_tries_the_smallest_complete_write(gathering, bucket):
-    banks = _installed()
-    original = [[_bits(leaf) for leaf in entry.state_leaves] for entry in banks]
-    for entry in banks:
-        entry.capacity_bucket = bucket
-    asked = []
-
-    def admit(need):
-        asked.append(need)
-        return need <= NEW + 64
-
-    bank = _verify_bank(banks, admit)
-    with pytest.raises(_Done):  # rebuilding the program after successful growth
-        bank.reserve_fixed_m4_window(banks, committed_count=100)
-
-    assert [entry.capacity for entry in banks] == [4352] * 3
-    assert asked[-4:] == [719872, 644096, 644096, 644096]
-    assert asked[0] > NEW + 64
-    for entry, old in zip(banks, original):
-        assert entry.size() == 4000
-        for leaf, previous in zip(entry.state_leaves, old):
-            retained = _bits(leaf)[tuple(slice(0, n) for n in previous.shape)]
-            assert np.array_equal(retained, previous)
-
-
-def test_refused_reserve_can_use_existing_slack_without_allocating(gathering):
-    banks = _installed()
-    leaves = [entry.state_leaves for entry in banks]
-    for entry in banks:
-        entry.dense_capacity = 4000
-    asked = []
-
-    def refuse(need):
-        asked.append(need)
-        return False
-
-    bank = _verify_bank(banks, refuse)
-    bank._fixed_m4_dispatch["dense_capacity"] = 4000
-    bank.reserve_fixed_m4_window(banks, committed_count=0)
-    assert asked and all(need > 0 for need in asked)
-    assert bank._fixed_m4_dispatch["dense_capacity"] >= 4004
-    for entry, original in zip(banks, leaves):
-        assert all(a is b for a, b in zip(entry.state_leaves, original))
+from test_qwen4_fixed_m4_growth_layerwise import _second_growth_write_raises
 
 
 @pytest.mark.parametrize("error", [asyncio.CancelledError, KeyboardInterrupt, ValueError])

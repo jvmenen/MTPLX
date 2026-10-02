@@ -2243,7 +2243,7 @@ class FixedM4GrowthRefused(MemoryError):
     """An installed fixed-M4 bank could not grow for the next write.
 
     Raised by ``reserve_fixed_m4_window`` when the memory admission refuses
-    the growth's bill at the bucketed, unbucketed and minimum width (no
+    the growth's bill at both the bucketed and the unbucketed width (no
     cache leaf has changed), or refuses a layer partway, or the memory
     refuses a layer's allocation while it is written: each layer is then at
     its old capacity or its new one, whole. The admission is the session
@@ -3156,6 +3156,15 @@ class CompiledVerifyBank:
         unchanged. Verification keeps four rows for a possible lazy bonus,
         even at width one. Only an explicit final capture has no following
         write and reserves just its window, preserving an existing grant.
+
+        A growth the memory refuses raises ``FixedM4GrowthRefused`` with
+        every layer whole, and the caller ends the answer between rounds. Any
+        other exception while the banks grow (a cancellation, a programming
+        error) first hands the cache back as stock containers, converted on a
+        copy of the list and published in one step, so the prompt's lease can
+        rewind it. If that hand-back fails as well, every adapter stays and
+        the session bank will not serve the lease. The original exception
+        always propagates.
         """
 
         dispatch = self._fixed_m4_dispatch
@@ -3210,20 +3219,13 @@ class CompiledVerifyBank:
                         # No cache leaf changes before this admission.
                         growing = _fixed_m4_growing(qsa_entries, next_capacity, bucket=0)
                         bill = _fixed_m4_growth_bill(growing)
-                        if growing and not admit(bill):
-                            # The reserve is a convenience, not a minimum answer
-                            # length. Try just the required write, still rounded
-                            # by each cache's layout and billed at its full peak.
-                            growing = _fixed_m4_growing(qsa_entries, required_end, bucket=0)
-                            bill = _fixed_m4_growth_bill(growing)
-                            if growing and not admit(bill):
-                                raise FixedM4GrowthRefused(
-                                    capacity=int(dispatch["dense_capacity"]),
-                                    required_end=required_end,
-                                    rows=max(rows for rows, _entry in growing),
-                                    bill_bytes=bill,
-                                )
-                            next_capacity = required_end
+                        if not admit(bill):
+                            raise FixedM4GrowthRefused(
+                                capacity=int(dispatch["dense_capacity"]),
+                                required_end=required_end,
+                                rows=max(rows for rows, _entry in growing),
+                                bill_bytes=bill,
+                            )
                         for entry in qsa_entries:
                             entry.capacity_bucket = 0
                         self.fixed_m4_capacity_bucket = self.capacity_plan.bucket = 0

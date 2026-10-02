@@ -175,7 +175,7 @@ def test_the_growth_holds_its_bill_and_no_more():
 
 
 def test_a_bill_over_the_line_changes_no_leaf(gathering):
-    """Even the smallest complete write is refused before any leaf changes."""
+    """The review's room, one layer's new banks: the growth is refused whole."""
 
     banks = _installed()
     leaves = [bank.state_leaves for bank in banks]
@@ -183,15 +183,13 @@ def test_a_bill_over_the_line_changes_no_leaf(gathering):
 
     def admit(need):
         asked.append(need)
-        return False
+        return need <= NEW + 64
 
     with pytest.raises(FixedM4GrowthRefused) as refused:
         _verify_bank(banks, admit).reserve_fixed_m4_window(banks, committed_count=100)
-    # The bucketed bill, the unbucketed reserve, then just the next write.
-    minimum_new = 4352 * (2 * 2 * 16 * 2 + 8 * 2) + 1088 * 8 * 2
-    minimum_bill = 2 * (minimum_new - OLD) + minimum_new
-    assert asked == [BILL, BILL, minimum_bill]
-    assert refused.value.receipt["bill_bytes"] == minimum_bill
+    # The bucketed bill, then the unbucketed one (the same here: no bucket).
+    assert asked == [BILL, BILL]
+    assert refused.value.receipt["bill_bytes"] == BILL
     assert refused.value.receipt["reason"] == "fixed_m4_growth_refused"
     for bank, old in zip(banks, leaves):
         assert bank.capacity == 4096
