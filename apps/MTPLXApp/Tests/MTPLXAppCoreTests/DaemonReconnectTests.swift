@@ -1595,7 +1595,7 @@ final class DaemonReconnectTests: XCTestCase {
         let blockedConfig = daemon.root.appendingPathComponent("opencode-blocked", isDirectory: true)
         try FileManager.default.createDirectory(at: blockedConfig, withIntermediateDirectories: true)
         var configuration = daemon.configuration(fanMode: .default)
-        configuration.apiKey = "key-the-daemon-started-with"
+        configuration.apiKey = "key-at-start"
         let store = daemon.makeStore(
             configuration: configuration,
             fans: FanCallRecorder(),
@@ -1620,7 +1620,7 @@ final class DaemonReconnectTests: XCTestCase {
         XCTAssertEqual(store.daemonState, .running)
         XCTAssertNotNil(store.configurationChangeFailure)
         XCTAssertEqual(store.configuration.apiKey, "a-new-key", "the saved change is kept for the next launch")
-        XCTAssertEqual(store.activeAPIKey, "key-the-daemon-started-with")
+        XCTAssertEqual(store.activeAPIKey, "key-at-start")
         let answer = try await store.apiClient.health()
         XCTAssertEqual(answer.startup?.launchId, launched.launchId, "requests still reach the serving daemon")
         await store.refresh()
