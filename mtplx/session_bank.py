@@ -675,6 +675,24 @@ def _mtp_lease_advance(entry: Any) -> int:
     return max(0, current - int(recorded))
 
 
+def _lease_mtp_rows(entry: Any) -> int:
+    """Rows a lease's draft history holds at the entry's own state.
+
+    A full history holds one row per prefix token but the last. An answer
+    whose appends cross generation's live bound on the draft history
+    (``MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD``) restarts it, and the history
+    the answer hands over holds only the rows written since the restart: the
+    lease recorded that many when it was taken (``lease_mtp_offset``). A
+    restore rewinds the history to those rows. Asking for the full count
+    refused every such lease, and the next turn re-read the whole answer
+    (2026-10-02: a 32,350-token answer, then 51,649 tokens re-read).
+    """
+
+    full = int(entry.prefix_len) - 1
+    recorded = getattr(entry, "lease_mtp_offset", None)
+    return full if recorded is None else min(full, int(recorded))
+
+
 def _lease_rewind_anchor(entry: Any) -> tuple[int, Any, Any] | None | bool:
     """The anchor an advanced lease restores its recurrent state from.
 
@@ -2405,7 +2423,7 @@ class SessionBank:
                 or not _cache_ref_trimmable_to(cache, target)
                 or (
                     mtp_ref is not None
-                    and not _cache_ref_trimmable_to(mtp_ref, entry.prefix_len - 1)
+                    and not _cache_ref_trimmable_to(mtp_ref, _lease_mtp_rows(entry))
                 )
             ):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
@@ -2453,7 +2471,7 @@ class SessionBank:
         if take_lease and entry.mtp_history_cache_ref is not None:
             mtp_history_cache = entry.mtp_history_cache_ref
             entry.mtp_history_cache_ref = None
-            if not _trim_cache_ref_to_prefix(mtp_history_cache, entry.prefix_len):
+            if not _trim_cache_ref_to_tokens(mtp_history_cache, _lease_mtp_rows(entry)):
                 # Validated above when the trunk lease was taken with it; a
                 # snapshot-backed entry reaches here without that check.
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
