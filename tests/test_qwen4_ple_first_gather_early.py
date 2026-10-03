@@ -430,6 +430,7 @@ def _predict(**stubs):
         "_geometric_tail_edges",
         "_split_spans_at",
         "_mandatory_prefill_edges",
+        "_merge_small_remainder",
     }
     tree = ast.parse(GENERATION_TEXT)
     nodes = [
@@ -449,6 +450,7 @@ def _predict(**stubs):
         "_gdn_boundary_tail_min_rung": lambda: 1024,
         "_gdn_boundary_tail_backoff": lambda: 64,
         "_session_head_anchors": lambda *_args, **_kwargs: (),
+        "_prefill_min_chunk_rows": lambda: 0,
     }
     namespace.update(stubs)
     exec(compile(module, "<generation>", "exec"), namespace)
