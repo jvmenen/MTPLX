@@ -27615,7 +27615,7 @@ def _history_ids_for_postcommit(
             committed_text = state.runtime.tokenizer.decode(
                 [int(token) for token in committed_stream_ids]
             )
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             committed_text = ""
         committed_turns = (
             _committed_assistant_turns(

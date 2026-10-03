@@ -32,9 +32,9 @@ import numpy as np
 import pytest
 
 from mtplx import generation, runtime_options
-from mtplx.checkpoint_anchors import AnchorPlan, CheckpointSink, retain_checkpoints
 from mtplx.cache_bank import SessionBankColdTier
 from mtplx.cache_state import snapshot_cache
+from mtplx.checkpoint_anchors import AnchorPlan, CheckpointSink, retain_checkpoints
 from mtplx.session_bank import CacheSnapshot, SessionBank
 from mtplx.session_head_anchor import (
     TurnMarkers,
