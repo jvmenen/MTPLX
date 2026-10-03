@@ -121,7 +121,7 @@ These are token counts only: the extra cost of verifying 6 or 10 rows instead of
 
 Measured in-process on the production verify path (`forward_ar_capture`, capture_commit, conv-tape GDN capture; compiled bank at 2K, eager above 6,144 tokens as in production), prefix of real text, cache rolled back between trials, M shuffled, 7 timed repetitions, thermal pressure 0 at the start of every series. Times include the logits and hidden eval (3 to 5 ms above Q6).
 
-Production paged KV, ms per verify forward (ratio to M=4):
+Paged KV, ms per verify forward (ratio to M=4). Correction 3 October: this is NOT the production layout. The in-process harness called the prefill directly without `MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS`, so it fell back to paged decode; the server decodes on dense KV up to 157,286 tokens on this machine. The dense numbers below are the relevant ones:
 
 | M | 2K | 16K | 48K |
 |---|---|---|---|
@@ -134,7 +134,7 @@ With dense KV the cost is a staircase: M=5 to 6 costs +12 to +18%, M=7 to 8 +43 
 
 Combined with the offline token gains of section 7 (+4 to +16%), every tree shape, form, context length and text type loses throughput: a 7-row tree -21% to -26%, an 11-row tree -26% to -64%; the most optimistic reading (6 rows at 2K) still nets -3% to -7%. Break-even for 7 rows would need the forward within +2% to +8% of M=4. Tree verification is not worth building for Qwen3.8 on this hardware unless the M=5 to 8 matmul and attention routes get as efficient as M=4.
 
-Side finding: at long context the production paged KV is much slower than dense KV for the same M=4 forward (48K: 134 ms paged against 89 to 97 ms dense on the eager route, -27% to -33%). Dense KV cannot batch and may interact with the session bank; to be investigated as a separate item.
+Side finding, corrected 3 October: the paged-versus-dense gap is real (dense 15% faster at 23K, 32 to 47% at 35K to 81K in a server test with a growing agent conversation), but production already decodes on dense KV: the turbo profile sets `MTPLX_SUSTAINED_PREFILL_LAYOUT=auto`, and `_sustained_prefill_layout` (`generation.py:2088-2109`) picks contiguous dense decode whenever the request context is known and below the dense ceiling (15% of RAM at 64 KB per token, 157,286 tokens here). The request log confirms it: no paged attention in any production Qwen3.8 request. Paged decode only applies above that ceiling or with KV quantization. Any in-process benchmark must set `MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS` to match the server.
 
 ## Conclusions
 
@@ -142,6 +142,6 @@ Side finding: at long context the production paged KV is much slower than dense 
 2. No DFlash2 integration for Qwen3.8 on this hardware.
 3. Fine-tuning the MTP head on off-policy text does not move acceptance on Qwen's own Dutch output; no further work without on-policy data.
 4. Tree verification is not worth building: the extra rows cost far more than the extra accepted tokens (section 8).
-5. New lead: dense KV instead of paged KV at long context (M=4 verify -27% to -33% at 48K), to be investigated.
+5. Production already uses dense KV at the context lengths Bink sees (finding Q17 was an artifact of the in-process harness); nothing to change.
 
 Scripts and raw data are local (`~/Dev/laya-nl/pld-38/`, `dflash38/`, `q38bf/`, `prefill38/`, `mtp-head-ft/`); the training data and cache contain private text and are not published.
