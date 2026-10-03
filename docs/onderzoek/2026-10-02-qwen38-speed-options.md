@@ -80,11 +80,48 @@ Acceptance per depth is equal within noise (greedy blog 0.69/0.29/0.13 against 0
 - Matmul at the prefill shape (4096 x 5120 x 17408): BF16 30.9 TFLOPS, 4-bit `quantized_matmul` 28.3 to 28.5, dequantize plus BF16 29.7. Kernels leave at most ~10%; prefill (~400 tok/s, ~21 TFLOPS effective) loses the rest in attention over long context and the GDN layers.
 - Request-log analysis: 43% of Qwen3.8 server time went to prefill, but most of it came from short standalone prompts (classification, titles) and from our own benchmark runs. In real agent sessions follow-up turns get their first token after 0.4 to 1.2 s at 20K to 90K context, and a new session reuses the shared system/tool prefix of an earlier one (11.5K tokens observed). Only the first session after a server restart is cold (31 to 34 s for 13K to 14K tokens).
 
+## 6. Fine-tuning the MTP head on own text (cheap trial, 3 October): no gain
+
+Setup: LoRA (rank 32, 3.96M trainable parameters) on fc, q/k/v/o and gate/up/down of the 4-bit head. Loss: KL against the trunk's top-64 distribution, restricted to the production FR-Spec table, depth weights 0.5/0.3/0.2, recursive rollout with the head's own hidden state. Data: 2.15M off-policy tokens (61% Dutch documents and assistant answers written by other models or people, 20% code, 20% English), split by source document. A teacher-forced trunk pass cached the post-norm hidden state and top-64 logits per position (2.4M tokens, 24 GB). Training: 1.5 epochs, learning rate 2e-4 cosine, about 770 tokens/s. Total GPU time 4.3 hours.
+
+The offline evaluator was checked against the real MTPLX head: identical drafts in 100%, 99.2% and 95.8% of 120 positions per depth. On Dutch prose it reproduces the in-process acceptance (0.673/0.295/0.101 against 0.69/0.29/0.13).
+
+Greedy acceptance per depth (cumulative), on-policy sets are greedy answers by Qwen3.8 itself on held-out prompts:
+
+| Set | Current head | After LoRA, merged and requantized to 4-bit g64 |
+|---|---|---|
+| Dutch, on-policy (12.5K positions) | 0.757 / 0.481 / 0.295 | 0.761 / 0.487 / 0.302 |
+| Dutch documents, off-policy | 0.799 / 0.576 / 0.450 | 0.819 / 0.596 / 0.471 |
+| Code, on-policy | 0.866 / 0.689 / 0.549 | 0.861 / 0.689 / 0.549 |
+| English, on-policy | 0.770 / 0.503 / 0.302 | 0.767 / 0.497 / 0.287 |
+
+On Dutch text written by Qwen itself the gain is +0.004 to +0.007 per depth, about +0.6% tokens per verify; the decision rule was +0.04. On agent-style text written by another model the acceptance rose sharply in BF16 (0.535 to 0.755 at depth 1), but that is the head learning the other model's style: it does not carry over to Qwen's own output, and requantization removes part of it. The missing ingredient is on-policy data (self-distillation), which costs about 20 hours of generation per 1M tokens on this machine; this trial gives no reason to expect the earlier estimate of +9 to +13%.
+
+## 7. Tree verification: offline estimate
+
+From the same evaluator, base head, FR-Spec restricted, how often the target's greedy token is among the head's top-k (given that earlier depths were hit):
+
+| Set | Top-1 d1/d2/d3 | Top-2 | Top-3 |
+|---|---|---|---|
+| Dutch, on-policy | 0.757 / 0.626 / 0.578 | 0.856 / 0.724 / 0.674 | 0.892 / 0.767 / 0.717 |
+| Code, on-policy | 0.866 / 0.792 / 0.788 | 0.927 / 0.864 / 0.858 | 0.948 / 0.891 / 0.883 |
+
+Expected accepted tokens per verify for the current 4-row chain against two small trees (t211: 2 candidates at depth 1, 1 below each, 6 nodes; t221: 2 at depth 1 and 2, 1 at depth 3, 10 nodes; each branch continues the head's own rollout):
+
+| Set | Chain | t211 | t221 |
+|---|---|---|---|
+| Dutch, on-policy | 2.53 | 2.71 (+7%) | 2.83 (+12%) |
+| Dutch blog (hardest) | 2.07 | 2.24 (+8%) | 2.37 (+15%) |
+| Code, on-policy | 3.10 | 3.23 (+4%) | 3.33 (+7%) |
+| English, on-policy | 2.57 | 2.80 (+9%) | 2.98 (+16%) |
+
+These are token counts only: the extra cost of verifying 6 or 10 rows instead of 4 and of drafting a tree is not included, and the GatedDeltaNet layers cannot process a tree in one sequence (each branch needs its own recurrent state, so in practice parallel chains with a shared prefix). A measurement of verify cost against row count is the next step.
+
 ## Conclusions
 
 1. Keep the int4 head and context-copy as they are.
 2. No DFlash2 integration for Qwen3.8 on this hardware.
-3. The remaining lever for Dutch prose is the MTP head itself (acceptance 0.69/0.29/0.13 on free Dutch writing against 0.94/0.87/0.82 on code): fine-tuning on own text is being tried as an offline experiment.
-4. Tree verification (several candidates per position) is a candidate for the same weak spot; first an offline estimate of top-2/top-3 hit rates from cached hidden states.
+3. Fine-tuning the MTP head on off-policy text does not move acceptance on Qwen's own Dutch output; no further work without on-policy data.
+4. Tree verification is the most promising remaining lever for prose (+12 to +16% tokens per verify for a 10-node tree in the offline estimate), provided the extra verify cost on this dense hybrid model stays small; to be measured.
 
-Scripts and raw data are local (`~/Dev/laya-nl/pld-38/`, `dflash38/`, `q38bf/`, `prefill38/`).
+Scripts and raw data are local (`~/Dev/laya-nl/pld-38/`, `dflash38/`, `q38bf/`, `prefill38/`, `mtp-head-ft/`); the training data and cache contain private text and are not published.
