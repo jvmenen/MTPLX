@@ -23,6 +23,8 @@ Carried on the `perf/definitief-2122` integration branch (v2.12.2 plus the chang
 ### Fixed
 
 - **Scoped reasoning history keeps the in-round postcommit** and client bookkeeping no longer closes the round (#570).
+- **A thinking model's answer after a tool result is no longer returned as empty content when the request declares tools** (#583). A turn that stops naturally inside the template-opened think block, without `</think>`, was filed entirely as reasoning, and the recovery that surfaces it as content only ran for requests without tools, so no agent turn got it. The recovery now also runs with tools declared when the turn ended at `stop` and holds no tool markup, on `/v1/chat/completions` and `/v1/messages`, streaming and not. On an M5 Max 64 GB with Qwen3.6-35B-A3B Optimized-Speed (v2.12.2, 2026-10-04), 6 growing agent turns x 3 runs x 2 protocols went from 1 to 2 empty replies per 36 turns to 0 of 108 over three repeats.
+
 
 ## [2.12.2] - 2026-10-03
 
