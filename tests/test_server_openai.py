@@ -3108,7 +3108,7 @@ def test_completions_prompt_scoring_trunk_uses_the_live_prefill_chunk(monkeypatc
     state.args.prefill_chunk_tokens = 1536
     seen: list[int] = []
 
-    def fake_score(runtime, prompt_ids, *, top_k):
+    def fake_score(runtime, prompt_ids, *, top_k, **_options):
         seen.append(generation._prompt_score_trunk_chunk_size())
         n = len(prompt_ids)
         return {
