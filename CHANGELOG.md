@@ -4,6 +4,23 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Carried on the `perf/definitief-2122` integration branch (v2.12.2 plus the changes of the fork that are not upstream yet). Every item sits behind its own switch and is off unless named; nothing changes a default of 2.12.2.
+
+### Added
+
+- **`MTPLX_BATCH_INVARIANT_PREFILL=1` (opt-in): batch-invariant prefill for MoE models** (#549). Every prefill row is independent of how many rows share its forward, so scores and routing do not move between block layouts; installed only where it covers every quantized projection and only on MoE models (`MTPLX_BATCH_INVARIANT_PREFILL_DENSE=1` forces it on a dense model). Prompt scoring runs its trunk in prefill-sized forwards with the lane (`MTPLX_PROMPT_SCORE_TRUNK_CHUNK` overrides the width), and a prompt below the block-restore floor gets no cold tail boundary grid. `/health` reports the install report or the refusal under `degradation.batch_invariant_prefill`.
+- **In-forward GDN boundaries for Qwen3.5/3.6 on the invariant lane** (#550, `MTPLX_GDN_BOUNDARY_INFORWARD=0` restores the ladder) and **`MTPLX_A3B_MOE_PREFILL_COMBINE=1`**, the one-kernel MoE combine on the lane (#558).
+- **`MTPLX_SESSION_HEAD_ANCHOR=1` (opt-in): a recurrent checkpoint where the prompt's fixed head ends** (#559), kept by the 2.12.1 checkpoint retention as an `AnchorPlan.head_anchors` anchor; the SSD block-prefix lane then restores to the exact match.
+- **`MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=N` (opt-in): non-blocking submits every N layers in the eager verify forward** (#579).
+- **Short shared prompt prefixes can be reused** (`--ram-session-prefix-min-match-tokens`, `MTPLX_SESSION_SHARED_PREFIX_EDGE`, `MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX`), and `/v1/completions` can use the session bank (`MTPLX_COMPLETIONS_SESSION_BANK=1`). One reader per session-prefix setting, one `common_prefix_len`.
+- **`MTPLX_PREFILL_ASYNC_RUNGS_STATES`**: async prefill rungs carry the GDN states. **`MTPLX_SESSION_BANK_SPIKE_BURSTS=N`**: the bank ceiling forgets a deep turn after N bursts. **`MTPLX_SHORT_REQUEST_PRIORITY=1`**: short requests go first in the serial scheduler. `sessionbank_put_s` in the stats.
+
+### Fixed
+
+- **Scoped reasoning history keeps the in-round postcommit** and client bookkeeping no longer closes the round (#570).
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
@@ -142,10 +159,6 @@ All notable user-facing changes to MTPLX. The format is based on
 - **`/health` and `--kv-quant` help describe the KV quantization routes that actually run**, and the dashboard's value axes fit their labels (#572 by @jvmenen).
 
 - **Tests no longer read the user's `~/.mtplx/config.toml` or depend on the Mac's memory size** (#535 by @jvmenen), and every client config the suite can write points at a scratch file.
-
-- **In-forward GDN boundaries for Qwen3.5/3.6 on the batch-invariant prefill lane.** A restore boundary inside the last prefill chunk used to end a forward (the tail ladder), and on Qwen3.6-35B-A3B that extra forward reads all routed experts again. With the lane installed, the mlx-lm `qwen3_5` and `qwen3_next` GDN layers now record the boundary state inside the wide forward: each GDN layer runs its stock call once per segment on its own cache, which is exactly the ladder's arithmetic, while attention and MoE see the whole forward. Installed only together with the lane (a refused model gets neither); `/health` reports `gdn_inforward_layers`; `MTPLX_GDN_BOUNDARY_INFORWARD=0` restores the ladder. Measured on M5 Pro 64 GB, macOS 26.6.2, MLX 0.32.2, Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo, fan mode default, 2026-09-26, fork commit `198e7194`, with a session bank on, ladder against hooks in two alternating rounds: bitwise identical results (240 of 240 first-token top-20s, 243 of 243 scored prompts, every NLL position, 24 of 24 greedy continuations, 12 of 12 chat and agent transcripts); requests with prompts from 512 tokens p50 456 -> 366 ms (-20%), one prefill forward instead of two; chat and agent conversations 5 to 6 fewer forwards, TTFT sum -0.6% to -1.2%; decode unchanged.
-
-- **`MTPLX_A3B_MOE_PREFILL_COMBINE=1` (opt-in): one-kernel MoE combine for Qwen3.5/3.6 MoE prefill on the invariant lane.** After the routed experts, mlx-lm's `Qwen3NextSparseMoeBlock` materializes three `[rows, top_k, hidden]` tensors (unsort, weight, column sum) before adding the shared expert. On the batch-invariant prefill lane the experts already run expert-sorted from 128 tokens, so the lane's `SwitchGLU` now hands out the sorted output and its inverse permutation, and a subclass of the stock block feeds both, with the scores and the gated shared expert, to the existing Flash-Next combine kernel (`kernels/qwen4_moe_prefill_combine.py`, same rounding as the stock tail). Bit-identical to the stock block. Installed only together with `MTPLX_BATCH_INVARIANT_PREFILL=1`; narrower forwards, decode, verify and the lone final token keep the stock block. A bitwise self-check lane (`a3b_moe_prefill_combine`) turns the route off for the process on any difference. Default off.
 
 ## [2.12.0] - 2026-09-23
 
