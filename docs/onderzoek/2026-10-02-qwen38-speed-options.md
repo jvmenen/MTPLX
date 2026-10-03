@@ -117,11 +117,31 @@ Expected accepted tokens per verify for the current 4-row chain against two smal
 
 These are token counts only: the extra cost of verifying 6 or 10 rows instead of 4 and of drafting a tree is not included, and the GatedDeltaNet layers cannot process a tree in one sequence (each branch needs its own recurrent state, so in practice parallel chains with a shared prefix). A measurement of verify cost against row count is the next step.
 
+## 8. Verify cost against row count: tree verification does not pay (3 October)
+
+Measured in-process on the production verify path (`forward_ar_capture`, capture_commit, conv-tape GDN capture; compiled bank at 2K, eager above 6,144 tokens as in production), prefix of real text, cache rolled back between trials, M shuffled, 7 timed repetitions, thermal pressure 0 at the start of every series. Times include the logits and hidden eval (3 to 5 ms above Q6).
+
+Production paged KV, ms per verify forward (ratio to M=4):
+
+| M | 2K | 16K | 48K |
+|---|---|---|---|
+| 4 | 79.1 (1.00) | 93.6 (1.00) | 134.4 (1.00) |
+| 6 | 111.3 (1.41) | 119.0 (1.27) | 196.7 (1.46) |
+| 8 | 136.1 (1.72) | 144.8 (1.55) | 225.7 (1.68) |
+| 12 | 159.3 (2.02) | 174.0 (1.86) | 274.3 (2.04) |
+
+With dense KV the cost is a staircase: M=5 to 6 costs +12 to +18%, M=7 to 8 +43 to +47%, M=9 and up jumps further at long context (attention leaves the q_len <= 8 kernel). Matmuls drop from 250 to 280 GB/s at M <= 4 to 150 to 190 GB/s at M = 6 to 12. Parallel chains as a batch (the form the GDN layers allow) are worse: 2 chains of 4 rows cost 1.45x (2K) to 2.03x (48K), 3 chains 1.67x to 2.63x, because every chain re-reads the prefix KV.
+
+Combined with the offline token gains of section 7 (+4 to +16%), every tree shape, form, context length and text type loses throughput: a 7-row tree -21% to -26%, an 11-row tree -26% to -64%; the most optimistic reading (6 rows at 2K) still nets -3% to -7%. Break-even for 7 rows would need the forward within +2% to +8% of M=4. Tree verification is not worth building for Qwen3.8 on this hardware unless the M=5 to 8 matmul and attention routes get as efficient as M=4.
+
+Side finding: at long context the production paged KV is much slower than dense KV for the same M=4 forward (48K: 134 ms paged against 89 to 97 ms dense on the eager route, -27% to -33%). Dense KV cannot batch and may interact with the session bank; to be investigated as a separate item.
+
 ## Conclusions
 
 1. Keep the int4 head and context-copy as they are.
 2. No DFlash2 integration for Qwen3.8 on this hardware.
 3. Fine-tuning the MTP head on off-policy text does not move acceptance on Qwen's own Dutch output; no further work without on-policy data.
-4. Tree verification is the most promising remaining lever for prose (+12 to +16% tokens per verify for a 10-node tree in the offline estimate), provided the extra verify cost on this dense hybrid model stays small; to be measured.
+4. Tree verification is not worth building: the extra rows cost far more than the extra accepted tokens (section 8).
+5. New lead: dense KV instead of paged KV at long context (M=4 verify -27% to -33% at 48K), to be investigated.
 
 Scripts and raw data are local (`~/Dev/laya-nl/pld-38/`, `dflash38/`, `q38bf/`, `prefill38/`, `mtp-head-ft/`); the training data and cache contain private text and are not published.
