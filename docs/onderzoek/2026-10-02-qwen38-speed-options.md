@@ -136,6 +136,35 @@ Combined with the offline token gains of section 7 (+4 to +16%), every tree shap
 
 Side finding, corrected 3 October: the paged-versus-dense gap is real (dense 15% faster at 23K, 32 to 47% at 35K to 81K in a server test with a growing agent conversation), but production already decodes on dense KV: the turbo profile sets `MTPLX_SUSTAINED_PREFILL_LAYOUT=auto`, and `_sustained_prefill_layout` (`generation.py:2088-2109`) picks contiguous dense decode whenever the request context is known and below the dense ceiling (15% of RAM at 64 KB per token, 157,286 tokens here). The request log confirms it: no paged attention in any production Qwen3.8 request. Paged decode only applies above that ceiling or with KV quantization. Any in-process benchmark must set `MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS` to match the server.
 
+## 9. Where long-context prefill time goes (3 October)
+
+Appending ~6,000 new tokens (a large tool result) to an existing conversation, in-process on the production path (`restore_or_prefill_prompt_state` with a session bank, chunk 4096, turbo profile and production env; this path sets `MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS` itself, dense `KVCache` confirmed). 3 repetitions per point, 60 s rest and thermal pressure 0 before each. A server cross-check with rest per turn came out 1.5 to 7% higher (about +3.5% on average); back-to-back turns under thermal load cost another 6 to 9%.
+
+| Prefix | Time for 6K new tokens | Prefill tok/s |
+|---|---|---|
+| 0 (cold) | 12.58 s | 477 |
+| 20K | 15.05 s | 399 |
+| 50K | 19.11 s | 314 |
+| 80K | 22.45 s | 267 |
+
+Per component (synced instrumented pass, overhead 4 to 8%):
+
+| Component | 0 | 20K | 50K | 80K |
+|---|---|---|---|---|
+| MLP (64 layers) | 7.9 | 7.8 | 7.8 | 7.8 |
+| GDN layers (48): projections | 2.7 | 2.7 | 2.7 | 2.7 |
+| GDN layers: recurrent kernel, norms | 1.24 | 1.24 | 1.24 | 1.24 |
+| Full attention (16): QKV and O projections | 0.8 | 0.8 | 0.8 | 0.8 |
+| Full attention: SDPA | 0.35 | 2.6 | 6.6 | 9.8 |
+| Other (norms, embedding, last-row lm_head) | 0.35 | 0.36 | 0.37 | 0.37 |
+
+- Only the SDPA over the prefix grows with context, about 0.123 s per 1K prefix tokens per 6K appended. At 80K it is 43% of the time; matmuls are 48%. Host overhead is under 1%.
+- The prefill uses `mx.fast.scaled_dot_product_attention` (bf16, causal) at 20 to 22 TFLOPS for head dimension 256, against 31 TFLOPS for a bf16 matmul and 28.4 for the 4-bit `quantized_matmul`. The in-model time matches an isolated benchmark, so there is no fallback; request logs show no paged or bailout routes.
+- Chunk size 2048, 4096 or 6144 makes no difference (within 2%), because every chunk attends over the whole prefix.
+- Below 1,024 query rows MLX takes an unfused route that is about 1.9x slower per row at 80K: a 5,000-token append planned as 4096 + 839 + 64 pays 3.35 s instead of about 2.6 s for the 839-row chunk. A 64-row tail chunk plus the final-token forward cost about 0.7 s per request.
+
+What can be improved: chunk planning without small remainders and without the tail chunk saves 0.3 to 1 s per request (code change in MTPLX). Raising SDPA at head dimension 256 towards matmul efficiency would save up to 2.5 to 3 s at 80K (MLX kernel work; repro script available). The matmuls leave at most about 1 s. The largest lever is outside the engine: every 1K tokens less in a tool result saves about 2.1 s at a short prefix and 3.7 s at 80K.
+
 ## Conclusions
 
 1. Keep the int4 head and context-copy as they are.
@@ -143,5 +172,6 @@ Side finding, corrected 3 October: the paged-versus-dense gap is real (dense 15%
 3. Fine-tuning the MTP head on off-policy text does not move acceptance on Qwen's own Dutch output; no further work without on-policy data.
 4. Tree verification is not worth building: the extra rows cost far more than the extra accepted tokens (section 8).
 5. Production already uses dense KV at the context lengths Bink sees (finding Q17 was an artifact of the in-process harness); nothing to change.
+6. Long-context prefill: the context-dependent part is the SDPA (section 9); engine-side gains are small (chunk planning, an MLX kernel improvement), trimming tool output is the larger lever.
 
 Scripts and raw data are local (`~/Dev/laya-nl/pld-38/`, `dflash38/`, `q38bf/`, `prefill38/`, `mtp-head-ft/`); the training data and cache contain private text and are not published.
