@@ -269,3 +269,13 @@ Production path in-process (turbo profile, dense KV cache, eager `forward_ar_cap
 **Estimated payoff (model, not measured end to end):** M=4 attention at 80% of the roof: +1.7%/+3.1%/+5.5% tok/s at 20K/50K/80K. Matmuls at M=5 to 16 at M=4 bandwidth: depth 4 goes from about +2 to +5% to about +12% (assuming cumulative depth-4 acceptance 0.45), and the break-even for 24-row context-copy blocks at 80K drops from 7.3 to 5.1 accepted tokens. Small trees only pay with both that and wide-row attention.
 
 **Ranking:** (1) lm_head at M=7 to 12: pad to 13 rows or route q8 through NAX, 3 to 9 ms per affected verify, trivial; (2) multi-row 4-bit matmul for M=5 to 16 without per-tile weight re-reads; (3) attention for q=6 to 24 at long context; (4) qmm above 16 rows on K=17408/K=5120 (split into 16-row calls); (5) M=4 attention efficiency; quick check: pad M=9 to 12 to 16 rows.
+
+## 10. MLX patches in upstream form; correction on the SDPA threshold (4 October)
+
+Both local MLX patches were ported to MLX main (65be04707, 128 commits after v0.32.2), formatted with MLX's pre-commit hooks, and covered by tests in `python/tests/test_fast_sdpa.py` and `python/tests/test_quantized.py` (both files pass with `MLX_ENABLE_TF32=0 MLX_ENABLE_CACHE_THRASHING_CHECK=0`, the settings MLX's own test runner uses; without them about 1,250 fp32 assertions fail on M5 because of TF32, which explains the earlier failures).
+
+**Correction.** A clean 8x8 grid (qL 16 to 1023 against keys 0 to 80K, three head configurations, GPU guarded against other jobs) shows that the earlier "1.3 to 18x" for the fused SDPA route below 1024 query rows was inflated by allocator effects and GPU contention in the unfused runs. Clean ratios (unfused / fused): 512 rows 1.04 to 2.2 (growing with key length), 1023 rows 1.09 to 1.83, 256 rows 0.86 to 1.53 (mostly 1.1 or more from 8K keys), 64 to 128 rows about 1.0, 16 to 32 rows 0.5 to 0.8 (fused slower). The upstream form therefore uses the fused kernel for head_dim 256 causal fp16/bf16 when qL >= 512, or qL >= 256 and kL >= 8192. The end-to-end gains measured on Qwen3.8 for 350 and 730-token appends (section 8) remain valid; the production setting `MLX_SDPA_D256_MINQ=64` is about neutral for 64 to 255-row chunks.
+
+**qmm tile, upstream form:** same kernel and loader; 1.02 to 1.33x (median 1.10x) on 21 large-M shapes, bit-identical; 144 new kernel instantiations, metallib +0.8%.
+
+MLX's contribution rules require the PR description to be written by a person and suggest an issue first for larger changes; the SDPA part fits as input to the open draft ml-explore/mlx#4476.
