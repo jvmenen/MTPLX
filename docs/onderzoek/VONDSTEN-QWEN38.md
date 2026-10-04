@@ -30,6 +30,9 @@ Noise: `frspec` (FR-Spec not active) came in at 32.4 tok/s against a baseline of
 
 | # | Finding | Outcome |
 |---|---|---|
+| Q13 | Qwen3.8 on the v2.12.2 rebase (variants A, B, C, D) | 3 Oct, one run per variant: decode 29.9 / 28.0 / 29.3 / 30.1 tok/s, cold prefill 22K 56.1 / 55.2 / 55.3 / 66.2 s; the 66 s of D was machine interference (in-process repeats D = C). On dense Qwen3.8 our carried work equals the upstream flags; see [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 1 |
+| Q14 | Chunk plan and SDPA threshold on Qwen3.8 | 4 Oct: `MTPLX_PREFILL_MIN_CHUNK_ROWS=1024` saves 0.3 to 1.4 s per append at 80K prefix; MINQ patch saves 0.2 to 0.76 s on 350/730-token appends at 50K to 80K ([rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) sections 2 and 3; open findings 100 and 101 in [VONDSTEN](VONDSTEN.md)) |
+| Q15 | Qwen3.8 against Bonsai 2 27B on Dutch writing | 4 Oct: Qwen3.8 clearly better (correct 3.17 against 2.83, Dutch 3.17 against 2.54, 22 against 58 invented words in 24 answers each); see [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 7 |
 | Q11 | Context-copy (prompt lookup) on Qwen3.8 | 2 Oct ([qwen38-speed-options](2026-10-02-qwen38-speed-options.md)): already on by default; agent Edit 2.1x, code edit +23 to +38%, extraction and prose unchanged; default min n-gram 6 beats 3. Untested: RAMP, block lengths |
 | Q12 | DFlash2 drafter | 2 Oct, stopped early: block 5 on par with MTP only on extraction and code edit, worse on prose, behind context-copy on edits. Not integrating |
 | Q13 | BF16 MTP head (pack ships int4 g64 despite the `keep_bf16` label) | 2 Oct: 2 to 8% slower at equal acceptance, greedy bit-identical. Keep the int4 head |
