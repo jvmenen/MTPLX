@@ -213,3 +213,31 @@ Public summary only; no prompt or answer content is recorded here. Pack: `Ternar
 Speed (end to end including reasoning, same machine): Bonsai median 36.8 tok/s, mean 1,745 completion tokens and 46.6 s per answer; Qwen3.8 median 28.5 tok/s, mean 533 tokens and 19.3 s per answer. Bonsai decodes faster but reasons much longer, so it is slower per answer. 18 of 24 Bonsai answers contained at least one invented or garbled Dutch word, 6 of 24 contained five or more.
 
 Conclusion: not suitable for Dutch writing tasks in this setup; Qwen3.8 stays. Earlier tests on classification and agent tasks are in [modeltest](2026-09-26-modeltest.md). Single run set, one reviewer: treat the gap with Qwen as indicative, the gap with the reference as clear.
+
+## 8. Faster 4-bit prefill matmuls: two routes (4 October)
+
+Goal: close the gap between the 4-bit `quantized_matmul` (28.3 TFLOPS) and the bf16 matmul (30.9 TFLOPS) at prefill shapes on Qwen3.8-27B (4-bit g32 body). In-process, production path, 60 s rest and thermal pressure 0 per series, 3 repetitions, medians.
+
+**Route A, in MTPLX: dequantize to bf16 for wide prefill chunks** (branch `perf/dequant-prefill`, switch `MTPLX_PREFILL_DEQUANT_MIN_ROWS`, default off). Each projection's weight is dequantized per call (transient, about 178 MB) and multiplied in bf16.
+
+| Case | Off | N=1024 | N=2048 | Peak memory |
+|---|---|---|---|---|
+| 6K appended, cold | 12.59 s | 12.32 s | | +1.0 GB |
+| 6K at 20K prefix | 14.93 s | 14.66 s | 14.61 s | +1.0 GB |
+| 6K at 80K prefix | 22.50 s | 22.25 s | 22.16 s | +1.0 GB |
+| 730 at 50K prefix | 3.02 s | 3.02 s (not routed) | | |
+| 730 at 50K, N=512 | | 3.20 s (+6%, slower) | | +0.4 GB |
+
+Only the 4096-row chunk gains; an 1839-row chunk does not, and a 665-row chunk gets slower. Greedy output identical at 20K and 80K; teacher-forced KL about 4e-4, the same order as a chunk-size change. Verdict: about 0.3 s per 6K append for 1 GB more peak memory; not used.
+
+**Route B, in MLX: a larger tile for large-M qmm** (patch `~/Dev/mlx-sdpa/patches/qmm-large-m-tile.patch` against v0.32.2, local only). For affine transposed qmm with M > 64 and K % 128 == 0 the NAX kernel uses BM=128, BN=64, BK=128 with 2x2 simdgroups instead of 64x64x64, plus a weight loader without the old thread-count constraint. Cause of the gap: per-step dequantization into threadgroup memory with barriers on a small tile; the bf16 NAX GEMM loads straight from device memory.
+
+| Shape (K to N), M=4096 | Stock | Patched | bf16 |
+|---|---|---|---|
+| 5120 to 17408 | 25.85 ms | 24.25 ms (-6.2%) | 23.72 ms |
+| 17408 to 5120 | 27.54 ms | 24.98 ms (-9.3%) | 26.02 ms |
+| 5120 to 6144 | 9.19 ms | 8.64 ms (-6.0%) | 8.44 ms |
+
+Bit-identical to stock in 178 cases (bits 2 to 8, group sizes 32 to 128, M 16 to 4096, unaligned N and K); M <= 64 (decode, verify) unchanged. End to end: 6K appended cold 12.59 to 12.06 s (-4.2%), at 20K 14.94 to 14.37 s (-3.8%). Tried and slower: 128x128 tiles, 256x64, double-buffered threadgroup memory; BN=32 or 16 tiles looked faster but produced wrong output (NAX tile needs an N-width of 32 per simdgroup). A similar upstream proposal for the non-NAX path (ml-explore/mlx#4204) was closed without review.
+
+**Combined MLX build** (v0.32.2 + `minq.patch` + the tile patch, `~/Dev/mlx-sdpa/pkg-combo`): measurement in progress; results will be added to this section.

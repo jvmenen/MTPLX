@@ -54,6 +54,31 @@ The 'In plain terms' column summarizes each open item in plain language: what it
 | 102 | Take `fix/ssd-fingerprint-mixer` into production; open the PR | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 4 | Fix is on the fork (1f032eac), 0 of 400 collisions, GPU cost +0.35 ms per 4 MiB; PR text ready, not opened | **What:** Make the SSD incremental-encode check collision-free.<br>**Effect:** removes a theoretical silent-corruption risk; no speed change.<br>**Do it?** yes with the next build.<br>**Needed from Jeroen:** approval for the PR. |
 | 103 | PR for `feat/context-copy-ar` (AR-only models) | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 6 | Text ready, not opened; Llama-3.1-8B: code edit 4.9x decode, extraction 1.3x, prose 1.0x, greedy 20/20 identical. Hybrid models not measured | **What:** Prompt-copy speedup for models without an MTP head.<br>**Effect:** large on code edits, none on prose; none for our production models.<br>**Do it?** only as a contribution.<br>**Needed from Jeroen:** approval. |
 | 104 | Follow #588 (fix for #583) and the reaction to our comment on #584 | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 5 | PR #588 open; #584 comment posted. Our production already needs #588 on Qwen3.6 (1 empty turn in 18); carry `fix/unclosed-reasoning-with-tools` in `perf/definitief-2122` until merged | **What:** Wait for upstream's reaction.<br>**Effect:** fewer empty agent answers on Qwen3.6.<br>**Needed from Jeroen:** nothing. |
+| 105 | Combined local MLX build (MINQ + large-M qmm tile) in production | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 8 | Measure end to end (in progress), then decide on a local build in production and on upstream submissions (tile patch: #4204 precedent) |
+| 106 | Decode-side MLX kernels: verify-forward breakdown at 2K to 80K (attention route and effective bandwidth), qmm bandwidth at M=1 to 32 (dip at 5 to 12 rows) | Estimate: verify at 81K is ~34 ms slower than at 23K while the minimal KV read is ~9 ms | Profiling run, then rank kernel work |
+
+## Tried and rejected (do not retry without a new reason)
+
+Short index of approaches that were measured and dropped, with where the numbers are. Check here before starting something "new".
+
+| Approach | Outcome | Source |
+|---|---|---|
+| BF16 MTP head on the Qwen3.8-27B Optimized-Speed pack | 2 to 8% slower, equal acceptance (the int4 g64 head is fine). On Qwen3.6 MoE the BF16 head did help (+12 to +32%) | [qwen38-speed-options](2026-10-02-qwen38-speed-options.md) section 4 |
+| DFlash 2 drafter for Qwen3.8-27B | Block 5 on par with MTP D3 on extraction and code, worse on prose, behind context-copy on edits | same, section 3 |
+| Fine-tuning the MTP head on off-policy (own, non-Qwen) text | +0.6% tokens per verify on Qwen's own Dutch output | same, section 6 |
+| Tree verification (2 to 3 candidates per position) on Qwen3.8 | Offline +4 to +16% tokens per verify, but 6 to 12 verify rows cost +12% to +104%; every variant nets -3 to -64% | same, sections 7 and 8 |
+| Minimum n-gram 3 (or 4) for context-copy | Worse than the default 6 (wrong blocks; slower at temperature 1.0) | same, section 1; [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 6 |
+| Faster prefill matmuls via MTPLX dequant-to-bf16 | 0.3 s per 6K append for +1 GB peak memory; slower on chunks under 2048 rows | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 8 |
+| MLX 0.32.3 for attention speed | 0 to 2% slower than 0.32.2, bit-identical | same, section 3 |
+| MLX SDPA D=256 with more query rows per simdgroup (TQ=2, BQ=128) | About 3x slower (register pressure) | same, section 3 |
+| MLX qmm tiles 128x128, 256x64, double buffering, BN=32/16 | Slower, or wrong output (BN<32) | same, section 8 |
+| KV quantization q8/q4 | Slower everywhere (-25% to -72%) | [kv-quantization](2026-09-30-kv-quantization.md) |
+| Prefill chunk 2048 or 6144 instead of 4096 | No difference at 20K to 80K; 8192 caused swap | [qwen38-speed-options](2026-10-02-qwen38-speed-options.md) section 9, VONDSTEN-QWEN38 Q3 |
+| Depth 4 or more on Qwen3.8 | Maker measured D6 -27%, D4 unstable; dip in qmm at 5+ rows (finding 106) is the reason to revisit only if that is fixed | VONDSTEN-QWEN38 Q0 |
+| Ternary-Bonsai-2-27B as a Dutch writing model | Invented words in half the answers, 2.4x slower than Qwen3.8 (always thinks) | [rebase-2122-and-fixes](2026-10-04-rebase-2122-and-fixes.md) section 7 |
+| 4-bit conversions (g64, mixed_4_6) of an Apertus-based 8B model | Model echoes the prompt; 6-bit and 8-bit work | [qwen38-speed-options](2026-10-02-qwen38-speed-options.md) section 2 |
+| Fan mode `max` | Not pursued: noise on the user's laptop outweighs a few percent | decision 3 October 2026 |
+| Qwen3.6 with 16 experts per token ("4B active") | Parked: expected little quality gain (router trained for 8), ~25 to 35% slower decode | decision 2 October 2026 |
 
 ## Handled
 
