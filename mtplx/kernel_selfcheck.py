@@ -40,6 +40,7 @@ Env:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -928,6 +929,12 @@ def run_kernel_selfcheck(
     for lane, env, kernel, rows in (
         ("nax_flash_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash, 8),
         ("nax_flash_dsplit_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash_dsplit, 4),
+        (
+            "nax_flash_dsplit4_sdpa",
+            "MTPLX_NAX_FLASH_DSPLIT4",
+            functools.partial(sdpa_nax_flash_dsplit, ndh=4),
+            4,
+        ),
         # 13 rows = 78 query rows per KV head: three row groups, the last one partial.
         ("nax_flash_dsplit_wide_sdpa", "MTPLX_NAX_FLASH_WIDE", sdpa_nax_flash_dsplit_wide, 13),
         ("nax_tile_sdpa", "MTPLX_NAX_TILE_ROUTE", sdpa_nax_tile, 8),
