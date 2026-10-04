@@ -884,6 +884,10 @@ def load(
         if nax_env_enabled():
             nax_report = install_nax_qlinear_patch()
             logger.info("[nax-verify] %s", nax_report)
+        from .prefill_dequant import install_prefill_dequant_patch
+
+        if os.environ.get("MTPLX_PREFILL_DEQUANT_MIN_ROWS", "").strip() not in {"", "0"}:
+            logger.info("[prefill-dequant] %s", install_prefill_dequant_patch())
         from .kernels.gdn_blocked_prefill import (
             blocked_prefill_env_enabled,
             install_gdn_blocked_prefill_patch,
