@@ -240,4 +240,16 @@ Only the 4096-row chunk gains; an 1839-row chunk does not, and a 665-row chunk g
 
 Bit-identical to stock in 178 cases (bits 2 to 8, group sizes 32 to 128, M 16 to 4096, unaligned N and K); M <= 64 (decode, verify) unchanged. End to end: 6K appended cold 12.59 to 12.06 s (-4.2%), at 20K 14.94 to 14.37 s (-3.8%). Tried and slower: 128x128 tiles, 256x64, double-buffered threadgroup memory; BN=32 or 16 tiles looked faster but produced wrong output (NAX tile needs an N-width of 32 per simdgroup). A similar upstream proposal for the non-NAX path (ml-explore/mlx#4204) was closed without review.
 
-**Combined MLX build** (v0.32.2 + `minq.patch` + the tile patch, `~/Dev/mlx-sdpa/pkg-combo`): measurement in progress; results will be added to this section.
+**Combined MLX build** (v0.32.2 + `minq.patch` + the tile patch, `~/Dev/mlx-sdpa/pkg-combo`, `MLX_SDPA_D256_MINQ=64`), end to end on Qwen3.8-27B, production MTPLX tree and env, medians of 3, interleaved, thermal pressure 0:
+
+| Prefix | Append | Stock | Combined | Saved |
+|---|---|---|---|---|
+| 0 | 6000 | 12.58 s | 12.00 s | 4.6% |
+| 20K | 350 | 1.07 s | 0.96 s | 10% |
+| 20K | 730 | 2.19 s | 2.10 s | 4.0% |
+| 20K | 6000 | 14.95 s | 14.35 s | 4.0% |
+| 80K | 350 | 1.93 s | 1.50 s | 22% |
+| 80K | 730 | 3.93 s | 3.15 s | 20% |
+| 80K | 6000 | 22.50 s | 21.80 s | 3.1% |
+
+Decode unchanged (MTP depth 3: 34.4 vs 34.5 tok/s; AR 13.75 vs 13.76), generated tokens identical. qmm bit-identical in 178 cases; the fused SDPA path adds a small logit drift (KL mean about 5e-4, top-1 agreement 100%, greedy continuations identical at 20K, 50K, 80K). Without `MLX_SDPA_D256_MINQ` the build is bit-identical to stock apart from the qmm speed-up.
