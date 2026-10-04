@@ -927,6 +927,24 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                         y = y + self["bias"]
                     return y
                 _count_qlinear_fallback(bits, m)
+        if (
+            bits in (4, 8)
+            and x.ndim >= 2
+            and current_attention_phase() != "prefill"
+            and _pad_wide_rows_enabled()
+        ):
+            m = 1
+            for d in x.shape[:-1]:
+                m *= int(d)
+            n = int(self["weight"].shape[0])
+            k = int(x.shape[-1])
+            if _pad_wide_rows_eligible(m, k, n, bits, group_size, x.dtype, self):
+                # No custom lane took these rows: pad to the qmm_nax row
+                # count and keep the first m rows (see _pad_wide_rows_enabled).
+                pad = mx.zeros((_PAD_WIDE_ROWS_TARGET - m, k), dtype=x.dtype)
+                xp = mx.concatenate([x.reshape(m, k), pad], axis=0)
+                y = original(self, xp)[:m, :]
+                return y.reshape(*x.shape[:-1], n)
         return original(self, x)
 
     nn.QuantizedLinear.__call__ = patched
@@ -972,6 +990,59 @@ def _m5_padded_lane() -> bool:
         "on",
         "yes",
     }
+
+
+# Rows at which MLX 0.32.2 leaves the tiled qmv_wide kernel for qmm_nax, and
+# the rows below it where padding pays in the whole verify forward.
+_PAD_WIDE_ROWS_TARGET = 13
+_PAD_WIDE_ROWS_MIN = 9
+
+
+def _pad_wide_rows_enabled() -> bool:
+    """Opt in to padding 9..12-row quantized matmuls to 13 rows (default: off).
+
+    MLX 0.32.2 serves M=2..12 rows through qmv_wide, which works in tiles of
+    at most 5 rows and re-reads the weights once per tile; from M=13 it uses
+    qmm_nax, which streams them once. The q8 g64 lm_head (5120 -> 248320,
+    ~1.3 GB) shows it: the stock call takes 4.9 ms up to M=6, 7.1 ms at M=7
+    and 8, 8.5 ms at M=9 and 10 and 10.5 ms at M=11 and 12, while 13 rows
+    take 7.1 ms. The overlay above covers only 4-bit bodies, so a verify of
+    9..12 rows (the 8-row context-copy probation block plus its bonus row,
+    depth 8 and up) paid that on the lm_head. With the switch on, 4/8-bit
+    affine calls in the verify window that no lane above took are padded
+    with zero rows to 13 and sliced back, for 9..12 rows, N >= 16384 and
+    K <= 8192 only (q8 down and out_proj and the tiny gate projections get
+    slower padded; see _pad_wide_rows_eligible). Rows 7 and 8 stay stock
+    (already at 7.1 ms). Rows differ from the unpadded stock result by
+    accumulation order only (bf16 ulp level, as with the other lanes here);
+    other row counts are untouched.
+    """
+    return str(os.environ.get("MTPLX_QMM_PAD_ROWS", "")).strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def _pad_wide_rows_eligible(
+    m: int, k: int, n: int, bits: int, group_size: int, dtype, layer
+) -> bool:
+    # Shape floor from the 2026-10-04 per-shape receipts (Qwen3.8-27B pack, 8-9
+    # rows, kernel level, off -> on): wins where N is large and K small (lm_head 11.6 -> 7.5
+    # ms, q8 gate/up 0.64 -> 0.55 ms at 8 rows); loses on q8 down (K=17408,
+    # 0.54 -> 1.01 ms), q8 out_proj (N=5120, 0.20 -> 0.35 ms) and the N=48
+    # gate projections (4 -> 16 us), where qmm_nax already underperforms.
+    return (
+        _PAD_WIDE_ROWS_MIN <= int(m) <= _PAD_WIDE_ROWS_TARGET - 1
+        and int(n) >= 16384
+        and int(k) <= 8192
+        and int(bits) in (4, 8)
+        and int(group_size) in (32, 64, 128)
+        and dtype in (mx.bfloat16, mx.float16)
+        and getattr(layer, "mode", "affine") == "affine"
+        and nax_available()
+    )
 
 
 def nax_qmm_m4(

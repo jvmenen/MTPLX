@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_QMM_PAD_ROWS=1` pads 9 to 12-row quantized matmuls to 13 rows (off by default).** MLX 0.32.2 runs 2 to 12 rows through `qmv_wide`, which works in tiles of at most 5 rows and re-reads the weights once per tile, and 13 or more rows through `qmm_nax`, which reads them once. The verify overlay covers only 4-bit bodies, so the q8 g64 lm_head (5120 to 248320, 1.3 GB) of Qwen 3.8 27B Optimized Speed took 4.9 ms at up to 6 rows, 7.1 ms at 7 and 8, 8.5 ms at 9 and 10 and 10.5 ms at 11 and 12 rows, against 7.1 ms at 13. With the switch on, verify-window calls of 9 to 12 rows that no overlay lane serves are padded with zero rows to 13 and sliced back: the lm_head takes 7.1 ms at every row count from 7 to 16, and the whole verify forward is 0.9 to 1.5 ms faster at 9 and 10 rows and 5.7 to 5.9 ms (3 to 5%) faster at 11 and 12 rows at 2,048 and 20,000 tokens of context. Shapes where the padded call measured slower (q8 down projection K=17408, q8 out_proj N=5120, the N=48 gate projections) and 7 and 8 rows stay stock; rows 1 to 6 and 13 or more are untouched. Padded rows differ from the stock rows by accumulation order only (largest logit difference 0.125, argmax identical on every row; four context-copy generations of 600 tokens at temperature 0 and 1 are token-identical, decode within +-0.6%, because default context-copy blocks are 9, 13, 17 and 25 rows). Measured on an M5 Pro 64 GB, macOS 26.6.2, MLX 0.32.2, thermal pressure 0, interleaved off/on runs (15 repetitions per forward, 3 per generation), 2026-10-04; tests in `tests/test_nax_verify.py`.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

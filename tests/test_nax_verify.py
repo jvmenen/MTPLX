@@ -251,3 +251,128 @@ def test_m5_falls_through_to_stock_by_default(monkeypatch) -> None:
         assert mx.array_equal(y, ref), "M=5 default must be the stock result"
     finally:
         uninstall_nax_qlinear_patch()
+
+
+def _wide_rows_layer(K: int, N: int, bits: int, group_size: int):
+    mx.random.seed(11)
+    layer = nn.QuantizedLinear(K, N, bias=False, group_size=group_size, bits=bits)
+    w = (mx.random.normal((N, K), dtype=mx.float32) * 0.02).astype(mx.bfloat16)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        w, group_size=group_size, bits=bits
+    )
+    mx.eval(layer.parameters())
+    return layer
+
+
+def test_pad_wide_rows_switch_and_eligibility(monkeypatch) -> None:
+    """MTPLX_QMM_PAD_ROWS is read per call and off by default; the lane covers
+    9..12 rows of 4/8-bit affine layers only (and needs NAX hardware, since
+    qmm_nax is what the padding buys)."""
+    from mtplx.nax_verify import _pad_wide_rows_eligible, _pad_wide_rows_enabled
+
+    monkeypatch.delenv("MTPLX_QMM_PAD_ROWS", raising=False)
+    assert _pad_wide_rows_enabled() is False
+    monkeypatch.setenv("MTPLX_QMM_PAD_ROWS", "1")
+    assert _pad_wide_rows_enabled() is True
+
+    layer = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=8)
+    dt = mx.bfloat16
+    expect = nax_available()
+    for m in (9, 10, 11, 12):
+        assert _pad_wide_rows_eligible(m, 5120, 248320, 8, 64, dt, layer) == expect
+        assert _pad_wide_rows_eligible(m, 5120, 17408, 8, 64, dt, layer) == expect
+        assert _pad_wide_rows_eligible(m, 5120, 17408, 4, 32, dt, layer) == expect
+    for m in (1, 4, 5, 6, 7, 8, 13, 16, 24):
+        assert not _pad_wide_rows_eligible(m, 5120, 248320, 8, 64, dt, layer)
+    assert not _pad_wide_rows_eligible(8, 5120, 248320, 6, 64, dt, layer)
+    assert not _pad_wide_rows_eligible(8, 5120, 248320, 8, 64, mx.float32, layer)
+    # Shapes where padding measured slower stay stock: q8 down (K=17408),
+    # q8 out_proj (N=5120) and the N=48 gate projections.
+    assert not _pad_wide_rows_eligible(8, 17408, 5120, 8, 64, dt, layer)
+    assert not _pad_wide_rows_eligible(8, 6144, 5120, 8, 64, dt, layer)
+    assert not _pad_wide_rows_eligible(8, 5120, 48, 4, 32, dt, layer)
+
+
+@pytest.mark.skipif(not nax_available(), reason="requires Apple G17 + macOS >= 26.2")
+@pytest.mark.parametrize(
+    "bits,group_size,K,N",
+    [(8, 64, 5120, 16384), (8, 32, 5120, 16384), (4, 32, 544, 16384), (4, 64, 576, 16384)],
+)
+def test_pad_wide_rows_matches_stock_rowwise(monkeypatch, bits, group_size, K, N) -> None:
+    """Padded 9..12-row calls: each row equals the stock row to bf16 rounding
+    (qmm_nax and qmv_wide accumulate in different orders), is bit-identical to
+    the same row of the 13-row stock call, and does not depend on how many
+    rows were padded. Rows outside 9..12 and the switch off are stock bits."""
+    layer = _wide_rows_layer(K, N, bits, group_size)
+    x_all = (mx.random.normal((16, K), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+    ref13 = layer(x_all[:13])
+    mx.eval(x_all, ref13)
+
+    monkeypatch.setenv("MTPLX_QMM_PAD_ROWS", "1")
+    report = install_nax_qlinear_patch()
+    assert report["installed"] is True
+    from mtplx.attention_context import attention_phase
+
+    try:
+        with attention_phase("decode_verify"):
+            first_rows = []
+            for m in range(9, 13):
+                y = layer(x_all[:m])
+                mx.eval(y)
+                assert y.shape == (m, N)
+                assert mx.array_equal(y, ref13[:m]), f"M={m} differs from 13-row rows"
+                first_rows.append(y[:9])
+            for rows in first_rows[1:]:
+                assert mx.array_equal(rows, first_rows[0])
+            # 3-D input (batch 1, M rows) keeps its shape.
+            y3 = layer(x_all[None, :12, :])
+            assert y3.shape == (1, 12, N)
+            assert mx.array_equal(y3[0], ref13[:12])
+            # Outside 9..12 the call is the untouched stock result (M=4..6
+            # belong to the 8-bit verify_kernels lanes, so they are not here).
+            for m in (1, 2, 3, 13, 16):
+                assert mx.array_equal(layer(x_all[:m]), _stock_layer(layer, x_all[:m]))
+        # Prefill phase never pads.
+        with attention_phase("prefill"):
+            assert mx.array_equal(layer(x_all[:12]), _stock_layer(layer, x_all[:12]))
+        # Switch off: stock bits.
+        monkeypatch.setenv("MTPLX_QMM_PAD_ROWS", "0")
+        with attention_phase("decode_verify"):
+            assert mx.array_equal(layer(x_all[:12]), _stock_layer(layer, x_all[:12]))
+    finally:
+        uninstall_nax_qlinear_patch()
+    # Against the stock 9..12-row kernel only the accumulation order differs.
+    for m in (9, 12):
+        diff = float(
+            mx.abs(ref13[:m].astype(mx.float32) - _stock_layer(layer, x_all[:m]).astype(mx.float32)).max()
+        )
+        assert diff < 0.25, f"padded rows drift too large at M={m}: {diff}"
+
+
+def _stock_layer(layer, x):
+    return mx.quantized_matmul(
+        x, layer["weight"], scales=layer["scales"], biases=layer["biases"],
+        transpose=True, group_size=layer.group_size, bits=layer.bits,
+    )
+
+
+@pytest.mark.skipif(not nax_available(), reason="requires Apple G17 + macOS >= 26.2")
+def test_pad_wide_rows_leaves_m16_nax_lane_alone(monkeypatch) -> None:
+    """A 4-bit shape the m16 NAX lane serves (K % 256 == 0) keeps that lane:
+    the padding only picks up calls that fell through to stock."""
+    from mtplx.attention_context import attention_phase
+
+    layer = _wide_rows_layer(5120, 17408, 4, 32)
+    x = (mx.random.normal((12, 5120), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+    results = []
+    for value in ("0", "1"):
+        monkeypatch.setenv("MTPLX_QMM_PAD_ROWS", value)
+        install_nax_qlinear_patch()
+        try:
+            with attention_phase("decode_verify"):
+                y = layer(x)
+                mx.eval(y)
+            results.append(y)
+        finally:
+            uninstall_nax_qlinear_patch()
+    assert mx.array_equal(results[0], results[1])
