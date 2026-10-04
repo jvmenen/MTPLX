@@ -253,3 +253,19 @@ Bit-identical to stock in 178 cases (bits 2 to 8, group sizes 32 to 128, M 16 to
 | 80K | 6000 | 22.50 s | 21.80 s | 3.1% |
 
 Decode unchanged (MTP depth 3: 34.4 vs 34.5 tok/s; AR 13.75 vs 13.76), generated tokens identical. qmm bit-identical in 178 cases; the fused SDPA path adds a small logit drift (KL mean about 5e-4, top-1 agreement 100%, greedy continuations identical at 20K, 50K, 80K). Without `MLX_SDPA_D256_MINQ` the build is bit-identical to stock apart from the qmm speed-up.
+
+## 9. Decode-side kernel profile on Qwen3.8-27B (4 October)
+
+Production path in-process (turbo profile, dense KV cache, eager `forward_ar_capture`), MLX 0.32.2 wheel, thermal pressure 0 at the start of each series. Data and scripts in `~/Dev/laya-nl/decode-prof/` (local).
+
+**Verify forward (M=4), ms:** 74.0 at 2K, 79.2 at 20K, 89.3 at 50K, 101.8 at 80K. Matmuls are about 75% of the forward at 2K and 60% at 80K (weights about 17 GB per forward, about 230 GB/s overall). Only the attention op grows with context: 2.3 ms at 2K to 27.9 ms at 80K.
+
+**Attention route and efficiency.** Minimal KV read at 80K is 5.24 GB (64 KiB per position over 16 layers; an earlier estimate of 2.6 GB counted K or V only). Measured read roof 288 GB/s. At M=4 the MTPLX `sdpa_nax_flash_dsplit` route reaches 181 to 188 GB/s (63% of the roof), in-model equal to an isolated microbenchmark; M=1 (MLX vector 2-pass) reaches 238 GB/s (83%). The dsplit route bails when 6 x q_len > 32, so M=6 to 8 fall to `sdpa_nax_flash` (129 GB/s at 80K) and M>=9 to MLX's unfused path (112 ms at M=16, 131 ms at M=24, 80K). `MTPLX_GQA_PACKED_WIDE=1` with `MTPLX_NAX_TILE_ROUTE=1` does not help (M=16 worse).
+
+**4-bit matmul bandwidth vs rows (production route, GB/s, gate/up 5120 to 17408 / down 17408 to 5120 / lm_head q8 5120 to 248320):** M=1: 283/282/280; M=4: 266/188/281; M=5: 241/184/284; M=6: 146/118/221; M=8: 199/165/121; M=12: 199/165/83; M=16: 146/174/190; M=24: 169/67/185. Cause: MLX `qmv_wide` handles M=2 to 12 in tiles of at most 5 rows and re-reads the weights per tile; MTPLX overlays kernels at M=4, 6 and 7 to 16 (4-bit only), M=5 falls back to stock; the q8 lm_head has no overlay at M=7 to 12 (10.6 to 16.2 ms instead of 4.8); `qmm_nax` above 16 rows drops to 60 to 67 GB/s on K=17408 and K=5120 shapes.
+
+**Whole verify forward by rows, ms (2K / 80K):** M=4 74.0/101.8, M=5 83.6/111.9, M=6 82.4/122.2, M=8 105.5/149.1, M=12 124.4/299.4, M=16 122.6/237.3, M=24 192.8/325.5.
+
+**Estimated payoff (model, not measured end to end):** M=4 attention at 80% of the roof: +1.7%/+3.1%/+5.5% tok/s at 20K/50K/80K. Matmuls at M=5 to 16 at M=4 bandwidth: depth 4 goes from about +2 to +5% to about +12% (assuming cumulative depth-4 acceptance 0.45), and the break-even for 24-row context-copy blocks at 80K drops from 7.3 to 5.1 accepted tokens. Small trees only pay with both that and wide-row attention.
+
+**Ranking:** (1) lm_head at M=7 to 12: pad to 13 rows or route q8 through NAX, 3 to 9 ms per affected verify, trivial; (2) multi-row 4-bit matmul for M=5 to 16 without per-tile weight re-reads; (3) attention for q=6 to 24 at long context; (4) qmm above 16 rows on K=17408/K=5120 (split into 16-row calls); (5) M=4 attention efficiency; quick check: pad M=9 to 12 to 16 rows.
