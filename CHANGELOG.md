@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Faster verify attention at long context, behind `MTPLX_NAX_FLASH_DSPLIT4=1` (off by default).** The head-dim-split flash kernel that serves 2 to 5-row verify windows (24 to 30 query rows per KV head) read the KV cache at 180 to 190 GB/s of a measured 288 GB/s on an M5 Pro 64 GB; with the matrix multiply removed the same loads ran at 248 GB/s, so the kernel was limited by live state per thread, not by memory. The switch splits the head dimension in quarters instead of halves (twice the simdgroups, half the accumulators each), which hides the multiply behind other simdgroups' loads. The attention op takes 27 to 32% less time at 20K, 50K and 80K tokens (4 rows, per layer: 0.47 to 0.37, 1.08 to 0.85 and 1.73 to 1.31 ms, up to 250 GB/s), a whole 4-row verify forward on Qwen3.8-27B 2.3, 4.1 and 6.1% faster (84.1 to 82.2, 96.9 to 92.9, 108.2 to 101.6 ms), and end to end decode at a 50K prefix (depth 3, 3 repetitions in separate processes) 1 to 9% faster on Dutch prose and code edits. Argmax of the verify logits is unchanged; the quarter split sums four partial scores, so outputs differ from the halves kernel within fp32 rounding. With the switch off the shipping kernel is bit-identical to before. A kernel self-check lane (`nax_flash_dsplit4_sdpa`) falls back to the halves kernel if the probe fails. (branch `perf/verify-attention-q4`, 2026-10-04)
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

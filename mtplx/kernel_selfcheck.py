@@ -40,6 +40,7 @@ Env:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -925,6 +926,12 @@ def run_kernel_selfcheck(
     for lane, env, kernel, rows in (
         ("nax_flash_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash, 8),
         ("nax_flash_dsplit_sdpa", "MTPLX_NAX_FLASH_ROUTE", sdpa_nax_flash_dsplit, 4),
+        (
+            "nax_flash_dsplit4_sdpa",
+            "MTPLX_NAX_FLASH_DSPLIT4",
+            functools.partial(sdpa_nax_flash_dsplit, ndh=4),
+            4,
+        ),
         ("nax_tile_sdpa", "MTPLX_NAX_TILE_ROUTE", sdpa_nax_tile, 8),
     ):
         if _env_on("MTPLX_GQA_PACKED_SDPA") and _env_on(env) and nax_verify.nax_available():
