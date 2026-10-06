@@ -26,6 +26,6 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 
 **Production flags that are obsolete on v2.12.2** (drop at the switch): `MTPLX_MTP_HISTORY_CACHE_ONLY` (default on upstream), `MTPLX_POSTCOMMIT_AFTER_RESPONSE` and `MTPLX_PERSIST_QUEUE_MAX_GB` (superseded; use `MTPLX_PERSISTENCE_MAX_PENDING_BYTES`).
 
-**MLX:** production runs v0.32.2 plus `minq.patch` and the qmm tile patch (`~/Dev/mlx-sdpa/pkg-combo`, `MLX_SDPA_D256_MINQ=64`).
+**MLX:** production runs branch `prod` of [jvmenen/mlx](https://github.com/jvmenen/mlx) (v0.32.2 plus the minq and qmm tile patches, tag `prod-2026-10-04`), built into `~/Dev/mlx-sdpa/pkg-combo` with `MLX_SDPA_D256_MINQ=64`. Upstream forms: branches `sdpa-d256-short-query` and `qmm-large-m-tile` (not filed; MLX wants an issue first and a description written by Jeroen).
 
 **Not on `prod`, filed separately:** #599 context-copy for AR-only runtimes (`feat/context-copy-ar`; Qwen3.8 has an MTP head, so production does not need it).
