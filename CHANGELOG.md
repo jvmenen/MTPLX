@@ -6,6 +6,10 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Segmented KV cache, behind `MTPLX_SEGMENTED_KV=1` (default off).** The full-attention layers keep a conversation as sealed, exact-size KV segments plus one growing tail instead of one buffer that the session bank's snapshot aliases. A follow-up turn writes only into a new tail, so MLX's copy-on-write no longer copies the history (a stock snapshot costs +4.95 GiB at 80K and +3.1 GiB at 50K on Qwen3.8 27B at the first write of the next turn; phase 1 measured +0.125 GiB with segments). The session bank stores the list of segments as the snapshot, shares segments between entries by reference count, and the admission gate prices no history copy for them. Verify windows of 2 to 5 rows attend straight over the segments with one fused split-softmax kernel launch for up to 12 segments (`mtplx/kernels/sdpa_segmented.py`; 0 to 1.1 % on a verify forward at 6 or 20 segments, phase 1 measurement); other calls gather the rows and run the stock route. Prefill over existing segments uses the fused SDPA with logsumexp when the MLX build has it and gathers otherwise. Not covered: the compiled verify (segmented caches verify eager), the SSD tier (segmented entries are not persisted), paged and quantized KV.
+
 ### Fixed
 
 - **A conversation restored from the SSD tier gets the cache layout the request asked for**, the same one a restore from memory gets. The SSD restore built the runtime's default layout, which for a long context is the paged KV cache (`VllmMetalPagedKVCache`) instead of the dense cache: about 5x slower prefill and slower decode after every restore from disk. Measured on Qwen3.8 27B (with the segmented KV cache of a later change, which had the same omission), the first token after a restore from SSD at 50K and 80K came after 5 to 8 s instead of 16 to 48 s and decode went from 14 to 18 to 25 to 30 tok/s; a run without segments showed the same 14 to 17 tok/s after its SSD restore.

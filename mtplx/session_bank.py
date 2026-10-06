@@ -35,6 +35,7 @@ from .cache_bank.codec import ColdEncodeInterrupted
 from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
 from .runtime_options import block_prefix_restore_enabled
+from .segmented_kv import SegmentedKVCache, SegmentedKVState, walk_segmented_states
 
 
 def _policy_uses_committed_history(policy: str | None) -> bool:
@@ -390,11 +391,43 @@ def _tree_nbytes(value: Any) -> int:
         return _tree_nbytes(value.states) + _tree_nbytes(value.meta_states)
     if isinstance(value, mx.array):
         return int(value.nbytes)
+    if isinstance(value, SegmentedKVState):
+        # The segments it references, counted as if it were alone; segments that several
+        # entries share are taken out once in ``SessionBank.total_nbytes``.
+        return int(value.nbytes)
     if isinstance(value, (list, tuple)):
         return sum(_tree_nbytes(item) for item in value)
     if isinstance(value, dict):
         return sum(_tree_nbytes(item) for item in value.values())
     return 0
+
+
+def _entry_segmented_states(entry: Any) -> list[SegmentedKVState]:
+    """The segmented KV states a bank entry's cache snapshot holds (empty for a stock snapshot)."""
+    snapshot = getattr(entry, "cache_snapshot", None)
+    if snapshot is None:
+        return []
+    return list(walk_segmented_states(snapshot.states))
+
+
+def entry_has_segmented_kv(entry: Any) -> bool:
+    return bool(_entry_segmented_states(entry))
+
+
+def _cache_has_segmented_kv(cache: list[Any] | None) -> bool:
+    return any(isinstance(layer, SegmentedKVCache) for layer in cache or ())
+
+
+def _shared_segment_overcount(entries: list[Any]) -> int:
+    """Bytes counted more than once because several snapshots reference the same segment."""
+    naive = 0
+    unique: dict[int, int] = {}
+    for entry in entries:
+        for state in _entry_segmented_states(entry):
+            naive += int(state.nbytes)
+            for ref in state.refs:
+                unique.setdefault(ref.segment.id, int(ref.segment.nbytes))
+    return max(0, naive - sum(unique.values()))
 
 
 def _snapshot_nbytes(snapshot: CacheSnapshot) -> int:
@@ -1266,7 +1299,9 @@ class SessionBank:
         # "nothing sheddable", shrink_to_bytes never entered its loop, and the
         # dynamic ceiling (working set = active - weights - this total) took
         # the lease for working set and evicted the durable snapshots instead.
-        return sum(entry.held_nbytes for entry in list(self._entries.values()))
+        entries = list(self._entries.values())
+        # A segment that several entries reference is held once (mtplx/segmented_kv.py).
+        return sum(entry.held_nbytes for entry in entries) - _shared_segment_overcount(entries)
 
     @property
     def lease_entries(self) -> int:
@@ -3115,6 +3150,13 @@ class SessionBank:
                 cold["enabled"] = False
                 cold["skip_reason"] = "no_cold_tier"
             return
+        if entry_has_segmented_kv(entry):
+            # The SSD tier encodes contiguous KV arrays; a segmented snapshot is a list of
+            # references. Not persisted in this phase (MTPLX_SEGMENTED_KV, mtplx/segmented_kv.py).
+            if cold is not None:
+                cold["enabled"] = False
+                cold["skip_reason"] = "segmented_kv"
+            return
         put_entry = getattr(self.cold_tier, "put_entry", None)
         if not callable(put_entry):
             if cold is not None:
@@ -3280,6 +3322,8 @@ class SessionBank:
         cold = self.cold_tier
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
+        if _cache_has_segmented_kv(entry.cache_ref):
+            return
         if self.cold_enqueue_dispatch is None:
             self.eviction_log.append(
                 {
@@ -3341,6 +3385,8 @@ class SessionBank:
         cold = self.cold_tier
         spill = getattr(cold, "spill_entry", None) if cold is not None else None
         if not callable(spill):
+            return False
+        if _cache_has_segmented_kv(entry.cache_ref):
             return False
         try:
             snapshot = snapshot_cache_lazy_hybrid(entry.cache_ref)

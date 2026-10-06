@@ -14,6 +14,14 @@ from .attention_context import (
 )
 from .attention_math import attention_gate
 from .compile_state import in_compiled_step_body, is_compile_trace_error
+from .segmented_kv import (
+    SegmentedKVCache,
+    attend_segments_lse,
+    decode_segments_attention,
+    gathered_view,
+    _count as segmented_count,
+    prefill_route as segmented_prefill_route,
+)
 from .rope_origin import (
     cache_owns_rotary_origin,
     note_unowned_rotary_origin,
@@ -425,11 +433,48 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and int(B) == 1
             and can_slice_mask
         )
+        segmented_output = None
+        segmented_route = ""
         if cache is not None:
             rope_offset = _cache_rope_offset(cache)
             queries = self.rope(queries, offset=rope_offset)
             keys = self.rope(keys, offset=rope_offset)
-            if blockwise_enabled or vllm_metal_paged_enabled:
+            if isinstance(cache, SegmentedKVCache):
+                # Sealed segments plus a tail (MTPLX_SEGMENTED_KV): the new rows go to
+                # the tail. A verify window attends straight over the segments; every
+                # other call runs the ladder below on one gathered view of the rows.
+                cache.append_rows(keys, values)
+                if (
+                    int(queries.shape[2]) > 8
+                    and cache.segment_count > 1
+                    and segmented_prefill_route() == "lse"
+                    and (mask is None or (isinstance(mask, str) and mask == "causal"))
+                ):
+                    segmented_output = attend_segments_lse(
+                        queries, cache, scale=self.scale
+                    )
+                    segmented_route = "segments_lse"
+                    segmented_count("prefill_lse")
+                elif (
+                    getattr(self, "_mtplx_gqa_packed_sdpa_enabled", False)
+                    and not blockwise_enabled
+                    and not vllm_metal_paged_enabled
+                ):
+                    segmented_output = decode_segments_attention(
+                        queries,
+                        cache,
+                        scale=self.scale,
+                        mask=mask,
+                        packed_threshold=int(
+                            getattr(self, "_mtplx_gqa_packed_sdpa_threshold", 8192)
+                        ),
+                    )
+                    segmented_route = "nax_flash_segments"
+                if segmented_output is None:
+                    view = gathered_view(cache)
+                    keys, values = view.keys, view.values
+                    cache = view
+            elif blockwise_enabled or vllm_metal_paged_enabled:
                 cache.update_without_fetch(keys, values)
             else:
                 keys, values = cache.update_and_fetch(keys, values)
@@ -559,7 +604,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
         )
         route = "sdpa"
         fallback = ""
-        if should_use_vllm_metal_paged:
+        if segmented_output is not None:
+            output = segmented_output
+            route = segmented_route
+        elif should_use_vllm_metal_paged:
             impl_override = (
                 "fast_sdpa_gather"
                 if getattr(self, "_mtplx_vllm_metal_exact_gather_layer", False)
