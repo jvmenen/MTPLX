@@ -25,6 +25,10 @@ Carried on the `perf/definitief-2122` integration branch (v2.12.2 plus the chang
 - **Scoped reasoning history keeps the in-round postcommit** and client bookkeeping no longer closes the round (#570).
 - **A thinking model's answer after a tool result is no longer returned as empty content when the request declares tools** (#583). A turn that stops naturally inside the template-opened think block, without `</think>`, was filed entirely as reasoning, and the recovery that surfaces it as content only ran for requests without tools, so no agent turn got it. The recovery now also runs with tools declared when the turn ended at `stop` and holds no tool markup, on `/v1/chat/completions` and `/v1/messages`, streaming and not. On an M5 Max 64 GB with Qwen3.6-35B-A3B Optimized-Speed (v2.12.2, 2026-10-04), 6 growing agent turns x 3 runs x 2 protocols went from 1 to 2 empty replies per 36 turns to 0 of 108 over three repeats.
 
+### Changed
+
+- **The dashboard's request log shows a refused request as a refusal.** A request the server refuses before prefill (a 507 memory refusal, a 503, a 429) used to render as an ordinary row with a "MISS" cache badge and zeros for tokens and speed. It now carries a "507 memory" badge, dashes for the generation columns, and the refusal reason and when a retry can succeed in its details. The request log row gained `refusal_reason`, `retry_when` and `retry_can_succeed` for memory refusals.
+
 
 ## [2.12.2] - 2026-10-03
 
