@@ -22,7 +22,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | dc02400a | Dashboard: live decode TPS line, 5-minute window | #598 | open | dashboard |
 | e61bde6c | Unclosed reasoning block recovered as content when tools are declared (#583) | #588 | open | default |
 | dd0cc3c1 | SSD cold tier: uint32 fingerprint mixer | #596 | open | matters with `MTPLX_SSD_INCREMENTAL_ENCODE=1` |
-| 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | not filed (`fix/dashboard-refusal-badge`) | branch ready | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
+| 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
 | 0eae8d62, 69d17afc, d3a74424, dd28b920, 1da1470b | Changelog, lint, test fixes, dashboard bundle | n/a | n/a | n/a |
 
 **Production flags that are obsolete on v2.12.2** (drop at the switch): `MTPLX_MTP_HISTORY_CACHE_ONLY` (default on upstream), `MTPLX_POSTCOMMIT_AFTER_RESPONSE` and `MTPLX_PERSIST_QUEUE_MAX_GB` (superseded; use `MTPLX_PERSISTENCE_MAX_PENDING_BYTES`).
