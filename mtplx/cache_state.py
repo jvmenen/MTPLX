@@ -5021,7 +5021,14 @@ def restore_cache(
     restore_meta_state: bool = True,
     clone_states: bool = True,
 ) -> None:
-    for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
+    for idx, (entry, state, meta_state) in enumerate(zip(list(cache), snapshot.states, snapshot.meta_states)):
+        if state is not None:
+            from .segmented_kv import adapt_layer_for_restore, segmented_kv_enabled
+
+            if segmented_kv_enabled():
+                # MTPLX_SEGMENTED_KV: the layer takes the layout its rows call for (above the
+                # compiled-verify boundary segments, below it the stock cache).
+                entry, state = adapt_layer_for_restore(cache, idx, state)
         if state is not None:
             install_view = not clone_states and _is_trimmable(entry)
             _restore_state_preserving_container(entry, state, clone=not install_view)

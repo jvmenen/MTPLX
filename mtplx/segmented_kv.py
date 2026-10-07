@@ -689,16 +689,106 @@ def is_segmented(entry: Any) -> bool:
     return isinstance(entry, SegmentedKVCache)
 
 
-def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None = None) -> dict[str, int | str]:
-    """Replace the empty stock full-attention KV caches of a fresh cache list by segmented ones.
+def segmented_kv_min_tokens() -> int:
+    """Context length above which a layer is kept as segments (MTPLX_SEGMENTED_KV).
 
-    Only plain dense ``KVCache`` entries that hold nothing yet are replaced (a prefill or a
-    restore fills them afterwards); recurrent layers, rotating/indexed caches and anything with
-    rows are left alone.
+    The segment cache cannot be promoted to the compiled verify (graphbank:
+    ``promotion_failure:segmented_kv_cache``), so below the compiled-verify context ceiling the
+    stock cache stays: production runs compiled there and the switch would only slow it down.
+    ``MTPLX_SEGMENTED_KV_MIN_TOKENS`` sets the boundary explicitly (0 = always segmented).
+    Otherwise it is the compiled-verify ceiling itself (``MTPLX_COMPILED_VERIFY_MAX_CONTEXT``,
+    32768 in the turbo profile, 6144 without a profile), read per call; with the compiled verify
+    off the boundary is 0, and with the compiled verify unlimited (ceiling 0) it is infinite,
+    because a compiled verify that runs at every length leaves the segments nothing to win.
+    A layer is segmented when its rows are strictly above the boundary, the same comparison the
+    compiled verify uses to fall back to eager.
     """
-    stats: dict[str, int | str] = {"enabled": 1, "mode": "segmented", "entries": 0, "skipped": 0}
+    raw = os.environ.get("MTPLX_SEGMENTED_KV_MIN_TOKENS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    from .graphbank import _compiled_verify_max_context, compiled_verify_mode
+
+    if compiled_verify_mode() == "off":
+        return 0
+    ceiling = _compiled_verify_max_context()
+    return ceiling if ceiling > 0 else (1 << 62)
+
+
+def _is_stock_plain_kv(entry: Any) -> bool:
+    return type(entry).__name__ == "KVCache" and getattr(entry, "_idx", None) is None
+
+
+def _segmentable(entry: Any) -> bool:
+    """A stock full-attention layer of the target cache (tagged at install; MTP caches never are)."""
+    return bool(getattr(entry, "_mtplx_segmentable", False)) and _is_stock_plain_kv(entry)
+
+
+def _segmented_from_stock(entry: Any) -> SegmentedKVCache:
+    """The stock cache's rows as one sealed segment, without a copy.
+
+    The segment views the stock buffers and is never written again; the stock object is dropped
+    by the caller, so nothing writes into those buffers any more.
+    """
+    new = SegmentedKVCache(step=int(getattr(entry, "step", 256)))
+    rows = int(getattr(entry, "offset", 0) or 0)
+    if rows and entry.keys is not None:
+        new.state = (entry.keys[..., :rows, :], entry.values[..., :rows, :])
+    return new
+
+
+def adapt_layer_for_restore(cache: list[Any], idx: int, state: Any) -> tuple[Any, Any]:
+    """Pick the layout of layer ``idx`` for a restore of ``state``; returns (entry, state).
+
+    Above ``segmented_kv_min_tokens()`` the layer is a segment cache (a stock snapshot becomes
+    one sealed segment, no copy); at or below it the layer is a stock cache (a segmented
+    snapshot is gathered into contiguous rows), so a conversation that crosses the boundary
+    changes layout at its next restore. Layers that were never tagged (MTP caches, recurrent
+    layers) are left alone. The entry is replaced in ``cache`` when its class changes.
+    """
+    entry = cache[idx]
+    if not (isinstance(entry, SegmentedKVCache) or _segmentable(entry)):
+        return entry, state
+    if isinstance(state, SegmentedKVState):
+        rows = state.rows
+    elif isinstance(state, (tuple, list)) and len(state) == 2 and state[0] is not None:
+        rows = int(state[0].shape[2])
+    else:
+        return entry, state
+    floor = segmented_kv_min_tokens()
+    want = rows > floor if floor > 0 else isinstance(entry, SegmentedKVCache)
+    if want and not isinstance(entry, SegmentedKVCache):
+        entry = SegmentedKVCache(step=int(getattr(entry, "step", 256)))
+        entry._mtplx_segmentable = True
+        cache[idx] = entry
+    elif not want and isinstance(entry, SegmentedKVCache):
+        from mlx_lm.models.cache import KVCache
+
+        entry = KVCache()
+        entry._mtplx_segmentable = True
+        cache[idx] = entry
+    if isinstance(state, SegmentedKVState) and not isinstance(entry, SegmentedKVCache):
+        state = state.to_arrays()
+    return entry, state
+
+
+def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None = None) -> dict[str, int | str]:
+    """Choose the layout of the full-attention KV layers of a target cache list.
+
+    Plain dense ``KVCache`` layers are tagged as segmentable. A layer without rows becomes a
+    segment cache straight away when the boundary is 0 (``segmented_kv_min_tokens``); otherwise
+    it stays stock (compiled verify below the boundary) and is converted after its prefill when
+    its rows are above the boundary (this function runs again from ``repage_target_prefill_cache``)
+    or at the next restore (``adapt_layer_for_restore``). A stock layer with rows above the
+    boundary becomes one sealed segment (no copy). Recurrent layers, rotating/indexed caches and
+    caches of other lists (MTP) are left alone.
+    """
+    stats: dict[str, int | str] = {"enabled": 1, "mode": "segmented", "entries": 0, "skipped": 0, "converted": 0}
     from .cache_state import _is_trimmable
 
+    floor = segmented_kv_min_tokens()
     for idx, entry in enumerate(cache or []):
         if entry is None:
             stats["skipped"] = int(stats["skipped"]) + 1
@@ -706,17 +796,27 @@ def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None =
         if isinstance(entry, SegmentedKVCache):
             stats["entries"] = int(stats["entries"]) + 1
             continue
-        if (
-            not _is_trimmable(entry)
-            or getattr(entry, "_idx", None) is not None
-            or getattr(entry, "keys", None) is not None
-            or int(getattr(entry, "offset", 0) or 0) != 0
-            or type(entry).__name__ != "KVCache"
-        ):
+        if not _is_trimmable(entry) or not _is_stock_plain_kv(entry):
             stats["skipped"] = int(stats["skipped"]) + 1
             continue
-        cache[idx] = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
-        stats["entries"] = int(stats["entries"]) + 1
+        rows = int(getattr(entry, "offset", 0) or 0)
+        if rows == 0 and getattr(entry, "keys", None) is None:
+            if floor == 0:
+                new = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
+                new._mtplx_segmentable = True
+                cache[idx] = new
+                stats["entries"] = int(stats["entries"]) + 1
+            else:
+                entry._mtplx_segmentable = True
+                stats["skipped"] = int(stats["skipped"]) + 1
+            continue
+        if getattr(entry, "_mtplx_segmentable", False) and rows > floor > 0:
+            cache[idx] = _segmented_from_stock(entry)
+            cache[idx]._mtplx_segmentable = True
+            stats["entries"] = int(stats["entries"]) + 1
+            stats["converted"] = int(stats["converted"]) + 1
+            continue
+        stats["skipped"] = int(stats["skipped"]) + 1
     return stats
 
 
