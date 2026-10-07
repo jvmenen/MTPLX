@@ -407,6 +407,9 @@ def test_stock_mlx_has_no_lse_kernel_and_falls_back_to_the_reference_route(monke
 
     monkeypatch.setattr(module, "_SDPA_LSE", None)
     monkeypatch.delenv("MTPLX_SEGMENTED_KV_PREFILL", raising=False)
+    if module.sdpa_lse_available():
+        pytest.skip("this MLX build has return_lse")
+    monkeypatch.setattr(module, "_SDPA_LSE", None)
     assert module.sdpa_lse_available() is False  # stock released MLX in the venv
     assert module.prefill_route() == "gather"
     module.route_counts.clear()
@@ -426,7 +429,7 @@ def test_lse_kernel_path_plumbing_with_mocked_detection(monkeypatch) -> None:
     def fake_sdpa(q, k, v, *, scale, return_lse=False, mask=None):
         calls.append((int(k.shape[2]), mask))
         out, lse = _segment_sdpa_lse_reference_for_test(q, k, v, scale, mask)
-        return out, lse
+        return out, lse[..., None]  # the MLX kernel returns (B, Hq, Q, 1)
 
     def _segment_sdpa_lse_reference_for_test(q, k, v, scale, mask):
         return module._segment_sdpa_lse_reference(q, k, v, int(k.shape[2]), scale=scale, causal=mask == "causal")
@@ -448,3 +451,17 @@ def test_prefill_route_env_override(monkeypatch) -> None:
     monkeypatch.setattr(module, "_SDPA_LSE", False)
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_PREFILL", "lse")
     assert module.prefill_route() == "lse"
+
+
+def test_real_lse_kernel_matches_the_reference_route() -> None:
+    import mtplx.segmented_kv as module
+
+    if not module.sdpa_lse_available():
+        pytest.skip("MLX build without return_lse")
+    cache, q = _lse_cache()
+    module.route_counts.clear()
+    got = attend_segments_lse(q, cache, scale=0.25)
+    assert module.route_counts.get("sdpa_lse_kernel") == len(cache.attention_segments())
+    keys, values = cache.gather()
+    want = mx.fast.scaled_dot_product_attention(q, keys, values, scale=0.25, mask="causal")
+    assert float(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max()) < 2e-2

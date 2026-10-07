@@ -596,7 +596,8 @@ def _segment_sdpa_lse_fast(queries, keys, values, n, *, scale, causal):
     out, lse = mx.fast.scaled_dot_product_attention(
         queries, k, v, scale=scale, return_lse=True, **kwargs
     )
-    return out, lse.astype(mx.float32)
+    # The kernel's logsumexp is (B, Hq, Q, 1); the merge works on (B, Hq, Q).
+    return out, lse.astype(mx.float32).reshape(out.shape[:-1])
 
 
 def segment_sdpa_lse(queries, keys, values, n, *, scale, causal):
