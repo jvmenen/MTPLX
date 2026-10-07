@@ -409,10 +409,12 @@ class SegmentedKVCache:
         if rows == 0:
             self._tail = None
             return False
+        _count("seal")
         if rows == tail.capacity:
             keys, values = tail.keys, tail.values
             mx.eval(keys, values)
         else:
+            _count("seal_copy")
             keys = _own_copy(tail.keys[..., :rows, :])
             values = _own_copy(tail.values[..., :rows, :])
             self.seal_copies += 1
@@ -496,6 +498,7 @@ class SegmentedKVCache:
             ref.segment.release(self)
         self._sealed[-2:] = [SegRef(segment, int(older.n) + int(newer.n))]
         self.merges += 1
+        _count("merge")
         self.merge_rows += int(older.n) + int(newer.n)
 
     def stats(self) -> dict[str, int]:
@@ -671,7 +674,7 @@ def decode_segments_attention(
     if lane_disabled("nax_flash_dsplit_sdpa"):
         return None
     q_len = int(queries.shape[2])
-    if not 2 <= q_len <= VERIFY_WINDOW_MAX:
+    if not 1 <= q_len <= VERIFY_WINDOW_MAX:
         return None
     if cache.offset < int(packed_threshold):
         return None
