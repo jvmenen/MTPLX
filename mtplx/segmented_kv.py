@@ -445,7 +445,11 @@ class SegmentedKVCache:
             refs = list(value.refs)
         elif isinstance(value, (tuple, list)) and len(value) == 2 and value[0] is not None:
             # A contiguous pair (an SSD restore, a stock snapshot): one sealed segment.
-            keys, values = value
+            # Rows of a stock buffer are a strided view of it (capacity beyond the rows). The
+            # fused kernel takes row-contiguous inputs and MLX would copy such a view on every
+            # launch (the whole history, per layer, per verify: +34 ms at 50K), so the segment
+            # owns exact rows (a no-op when the pair is already row-contiguous).
+            keys, values = (_own_copy(a) for a in value)
             segment = KVSegment(keys, values, sealed=True)
             refs = [SegRef(segment, int(keys.shape[2]))]
         else:
