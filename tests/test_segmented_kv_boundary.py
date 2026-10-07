@@ -182,3 +182,18 @@ def test_conversion_and_snapshot_do_not_copy_the_history(monkeypatch) -> None:
     grew = mx.get_active_memory() - before
     assert isinstance(snap.states[0], SegmentedKVState)
     assert grew < history // 4
+
+
+def test_a_converted_stock_buffer_is_stored_as_exact_rows(monkeypatch) -> None:
+    """A stock buffer has capacity beyond its rows; a segment of its rows must not keep a strided view
+    (MLX copies a non-contiguous kernel input on every launch)."""
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MIN_TOKENS", "100")
+    cache = _target_cache(1)
+    cache[0].update_and_fetch(*_rows(1, 300))  # stock capacity: 512 rows
+    assert cache[0].keys.shape[2] > 300
+    configure_tail_owned_attention_kv_cache(cache)
+    segment = cache[0].attention_segments()[0][0]
+    assert segment.shape[2] == 300
+    flat = mx.contiguous(segment)
+    mx.eval(flat)
+    assert mx.array_equal(flat, segment).item()
