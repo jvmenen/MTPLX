@@ -16,6 +16,7 @@ from .attention_math import attention_gate
 from .compile_state import in_compiled_step_body, is_compile_trace_error
 from .segmented_kv import (
     SegmentedKVCache,
+    VERIFY_WINDOW_MAX,
     attend_segments_lse,
     decode_segments_attention,
     gathered_view,
@@ -445,7 +446,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 # other call runs the ladder below on one gathered view of the rows.
                 cache.append_rows(keys, values)
                 if (
-                    int(queries.shape[2]) > 8
+                    int(queries.shape[2]) > VERIFY_WINDOW_MAX
                     and cache.segment_count > 1
                     and segmented_prefill_route() == "lse"
                     and (mask is None or (isinstance(mask, str) and mask == "causal"))
@@ -471,6 +472,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     )
                     segmented_route = "nax_flash_segments"
                 if segmented_output is None:
+                    segmented_count(f"gather_q{int(queries.shape[2]) if int(queries.shape[2]) <= 32 else 'prefill'}")
                     view = gathered_view(cache)
                     keys, values = view.keys, view.values
                     cache = view
