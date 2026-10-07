@@ -227,7 +227,8 @@ def test_eviction_releases_the_segments(monkeypatch) -> None:
     assert held - mx.get_active_memory() >= BASE * ROW_BYTES * 0.9
 
 
-def test_ssd_tier_skips_segmented_entries_and_leaves_stock_ones_alone(monkeypatch) -> None:
+def test_ssd_tier_skips_segmented_entries_with_the_ssd_switch_off(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_SSD", "0")
     class Cold:
         puts = 0
 
