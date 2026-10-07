@@ -858,6 +858,73 @@ def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None =
     return stats
 
 
+# ---- SSD tier ---------------------------------------------------------------------------------
+
+
+def segmented_ssd_enabled() -> bool:
+    """Segmented snapshots may go to the SSD tier (MTPLX_SEGMENTED_KV_SSD, default on with the switch)."""
+    if not segmented_kv_enabled():
+        return False
+    return os.environ.get("MTPLX_SEGMENTED_KV_SSD", "").strip().lower() not in {"0", "false", "no", "off"}
+
+
+class SegmentedRows:
+    """One tensor of a segmented snapshot (all K or all V rows) as the codec sees an array.
+
+    The SSD codec asks an array for ``shape``, ``dtype``, ``nbytes`` and slices along axis 2.
+    A slice inside one segment is a view; a slice across a segment edge is a concatenation of
+    the two small slices, so the history is never gathered. Encoded with the codec's own
+    256-row blocks, the result is the spec and the block blobs of the stock cache holding the
+    same rows (``docs``: SSD tier of the segmented KV cache).
+    """
+
+    def __init__(self, refs: Sequence[SegRef], *, values: bool) -> None:
+        self._refs = tuple(refs)
+        self._values = bool(values)
+        first = self._arrays()[0]
+        self.dtype = first.dtype
+        self._rows = sum(int(r.n) for r in self._refs)
+        self.shape = (int(first.shape[0]), int(first.shape[1]), self._rows, int(first.shape[3]))
+        self.nbytes = int(first.nbytes) // max(1, int(first.shape[2])) * self._rows
+        self.ndim = 4
+
+    def _arrays(self) -> list[mx.array]:
+        return [r.segment.values if self._values else r.segment.keys for r in self._refs]
+
+    def rows_slice(self, start: int, stop: int) -> mx.array:
+        """Rows [start, stop) as one array (a view when inside one segment)."""
+        start, stop = max(0, int(start)), min(self._rows, int(stop))
+        parts: list[mx.array] = []
+        offset = 0
+        for ref, array in zip(self._refs, self._arrays()):
+            lo, hi = offset, offset + int(ref.n)
+            if hi > start and lo < stop:
+                parts.append(array[..., max(start, lo) - lo : min(stop, hi) - lo, :])
+            offset = hi
+            if offset >= stop:
+                break
+        if not parts:
+            return mx.zeros((*self.shape[:2], 0, self.shape[3]), self.dtype)
+        return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
+
+    def __getitem__(self, index: Any) -> mx.array:
+        if not isinstance(index, tuple) or len(index) != 4 or not all(
+            isinstance(i, slice) and i == slice(None) for k, i in enumerate(index) if k != 2
+        ):
+            raise TypeError("SegmentedRows only slices along axis 2")
+        rows = index[2]
+        start, stop, step = rows.indices(self._rows)
+        if step != 1:
+            raise TypeError("SegmentedRows slices have step 1")
+        return self.rows_slice(start, stop)
+
+
+def segmented_state_tensors(state: SegmentedKVState) -> tuple[SegmentedRows, SegmentedRows]:
+    """(keys, values) of a snapshot for the SSD codec; refs dropped to zero rows are skipped."""
+    refs = [r for r in state.refs if int(r.n) > 0]
+    return SegmentedRows(refs, values=False), SegmentedRows(refs, values=True)
+
+
 # ---- accounting -----------------------------------------------------------------------------
 
 

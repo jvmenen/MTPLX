@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,6 +151,16 @@ def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | 
     ]
 
 
+# Segmented KV (MTPLX_SEGMENTED_KV): blocks gathered per fingerprint unit (16 x 256 rows).
+_SEGMENTED_FINGERPRINT_BLOCKS = 16
+
+
+def _is_segmented_state(value: Any) -> bool:
+    """True for a SegmentedKVState; never imports the segmented module when it is not loaded."""
+    module = sys.modules.get("mtplx.segmented_kv")
+    return module is not None and isinstance(value, module.SegmentedKVState)
+
+
 class TreeCodec:
     """Flatten JSON-safe trees plus MLX arrays into raw tensor blobs."""
 
@@ -249,6 +260,20 @@ class TreeCodec:
             return {"kind": "str", "value": str(value)}
         if isinstance(value, mx.array):
             return self._encode_tensor(value)
+        if _is_segmented_state(value):
+            # MTPLX_SEGMENTED_KV: the same spec and blobs as the stock (keys, values) tuple of
+            # the same rows; the history is sliced block by block, never gathered.
+            from mtplx.segmented_kv import segmented_state_tensors
+
+            return {
+                "kind": "tuple",
+                "items": [
+                    self._encode_tensor(
+                        t if t.shape[2] >= self.block_size * 2 else t.rows_slice(0, t.shape[2])
+                    )
+                    for t in segmented_state_tensors(value)
+                ],
+            }
         if isinstance(value, tuple):
             return {"kind": "tuple", "items": [self.encode(item) for item in value]}
         if isinstance(value, list):
@@ -339,7 +364,20 @@ class TreeCodec:
         block_fps: list[int] | None = None
         if self.reuse is not None:
             full = (shape[axis] // self.block_size) * self.block_size
-            if full:
+            if full and hasattr(value, "rows_slice"):
+                # Segmented rows: fingerprints per chunk of blocks, so the fingerprint pass
+                # never builds the whole history either.
+                block_fps = []
+                chunk_rows = self.block_size * _SEGMENTED_FINGERPRINT_BLOCKS
+                for lo in range(0, full, chunk_rows):
+                    part = self._fingerprints(
+                        value.rows_slice(lo, min(full, lo + chunk_rows)), rows=self.block_size
+                    )
+                    if part is None:
+                        block_fps = None
+                        break
+                    block_fps.extend(part)
+            elif full:
                 slices = [slice(None)] * len(shape)
                 slices[axis] = slice(0, full)
                 block_fps = self._fingerprints(
