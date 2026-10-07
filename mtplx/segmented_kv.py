@@ -639,6 +639,10 @@ def attend_segments_lse(queries: mx.array, cache: SegmentedKVCache, *, scale: fl
 # ---- the decode/verify route used by attention_split -----------------------------------
 
 
+#: Verify windows (rows per call) the segmented decode route serves; bigger calls are prefill chunks.
+VERIFY_WINDOW_MAX = 32
+
+
 def decode_segments_attention(
     queries: mx.array,
     cache: SegmentedKVCache,
@@ -667,7 +671,7 @@ def decode_segments_attention(
     if lane_disabled("nax_flash_dsplit_sdpa"):
         return None
     q_len = int(queries.shape[2])
-    if not 2 <= q_len <= 8:
+    if not 2 <= q_len <= VERIFY_WINDOW_MAX:
         return None
     if cache.offset < int(packed_threshold):
         return None
@@ -678,9 +682,35 @@ def decode_segments_attention(
     if not segments:
         return None
     hk = int(segments[0][0].shape[1])
-    if hk <= 0 or hq % hk or not segments_supported(q_len, hq // hk, d):
+    if hk <= 0 or hq % hk:
         return None
-    return sdpa_nax_flash_dsplit_segments(queries=queries, segments=segments, scale=scale)
+    gqa = hq // hk
+    if segments_supported(q_len, gqa, d):
+        out = sdpa_nax_flash_dsplit_segments(queries=queries, segments=segments, scale=scale)
+        if out is not None:
+            _count(f"fused_q{q_len}")
+        return out
+    # A window the kernel does not take whole (6 to 32 rows without a wide route): sub-windows of
+    # the rows it does take, each over the keys up to its own last row, so the history is read
+    # once per sub-window and never gathered. Row i of the window sees keys up to n - Q + i.
+    sub = max(1, 32 // gqa)
+    if not segments_supported(sub, gqa, d):
+        return None
+    tail_keys, tail_values, tail_n = segments[-1]
+    if tail_n < q_len:
+        return None
+    outs = []
+    for r0 in range(0, q_len, sub):
+        r1 = min(q_len, r0 + sub)
+        trimmed = segments[:-1] + [(tail_keys, tail_values, tail_n - (q_len - r1))]
+        part = sdpa_nax_flash_dsplit_segments(
+            queries=queries[:, :, r0:r1, :], segments=trimmed, scale=scale
+        )
+        if part is None:
+            return None
+        outs.append(part)
+    _count(f"chunked_q{q_len}")
+    return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
 # ---- install --------------------------------------------------------------------------------

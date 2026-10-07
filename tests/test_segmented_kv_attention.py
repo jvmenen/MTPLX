@@ -131,3 +131,31 @@ def test_lse_prefill_route_matches_the_gather_route(lane, monkeypatch) -> None:
     b, _ = _run_turns(lane, SegmentedKVCache(), True)
     for x, y in zip(a, b):
         assert _top_ulps(x, y) <= 8  # fp32 reference route vs bf16 SDPA on the same rows
+
+
+@pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
+@pytest.mark.parametrize("window", [6, 9, 17, 32])
+def test_wide_verify_windows_run_on_the_segments_without_a_gather(lane, window) -> None:
+    """Context-copy windows (6 to 32 rows): sub-windows over the segments, history never gathered."""
+    import mtplx.segmented_kv as module
+
+    def run(cache):
+        outs = [lane(_x(1, 9000), mask="causal", cache=cache)]
+        if isinstance(cache, SegmentedKVCache):
+            state = cache.state
+            cache = SegmentedKVCache()
+            cache.state = state
+        outs.append(lane(_x(2, 300), mask="causal", cache=cache))
+        for seed in (4, 5):
+            outs.append(lane(_x(seed, window), mask="causal", cache=cache))
+            cache.trim(window - 3)
+        mx.eval(outs)
+        return outs
+
+    stock = run(KVCache())
+    module.route_counts.clear()
+    seg = run(SegmentedKVCache())
+    assert not any(k.startswith("gather_q") and k[8:].isdigit() for k in module.route_counts), module.route_counts
+    assert module.route_counts.get(f"chunked_q{window}", 0) + module.route_counts.get(f"fused_q{window}", 0) == 2
+    for a, b in zip(stock, seg):
+        assert _top_ulps(a, b) <= 4
