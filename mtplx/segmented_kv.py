@@ -651,9 +651,9 @@ def decode_segments_attention(
 
     Engages under the same conditions as the packed route over a dense cache, with the total
     length where that route reads the buffer capacity: MTPLX_NAX_FLASH_ROUTE on, a verify
-    window of 2 to 8 rows, total length at least ``packed_threshold``, a causal or no mask.
-    The head-dim-split kernel serves windows of up to 5 rows at GQA 6 (wide and dsplit4 are not
-    in this tree); a longer window, an unsupported shape or a kernel bail returns None and the
+    window of 2 to 32 rows (the kernel decides which sizes it serves), total length at least ``packed_threshold``, a causal or no mask.
+    The head-dim-split kernel serves windows of up to 5 rows at GQA 6 (quarters with
+    MTPLX_NAX_FLASH_DSPLIT4) and, with MTPLX_NAX_FLASH_WIDE, 9 to 32 rows; a longer window, an unsupported shape or a kernel bail returns None and the
     call runs on the gathered rows through the stock ladder.
     """
     from .kernel_selfcheck import lane_disabled
@@ -667,7 +667,7 @@ def decode_segments_attention(
     if lane_disabled("nax_flash_dsplit_sdpa"):
         return None
     q_len = int(queries.shape[2])
-    if not 2 <= q_len <= 8:
+    if not 2 <= q_len <= 32:
         return None
     if cache.offset < int(packed_threshold):
         return None
