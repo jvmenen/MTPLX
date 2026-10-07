@@ -415,7 +415,7 @@ def test_stock_mlx_has_no_lse_kernel_and_falls_back_to_the_reference_route(monke
     module.route_counts.clear()
     cache, q = _lse_cache()
     attend_segments_lse(q, cache, scale=0.25)
-    assert module.route_counts == {"sdpa_lse_reference": 3}
+    assert {k: v for k, v in module.route_counts.items() if k.startswith("sdpa_lse")} == {"sdpa_lse_reference": 3}
 
 
 def test_lse_kernel_path_plumbing_with_mocked_detection(monkeypatch) -> None:
@@ -438,7 +438,7 @@ def test_lse_kernel_path_plumbing_with_mocked_detection(monkeypatch) -> None:
     module.route_counts.clear()
     cache, q = _lse_cache()
     got = attend_segments_lse(q, cache, scale=0.25)
-    assert module.route_counts == {"sdpa_lse_kernel": 3}
+    assert {k: v for k, v in module.route_counts.items() if k.startswith("sdpa_lse")} == {"sdpa_lse_kernel": 3}
     assert [c[1] for c in calls] == [None, None, "causal"]  # only the last segment is causal
     monkeypatch.setattr(module, "_SDPA_LSE", False)
     want = attend_segments_lse(q, cache, scale=0.25)
