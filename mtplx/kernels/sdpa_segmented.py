@@ -26,9 +26,11 @@ kernel); cost per extra segment at q_len 4 is 0 to 0.005 ms/layer fused up to 12
 and 80K costs 0 to 1.1 % more than the contiguous one.
 
 Routes that cannot take segments yet fall back to ``segmented_kv.gather_attention`` (one
-contiguous copy of the history per call, then the stock kernel): the wide (q_len 6 to 16)
-and dsplit4 variants are not in this tree, and the head-dim-split kernel serves q_len 1 to 5
-at GQA 6 (``gqa_factor * q_len <= 32``).
+contiguous copy of the history per call, then the stock kernel): windows the contiguous
+dispatcher does not give to the head-dim-split kernel either (q_len 6 to 8 at GQA 6, or the
+wide route with ``MTPLX_NAX_FLASH_WIDE`` off). The kernel follows the contiguous dispatcher's
+configuration: halves or quarters (``MTPLX_NAX_FLASH_DSPLIT4``) for ``gqa_factor * q_len <= 32``,
+row groups of the wide route (``MTPLX_NAX_FLASH_WIDE``) for 9 to 32 query rows.
 """
 
 from __future__ import annotations
@@ -189,14 +191,55 @@ def _reduce_kernel(ngroups: int):
         return None
 
 
-def segment_block_counts(rows: Sequence[int]) -> list[int]:
-    """Key blocks per segment: the chunk the contiguous dispatcher uses for the same total."""
+def segment_block_counts(rows: Sequence[int], *, ndh: int = 2, wide_rows: int = 0) -> list[int]:
+    """Key blocks per segment: the chunk the contiguous dispatcher uses for the same total.
+
+    ``ndh`` 4 reads the quarter-split table (``MTPLX_NAX_FLASH_DSPLIT4``), ``wide_rows`` > 0 the
+    wide route's table for that many live query rows per KV head.
+    """
     total = sum(int(n) for n in rows)
     override = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0)
-    base = override or _dsplit._default_dsplit_blocks(total)
+    if wide_rows:
+        default = _dsplit._default_wide_blocks(total, wide_rows)
+    elif ndh == 4:
+        default = _dsplit._default_dsplit4_blocks(total)
+    else:
+        default = _dsplit._default_dsplit_blocks(total)
+    base = override or default
     base = max(32, (base // 32) * 32)
     chunk = (-(-total // base) + 31) // 32 * 32
     return [max(1, -(-int(n) // chunk)) for n in rows]
+
+
+def _route_shape(q_len: int, gqa_factor: int) -> tuple[bool, int, int] | None:
+    """(wide, ndh, tg_m) the contiguous dispatcher would pick for this window, or None.
+
+    Mirrors ``sdpa_nax_flash_dsplit._dsplit_dispatch`` and the call order in ``attention_split``:
+    windows of up to 32 live rows per KV head take the shipping contract (halves, or quarters
+    with ``MTPLX_NAX_FLASH_DSPLIT4=1`` unless the quarter self-check lane is off); 9 to 32 query
+    rows take the wide contract (halves, row groups) when ``MTPLX_NAX_FLASH_WIDE=1``.
+    """
+    live = gqa_factor * q_len
+    if live <= 32 and 1 <= q_len <= 10:
+        ndh = 4 if os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
+        if ndh == 4:
+            from ..kernel_selfcheck import lane_disabled
+
+            if lane_disabled("nax_flash_dsplit4_sdpa"):
+                ndh = 2
+        return False, ndh, (live + 15) // 16
+    if (
+        q_len >= 9
+        and q_len <= _dsplit.WIDE_MAX_Q
+        and live <= _dsplit.WIDE_MAX_ROWS
+        and os.environ.get("MTPLX_NAX_FLASH_WIDE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    ):
+        from ..kernel_selfcheck import lane_disabled
+
+        if lane_disabled("nax_flash_dsplit_wide_sdpa"):
+            return None
+        return True, 2, min(_dsplit._wide_rows_per_tg(), (live + 15) // 16)
+    return None
 
 
 def sdpa_nax_flash_dsplit_segments(
@@ -229,10 +272,11 @@ def sdpa_nax_flash_dsplit_segments(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    if gqa_factor * q_len > 32:
-        return _bail("m_rows_gt_32")
-    if q_len < 1 or q_len > 10:
-        return _bail("q_len")
+    shape = _route_shape(q_len, gqa_factor)
+    if shape is None:
+        return _bail("route_shape")
+    wide, ndh, tg_m = shape
+    live = gqa_factor * q_len
     if queries.dtype not in (mx.bfloat16, mx.float16):
         return _bail("query_dtype")
     for keys, values, n in segments:
@@ -252,21 +296,20 @@ def sdpa_nax_flash_dsplit_segments(
 
     if len(segments) == 1:
         keys, values, n = segments[0]
-        return _dsplit.sdpa_nax_flash_dsplit(
-            queries=queries, keys=keys, values=values, offset=int(n), scale=scale
-        )
+        entry = _dsplit.sdpa_nax_flash_dsplit_wide if wide else _dsplit.sdpa_nax_flash_dsplit
+        return entry(queries=queries, keys=keys, values=values, offset=int(n), scale=scale)
 
     groups = [segments[i:i + MAX_FUSED_SEGMENTS] for i in range(0, len(segments), MAX_FUSED_SEGMENTS)]
     if len(groups) > MAX_GROUPS:
         return _bail("too_many_segments")
     rows = [int(n) for _, _, n in segments]
-    blocks = segment_block_counts(rows)
+    blocks = segment_block_counts(rows, ndh=ndh, wide_rows=live if wide else 0)
     reduce_kernel = _reduce_kernel(len(groups))
     if reduce_kernel is None:
         return _bail("kernel_unavailable")
 
-    nsgm = (gqa_factor * q_len + 15) // 16
-    nthreads = 32 * nsgm * 2
+    nthreads = 32 * tg_m * ndh
+    row_groups = (live + 16 * tg_m - 1) // (16 * tg_m)
     pdt = unnormalized_partials_dtype(queries.dtype)
     parts, sums, maxs, counts = [], [], [], []
     first = 0
@@ -295,10 +338,12 @@ def sdpa_nax_flash_dsplit_segments(
                     ("D", d),
                     ("QL", q_len),
                     ("GQA_F", gqa_factor),
+                    ("TG_M", tg_m),
+                    ("NDH", ndh),
                     ("NOMASK", 0),
                     ("NLAST", nseg - 1 if last_group else nseg),
                 ],
-                grid=(hk * nthreads, 1, total_blocks),
+                grid=(hk * nthreads, row_groups, total_blocks),
                 threadgroup=(nthreads, 1, 1),
                 output_shapes=[
                     (bsz, hq, q_len, total_blocks, d),
@@ -333,5 +378,4 @@ def sdpa_nax_flash_dsplit_segments(
 
 def segments_supported(q_len: int, gqa_factor: int, head_dim: int) -> bool:
     """Static part of the contract (no device work), for the route gate in attention_split."""
-    return head_dim == 256 and 1 <= q_len <= 10 and gqa_factor * q_len <= 32
-
+    return head_dim == 256 and _route_shape(q_len, gqa_factor) is not None

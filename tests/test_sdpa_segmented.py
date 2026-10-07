@@ -9,7 +9,7 @@ import mlx.core as mx
 import pytest
 
 from mtplx.kernels import sdpa_segmented as S
-from mtplx.kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit
+from mtplx.kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit, sdpa_nax_flash_dsplit_wide
 from mtplx.nax_verify import nax_available
 
 HQ, HK, D = 24, 4, 256
@@ -67,8 +67,16 @@ def _ulps(a, b):
     return float(mx.abs(a - b).max().item()) / ulp
 
 
+@pytest.fixture(params=["halves", "quarters"])
+def split(request, monkeypatch):
+    """The two shipping configurations of the contiguous kernel (MTPLX_NAX_FLASH_DSPLIT4)."""
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "1" if request.param == "quarters" else "0")
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    return request.param
+
+
 @pytest.mark.parametrize("q_len", [1, 2, 4, 5])
-def test_one_segment_is_bit_identical_to_the_contiguous_kernel(q_len) -> None:
+def test_one_segment_is_bit_identical_to_the_contiguous_kernel(q_len, split) -> None:
     total = 9000
     q, k, v = _data(total, q_len)
     ref = sdpa_nax_flash_dsplit(queries=q, keys=k, values=v, offset=total, scale=SCALE)
@@ -79,7 +87,7 @@ def test_one_segment_is_bit_identical_to_the_contiguous_kernel(q_len) -> None:
 @pytest.mark.parametrize("nseg", [2, 3, 6, 13, 30])
 @pytest.mark.parametrize("q_len", [1, 4, 5])
 @pytest.mark.parametrize("peaked", [False, True])
-def test_segments_match_contiguous_within_bf16_ulps_and_the_fp32_reference(nseg, q_len, peaked) -> None:
+def test_segments_match_contiguous_within_bf16_ulps_and_the_fp32_reference(nseg, q_len, peaked, split) -> None:
     total = 12000
     q, k, v = _data(total, q_len, peaked)
     contiguous = sdpa_nax_flash_dsplit(queries=q, keys=k, values=v, offset=total, scale=SCALE)
@@ -124,9 +132,39 @@ def test_only_the_last_segment_is_tail_causal() -> None:
     assert float(mx.abs(out.astype(mx.float32) - ref).max()) < 5e-3
 
 
-def test_unsupported_shapes_bail_without_a_kernel_launch() -> None:
-    q, k, v = _data(9000, 6)  # 6 rows x GQA 6 = 36 > 32
+def test_unsupported_shapes_bail_without_a_kernel_launch(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    q, k, v = _data(9000, 6)  # 6 rows x GQA 6 = 36 > 32, and below the wide route's 9 rows
     before = dict(S.segmented_bail_counts)
     assert S.sdpa_nax_flash_dsplit_segments(queries=q, segments=_split(k, v, _lens(9000, 2)), scale=SCALE) is None
-    assert S.segmented_bail_counts.get("m_rows_gt_32", 0) == before.get("m_rows_gt_32", 0) + 1
+    assert S.segmented_bail_counts.get("route_shape", 0) == before.get("route_shape", 0) + 1
     assert S.segments_supported(5, 6, 256) and not S.segments_supported(6, 6, 256)
+    assert S.segments_supported(9, 6, 256) and S.segments_supported(32, 6, 256)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "0")
+    assert not S.segments_supported(9, 6, 256)
+
+
+@pytest.mark.parametrize("q_len", [9, 16, 24, 32])
+def test_wide_one_segment_is_bit_identical_to_the_contiguous_wide_kernel(q_len, monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    total = 9000
+    q, k, v = _data(total, q_len)
+    ref = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=total, scale=SCALE)
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=[(k, v, total)], scale=SCALE)
+    assert mx.array_equal(out, ref).item()
+
+
+@pytest.mark.parametrize("nseg", [2, 6, 13])
+@pytest.mark.parametrize("q_len", [9, 17, 32])
+def test_wide_segments_match_contiguous_within_bf16_ulps_and_the_fp32_reference(nseg, q_len, monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    total = 12000
+    q, k, v = _data(total, q_len, peaked=True)
+    contiguous = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=total, scale=SCALE)
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=_split(k, v, _lens(total, nseg)), scale=SCALE)
+    assert out is not None and bool(mx.all(mx.isfinite(out)).item())
+    assert _ulps(out, contiguous) <= 3
+    ref = _ref(q, k, v, total)
+    err = float(mx.abs(out.astype(mx.float32) - ref).max())
+    err_contig = float(mx.abs(contiguous.astype(mx.float32) - ref).max())
+    assert err <= max(2 * err_contig, 1e-3)
