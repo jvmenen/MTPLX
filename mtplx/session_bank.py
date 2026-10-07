@@ -42,7 +42,12 @@ from .runtime_options import (
     DEFAULT_PREFIX_BLOCK_SIZE,
     block_prefix_restore_enabled,
 )
-from .segmented_kv import SegmentedKVCache, SegmentedKVState, walk_segmented_states
+from .segmented_kv import (
+    SegmentedKVCache,
+    SegmentedKVState,
+    segmented_ssd_enabled,
+    walk_segmented_states,
+)
 
 
 def _policy_uses_committed_history(policy: str | None) -> bool:
@@ -3169,9 +3174,10 @@ class SessionBank:
                 cold["enabled"] = False
                 cold["skip_reason"] = "no_cold_tier"
             return
-        if entry_has_segmented_kv(entry):
-            # The SSD tier encodes contiguous KV arrays; a segmented snapshot is a list of
-            # references. Not persisted in this phase (MTPLX_SEGMENTED_KV, mtplx/segmented_kv.py).
+        if entry_has_segmented_kv(entry) and not segmented_ssd_enabled():
+            # MTPLX_SEGMENTED_KV_SSD=0: a segmented snapshot is a list of references and is not
+            # persisted. By default the codec encodes it as the stock tensors of the same rows
+            # (mtplx/cache_bank/codec.py, mtplx/segmented_kv.py:SegmentedRows).
             if cold is not None:
                 cold["enabled"] = False
                 cold["skip_reason"] = "segmented_kv"
@@ -3341,7 +3347,7 @@ class SessionBank:
         cold = self.cold_tier
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
-        if _cache_has_segmented_kv(entry.cache_ref):
+        if _cache_has_segmented_kv(entry.cache_ref) and not segmented_ssd_enabled():
             return
         if self.cold_enqueue_dispatch is None:
             self.eviction_log.append(
@@ -3405,7 +3411,7 @@ class SessionBank:
         spill = getattr(cold, "spill_entry", None) if cold is not None else None
         if not callable(spill):
             return False
-        if _cache_has_segmented_kv(entry.cache_ref):
+        if _cache_has_segmented_kv(entry.cache_ref) and not segmented_ssd_enabled():
             return False
         try:
             snapshot = snapshot_cache_lazy_hybrid(entry.cache_ref)
