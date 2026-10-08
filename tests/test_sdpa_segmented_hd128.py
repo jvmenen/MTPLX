@@ -1,0 +1,180 @@
+"""Segmented verify kernel at head_dim 128 (Qwen3-8B, Llama-like shapes: 32 query / 8 KV heads, GQA 4).
+
+The kernel tests need a TensorOps GPU (pending on a machine on power); the support-contract and the
+lse-fallback tests are CPU-safe.
+"""
+
+from __future__ import annotations
+
+import math
+
+import mlx.core as mx
+import pytest
+
+import mtplx.segmented_kv as module
+from mtplx.kernels import sdpa_segmented as S
+from mtplx.nax_verify import nax_available
+
+HQ, HK, D = 32, 8, 128
+SCALE = 1.0 / math.sqrt(D)
+
+needs_nax = pytest.mark.skipif(
+    not mx.metal.is_available() or not nax_available(),
+    reason="TensorOps kernel unavailable on this machine",
+)
+
+
+def _data(total, q_len, peaked=False, seed=3):
+    mx.random.seed(seed)
+    q = (mx.random.normal((1, HQ, q_len, D)) * (2.5 if peaked else 0.5)).astype(mx.bfloat16)
+    k = (mx.random.normal((1, HK, total + 64, D)) * 0.5).astype(mx.bfloat16)
+    v = (mx.random.normal((1, HK, total + 64, D)) * 0.5).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+    return q, k, v
+
+
+def _split(k, v, lens, spare=0):
+    segs, a = [], 0
+    for n in lens:
+        kk, vv = mx.contiguous(k[:, :, a : a + n + spare]), mx.contiguous(v[:, :, a : a + n + spare])
+        mx.eval(kk, vv)
+        segs.append((kk, vv, n))
+        a += n
+    return segs
+
+
+def _lens(total, nseg):
+    lens = [total // nseg] * nseg
+    lens[-1] += total - sum(lens)
+    return lens
+
+
+def _ref(q, k, v, total):
+    q_len = q.shape[2]
+    kf = mx.repeat(k[:, :, :total].astype(mx.float32), HQ // HK, axis=1)
+    vf = mx.repeat(v[:, :, :total].astype(mx.float32), HQ // HK, axis=1)
+    s = (q.astype(mx.float32) @ kf.transpose(0, 1, 3, 2)) * SCALE
+    vis = mx.arange(total)[None, :] <= (total - q_len + mx.arange(q_len))[:, None]
+    return mx.softmax(mx.where(vis[None, None], s, -mx.inf), axis=-1) @ vf
+
+
+def test_the_support_contract_names_head_dim_128_and_nothing_below() -> None:
+    assert S.segments_supported(4, 4, 128) and S.segments_supported(1, 4, 256)
+    assert not S.segments_supported(4, 4, 64) and not S.segments_supported(4, 4, 96)
+    assert S.SUPPORTED_HEAD_DIMS == (128, 256)
+
+
+@needs_nax
+@pytest.mark.parametrize("nseg", [1, 2, 6, 13])
+@pytest.mark.parametrize("q_len", [1, 4, 5])
+@pytest.mark.parametrize("peaked", [False, True])
+def test_segments_match_the_fp32_reference_as_well_as_the_stock_sdpa_does(nseg, q_len, peaked) -> None:
+    total = 12000
+    q, k, v = _data(total, q_len, peaked)
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=_split(k, v, _lens(total, nseg)), scale=SCALE)
+    assert out is not None and bool(mx.all(mx.isfinite(out)).item())
+    ref = _ref(q, k, v, total)
+    err = float(mx.abs(out.astype(mx.float32) - ref).max())
+    mask = (mx.arange(total)[None, :] <= (total - q_len + mx.arange(q_len))[:, None])
+    stock = mx.fast.scaled_dot_product_attention(
+        q, k[:, :, :total], v[:, :, :total], scale=SCALE, mask=mask[None, None]
+    )
+    err_stock = float(mx.abs(stock.astype(mx.float32) - ref).max())
+    assert err <= max(2.5 * err_stock, 1e-3), (err, err_stock)
+
+
+@needs_nax
+def test_head_dim_128_one_segment_does_not_go_through_the_contiguous_dispatcher() -> None:
+    q, k, v = _data(9000, 4)
+    before = dict(S._dsplit.nax_flash_dsplit_dispatch_counts)
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=[(k, v, 9000)], scale=SCALE)
+    assert out is not None
+    assert dict(S._dsplit.nax_flash_dsplit_dispatch_counts) == before  # the contiguous kernel stays 256 only
+    assert float(mx.abs(out.astype(mx.float32) - _ref(q, k, v, 9000)).max()) < 5e-3
+
+
+@needs_nax
+def test_a_reference_shorter_than_its_buffer_reads_only_its_rows() -> None:
+    total, q_len = 9000, 4
+    q, k, v = _data(total, q_len)
+    lens = _lens(total, 3)
+    segs = _split(k, v, lens)
+    junk = mx.ones((1, HK, 300, D), mx.bfloat16) * 9
+    segs[0] = (mx.concatenate([segs[0][0], junk], axis=2), mx.concatenate([segs[0][1], junk], axis=2), lens[0])
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=segs, scale=SCALE)
+    assert float(mx.abs(out.astype(mx.float32) - _ref(q, k, v, total)).max()) < 5e-3
+
+
+def test_prefill_lse_falls_back_to_the_reference_route_when_the_kernel_refuses_a_shape(monkeypatch) -> None:
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        monkeypatch.setattr(module, "_SDPA_LSE", True)
+        module.route_counts.clear()
+
+        def refuses(*a, **k):
+            raise ValueError("unsupported head dim for return_lse")
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", refuses)
+        q = mx.random.normal((1, 4, 6, 8)).astype(mx.bfloat16)
+        keys = mx.random.normal((1, 2, 40, 8)).astype(mx.bfloat16)
+        out, lse = module.segment_sdpa_lse(q, keys, keys, 40, scale=0.35, causal=False)
+        assert out.shape == (1, 4, 6, 8) and lse.shape == (1, 4, 6)
+        assert module.route_counts.get("sdpa_lse_kernel_unsupported") == 1
+        assert module.route_counts.get("sdpa_lse_reference") == 1
+    finally:
+        mx.set_default_device(previous)
+
+
+@needs_nax
+def test_attention_layer_at_head_dim_128_matches_the_stock_cache_through_turns_and_rollback(monkeypatch) -> None:
+    """Qwen3-style attention (32 query / 8 KV heads, head_dim 128) through the attention_split ladder."""
+    from types import SimpleNamespace
+
+    from mlx.utils import tree_map
+    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.qwen3_next import Qwen3NextAttention
+
+    from mtplx.attention_split import configure_split_full_attention
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    for name in ("MTPLX_GQA_PACKED_SDPA", "MTPLX_NAX_FLASH_ROUTE"):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "0")
+    hidden = 128
+    args = SimpleNamespace(
+        hidden_size=hidden, num_attention_heads=HQ, num_key_value_heads=HK, head_dim=D, attention_bias=False,
+        rms_norm_eps=1e-6, partial_rotary_factor=0.25, rope_theta=10000.0, rope_scaling=None,
+        max_position_embeddings=65536,
+    )
+    mx.random.seed(0)
+    attn = Qwen3NextAttention(args)
+    attn.update(tree_map(lambda p: p.astype(mx.bfloat16), attn.parameters()))
+    mx.eval(attn.parameters())
+    configure_split_full_attention(SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(is_linear=False, self_attn=attn)])))
+
+    def x(seed, n):
+        return (mx.random.normal((1, n, hidden), key=mx.random.key(seed)) * 0.5).astype(mx.bfloat16)
+
+    def run(cache):
+        outs = [attn(x(1, 9000), mask="causal", cache=cache)]
+        if isinstance(cache, SegmentedKVCache):
+            state = cache.state
+            cache = SegmentedKVCache()
+            cache.state = state
+        outs.append(attn(x(2, 300), mask="causal", cache=cache))
+        for seed, window in ((4, 4), (5, 4), (6, 9), (7, 1)):
+            outs.append(attn(x(seed, window), mask="causal" if window > 1 else None, cache=cache))
+            cache.trim(max(1, window - 2))
+        mx.eval(outs)
+        return outs, cache
+
+    stock, _ = run(KVCache())
+    module.route_counts.clear()
+    seg, cache = run(SegmentedKVCache())
+    assert cache.segment_count >= 2
+    assert not any(k.startswith("gather_q") and k[8:].isdigit() for k in module.route_counts), module.route_counts
+    for a, b in zip(stock, seg):
+        top = float(mx.maximum(mx.abs(a).max(), mx.abs(b).max()).item())
+        ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
+        assert float(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item()) / ulp <= 4

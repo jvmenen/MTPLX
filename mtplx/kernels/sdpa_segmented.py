@@ -44,8 +44,11 @@ from . import sdpa_nax_flash_dsplit as _dsplit
 from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_nax_flash import _HEADER
 
-#: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel).
-SUPPORTED_HEAD_DIMS = (256,)
+#: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel; ``D`` is a
+#: template parameter, 128 gives 64 dims per simdgroup at the halves split). The contiguous
+#: dispatcher in sdpa_nax_flash_dsplit stays 256 only: a model with head_dim 128 that does not
+#: use segments keeps exactly the routes it has today.
+SUPPORTED_HEAD_DIMS = (128, 256)
 
 #: Metal allows 31 buffer bindings: queries + 2 per segment + meta + scale + 3 outputs.
 MAX_FUSED_SEGMENTS = 12
@@ -210,7 +213,7 @@ def sdpa_nax_flash_dsplit_segments(
 ) -> mx.array | None:
     """Exact attention of ``queries`` over ``segments`` = [(keys, values, n), ...], oldest first.
 
-    ``keys``/``values`` are (1, Hk, capacity, 256) buffers of which the first ``n`` rows are
+    ``keys``/``values`` are (1, Hk, capacity, D) buffers, D in SUPPORTED_HEAD_DIMS, of which the first ``n`` rows are
     live. Every segment but the last is fully visible; the last holds the rows being verified
     as its final ``q_len`` rows and keeps the tail-causal mask. None when the contract is not
     met (the caller falls back to ``segmented_kv.gather_attention``).
@@ -224,7 +227,7 @@ def sdpa_nax_flash_dsplit_segments(
     if queries.ndim != 4:
         return _bail("ndim")
     bsz, hq, q_len, d = (int(x) for x in queries.shape)
-    if bsz != 1 or d != 256:
+    if bsz != 1 or d not in SUPPORTED_HEAD_DIMS:
         return _bail("shape_gate")
     if not segments:
         return _bail("no_segments")
@@ -253,7 +256,9 @@ def sdpa_nax_flash_dsplit_segments(
     if int(segments[-1][2]) < q_len:
         return _bail("tail_shorter_than_q")
 
-    if len(segments) == 1:
+    if len(segments) == 1 and d == 256:
+        # One segment is the contiguous kernel's input (bit-identical). The contiguous
+        # dispatcher is 256 only; a head_dim-128 segment goes through the fused path below.
         keys, values, n = segments[0]
         return _dsplit.sdpa_nax_flash_dsplit(
             queries=queries, keys=keys, values=values, offset=int(n), scale=scale
@@ -336,5 +341,5 @@ def sdpa_nax_flash_dsplit_segments(
 
 def segments_supported(q_len: int, gqa_factor: int, head_dim: int) -> bool:
     """Static part of the contract (no device work), for the route gate in attention_split."""
-    return head_dim == 256 and 1 <= q_len <= 10 and gqa_factor * q_len <= 32
+    return head_dim in SUPPORTED_HEAD_DIMS and 1 <= q_len <= 10 and gqa_factor * q_len <= 32
 

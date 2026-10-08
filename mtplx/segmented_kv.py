@@ -702,8 +702,15 @@ def _segment_sdpa_lse_fast(queries, keys, values, n, *, scale, causal):
 def segment_sdpa_lse(queries, keys, values, n, *, scale, causal):
     """Per segment (out, lse): the MLX kernel when present, else the exact reference route."""
     if sdpa_lse_available():
-        _count("sdpa_lse_kernel")
-        return _segment_sdpa_lse_fast(queries, keys, values, n, scale=scale, causal=causal)
+        try:
+            out = _segment_sdpa_lse_fast(queries, keys, values, n, scale=scale, causal=causal)
+        except (ValueError, RuntimeError):
+            # The fused kernel does not take this shape (the detection probe uses a tiny head
+            # dim): the exact reference route serves the call, once counted.
+            _count("sdpa_lse_kernel_unsupported")
+        else:
+            _count("sdpa_lse_kernel")
+            return out
     _count("sdpa_lse_reference")
     return _segment_sdpa_lse_reference(queries, keys, values, n, scale=scale, causal=causal)
 
