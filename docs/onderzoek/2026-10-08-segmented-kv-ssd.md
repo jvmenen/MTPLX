@@ -102,3 +102,22 @@ With the switch on the session bank section of `/health` has `segmented_kv`: `en
 ### 7.5 Suites
 
 Feature tree full suite: green on stock MLX and on `pkg-lse`; `prod-segkv` (cherry-picked, one CHANGELOG conflict resolved): green on `pkg-lse` (`m3/logs/suite-r4-*.log`). The temporary worktrees for the identity and before-measurements were removed.
+
+## 8. Another model: Qwen3.6-35B-A3B (2026-10-08, established)
+
+Model `Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed` (local, 20 GB; MoE; 40 layers of which 10 full attention, 16 query / 2 KV heads = GQA 8, head_dim 256), production env of the m3 runs (the 27B launch environment, no FR-Spec), `prod-segkv` tree with `pkg-lse`, in-process with the real session bank and `generate_mtpk` (depth 3, context copy on, greedy), a 50K prefix and four follow-up turns (1,024, 2,048, 3,072, 4,096 new tokens, 200 decoded each, every turn continuing from the run's own output so every bank hit is exact). Order off on on off off on (one process per run), gate before each run, thermal 0 throughout. Medians of 3, `m3/out/q36-50000-*.json`.
+
+| turn | prefill s off / on | decode tok/s off / on | ms per verify off / on | peak over turn start GiB off / on | peak GiB off / on |
+|---|---|---|---|---|---|
+| 1 | 0.9 / 0.9 | 83.8 / 107.5 | 27 / 27 | 2.68 / 1.65 | 24.1 / 23.1 |
+| 2 | 1.7 / 1.7 | 62.9 / 62.6 | 25 / 22 | 1.93 / -0.50 | 24.6 / 21.2 |
+| 3 | 2.7 / 2.6 | 70.9 / 68.7 | 28 / 26 | 2.15 / 0.59 | 25.0 / 21.5 |
+| 4 | 3.7 / 3.5 | 50.7 / 54.9 | 25 / 22 | 2.43 / 0.72 | 25.4 / 21.7 |
+
+Cold prefill of the 50K prefix (turn 0): 25.6 s off, 25.8 s on; decode 74.7 and 74.8 tok/s.
+
+- Memory: the follow-up peak above the turn start is 1.0 to 2.4 GiB lower with segments from turn 2 on (a negative value means the peak stayed below the memory at the turn start, because the stock snapshot's duplicate was released first); the absolute peak is 3.0 to 3.7 GiB lower. Turn 1 pays the one-off conversion of the stock snapshot (1.65 against 2.68 GiB here, smaller than on the 27B because the model has 10 attention layers and 2 KV heads: 20 KiB of KV per token against 64 KiB).
+- Speed: prefill equal within noise; ms per verify equal at turn 1 and 2 to 3 ms (10 %) lower from turn 2; decode tok/s differ by the noise of the greedy trajectories (these vary between 51 and 108 tok/s with the acceptance of the copied text). Thermal 0 in every run.
+- Routes (on): `fused_q4` 3,140, `fused_q9` 290, `chunked_q25` 40, `fused_q1` 50, `fused_q2/q3/q12` 50 together, `prefill_lse` 40 (`sdpa_lse_kernel` 140), `merge` 60, `restored_stock_as_segment` 10. No `gather_qN` counter: no verify window and no prefill chunk gathered the history. GQA 8 limits the single-launch window to 4 rows (8 x 4 = 32 rows per KV head); windows of 5 to 8 rows run as sub-windows over the segments, 9 or more through the wide route (`fused_q9`, `fused_q12`).
+- Correctness: both variants are deterministic run to run. On and off first differ at generated token 52, 22, 56 and 51 of turns 1 to 4. The top-1/top-2 margin of the base logits at the first difference (turn 1, position 52, cold stock prefill of prompt plus the common 52 tokens, `m3/margin2.py`) is 0.125: the two tokens have logits 17.125 and 17.0, one bf16 step at that magnitude, a tie. Margins for the later turns were not computed (their histories already differ, so they follow from the first difference).
+- Not measured: 80K on this model, the SSD tier on it, sampled decoding.
