@@ -345,6 +345,18 @@ def _attention_has_gated_q_proj(attn: Any) -> bool:
     return int(weight.shape[0]) == expected
 
 
+def _attention_has_plain_q_proj(attn: Any) -> bool:
+    """Plain q/k-norm attention (Qwen3): q_proj has one output per head dimension, no gate."""
+    q_proj = getattr(attn, "q_proj", None)
+    q_norm = getattr(attn, "q_norm", None)
+    weight = getattr(q_proj, "weight", None)
+    norm_weight = getattr(q_norm, "weight", None)
+    if weight is None or norm_weight is None:
+        return False
+    num_heads = int(getattr(attn, "num_attention_heads", getattr(attn, "n_heads", 0)))
+    return int(weight.shape[0]) == num_heads * int(norm_weight.shape[0])
+
+
 def _install_split_attention_hook(attn: Any) -> bool:
     cls = type(attn)
     if getattr(cls, "_mtplx_split_full_attention_installed", False):
@@ -380,27 +392,38 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # standalone sigmoid eagerly and a fused one inside the compiled
             # verifier's trace, which differ in the last bit of some bfloat16
             # and float32 values (mtplx/attention_math.py).
-        if not _attention_has_gated_q_proj(self):
+        gated_q_proj = _attention_has_gated_q_proj(self)
+        if not gated_q_proj and not (
+            isinstance(cache, SegmentedKVCache) and _attention_has_plain_q_proj(self)
+        ):
+            # Only the gated (Qwen3-Next style) attention goes through this body, and, for
+            # MTPLX_SEGMENTED_KV, a plain q/k-norm attention (Qwen3, head_dim 128) on a
+            # segmented cache: the stock forward would gather the history on every call.
             return original_call(self, x, mask=mask, cache=cache)
 
         from mlx_lm.models.base import scaled_dot_product_attention
 
+        n_heads = getattr(self, "num_attention_heads", None) or self.n_heads
+        n_kv_heads = getattr(self, "num_key_value_heads", None) or self.n_kv_heads
         B, L, _ = x.shape
         q_proj_output = self.q_proj(x)
-        queries, gate = mx.split(
-            q_proj_output.reshape(B, L, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(B, L, -1)
+        if gated_q_proj:
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, L, n_heads, -1),
+                2,
+                axis=-1,
+            )
+            gate = gate.reshape(B, L, -1)
+        else:
+            queries, gate = q_proj_output.reshape(B, L, n_heads, -1), None
 
         keys = self.k_proj(x)
         values = self.v_proj(x)
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(
-            keys.reshape(B, L, self.num_key_value_heads, -1)
+            keys.reshape(B, L, n_kv_heads, -1)
         ).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+        values = values.reshape(B, L, n_kv_heads, -1).transpose(
             0,
             2,
             1,
@@ -849,6 +872,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
             )
         _note_kv_attention(self, cache, queries, output, mask, route, fallback)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if gate is None:
+            return self.o_proj(output)
         return self.o_proj(attention_gate(output, gate))
 
     cls.__call__ = split_call
@@ -947,7 +972,10 @@ def configure_split_full_attention(
         )
         newly_hooked = bool(_install_split_attention_hook(attn))
         # The hook is installed once per attention class: later instances report False.
-        hooked_layers.append(newly_hooked or bool(getattr(type(attn), "_mtplx_split_full_attention_installed", False)))
+        hooked_layers.append(
+            (newly_hooked or bool(getattr(type(attn), "_mtplx_split_full_attention_installed", False)))
+            and (_attention_has_gated_q_proj(attn) or _attention_has_plain_q_proj(attn))
+        )
         stats["installed"] += int(newly_hooked)
         attn._mtplx_split_full_attention_enabled = bool(
             active or sdpa_2pass or vllm_metal_paged or gqa_packed

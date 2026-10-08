@@ -146,3 +146,66 @@ def test_head_dim_is_read_from_the_scale_when_the_module_has_no_attribute() -> N
     verdict = evaluate_model_support([attn])
     assert verdict["supported"], verdict
     assert verdict["head_dims"] == [128] and verdict["gqa"] == [4]
+
+
+def _qwen3_attention(head_dim=32, q=4, kv=2, hidden=64):
+    from mlx_lm.models.qwen3 import Attention, ModelArgs
+
+    args = ModelArgs(
+        model_type="qwen3", hidden_size=hidden, num_hidden_layers=1, intermediate_size=64, num_attention_heads=q,
+        rms_norm_eps=1e-6, vocab_size=64, num_key_value_heads=kv, max_position_embeddings=4096, rope_theta=10000.0,
+        head_dim=head_dim, tie_word_embeddings=False,
+    )
+    mx.random.seed(0)
+    return Attention(args)
+
+
+def test_plain_qwen3_attention_is_hooked_for_segmented_caches_only_and_matches_the_stock_forward() -> None:
+    """A plain q/k-norm attention (no gate) goes through the hook body only on a segmented cache; with a
+    stock cache it is the unchanged mlx-lm forward, so models without the switch keep their code."""
+    from mlx_lm.models.cache import KVCache
+
+    from mtplx.attention_split import _attention_has_gated_q_proj, _attention_has_plain_q_proj, _install_split_attention_hook
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    attn = _qwen3_attention()
+    assert not _attention_has_gated_q_proj(attn) and _attention_has_plain_q_proj(attn)
+
+    def run(cache):
+        outs = []
+        for seed, n in ((1, 40), (2, 9), (3, 1)):
+            x = mx.random.normal((1, n, 64), key=mx.random.key(seed))
+            outs.append(attn(x, mask="causal" if n > 1 else None, cache=cache))
+        mx.eval(outs)
+        return outs
+
+    before = run(KVCache())
+    _install_split_attention_hook(attn)
+    attn._mtplx_split_full_attention_enabled = True
+    after_stock = run(KVCache())
+    for a, b in zip(before, after_stock):
+        assert mx.array_equal(a, b).item()  # stock cache: the unchanged forward
+    cache = SegmentedKVCache()
+    seg = run(cache)
+    cache.seal()
+    for a, b in zip(before, seg):
+        assert float(mx.abs(a - b).max().item()) < 1e-4  # same math on the gathered rows (CPU: no kernel)
+    assert cache.offset == 50
+
+
+def test_the_hook_covers_plain_attention_in_the_support_check() -> None:
+    from types import SimpleNamespace
+
+    from mtplx.attention_split import configure_split_full_attention
+
+    attn = _qwen3_attention(head_dim=128, q=8, kv=2, hidden=128)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(is_linear=False, self_attn=attn)]))
+    import os
+
+    os.environ["MTPLX_GQA_PACKED_SDPA"] = "1"
+    try:
+        stats = configure_split_full_attention(model)
+    finally:
+        os.environ.pop("MTPLX_GQA_PACKED_SDPA")
+    assert stats["segmented_kv_supported"] is True
+    assert model_support()["head_dims"] == [128] and model_support()["gqa"] == [4]
