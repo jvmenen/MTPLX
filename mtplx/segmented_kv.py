@@ -22,9 +22,12 @@ same follow-up turn costs the new segment only (+0.125 GiB for 1,024 tokens plus
 2026-10-07 phase 1 measurement) and a branch from the same history costs 0.
 
 Attention over the segments: ``mtplx/kernels/sdpa_segmented.py`` (exact split-softmax merge,
-one launch for up to 12 segments) for the verify/decode window; everything else gathers the
-rows into one contiguous array per layer and call (``gather``, correct and slower for long
-histories) and runs the stock route on it. The prefill over existing segments has its own
+one launch for up to 12 segments) for the verify/decode window. A cache with a single segment
+(a cold prompt, or a conversation not yet sealed) runs the stock route on that segment's rows,
+a zero-copy view of the buffer the stock cache would have (counter ``single_q<rows>``). Only
+a call over several segments that no kernel takes (a masked or oversized window, a missing
+logsumexp kernel for prefill) gathers the rows into one contiguous array (``gather_q<rows>``,
+correct and slower for long histories) and runs the stock route on it. The prefill over existing segments has its own
 interface, ``attend_segments_lse`` (per segment ``(out, lse)`` plus one merge), so that an
 MLX kernel which returns the logsumexp can replace ``segment_sdpa_lse``.
 
@@ -763,7 +766,7 @@ def decode_segments_attention(
 
     Engages under the same conditions as the packed route over a dense cache, with the total
     length where that route reads the buffer capacity: MTPLX_NAX_FLASH_ROUTE on, a verify
-    window of 2 to 8 rows, total length at least ``packed_threshold``, a causal or no mask.
+    window of 1 to 8 rows, a causal or no mask, and total length at least ``packed_threshold`` when the cache is one segment (several segments take the kernel at any length).
     The head-dim-split kernel serves windows of up to 5 rows at GQA 6 (wide and dsplit4 are not
     in this tree); a longer window, an unsupported shape or a kernel bail returns None and the
     call runs on the gathered rows through the stock ladder.
@@ -781,7 +784,10 @@ def decode_segments_attention(
     q_len = int(queries.shape[2])
     if not 1 <= q_len <= VERIFY_WINDOW_MAX:
         return None
-    if cache.offset < int(packed_threshold):
+    if cache.segment_count == 1 and cache.offset < int(packed_threshold):
+        # One segment below the packed threshold: the stock route over a zero-copy view,
+        # exactly what the stock cache does there (several segments always take the kernel,
+        # the alternative would be a gather).
         return None
     if not (mask is None or (isinstance(mask, str) and mask == "causal")):
         return None
@@ -828,108 +834,40 @@ def is_segmented(entry: Any) -> bool:
     return isinstance(entry, SegmentedKVCache)
 
 
-def segmented_kv_min_tokens() -> int:
-    """Context length above which a layer is kept as segments (MTPLX_SEGMENTED_KV).
-
-    The segment cache cannot be promoted to the compiled verify (graphbank:
-    ``promotion_failure:segmented_kv_cache``), so below the compiled-verify context ceiling the
-    stock cache stays: production runs compiled there and the switch would only slow it down.
-    ``MTPLX_SEGMENTED_KV_MIN_TOKENS`` sets the boundary explicitly (0 = always segmented).
-    Otherwise it is the compiled-verify ceiling itself (``MTPLX_COMPILED_VERIFY_MAX_CONTEXT``,
-    32768 in the turbo profile, 6144 without a profile), read per call; with the compiled verify
-    off the boundary is 0, and with the compiled verify unlimited (ceiling 0) it is infinite,
-    because a compiled verify that runs at every length leaves the segments nothing to win.
-    A layer is segmented when its rows are strictly above the boundary, the same comparison the
-    compiled verify uses to fall back to eager.
-    """
-    raw = os.environ.get("MTPLX_SEGMENTED_KV_MIN_TOKENS", "").strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            pass
-    from .graphbank import _compiled_verify_max_context, compiled_verify_mode
-
-    if compiled_verify_mode() == "off":
-        return 0
-    ceiling = _compiled_verify_max_context()
-    return ceiling if ceiling > 0 else (1 << 62)
-
-
 def _is_stock_plain_kv(entry: Any) -> bool:
     return type(entry).__name__ == "KVCache" and getattr(entry, "_idx", None) is None
 
 
-def _segmentable(entry: Any) -> bool:
-    """A stock full-attention layer of the target cache (tagged at install; MTP caches never are)."""
-    return bool(getattr(entry, "_mtplx_segmentable", False)) and _is_stock_plain_kv(entry)
-
-
-def _segmented_from_stock(entry: Any) -> SegmentedKVCache:
-    """The stock cache's rows as one sealed segment, without a copy.
-
-    The segment views the stock buffers and is never written again; the stock object is dropped
-    by the caller, so nothing writes into those buffers any more.
-    """
-    new = SegmentedKVCache(step=int(getattr(entry, "step", 256)))
-    rows = int(getattr(entry, "offset", 0) or 0)
-    if rows and entry.keys is not None:
-        new.state = (entry.keys[..., :rows, :], entry.values[..., :rows, :])
-    return new
-
-
 def adapt_layer_for_restore(cache: list[Any], idx: int, state: Any) -> tuple[Any, Any]:
-    """Pick the layout of layer ``idx`` for a restore of ``state``; returns (entry, state).
+    """Prepare layer ``idx`` for a restore of ``state``; returns (entry, state).
 
-    Above ``segmented_kv_min_tokens()`` the layer is a segment cache (a stock snapshot becomes
-    one sealed segment, no copy); at or below it the layer is a stock cache (a segmented
-    snapshot is gathered into contiguous rows), so a conversation that crosses the boundary
-    changes layout at its next restore. Layers that were never tagged (MTP caches, recurrent
-    layers) are left alone. The entry is replaced in ``cache`` when its class changes.
+    A segment cache takes either snapshot kind (a stock snapshot, from the SSD tier or a stock
+    bank entry, becomes its rows). A stock layer that cannot hold segments (a layer that was
+    never tagged: MTP caches, recurrent layers, or one that already had rows at install) gets a
+    segmented snapshot as contiguous rows. The entry is never replaced: with the switch on, the
+    layout is decided once, when the cache is built (``install_segmented_attention_kv_cache``).
     """
     entry = cache[idx]
-    if not (isinstance(entry, SegmentedKVCache) or _segmentable(entry)):
+    if isinstance(entry, SegmentedKVCache):
+        if not isinstance(state, SegmentedKVState) and isinstance(state, (tuple, list)) and len(state) == 2 and state[0] is not None:
+            _count("restored_stock_as_segment")
         return entry, state
     if isinstance(state, SegmentedKVState):
-        rows = state.rows
-    elif isinstance(state, (tuple, list)) and len(state) == 2 and state[0] is not None:
-        rows = int(state[0].shape[2])
-    else:
-        return entry, state
-    floor = segmented_kv_min_tokens()
-    want = rows > floor if floor > 0 else isinstance(entry, SegmentedKVCache)
-    if want and not isinstance(entry, SegmentedKVCache):
-        if not isinstance(state, SegmentedKVState):
-            _count("restored_stock_as_segment")  # a stock snapshot (SSD restore, stock bank entry)
-        entry = SegmentedKVCache(step=int(getattr(entry, "step", 256)))
-        entry._mtplx_segmentable = True
-        cache[idx] = entry
-    elif not want and isinstance(entry, SegmentedKVCache):
-        from mlx_lm.models.cache import KVCache
-
-        entry = KVCache()
-        entry._mtplx_segmentable = True
-        cache[idx] = entry
-    if isinstance(state, SegmentedKVState) and not isinstance(entry, SegmentedKVCache):
         state = state.to_arrays()
     return entry, state
 
 
 def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None = None) -> dict[str, int | str]:
-    """Choose the layout of the full-attention KV layers of a target cache list.
+    """Make the empty full-attention KV layers of a target cache list segment caches.
 
-    Plain dense ``KVCache`` layers are tagged as segmentable. A layer without rows becomes a
-    segment cache straight away when the boundary is 0 (``segmented_kv_min_tokens``); otherwise
-    it stays stock (compiled verify below the boundary) and is converted after its prefill when
-    its rows are above the boundary (this function runs again from ``repage_target_prefill_cache``)
-    or at the next restore (``adapt_layer_for_restore``). A stock layer with rows above the
-    boundary becomes one sealed segment (no copy). Recurrent layers, rotating/indexed caches and
+    Plain dense ``KVCache`` layers without rows become a ``SegmentedKVCache`` from the first
+    token (one path with the switch on; there is no context boundary below which the stock
+    cache stays). Recurrent layers, rotating/indexed caches, layers that already hold rows and
     caches of other lists (MTP) are left alone.
     """
-    stats: dict[str, int | str] = {"enabled": 1, "mode": "segmented", "entries": 0, "skipped": 0, "converted": 0}
+    stats: dict[str, int | str] = {"enabled": 1, "mode": "segmented", "entries": 0, "skipped": 0}
     from .cache_state import _is_trimmable
 
-    floor = segmented_kv_min_tokens()
     for idx, entry in enumerate(cache or []):
         if entry is None:
             stats["skipped"] = int(stats["skipped"]) + 1
@@ -937,27 +875,19 @@ def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None =
         if isinstance(entry, SegmentedKVCache):
             stats["entries"] = int(stats["entries"]) + 1
             continue
-        if not _is_trimmable(entry) or not _is_stock_plain_kv(entry):
-            stats["skipped"] = int(stats["skipped"]) + 1
-            continue
         rows = int(getattr(entry, "offset", 0) or 0)
-        if rows == 0 and getattr(entry, "keys", None) is None:
-            if floor == 0:
-                new = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
-                new._mtplx_segmentable = True
-                cache[idx] = new
-                stats["entries"] = int(stats["entries"]) + 1
-            else:
-                entry._mtplx_segmentable = True
-                stats["skipped"] = int(stats["skipped"]) + 1
-            continue
-        if getattr(entry, "_mtplx_segmentable", False) and rows > floor > 0:
-            cache[idx] = _segmented_from_stock(entry)
-            cache[idx]._mtplx_segmentable = True
+        if (
+            _is_trimmable(entry)
+            and _is_stock_plain_kv(entry)
+            and rows == 0
+            and getattr(entry, "keys", None) is None
+        ):
+            new = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
+            new._mtplx_segmentable = True
+            cache[idx] = new
             stats["entries"] = int(stats["entries"]) + 1
-            stats["converted"] = int(stats["converted"]) + 1
-            continue
-        stats["skipped"] = int(stats["skipped"]) + 1
+        else:
+            stats["skipped"] = int(stats["skipped"]) + 1
     return stats
 
 
@@ -1098,7 +1028,6 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         "enabled": True,
         "requested": True,
         "model_support": model_support(),
-        "min_tokens": segmented_kv_min_tokens(),
         "ssd": segmented_ssd_enabled(),
         "prefill_route": prefill_route(),
         "entries": per_entry,

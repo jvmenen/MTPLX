@@ -159,3 +159,38 @@ def test_wide_verify_windows_run_on_the_segments_without_a_gather(lane, window) 
     assert module.route_counts.get(f"chunked_q{window}", 0) + module.route_counts.get(f"fused_q{window}", 0) == 2
     for a, b in zip(stock, seg):
         assert _top_ulps(a, b) <= 4
+
+
+@pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
+@pytest.mark.parametrize("cold_rows", [3000, 9000])
+def test_no_gather_route_fires_in_a_cold_turn_or_in_follow_up_turns(lane, cold_rows) -> None:
+    """One path with the switch on: a cold prompt (below and above the packed threshold) and the
+    follow-up turns after it never gather the history. A single-segment call runs the stock
+    route over a zero-copy view (``single_q*``); several segments take the kernels."""
+    import mtplx.segmented_kv as module
+
+    module.route_counts.clear()
+    cache = SegmentedKVCache()
+    for seed, n in ((1, cold_rows // 2), (2, cold_rows - cold_rows // 2)):  # cold prefill, two chunks
+        lane(_x(seed, n), mask="causal", cache=cache)
+    for seed in (3, 4):
+        lane(_x(seed, 4), mask="causal", cache=cache)  # cold verify windows
+        cache.trim(2)
+    lane(_x(5, 1), mask=None, cache=cache)  # cold decode
+    mx.eval(cache.keys)
+    assert not any(k.startswith("gather") for k in module.route_counts), module.route_counts
+    assert any(k.startswith(("single_q", "fused_q")) for k in module.route_counts)
+    for turn in range(3):  # follow-up turns on restored caches
+        state = cache.state
+        cache = SegmentedKVCache()
+        cache.state = state
+        lane(_x(10 + turn, 300), mask="causal", cache=cache)  # prefill over history
+        for seed in (20 + turn, 30 + turn):
+            lane(_x(seed, 4), mask="causal", cache=cache)
+            cache.trim(2)
+        lane(_x(40 + turn, 9), mask="causal", cache=cache)  # context-copy window
+        cache.trim(5)
+        lane(_x(50 + turn, 1), mask=None, cache=cache)
+    mx.eval(cache.keys)
+    assert not any(k.startswith("gather") for k in module.route_counts), module.route_counts
+    assert module.route_counts.get("prefill_lse", 0) >= 1

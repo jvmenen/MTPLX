@@ -278,7 +278,7 @@ def test_health_block_is_absent_with_the_switch_off_and_reports_segments_with_it
     assert block["enabled"] is True and block["entries"]
     assert block["max_segments"] >= 2
     assert block["sealed_bytes_unique"] > 0
-    assert {"route_counts", "ssd_counts", "merges", "seals", "min_tokens"} <= set(block)
+    assert {"route_counts", "ssd_counts", "merges", "seals"} <= set(block)
     assert all(e["segments"] >= 1 and e["sealed_bytes"] > 0 for e in block["entries"])
     import json
 

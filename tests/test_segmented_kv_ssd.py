@@ -215,7 +215,6 @@ def test_a_stock_entry_on_disk_restores_with_the_switch_on_as_segments(monkeypat
         if (tier.base_dir / "blobs" / next(iter(names.values()))["sha256"][:2]).exists() else None
     decoded = decode_payload(payload["payload_spec"], (lambda n: blobs[n]) if blobs else None)
     monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")
-    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MIN_TOKENS", "100")
     from mtplx.cache_state import configure_tail_owned_attention_kv_cache
     cache = [KVCache(), KVCache(), KVCache()]
     cache = cache[:2]
@@ -318,7 +317,6 @@ def test_ssd_restore_builds_the_requests_cache_layout_with_and_without_the_switc
     its own tests are in tests/test_ssd_restore_cache_layout.py)."""
     from mtplx.session_bank import SessionBank
 
-    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MIN_TOKENS", "100000")  # stock layers stay stock
     if flag:
         monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")
     else:

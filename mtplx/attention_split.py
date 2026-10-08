@@ -495,7 +495,11 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     )
                     segmented_route = "nax_flash_segments"
                 if segmented_output is None:
-                    segmented_count(f"gather_q{int(queries.shape[2]) if int(queries.shape[2]) <= 32 else 'prefill'}")
+                    q_rows = int(queries.shape[2])
+                    segmented_count(
+                        f"{'single' if cache.segment_count == 1 else 'gather'}_q"
+                        f"{q_rows if q_rows <= 32 else 'prefill'}"
+                    )
                     view = gathered_view(cache)
                     keys, values = view.keys, view.values
                     cache = view
