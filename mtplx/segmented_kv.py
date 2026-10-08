@@ -102,6 +102,8 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
         reasons.append("attention_not_hooked")
     for attn in layers:
         head_dim = getattr(attn, "head_dim", None)
+        if not head_dim and getattr(attn, "scale", None):
+            head_dim = round(float(attn.scale) ** -2)  # mlx-lm Qwen3/Llama attention: scale = head_dim ** -0.5
         q_heads = getattr(attn, "num_attention_heads", None) or getattr(attn, "n_heads", None)
         kv_heads = getattr(attn, "num_key_value_heads", None) or getattr(attn, "n_kv_heads", None)
         if not (head_dim and q_heads and kv_heads):
