@@ -27,7 +27,6 @@ def _cpu_and_clean(monkeypatch):
     reset_model_support()
     monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
     monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")
-    monkeypatch.delenv("MTPLX_SEGMENTED_KV_MIN_TOKENS", raising=False)
     monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: True)
     yield
     reset_model_support()
