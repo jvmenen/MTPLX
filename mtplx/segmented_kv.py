@@ -50,9 +50,94 @@ import mlx.core as mx
 _SEGMENT_IDS = itertools.count(1)
 
 
-def segmented_kv_enabled() -> bool:
-    """MTPLX_SEGMENTED_KV (default off), read on every call."""
+def segmented_kv_requested() -> bool:
+    """MTPLX_SEGMENTED_KV (default off), read on every call: what the operator asked for."""
     return os.environ.get("MTPLX_SEGMENTED_KV", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+#: Verdict on the loaded model (``evaluate_model_support``); None until a model was checked.
+_MODEL_SUPPORT: dict[str, Any] | None = None
+_UNSUPPORTED_LOGGED = False
+
+
+def segmented_kv_enabled() -> bool:
+    """MTPLX_SEGMENTED_KV, unless the loaded model cannot use segments (then everything behaves
+    as with the switch off: stock caches, stock bank, stock SSD path)."""
+    if not segmented_kv_requested():
+        return False
+    return _MODEL_SUPPORT is None or bool(_MODEL_SUPPORT.get("supported", True))
+
+
+def model_support() -> dict[str, Any] | None:
+    return None if _MODEL_SUPPORT is None else dict(_MODEL_SUPPORT)
+
+
+def reset_model_support() -> None:
+    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED
+    _MODEL_SUPPORT = None
+    _UNSUPPORTED_LOGGED = False
+
+
+def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | None = None) -> dict[str, Any]:
+    """Whether the segmented cache can serve this model without ever gathering the history.
+
+    A call that the segment kernel does not take runs on one gathered copy of the history
+    (correct, but a full copy per layer per verify), so a model whose full-attention layers the
+    kernel cannot serve keeps the stock cache instead. ``layers`` are the full-attention modules
+    (``head_dim``, ``num_attention_heads``, ``num_key_value_heads``; ``hooked`` says which of
+    them run the split-attention hook, the only code that reads segments). The verdict is
+    stored; it switches the feature off (``segmented_kv_enabled``) and is reported on /health.
+    """
+    from .kernels.sdpa_segmented import SUPPORTED_HEAD_DIMS, segments_supported
+    from .nax_verify import nax_available
+
+    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED
+    layers = list(layers)
+    flags = list(hooked) if hooked is not None else [True] * len(layers)
+    reasons: list[str] = []
+    shapes: set[tuple[int, int, int]] = set()
+    if not layers:
+        reasons.append("no_full_attention_layers")
+    if not all(flags):
+        reasons.append("attention_not_hooked")
+    for attn in layers:
+        head_dim = getattr(attn, "head_dim", None)
+        q_heads = getattr(attn, "num_attention_heads", None) or getattr(attn, "n_heads", None)
+        kv_heads = getattr(attn, "num_key_value_heads", None) or getattr(attn, "n_kv_heads", None)
+        if not (head_dim and q_heads and kv_heads):
+            reasons.append("attention_shape_unknown")
+            continue
+        shapes.add((int(head_dim), int(q_heads), int(kv_heads)))
+    for head_dim, q_heads, kv_heads in sorted(shapes):
+        if head_dim not in SUPPORTED_HEAD_DIMS:
+            reasons.append(f"head_dim_{head_dim}_unsupported")
+        elif q_heads % kv_heads or not segments_supported(1, q_heads // kv_heads, head_dim):
+            reasons.append(f"gqa_{q_heads}_{kv_heads}_unsupported")
+    if not all(getattr(a, "_mtplx_gqa_packed_sdpa_enabled", False) for a in layers):
+        reasons.append("gqa_packed_sdpa_off")
+    if os.environ.get("MTPLX_NAX_FLASH_ROUTE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        reasons.append("nax_flash_route_off")
+    if not nax_available():
+        reasons.append("nax_unavailable")
+    reasons = list(dict.fromkeys(reasons))
+    verdict = {
+        "supported": not reasons,
+        "reasons": reasons,
+        "head_dims": sorted({s[0] for s in shapes}),
+        "gqa": sorted({s[1] // s[2] for s in shapes if s[2] and s[1] % s[2] == 0}),
+        "supported_head_dims": list(SUPPORTED_HEAD_DIMS),
+        "full_attention_layers": len(layers),
+    }
+    _MODEL_SUPPORT = verdict
+    if reasons and segmented_kv_requested() and not _UNSUPPORTED_LOGGED:
+        _UNSUPPORTED_LOGGED = True
+        print(
+            "[mtplx] MTPLX_SEGMENTED_KV is on but this model cannot use it ("
+            + ", ".join(reasons)
+            + "): keeping the stock KV cache",
+            flush=True,
+        )
+    return verdict
 
 
 def _int_env(name: str, default: int) -> int:
@@ -969,8 +1054,11 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
     ``entries`` are the session bank's entries. Per entry: the segment count of its snapshot
     (largest over the layers) or of its live cache, and the bytes of the segments it references.
     """
-    if not segmented_kv_enabled():
+    if not segmented_kv_requested():
         return None
+    if not segmented_kv_enabled():
+        # Asked for, but the loaded model cannot use it: say so (and why) instead of staying silent.
+        return {"enabled": False, "requested": True, "model_support": model_support()}
     per_entry: list[dict[str, Any]] = []
     unique: dict[int, int] = {}
     for entry in entries:
@@ -999,6 +1087,8 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
     counts_now = dict(route_counts)
     return {
         "enabled": True,
+        "requested": True,
+        "model_support": model_support(),
         "min_tokens": segmented_kv_min_tokens(),
         "ssd": segmented_ssd_enabled(),
         "prefill_route": prefill_route(),

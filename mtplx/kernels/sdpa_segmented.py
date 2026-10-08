@@ -44,6 +44,9 @@ from . import sdpa_nax_flash_dsplit as _dsplit
 from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_nax_flash import _HEADER
 
+#: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel).
+SUPPORTED_HEAD_DIMS = (256,)
+
 #: Metal allows 31 buffer bindings: queries + 2 per segment + meta + scale + 3 outputs.
 MAX_FUSED_SEGMENTS = 12
 #: The reduce kernel binds one partial buffer per launch group plus sums, maxs, starts, out.

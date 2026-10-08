@@ -933,6 +933,7 @@ def configure_split_full_attention(
     }
     full_layers = list(_full_attention_layers(model))
     full_layer_count = len(full_layers)
+    hooked_layers: list[bool] = []
     for full_idx, attn in enumerate(full_layers):
         exact_gather_layer = bool(
             vllm_metal_paged
@@ -944,7 +945,10 @@ def configure_split_full_attention(
                 )
             )
         )
-        stats["installed"] += int(_install_split_attention_hook(attn))
+        newly_hooked = bool(_install_split_attention_hook(attn))
+        # The hook is installed once per attention class: later instances report False.
+        hooked_layers.append(newly_hooked or bool(getattr(type(attn), "_mtplx_split_full_attention_installed", False)))
+        stats["installed"] += int(newly_hooked)
         attn._mtplx_split_full_attention_enabled = bool(
             active or sdpa_2pass or vllm_metal_paged or gqa_packed
         )
@@ -966,4 +970,11 @@ def configure_split_full_attention(
         attn._mtplx_split_full_attention_calls = 0
         stats["layers"] += 1
         stats["exact_gather_layers"] += int(exact_gather_layer)
+    if _env_enabled("MTPLX_SEGMENTED_KV"):
+        # MTPLX_SEGMENTED_KV: decide once, from the hooked layers, whether this model can use
+        # segments without ever falling back to a gather (mtplx/segmented_kv.py).
+        from .segmented_kv import evaluate_model_support
+
+        verdict = evaluate_model_support(full_layers, hooked=hooked_layers)
+        stats["segmented_kv_supported"] = bool(verdict["supported"])
     return stats
