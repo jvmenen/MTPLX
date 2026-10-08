@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-06` (prod-2026-10-05 plus the refusal badge; config unchanged since 2b6c81f). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-08` (prod-2026-10-06 plus AR context-copy #599, off by default; config unchanged since 2b6c81f). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -23,10 +23,10 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | e61bde6c | Unclosed reasoning block recovered as content when tools are declared (#583) | #588 | open | default |
 | dd0cc3c1 | SSD cold tier: uint32 fingerprint mixer | #596 | open | matters with `MTPLX_SSD_INCREMENTAL_ENCODE=1` |
 | 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
+| 23468b07, 85d4a49a | Context-copy drafting for AR-only runtimes (models without an MTP head) | #599 | open | `MTPLX_CONTEXT_COPY_AR=1` (not used by Qwen3.8, which has an MTP head) |
 | 0eae8d62, 69d17afc, d3a74424, dd28b920, 1da1470b | Changelog, lint, test fixes, dashboard bundle | n/a | n/a | n/a |
 
 **Production flags that are obsolete on v2.12.2** (drop at the switch): `MTPLX_MTP_HISTORY_CACHE_ONLY` (default on upstream), `MTPLX_POSTCOMMIT_AFTER_RESPONSE` and `MTPLX_PERSIST_QUEUE_MAX_GB` (superseded; use `MTPLX_PERSISTENCE_MAX_PENDING_BYTES`).
 
 **MLX:** production runs branch `prod` of [jvmenen/mlx](https://github.com/jvmenen/mlx) (v0.32.2 plus the minq and qmm tile patches, tag `prod-2026-10-04`), built into `~/Dev/mlx-sdpa/pkg-combo` with `MLX_SDPA_D256_MINQ=64`. Upstream forms: branches `sdpa-d256-short-query` and `qmm-large-m-tile` (not filed; MLX wants an issue first and a description written by Jeroen).
 
-**Not on `prod`, filed separately:** #599 context-copy for AR-only runtimes (`feat/context-copy-ar`; Qwen3.8 has an MTP head, so production does not need it).
