@@ -247,7 +247,6 @@ One-line reasons; finding numbers refer to [VONDSTEN.md](VONDSTEN.md) (Q-numbers
 | Context-copy AR on Qwen3-8B and on hybrid models | Only Llama 3.1 8B measured. |
 | Gemma 4 and Llama-like models with segmented KV | Gemma has sliding layers; Llama attention is not hooked (reports `attention_not_hooked`, keeps the stock cache). |
 | `mtplx serve --mtp` with a model that has no MTP head | Not checked. |
-| #574 (fused-expert loader fix for the `-yb` packs) on `prod` | Not in the CARRIED table; the production packs depend on it unless upstream took it. |
 | Thinking budget 6144: evaluation due 2 Oct (per notes) | No written result found in the research folder. |
 
 ## 11. Contradictions and gaps found between the sources
@@ -257,7 +256,7 @@ One-line reasons; finding numbers refer to [VONDSTEN.md](VONDSTEN.md) (Q-numbers
 3. **Chunk size 4096.** The profile sets 2,048; our command sets 4,096. On the 27B no difference is shown (22K cold 55.2 vs 57.0 s, single run). The measured gain (-12.2% cold) is from A3B only.
 4. **`MTPLX_PREFILL_MIN_CHUNK_ROWS`.** Finding 100 says "enable for Qwen3.8 only"; the shared command applies it to every model, including the Qwen3.6 pack where it was mixed.
 5. **Persistence cap.** CARRIED.md and finding 99 call the old queue flag superseded by `MTPLX_PERSISTENCE_MAX_PENDING_BYTES` (upstream default RAM/32, about 2 GiB), but our measured value is 4 GiB, so we run a looser cap than the default.
-6. **#574 and FR-Spec PR #578** are used by production (the `-yb` packs and the Q2 binding) but are not in the CARRIED.md table.
+6. **#574 and FR-Spec PR #578: checked, no gap.** The #574 loader fix (024bba2c, with 13128e2e) is part of the v2.12.2 release `prod` is based on, so it is not carried. #578 (binding the pruned draft head on the configured route) is not on `prod`; production runs FR-Spec on the legacy lane (`MTPLX_FRSPEC_LEGACY=1`), which does not need it. Consequence: the Q2 rows measured on the #578 binding do not describe production, which is one more reason to re-measure FR-Spec on `prod` (queued).
 7. **Qwen3.5-9B lane.** The 26 Sep model test installed the batch-invariant lane on the 9B; the MoE-only gate (finding 59) now refuses it on dense models, so the 9B numbers of that test do not describe `prod`.
 8. **Segmented KV scope of 9B numbers.** Only in `m3/RESUME.md`, no report section.
 9. **Task-named source missing.** `~/Dev/laya-nl/pld-pr/` does not exist; #599 numbers come from the `prod` CHANGELOG and finding 103.
