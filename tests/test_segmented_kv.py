@@ -293,17 +293,49 @@ def test_tiered_merge_only_merges_small_recent_unshared_segments(monkeypatch) ->
     assert _same(cache, control)
 
 
-def test_merge_leaves_segments_that_a_snapshot_holds(monkeypatch) -> None:
+def test_merge_also_merges_segments_a_snapshot_holds_and_leaves_the_snapshot_intact(monkeypatch) -> None:
+    """Every turn's bank snapshot holds that turn's segments; without merging held segments nothing
+    would ever merge and the count would grow by two per turn."""
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "16384")
     cache = SegmentedKVCache()
     for seed in (1, 2):
         _fill(cache, [(seed, 300)])
         cache.seal()
     held = cache.state  # a bank entry references both segments
+    held_segments = [ref.segment for ref in held.refs]
     before = [ref.segment for ref in cache._sealed]
-    _fill(cache, [(3, 300)])  # new tail: compact() must not merge held segments
-    assert [ref.segment for ref in cache._sealed] == before
-    assert held.rows == 600
+    assert before == held_segments
+    _fill(cache, [(3, 300)])  # new tail: compact() merges the two equal-sized held segments
+    assert len(cache._sealed) == 1 and cache._sealed[0].n == 600
+    assert cache.merges == 1 and cache.merge_rows == 600
+    assert held.rows == 600 and [ref.segment for ref in held.refs] == held_segments  # the snapshot is untouched
+    control = KVCache()
+    for seed in (1, 2):
+        control.update_and_fetch(*_rows(seed, 300))
+    k, v = held.to_arrays()
+    assert mx.array_equal(k, control.state[0]).item() and mx.array_equal(v, control.state[1]).item()
+    merged_k = cache._sealed[0].segment.keys[..., :600, :]
+    assert mx.array_equal(merged_k, control.state[0]).item()
+
+
+def test_segment_count_stays_bounded_over_many_turns_with_snapshots(monkeypatch) -> None:
+    """Two seals per turn (a prompt snapshot and the final one), every snapshot kept alive."""
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "16384")
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_TIER", "2")
+    cache = SegmentedKVCache()
+    _fill(cache, [(1, 20000)])
+    cache.seal()
+    snapshots = [cache.state]
+    peak = 0
+    for turn in range(2, 26):
+        _fill(cache, [(turn, 700)])
+        snapshots.append(cache.state)  # prompt snapshot
+        _fill(cache, [(100 + turn, 150)])
+        snapshots.append(cache.state)  # final snapshot
+        peak = max(peak, cache.segment_count)
+    assert peak <= 12, peak
+    assert cache.segment_count <= 12
+    assert cache.merges > 0
 
 
 def test_nbytes_counts_each_shared_segment_once() -> None:
