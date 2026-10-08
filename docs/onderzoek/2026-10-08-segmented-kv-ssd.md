@@ -68,3 +68,37 @@ Write time and bytes per turn in the server could not be taken from the run log 
 - TTFT after an SSD restore at 80K (49 s for 1.5K new tokens in B) is dominated by something other than the suffix prefill and the 2.3 s restore; not decomposed.
 - The at-rest merge of the large history and `/health` reporting (from the m3 report) are still open.
 - A's failure to restore from the SSD in this scenario, and the orphan bytes, are observations of the existing code that this work did not touch.
+
+## 7. Follow-up round (2026-10-08): TTFT after an SSD restore, spill hashing, merge, /health
+
+### 7.1 Why the first token took 14 to 50 s after an SSD restore (established; fixed behind the switch)
+
+Measured in-process (`m3/ssdrun.py`: one process writes a 50K conversation through the bank and cold tier, a fresh process restores it; forward calls timed with synchronisation) and with a macOS `sample` of the server during the slow request.
+- The restore is not the cost: decode of the blobs 0.5 to 1.0 s, conversion into a segment 0.14 s.
+- The suffix prefill is: the first forward of 535 tokens took 10.56 s (1.83 s on the following, RAM-restored turn), the following 64-token forward 1.34 s (0.39 s). `sample` showed the server main thread 90 % of the time in `waitUntilCompleted`, i.e. the GPU is slow, not the host.
+- The weights-eviction hypothesis is refuted: page-ins of the slow requests were 2.8 to 3.2 GiB (173k to 197k 16 KiB pages), about the size of the blobs read, not the 15.6 GB of weights; swap-ins were 16 to 507 pages; the RSS drop during the request is the bank evicting.
+- Cause: the layer types after the restore (`adapt` log) were `VllmMetalPagedKVCache`. `SessionBank._restore_cold` called `runtime.make_cache()` and ignored the request's `cache_factory`, which every RAM restore uses to build the dense contiguous layout. The SSD-restored conversation therefore prefilled and decoded on the paged layout (about 5x slower prefill, 13 against 23 tok/s decode in the in-process run) and could not become segments. This is pre-existing and also happens with the switch off (A's `ssd_clone` requests show the same 14 to 17 tok/s).
+- Fix (behind `MTPLX_SEGMENTED_KV`, `MTPLX_SEGMENTED_KV_SSD`): `_restore_cold` uses the request's cache factories. Test: `test_ssd_restore_builds_the_requests_cache_layout_only_with_the_switch` (factory used with the switch, not without).
+
+Before and after, in-process (`p3` before, `p4` after; same data, 50K, 600-token follow-up after a restart): TTFT 14.22 s to 4.25 s; first forward 10.56 s to 1.92 s; layers after the restore: 16 paged caches to 16 segment caches; peak 32.3 to 27.6 GiB; decode of the following 64 tokens 13.2 to 19.6 tok/s.
+Server (`SC1` before, `SC3` after, same scenario, bank cap 7G, switch on, prod-segkv): TTFT s50-t4 (after eviction) 16.3 s to 5.2 s; s80-t3 47.9 s to 8.3 s; after a restart r50-t5 25.4 s to 7.3 s, r80-t4 21.3 s to 7.2 s; decode of those requests 14.5 to 17.7 tok/s to 25.4 to 29.5 tok/s; peak process memory unchanged (35.5 GB). Not yet measured: the same scenario with the switch off after the same fix (that would need the fix outside the switch).
+
+### 7.2 Spill without the full-history rehash (established)
+
+`spill_entry` read every block of the history back and hashed it each turn. A sealed segment never changes, so the sha256 and size of each of its blocks lying inside one segment are kept on the segment (`KVSegment.block_digests`); the next spill references them after the tier has claimed the digest (so the orphan cleanup keeps it) and confirmed the blob file exists, and hashes only new segments and the block at each segment edge. A missing blob is rewritten. With the switch off no segmented rows exist and the codec path is unchanged.
+- Flag-off identity: `m3/ssd/store_identity.py` writes stock entries through `put_entry` and `spill_entry` and digests the whole store (blobs, payload.json without timestamps): origin/main (9882703f, a separate worktree) and the current tree give the same digest `23a6efaf9c4cf333…` (94 blob files). `pristine_check.py` still reports equal specs and bytes.
+- Tests: `test_spill_does_not_rehash_sealed_segments_it_already_hashed` (a second spill hashes under 45 % of the blocks and writes the same payload and blob digests as the stock entry of the same rows), `test_spill_rehashes_a_block_whose_blob_is_gone`.
+- Write time per turn at 80K, direct benchmark (`ssd/ssd_bench.py`, 16 layers, real shapes, persistent per-layer caches that grow by 1,024 to 4,096 rows a turn, `spill_entry`, ABBA, median of 2; before = 598127b5, after = this round): turn 0 3.61 s / 3.68 s; turn 1 2.21 s / 0.25 s; turn 2 2.28 / 0.31; turn 3 2.43 / 0.43; turn 4 2.55 / 0.58. Disk bytes identical (5.97 GB), restore 0.98 / 1.06 s. The remaining time grows with the added rows (hashing the new segment and the edge blocks).
+
+### 7.3 The tiered merge never ran, and now does (established)
+
+Reason: `compact()` merged only segments with reference count 1, but every turn's bank snapshot holds that turn's segments, so nothing was ever alone and the `merge` counter never appeared. A conversation therefore gained two segments per turn (a prompt snapshot and the final snapshot each seal the tail) and would have passed the 12 segments of one fused launch after six turns (estimate from the seal counts: 32 seals per turn over 16 layers). Fix: small adjacent segments (combined at most 16,384 rows, the older at most twice the newer) merge also when snapshots hold them; the snapshot keeps its own pieces, the merged copy is the only new memory, the large history is never copied. Tests: a held pair merges and the snapshot stays bit-identical; 24 turns with two snapshots each (every snapshot kept) stay at 12 segments or fewer.
+Model run, 12 follow-up turns of 1,024 tokens at 50K (`seg12`, one process): segments per bank entry 3, 3, 3, 4, 3, 4, 4, 3, 4, 4, 4, 5 after turns 1 to 12 (maximum 5, never near 12). Merge cost per turn: 5 to 23 ms in total over the 16 layers (16 to 48 merges, 19,584 to 231,808 merged rows summed over the layers); transient memory of one layer's merge 4.8 to 52 MiB. Peak over the turn start stays 0.9 to 1.5 GiB; ms per verify 94 to 119 (thermal noise; no trend). Conclusion for the open item: with the merge of held segments the at-rest merge of the large history is not needed for the 12-segment limit; it would only matter for the 50K history itself (not copied) and for the SSD granularity, which does not depend on segments.
+
+### 7.4 /health (established)
+
+With the switch on the session bank section of `/health` has `segmented_kv`: `enabled`, `min_tokens`, `ssd`, `prefill_route`, `entries` (session id, prefix length, segments, sealed bytes, live), `max_segments`, `sealed_bytes_unique`, `merges`, `seals`, `seal_copies`, `route_counts` and `ssd_counts` (`ssd_layer_states_encoded`, `ssd_blocks_reused`, `ssd_blocks_hashed`, `restored_stock_as_segment`). Absent with the switch off. Test: `test_health_block_is_absent_with_the_switch_off_and_reports_segments_with_it_on`.
+
+### 7.5 Suites
+
+Feature tree full suite: green on stock MLX and on `pkg-lse`; `prod-segkv` (cherry-picked, one CHANGELOG conflict resolved): green on `pkg-lse` (`m3/logs/suite-r4-*.log`). The temporary worktrees for the identity and before-measurements were removed.
