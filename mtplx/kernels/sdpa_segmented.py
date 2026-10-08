@@ -46,8 +46,11 @@ from . import sdpa_nax_flash_dsplit as _dsplit
 from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_nax_flash import _HEADER
 
-#: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel).
-SUPPORTED_HEAD_DIMS = (256,)
+#: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel; ``D`` is a
+#: template parameter, 128 runs at the halves split, 64 dims per simdgroup). The contiguous
+#: dispatcher in sdpa_nax_flash_dsplit stays 256 only: a model with head_dim 128 that does not
+#: use segments keeps exactly the routes it has today.
+SUPPORTED_HEAD_DIMS = (128, 256)
 
 #: Metal allows 31 buffer bindings: queries + 2 per segment + meta + scale + 3 outputs.
 MAX_FUSED_SEGMENTS = 12
@@ -214,7 +217,7 @@ def segment_block_counts(rows: Sequence[int], *, ndh: int = 2, wide_rows: int = 
     return [max(1, -(-int(n) // chunk)) for n in rows]
 
 
-def _route_shape(q_len: int, gqa_factor: int) -> tuple[bool, int, int] | None:
+def _route_shape(q_len: int, gqa_factor: int, head_dim: int = 256) -> tuple[bool, int, int] | None:
     """(wide, ndh, tg_m) the contiguous dispatcher would pick for this window, or None.
 
     Mirrors ``sdpa_nax_flash_dsplit._dsplit_dispatch`` and the call order in ``attention_split``:
@@ -224,7 +227,8 @@ def _route_shape(q_len: int, gqa_factor: int) -> tuple[bool, int, int] | None:
     """
     live = gqa_factor * q_len
     if live <= 32 and 1 <= q_len <= 10:
-        ndh = 4 if os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
+        # head_dim 128 keeps the halves split (quarters would leave 32 dims per simdgroup, untuned).
+        ndh = 4 if head_dim == 256 and os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
         if ndh == 4:
             from ..kernel_selfcheck import lane_disabled
 
@@ -267,7 +271,7 @@ def sdpa_nax_flash_dsplit_segments(
     if queries.ndim != 4:
         return _bail("ndim")
     bsz, hq, q_len, d = (int(x) for x in queries.shape)
-    if bsz != 1 or d != 256:
+    if bsz != 1 or d not in SUPPORTED_HEAD_DIMS:
         return _bail("shape_gate")
     if not segments:
         return _bail("no_segments")
@@ -275,7 +279,7 @@ def sdpa_nax_flash_dsplit_segments(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    shape = _route_shape(q_len, gqa_factor)
+    shape = _route_shape(q_len, gqa_factor, d)
     if shape is None:
         return _bail("route_shape")
     wide, ndh, tg_m = shape
@@ -297,7 +301,9 @@ def sdpa_nax_flash_dsplit_segments(
     if int(segments[-1][2]) < q_len:
         return _bail("tail_shorter_than_q")
 
-    if len(segments) == 1:
+    if len(segments) == 1 and d == 256:
+        # One segment is the contiguous kernel's input (bit-identical). The contiguous dispatcher is
+        # 256 only; a head_dim-128 segment goes through the fused path below.
         keys, values, n = segments[0]
         entry = _dsplit.sdpa_nax_flash_dsplit_wide if wide else _dsplit.sdpa_nax_flash_dsplit
         return entry(queries=queries, keys=keys, values=values, offset=int(n), scale=scale)
@@ -381,4 +387,4 @@ def sdpa_nax_flash_dsplit_segments(
 
 def segments_supported(q_len: int, gqa_factor: int, head_dim: int) -> bool:
     """Static part of the contract (no device work), for the route gate in attention_split."""
-    return head_dim == 256 and _route_shape(q_len, gqa_factor) is not None
+    return head_dim in SUPPORTED_HEAD_DIMS and _route_shape(q_len, gqa_factor, head_dim) is not None
