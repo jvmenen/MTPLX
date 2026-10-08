@@ -133,3 +133,29 @@ Setup: `mlx-community--Qwen3-8B-4bit` (36 full-attention layers, 32q/8kv, head_d
 - Context-copy acceptance (measured, runs `out/arcc-*`; acceptance is identical off and on for code): code turns 1 to 4 drafted/accepted 241/241, 250/242, 294/219, 255/226 (1.00, 0.97, 0.74, 0.89). Prose on: turn 1 no context-copy rounds, turns 2 to 4 243/243, 243/243, 184/181. Turn 0 (cold, no copy source): 64 drafted, 12 accepted.
 - Greedy identity off vs on: both variants deterministic run to run. Plain: first divergence at generated token 6, 2, 34, 31 (turns 1 to 4); prose: turn 1 token 60 onward; code: no divergence in any turn. Margin at the first divergence (base logits, `margin_ar.py`): plain turn 1 pos 6: tokens 374 vs 320 both 16.875, margin 0.0; prose turn 1 pos 60: 31918 vs 46494 both 32.75, margin 0.0. Both are exact bf16 ties. Margins for later divergences were not computed (histories differ from there).
 - Not measured: contexts beyond 22K on this model, sampled decoding, verify windows via an MTP head at head_dim 128 (no such model locally).
+
+## 10. Fence sweep: should the segment fence exist? (2026-10-08, Qwen3.8-27B, measured)
+
+Setup: prod-segkv tree, production env, own mode (`m3/modelrun.py`, exact bank hits: cached tokens = previous prompt + 200 in every turn, all runs). A = flag off (stock cache, compiled verify as in production). B = `MTPLX_SEGMENTED_KV=1` with `MTPLX_SEGMENTED_KV_MIN_TOKENS=0` (segments from the start, eager verify). Contexts 8K, 16K, 24K, 32K; 4 follow-up turns (1024/2048/3072/4096 new tokens); ABBA (off on on off off on), medians of 3. 50K was not re-run: Jeroen decided that `g3` (section 2 of the earlier M3 report) covers it, with the caveat that g3 ran on the feature tree at 365810aa with the default fence 32K, so segments began at the first follow-up turn; same comparison (stock compiled vs segments eager). Data: `out/f8-*`, `python3 cmp.py f8 <ctx>`.
+
+ms per verify, off -> on, turns 1 to 4:
+- 8K: 79 -> 72, 80 -> 75, 101 -> 89, 82 -> 74
+- 16K: 82 -> 75, 83 -> 76, 89 -> 78, 87 -> 78
+- 24K: 85 -> 75, 84 -> 77, 92 -> 85, 88 -> 79
+- 32K: 87 -> 80, 88 -> 82, 86 -> 80, 93 -> 86
+- 50K (g3, feature tree): 109 -> 105, 108 -> 106, 122 -> 120, 104 -> 103
+
+Segments are 3 to 12 % faster per verify at every context from 8K to 32K and equal to 4 % faster at 50K; no crossover where segments lose. Decode tok/s varies by 10 to 20 % between turns in both variants because greedy trajectories diverge at bf16 ties and acceptance differs (for example 8K turn 4: 26.7 -> 29.9, turn 3: 42.1 -> 36.8); ms per verify is the comparable number. Prefill is equal within 5 % at all contexts (8K turn 4 10.7 vs 10.6 s; 32K 12.3 vs 12.1 s; the g3 50K lse cost of +3..12 % is the one place segments are slower).
+
+Peak over turn start (GiB), off -> on, turns 1 to 4: 8K 2.22 -> 1.23, 3.31 -> 1.28, 3.45 -> 2.28, 4.83 -> 1.01; 16K 3.24 -> 1.26, 3.80 -> 1.26, 3.94 -> 1.45, 5.32 -> 1.68; 24K 3.13 -> 0.87, 3.94 -> 1.42, 4.42 -> 1.61, 5.81 -> 1.63; 32K 3.63 -> 1.09, 4.77 -> 1.23, 4.92 -> 1.50, 6.33 -> 1.76. Segments lower the peak by 1 to 4.5 GiB at every context, and the benefit grows with turns. Active memory after the put is 1 to 2 GiB lower on.
+
+Routes: in turns 1 to 4 no gather route at any context. Turn 0 (cold prefill, segments from the start because the fence is 0) shows `gather_qprefill` at all contexts, and at 8K additionally `gather_q1` 16, `gather_q4` 1,328 and `gather_q9` 32 (short-context cold decode; the gather is then over a small cache). These are only in the cold turn that the fence normally keeps on stock caches; they cost nothing measurable (8K turn 0 ms/verify 79 vs 79, 16K 88 -> 78). Thermal stayed 0 to 1 (2 once after a 50K cold prefill).
+
+Recommendation: (a) no fence. Segments are never slower per verify in this data, use less peak memory, and a fence adds an environment variable, a conversion at the boundary (one-off about 5 GiB transient at 50K to 80K) and a compiled-versus-eager switch for no measured benefit. Caveats (not measured): contexts below 8K, sampled decoding, and that compiled verify is lost with segments (the measured eager cost here is more than offset); if the default is ever set to 0 the cold-turn gather at very short contexts should be checked once, otherwise leave the fence at 0 when segments are on.
+
+### Async chunk layers with segments on (MIN_TOKENS=0)
+Question: does `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` (production) still matter with segmented eager verify, now that the strided-copy bug is fixed? a8 = 8, a0 = unset; ABBA a8 a0 a0 a8 a8 a0, medians of 3, 4 follow-up turns (`out/as-*`, `m3/cmp_as.py`).
+- 16K ms/verify a8 vs a0 (turns 1 to 4): 74 vs 91, 76 vs 92, 78 vs 89, 78 vs 84; tok/s 23.9 vs 19.7, 22.8 vs 19.0, 23.8 vs 21.0, 23.3 vs 21.8.
+- 50K ms/verify: 88 vs 92, 87 vs 92, 99 vs 103, 87 vs 92; tok/s 30.7 vs 29.5, 27.7 vs 26.6, 33.9 vs 32.8, 21.6 vs 20.7. Prefill and peak identical in both.
+- Result: async chunking still helps with segments, by 6 to 19 % per verify at 16K and 4 to 5 % at 50K; keep it at 8 (production setting). The old finding that async made segmented verify slower no longer holds. Cause of the gap at 16K not investigated.
+- Side observation: with segments from the start on the prod-segkv tree, 50K runs at 87 to 99 ms/verify against 103 to 120 in g3 on the feature tree (older code, different tree, not a controlled comparison).
