@@ -466,13 +466,18 @@ class SegmentedKVCache:
     def compact(self, *, max_segments: int | None = None) -> int:
         """Merge small recent sealed segments among themselves (geometric tiers).
 
-        Two adjacent sealed segments merge when no snapshot holds either (reference count 1:
-        this cache), the older is at most ``MTPLX_SEGMENTED_KV_TIER`` times (default 2) the
-        newer one and the result stays within ``MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS`` (default
-        16384) rows. The big history segment is never merged here: a full copy would bring the
-        duplicate back while a snapshot, a subagent or a lease references it. Copying two small
-        segments costs 0.8 ms (512 + 512 rows) to 4.1 ms (4096 + 4096 rows) for 16 layers (phase 1
-        measurement). Returns the number of merges.
+        Two adjacent sealed segments merge when the older is at most ``MTPLX_SEGMENTED_KV_TIER``
+        times (default 2) the newer one and the result stays within
+        ``MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS`` (default 16384) rows. The big history segment is
+        never merged here: a full copy would bring the duplicate back while a snapshot, a
+        subagent or a lease references it. A segment that bank snapshots also hold (reference
+        count above 1) is merged too: the merged copy is new memory (at most the merged rows,
+        released when the snapshots holding the originals go), and without it nothing would
+        ever merge, because every turn's snapshot holds that turn's segments. The segment count
+        is thereby bounded by the tier structure (logarithmic in the rows added) instead of
+        growing by two per turn. Copying two small segments costs 0.8 ms (512 + 512 rows) to
+        4.1 ms (4096 + 4096 rows) for 16 layers (phase 1 measurement). Returns the number of
+        merges.
         """
         tier = max(1, _int_env("MTPLX_SEGMENTED_KV_TIER", 2))
         cap_rows = _int_env("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", 16384)
@@ -480,11 +485,10 @@ class SegmentedKVCache:
         merged = 0
         while len(self._sealed) >= 2:
             older, newer = self._sealed[-2], self._sealed[-1]
-            alone = older.segment.refcount <= 1 and newer.segment.refcount <= 1
             small = int(older.n) + int(newer.n) <= cap_rows
             geometric = int(older.n) <= tier * int(newer.n)
-            over = len(self._sealed) > limit and alone
-            if not (alone and ((small and geometric) or over)):
+            over = len(self._sealed) > limit and small
+            if not (small and (geometric or over)):
                 break
             self._merge_last_two()
             merged += 1
