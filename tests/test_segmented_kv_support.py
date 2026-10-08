@@ -138,3 +138,11 @@ def test_configure_split_full_attention_decides_from_the_hooked_layers(monkeypat
     stats = configure_split_full_attention(model(256))
     assert stats["segmented_kv_supported"] is True
     assert segmented_kv_enabled() is True
+
+
+def test_head_dim_is_read_from_the_scale_when_the_module_has_no_attribute() -> None:
+    """mlx-lm's Qwen3 attention (head_dim 128) keeps n_heads, n_kv_heads and scale only."""
+    attn = SimpleNamespace(n_heads=32, n_kv_heads=8, scale=128**-0.5, _mtplx_gqa_packed_sdpa_enabled=True)
+    verdict = evaluate_model_support([attn])
+    assert verdict["supported"], verdict
+    assert verdict["head_dims"] == [128] and verdict["gqa"] == [4]
