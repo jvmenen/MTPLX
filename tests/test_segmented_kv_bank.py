@@ -262,3 +262,24 @@ def test_admission_prices_no_history_copy_for_a_segmented_entry(monkeypatch) -> 
     assert _admission_restore_copies_prefix(seg_entry, "clone", "x") is False
     assert _admission_restore_copies_prefix(seg_entry, "reference", "x") is False
     assert _admission_restore_copies_prefix(stock_entry, "clone", "y") is True
+
+
+def test_health_block_is_absent_with_the_switch_off_and_reports_segments_with_it_on(monkeypatch) -> None:
+    monkeypatch.delenv("MTPLX_SEGMENTED_KV", raising=False)
+    bank = _bank(monkeypatch)
+    runtime = Runtime("segmented")
+    tokens = list(range(BASE))
+    _, entry = _turn(bank, runtime, tokens, BASE, 1, "s")
+    tokens2 = tokens + list(range(BASE * 10, BASE * 10 + TURN))
+    _turn(bank, runtime, tokens2, TURN, 2, "s", prev=tokens)
+    assert "segmented_kv" not in bank.to_dict()
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")
+    block = bank.to_dict()["segmented_kv"]
+    assert block["enabled"] is True and block["entries"]
+    assert block["max_segments"] >= 2
+    assert block["sealed_bytes_unique"] > 0
+    assert {"route_counts", "ssd_counts", "merges", "seals", "min_tokens"} <= set(block)
+    assert all(e["segments"] >= 1 and e["sealed_bytes"] > 0 for e in block["entries"])
+    import json
+
+    json.dumps(block)  # /health serialises it

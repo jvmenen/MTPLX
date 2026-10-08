@@ -155,6 +155,12 @@ def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | 
 _SEGMENTED_FINGERPRINT_BLOCKS = 16
 
 
+def _count_ssd(route: str) -> None:
+    from mtplx.segmented_kv import _count
+
+    _count(route)
+
+
 def _is_segmented_state(value: Any) -> bool:
     """True for a SegmentedKVState; never imports the segmented module when it is not loaded."""
     module = sys.modules.get("mtplx.segmented_kv")
@@ -182,6 +188,12 @@ class TreeCodec:
         self.reuse = reuse
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
+        # Streaming writer hooks for segmented rows (MTPLX_SEGMENTED_KV, spill_entry): a block
+        # inside one sealed segment that an earlier spill already hashed is referenced
+        # (known_blob confirms the blob is still on disk) instead of read back and hashed again;
+        # on_block records the digest of every block that was hashed.
+        self.known_blob: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+        self.on_block: Callable[[Any, int, int, str], None] | None = None
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -263,7 +275,9 @@ class TreeCodec:
         if _is_segmented_state(value):
             # MTPLX_SEGMENTED_KV: the same spec and blobs as the stock (keys, values) tuple of
             # the same rows; the history is sliced block by block, never gathered.
-            from mtplx.segmented_kv import segmented_state_tensors
+            from mtplx.segmented_kv import _count, segmented_state_tensors
+
+            _count("ssd_layer_states_encoded")
 
             return {
                 "kind": "tuple",
@@ -412,8 +426,29 @@ class TreeCodec:
                         }
                     )
                     continue
+            seg_rows = value if hasattr(value, "known_digest") and self.known_blob is not None else None
+            if seg_rows is not None:
+                known = seg_rows.known_digest(start, end)
+                known = self.known_blob(known) if known is not None else None
+                if known is not None:
+                    _count_ssd("ssd_blocks_reused")
+                    self.reused[name] = dict(known)
+                    total += int(known["nbytes"])
+                    blocks.append(
+                        {
+                            "name": name,
+                            "start": int(start),
+                            "end": int(end),
+                            "shape": [int(dim) for dim in chunk.shape],
+                            "nbytes": int(known["nbytes"]),
+                        }
+                    )
+                    continue
             raw = self._materialize("block", chunk)
             self.tensors[name] = raw
+            if seg_rows is not None and self.on_block is not None:
+                _count_ssd("ssd_blocks_hashed")
+                self.on_block(seg_rows, int(start), int(end), name)
             total += len(raw)
             blocks.append(
                 {

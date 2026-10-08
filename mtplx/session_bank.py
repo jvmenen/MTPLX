@@ -38,6 +38,7 @@ from .runtime_options import block_prefix_restore_enabled
 from .segmented_kv import (
     SegmentedKVCache,
     SegmentedKVState,
+    segmented_kv_health,
     segmented_ssd_enabled,
     walk_segmented_states,
 )
@@ -2953,6 +2954,13 @@ class SessionBank:
         return bool(flush(timeout_s=timeout_s))
 
     def to_dict(self) -> dict[str, Any]:
+        payload = self._to_dict()
+        segmented = segmented_kv_health(list(self._entries.values()))
+        if segmented is not None:
+            payload["segmented_kv"] = segmented  # MTPLX_SEGMENTED_KV only; absent otherwise
+        return payload
+
+    def _to_dict(self) -> dict[str, Any]:
         return {
             "max_entries": self.max_entries,
             "max_bytes": self.max_bytes,

@@ -119,7 +119,7 @@ class KVSegment:
     The tail of a cache is an unsealed segment: only its owner writes it.
     """
 
-    __slots__ = ("__weakref__", "_holders", "id", "keys", "sealed", "values")
+    __slots__ = ("__weakref__", "_holders", "block_digests", "id", "keys", "sealed", "values")
 
     def __init__(self, keys: mx.array, values: mx.array, *, sealed: bool = False) -> None:
         self.id = next(_SEGMENT_IDS)
@@ -127,6 +127,9 @@ class KVSegment:
         self.values = values
         self.sealed = bool(sealed)
         self._holders: weakref.WeakSet[Any] = weakref.WeakSet()
+        # SSD tier: sha256 and size of the 256-row blocks of this (immutable) segment that a
+        # spill already hashed, keyed (is_values, first_row, last_row) in segment rows.
+        self.block_digests: dict[tuple[bool, int, int], dict[str, Any]] = {}
 
     @property
     def capacity(self) -> int:
@@ -798,6 +801,8 @@ def adapt_layer_for_restore(cache: list[Any], idx: int, state: Any) -> tuple[Any
     floor = segmented_kv_min_tokens()
     want = rows > floor if floor > 0 else isinstance(entry, SegmentedKVCache)
     if want and not isinstance(entry, SegmentedKVCache):
+        if not isinstance(state, SegmentedKVState):
+            _count("restored_stock_as_segment")  # a stock snapshot (SSD restore, stock bank entry)
         entry = SegmentedKVCache(step=int(getattr(entry, "step", 256)))
         entry._mtplx_segmentable = True
         cache[idx] = entry
@@ -907,6 +912,32 @@ class SegmentedRows:
             return mx.zeros((*self.shape[:2], 0, self.shape[3]), self.dtype)
         return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
 
+    def _block_home(self, start: int, stop: int) -> tuple[KVSegment, int, int] | None:
+        """(segment, first, last row in segment rows) when the block lies in one sealed segment."""
+        offset = 0
+        for ref in self._refs:
+            lo, hi = offset, offset + int(ref.n)
+            if lo <= start and stop <= hi:
+                seg = ref.segment
+                return (seg, start - lo, stop - lo) if seg.sealed else None
+            offset = hi
+        return None
+
+    def known_digest(self, start: int, stop: int) -> dict[str, Any] | None:
+        """The blob a spill already wrote for this block, when it lies inside one sealed segment."""
+        home = self._block_home(start, stop)
+        if home is None:
+            return None
+        seg, lo, hi = home
+        hit = seg.block_digests.get((self._values, lo, hi))
+        return dict(hit) if hit is not None else None
+
+    def remember_digest(self, start: int, stop: int, blob: dict[str, Any]) -> None:
+        home = self._block_home(start, stop)
+        if home is not None:
+            seg, lo, hi = home
+            seg.block_digests[(self._values, lo, hi)] = {"sha256": str(blob["sha256"]), "nbytes": int(blob["nbytes"])}
+
     def __getitem__(self, index: Any) -> mx.array:
         if not isinstance(index, tuple) or len(index) != 4 or not all(
             isinstance(i, slice) and i == slice(None) for k, i in enumerate(index) if k != 2
@@ -923,6 +954,59 @@ def segmented_state_tensors(state: SegmentedKVState) -> tuple[SegmentedRows, Seg
     """(keys, values) of a snapshot for the SSD codec; refs dropped to zero rows are skipped."""
     refs = [r for r in state.refs if int(r.n) > 0]
     return SegmentedRows(refs, values=False), SegmentedRows(refs, values=True)
+
+
+# ---- /health ------------------------------------------------------------------------------
+
+
+def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
+    """The segmented-KV block of /health, None when the switch is off (the key is then absent).
+
+    ``entries`` are the session bank's entries. Per entry: the segment count of its snapshot
+    (largest over the layers) or of its live cache, and the bytes of the segments it references.
+    """
+    if not segmented_kv_enabled():
+        return None
+    per_entry: list[dict[str, Any]] = []
+    unique: dict[int, int] = {}
+    for entry in entries:
+        counts: list[int] = []
+        sealed_bytes = 0
+        snapshot = getattr(entry, "cache_snapshot", None)
+        for state in walk_segmented_states(snapshot.states) if snapshot is not None else ():
+            counts.append(len(state.refs))
+            sealed_bytes += int(state.nbytes)
+            for ref in state.refs:
+                unique.setdefault(ref.segment.id, int(ref.segment.nbytes))
+        live = getattr(entry, "cache_ref", None)
+        for layer in live or ():
+            if isinstance(layer, SegmentedKVCache):
+                counts.append(layer.segment_count)
+        if counts:
+            per_entry.append(
+                {
+                    "session_id": getattr(entry, "session_id", None),
+                    "prefix_len": getattr(entry, "prefix_len", None),
+                    "segments": max(counts),
+                    "sealed_bytes": sealed_bytes,
+                    "live": bool(live),
+                }
+            )
+    counts_now = dict(route_counts)
+    return {
+        "enabled": True,
+        "min_tokens": segmented_kv_min_tokens(),
+        "ssd": segmented_ssd_enabled(),
+        "prefill_route": prefill_route(),
+        "entries": per_entry,
+        "max_segments": max((e["segments"] for e in per_entry), default=0),
+        "sealed_bytes_unique": sum(unique.values()),
+        "merges": counts_now.get("merge", 0),
+        "seals": counts_now.get("seal", 0),
+        "seal_copies": counts_now.get("seal_copy", 0),
+        "route_counts": counts_now,
+        "ssd_counts": {k: v for k, v in counts_now.items() if k.startswith("ssd_")},
+    }
 
 
 # ---- accounting -----------------------------------------------------------------------------

@@ -224,3 +224,75 @@ def test_a_stock_entry_on_disk_restores_with_the_switch_on_as_segments(monkeypat
     restore_cache(cache, snap)
     assert all(isinstance(c, SegmentedKVCache) and c.offset == 1101 for c in cache)
     assert mx.array_equal(cache[0].gather()[0], stock[0].state[0]).item()
+
+
+def _count_block_units(monkeypatch):
+    from mtplx.cache_bank import codec as codec_module
+
+    calls = []
+    original = codec_module.TreeCodec._materialize
+
+    def counting(self, kind, array):
+        calls.append(kind)
+        return original(self, kind, array)
+
+    monkeypatch.setattr(codec_module.TreeCodec, "_materialize", counting)
+    return calls
+
+
+def _grown(seg, extra_rows, seed):
+    """The same segments plus one more sealed segment (the next turn)."""
+    out = []
+    for layer in seg:
+        c = SegmentedKVCache()
+        c.state = layer.state
+        c.update_and_fetch(_rand(seed, extra_rows), _rand(seed + 1, extra_rows))
+        c.seal()
+        out.append(c)
+    return out
+
+
+def test_spill_does_not_rehash_sealed_segments_it_already_hashed(monkeypatch, tmp_path) -> None:
+    seg, _ = _segmented_and_stock(lens=(4000, 700, 90))
+    for layer in seg:
+        layer.seal()
+    calls = _count_block_units(monkeypatch)
+    tier = _tier(tmp_path / "seg")
+    assert tier.spill_entry(_Entry(seg, range(4790)))
+    first = calls.count("block")
+    grown = _grown(seg, 300, 500)
+    calls.clear()
+    assert tier.spill_entry(_Entry(grown, range(5090)))
+    second = calls.count("block")
+    assert first > 40 and second < 0.45 * first, (first, second)
+    # and the result is what the stock cache of the same rows writes
+    stock = []
+    for layer in grown:
+        k, v = layer.gather()
+        c = KVCache()
+        c.keys, c.values, c.offset = k, v, k.shape[2]
+        stock.append(c)
+    ref = _tier(tmp_path / "stock")
+    assert ref.spill_entry(_Entry(stock, range(5090)))
+    assert _blobs(tier).keys() >= _blobs(ref).keys()
+    eid = lambda t, e: t._metadata_for_entry(e, capabilities=(), payload_nbytes=0)["entry_id"]
+    a = _entry_json(tier, _Entry(grown, range(5090)))
+    b = _entry_json(ref, _Entry(stock, range(5090)))
+    assert a["payload_spec"] == b["payload_spec"] and a["tensor_blobs"] == b["tensor_blobs"]
+    assert eid(tier, _Entry(grown, range(5090))) == eid(ref, _Entry(stock, range(5090)))
+
+
+def test_spill_rehashes_a_block_whose_blob_is_gone(monkeypatch, tmp_path) -> None:
+    seg, _ = _segmented_and_stock(lens=(1500, 700))
+    for layer in seg:
+        layer.seal()
+    tier = _tier(tmp_path / "seg")
+    assert tier.spill_entry(_Entry(seg, range(2200)))
+    full = max(p.stat().st_size for p in (tier.base_dir / "blobs").rglob("*.bin"))
+    victims = [p for p in sorted((tier.base_dir / "blobs").rglob("*.bin")) if p.stat().st_size == full][:5]
+    for blob in victims:
+        blob.unlink()
+    grown = _grown(seg, 256, 700)
+    assert tier.spill_entry(_Entry(grown, range(2456)))
+    for blob in victims:
+        assert blob.exists()  # rewritten from the live rows
