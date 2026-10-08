@@ -159,3 +159,13 @@ Question: does `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` (production) still matter wit
 - 50K ms/verify: 88 vs 92, 87 vs 92, 99 vs 103, 87 vs 92; tok/s 30.7 vs 29.5, 27.7 vs 26.6, 33.9 vs 32.8, 21.6 vs 20.7. Prefill and peak identical in both.
 - Result: async chunking still helps with segments, by 6 to 19 % per verify at 16K and 4 to 5 % at 50K; keep it at 8 (production setting). The old finding that async made segmented verify slower no longer holds. Cause of the gap at 16K not investigated.
 - Side observation: with segments from the start on the prod-segkv tree, 50K runs at 87 to 99 ms/verify against 103 to 120 in g3 on the feature tree (older code, different tree, not a controlled comparison).
+
+## 11. Decision: one path, no fence; verification run (2026-10-09, measured)
+Jeroen approved option (a). With `MTPLX_SEGMENTED_KV=1` the full-attention layers are segment caches from the first token; the fence, the `MTPLX_SEGMENTED_KV_MIN_TOKENS` setting and the stock-below-the-fence plus conversion code are removed (feature tree 653fe78b and 26660492, prod-segkv e15cab29 and 5a0229e0). Flag off is unchanged: the store digest of `store_identity.py` is the same as before (23a6efaf...) and `pristine_check.py` reports spec, tensors and fingerprints equal.
+
+Gather counters: the cold-turn `gather_*` routes were calls over a single segment, where the gathered view is the segment's own rows (no copy). They now count as `single_q*` (the stock route on a zero-copy view, as the stock cache does); `gather_q*` means a real concatenation. In addition, calls over several segments take the fused kernel at any length (the packed-route length threshold applies to one-segment caches only), which removes the real gathers that short follow-up turns (below 8K) had.
+
+Verification, Qwen3.8-27B, prod-segkv, flag on, no fence setting, one run each (not ABBA), own mode:
+- 8K: no `gather_*` in any turn; cold turn: `single_qprefill` 64, `single_q1` 16; ms/verify 84, 86, 89, 104, 91 (turns 0 to 4; f8 on: 79 to 89 for turns 0 to 4 of the same series); bank hits exact in all 4 follow-ups (cached = previous prompt + 200); peak above turn start 1.26, 1.29, 2.23, 1.19 GiB in turns 1 to 4 (f8: 1.23 to 2.28).
+- 50K: no `gather_*` in any turn; cold turn `single_qprefill` 240; ms/verify 100, 102, 100, 112, 101 (g3 on: 105, 106, 120, 103; async check on: 87 to 99); cold prefill 149 s with thermal level 2 at the end of turn 0 (earlier runs 127 s); bank hits exact; peak 0.90, 1.11, 1.58, 1.89 GiB in turns 1 to 4.
+- Not measured: ABBA repeats of this build (single runs are within the run-to-run spread of earlier tables but cannot show differences below about 5 %).
