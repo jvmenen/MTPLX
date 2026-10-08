@@ -192,9 +192,9 @@ Server run, Qwen3.8-27B, A B B A (port 8010): stock had one HTTP 507 and 8 sheds
 | Case | Stock | Segmented | Source |
 |---|---|---|---|
 | Fork of an 80K conversation on disk | +5.4 GB | +146 MB | direct cold-tier bench, [segmented-kv-ssd](2026-10-08-segmented-kv-ssd.md) section 4 |
-| Per-turn spill write at 80K | 2.2 to 2.6 s | 0.25 to 0.58 s (same bytes on disk, 5.97 GB) | section 7.2 |
-| TTFT after eviction (bank cap 7G), 50K / 80K | cold 143 s / 248 s | 5.2 s / 8.3 s | section 7.1 |
-| TTFT after a server restart, 50K / 80K | cold 70 s (50K) | 7.3 s / 7.2 s | section 7.1 |
+| Per-turn spill write at 80K | 2.2 to 2.6 s | 0.25 to 0.58 s (same bytes on disk, 5.97 GB) | [segmented-kv-ssd](2026-10-08-segmented-kv-ssd.md) section 7.2 |
+| TTFT after eviction (bank cap 7G), 50K / 80K | cold 143 s / 248 s | 5.2 s / 8.3 s | [segmented-kv-ssd](2026-10-08-segmented-kv-ssd.md) section 7.1 |
+| TTFT after a server restart, 50K / 80K | 25.4 s / 21.3 s (segmented, before the restore-layout fix; stock restores at about the same speed) | 7.3 s / 7.2 s | [segmented-kv-ssd](2026-10-08-segmented-kv-ssd.md) section 7.1 |
 | Process peak with eviction | 41.4 GB | 35.5 to 37.3 GB | section 5 |
 
 The restore speed-up came from a separate fix: `_restore_cold` ignored the request's cache factory and built a paged KV cache (about 5x slower prefill, slower decode). That bug also exists in stock without the flag; the fix is only behind the flag so far (finding 115, open as a separate PR).
