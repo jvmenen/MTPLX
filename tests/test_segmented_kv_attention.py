@@ -163,12 +163,13 @@ def test_wide_verify_windows_run_on_the_segments_without_a_gather(lane, window) 
 
 @pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
 @pytest.mark.parametrize("cold_rows", [3000, 9000])
-def test_no_gather_route_fires_in_a_cold_turn_or_in_follow_up_turns(lane, cold_rows) -> None:
+def test_no_gather_route_fires_in_a_cold_turn_or_in_follow_up_turns(lane, cold_rows, monkeypatch) -> None:
     """One path with the switch on: a cold prompt (below and above the packed threshold) and the
     follow-up turns after it never gather the history. A single-segment call runs the stock
     route over a zero-copy view (``single_q*``); several segments take the kernels."""
     import mtplx.segmented_kv as module
 
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_PREFILL", "lse")  # the LSE route also runs (reference) without the MLX kernel
     module.route_counts.clear()
     cache = SegmentedKVCache()
     for seed, n in ((1, cold_rows // 2), (2, cold_rows - cold_rows // 2)):  # cold prefill, two chunks
