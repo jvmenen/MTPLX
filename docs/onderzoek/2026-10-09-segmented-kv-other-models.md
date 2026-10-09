@@ -66,3 +66,47 @@ Caveat (checked): with the `sustained` profile, which `mtplx_runtime.json` recom
 - Step 2, Gemma 4: segment kernel at head_dim 512 (NDH 4), a Gemma-specific hook for full layers on a segmented cache (sliding layers unchanged), a segment handle as the drafter's full-attention shared KV, the pair runtime's touch points (cache factory, cache arrays, bank extra state, compiled-verify promotion), a verdict for the pair path over the full layers only; tests (kernel vs fp32 reference, no gather, flag-off identity), GPU off/on at 16K and the largest context.
 - Step 3, Mistral: plain no-norm attention form in the hook and the support check, tests, AR runs; context-copy runs need the AR context copy on the measured tree (decision open).
 - Side finding to fix separately: the generic hook breaks Gemma 4 on `mtp=False`; `configure_split_full_attention` should skip attention classes whose `__call__` has a different signature.
+
+## 4. Segments under the `sustained` profile (VONDSTEN 122)
+
+### Why the two switches are turbo-only
+
+`turbo` is `SUSTAINED_PREFILL_ENV` plus a bundle: NAX verify matmuls, compiled verify, `MTPLX_GQA_PACKED_SDPA=1` (+threshold 8192, since 2.0.0) and `MTPLX_NAX_FLASH_ROUTE=1` (3096f9ea, 2 Sep). The bundle is assigned per model by measurement under a flat-or-better rule (`docs/profiles.md`, `docs/releases/v2.0.1.md`): the 35B-A3B MoE models stay on sustained because "their expert layers bypass the current kernel patch" (the NAX verify matmuls), Gemma 4 because its assistant pair does not use the native verify path, the 4B because turbo measured slightly slower. No reason is given against the two attention switches themselves; they were never evaluated separately on the sustained models. The flash route has a hardware gate since #459: on M1 to M4 (or macOS before 26.2) it is unavailable, so there `nax_unavailable` switches segments off under any profile.
+
+### What segments use the switches for (from code)
+
+- `MTPLX_GQA_PACKED_SDPA`: the hook only calls `decode_segments_attention` when `_mtplx_gqa_packed_sdpa_enabled` is set, and reads the packed threshold (8192) for a cache that is still one segment. The scalar packed kernel itself is never used by segments.
+- `MTPLX_NAX_FLASH_ROUTE`: `decode_segments_attention` returns None without it; the segment kernel is the NAX head-dim-split kernel.
+- Both: the kernel self-check probes `nax_flash_dsplit_sdpa` only when both are on (`kernel_selfcheck.py`), and the self-check runs only when one of a list of switches is on. Under sustained with only the segment switch, the segment kernel would serve without a boot probe.
+- The verdict requires both (`gqa_packed_sdpa_off`, `nax_flash_route_off`).
+
+Two further holes, profile independent: the verdict is made before the self-check (`runtime.py`: `configure_split_full_attention` at load, `maybe_run_model_selfcheck` after it), and a self-check that disables `nax_flash_dsplit_sdpa` makes `decode_segments_attention` return None, so every multi-segment call then gathers the history (the case the verdict exists to prevent). Also, the hook's early exit (`route_off`) sends a segmented cache to the stock forward (a gather per call) under a profile that enables no attention route at all; sustained enables one through `MTPLX_VLLM_METAL_PAGED_ATTN`, so it is not hit there.
+
+### Measured cost (GPU, gate.sh)
+
+Qwen3.6-35B-A3B Optimized-Speed (the sustained default), `sustained` profile, pkg-lse MLX, 50K prefix plus 4 follow-up turns (1-4K new tokens, 200 decoded, greedy, own mode, real `SessionBank`), feature tree c3119c7f (detached snapshot). Variants: `off` = sustained; `on` = sustained + `MTPLX_SEGMENTED_KV=1` + the two switches (what the fix below would give); `offsw` = sustained + the two switches, no segments. Order off on offsw offsw on off off on offsw, medians of 3, thermal 0 throughout. Data `other-models/out/sus-50000-*.json`, `python3 cmp3.py sus 50000`.
+
+| turn | ms per verify off / on / offsw | decode tok/s off / on / offsw | peak over turn start GiB off / on / offsw | prefill s (all three) |
+|---|---|---|---|---|
+| 0 (cold) | 35.4 / 26.1 / 27.3 | 54.0 / 67.5 / 66.6 | 4.29 / 4.29 / 4.29 | 25.7 |
+| 1 | 40.0 / 30.6 / 31.9 | 66.3 / 81.7 / 79.7 | 2.68 / 0.73 / 2.68 | 1.0 |
+| 2 | 33.9 / 25.1 / 24.6 | 47.4 / 51.6 / 58.2 | 2.75 / 0.45 / 2.75 | 1.7 |
+| 3 | 41.2 / 30.5 / 33.1 | 49.7 / 64.1 / 60.3 | 2.79 / 0.60 / 2.79 | 2.7 |
+| 4 | 36.7 / 26.6 / 27.0 | 38.8 / 45.6 / 45.7 | 3.34 / 0.76 / 3.34 | 3.6 |
+
+- Route counters `on`: no `gather_q*`; `fused_q1..4`, `chunked_q9/13/25`, `sdpa_lse_kernel` 1140, `merge` 210 (sums over 3 runs). Active memory after the turn 1.9 to 2.0 GiB lower with segments.
+- The ms per verify gain (24 to 28 % with segments, 20 to 27 % for `offsw`) comes from the attention kernel, not from the segments. Segments add the memory gain (peak above turn start 2.7 to 3.3 GiB down to 0.45 to 0.76) at the same speed as `offsw`. Decode tok/s differs more between variants than ms per verify because the outputs diverge and acceptance differs per trajectory.
+- Every variant is deterministic run to run. `on` and `offsw` both diverge from `off` (first divergence at 12 to 166 tokens): a different attention kernel, expected at bf16 ties; margins at the first divergence are queued (`out/sus-margin-*.json`).
+
+### Proposed fix (smallest safe, not implemented)
+
+Segments stop depending on the two switches and honour them only as kill switches:
+
+1. Verdict: drop `gqa_packed_sdpa_off`; `nax_flash_route_off` only when `MTPLX_NAX_FLASH_ROUTE=0` is set explicitly; `nax_unavailable` stays.
+2. Hook: a segmented cache always takes `decode_segments_attention` (no `_mtplx_gqa_packed_sdpa_enabled` check), and the `route_off` early exit does not apply to a segmented cache. The one-segment threshold keeps 8192 as its default.
+3. `decode_segments_attention`: the flash-route check becomes "not switched off".
+4. Self-check: runs when `MTPLX_SEGMENTED_KV` is requested and probes `nax_flash_dsplit_sdpa` (at the model's head_dim, 128 or 256); `segmented_kv_enabled()` is False when that lane is disabled, so a failed probe means stock caches, never a gather per call. This also closes the hole under turbo.
+
+With the switch off nothing changes (all four points sit behind `segmented_kv_requested()` or a segmented cache). With the switch on under sustained, the full-attention layers run on the same NAX kernel turbo already ships on M5-class GPUs; the dense attention of other layers and the MTP head keep sustained's routes. Cost per the table: none measured; faster verify and lower peak.
+
+Separate question, outside segments: the two switches alone gave 20 to 27 % fewer ms per verify on Qwen3.6-35B-A3B under sustained (one model, one context, M5 Max). That is a case for evaluating them for the sustained models upstream, under the flat-or-better rule; not part of the segmented KV PR.
