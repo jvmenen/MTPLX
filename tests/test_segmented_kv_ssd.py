@@ -296,3 +296,50 @@ def test_spill_rehashes_a_block_whose_blob_is_gone(monkeypatch, tmp_path) -> Non
     assert tier.spill_entry(_Entry(grown, range(2456)))
     for blob in victims:
         assert blob.exists()  # rewritten from the live rows
+
+
+class _FakeRuntime:
+    from pathlib import Path as _P
+
+    model_path = _P("models/example")
+    mtp_enabled = False
+
+    def __init__(self):
+        self.made = 0
+
+    def make_cache(self):
+        self.made += 1
+        return [KVCache() for _ in range(2)]
+
+
+@pytest.mark.parametrize("flag", ["1", ""])
+def test_ssd_restore_builds_the_requests_cache_layout_with_and_without_the_switch(monkeypatch, tmp_path, flag) -> None:
+    """The SSD restore builds the request's cache layout, with or without segments (the fix itself and
+    its own tests are in tests/test_ssd_restore_cache_layout.py)."""
+    from mtplx.session_bank import SessionBank
+
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MIN_TOKENS", "100000")  # stock layers stay stock
+    if flag:
+        monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")
+    else:
+        monkeypatch.delenv("MTPLX_SEGMENTED_KV", raising=False)
+    runtime = _FakeRuntime()
+    tier = _tier(tmp_path / "t")
+    bank = SessionBank(cold_tier=tier)
+    cache = [KVCache() for _ in range(2)]
+    for c in cache:
+        c.update_and_fetch(_rand(1, 700), _rand(2, 700))
+    tokens = list(range(700))
+    bank.put(runtime=runtime, token_ids=tokens, cache=cache, logits=mx.zeros((1, 8)), hidden=None, session_id="s")
+    assert tier.flush(timeout_s=30.0)
+    fresh = SessionBank(cold_tier=tier)
+    made_by_factory = []
+
+    def factory():
+        made_by_factory.append(1)
+        return [KVCache() for _ in range(2)]
+
+    restored = fresh.restore(runtime, tokens + [701, 702], session_id="s", cache_factory=factory)
+    assert restored is not None and restored.restore_mode == "ssd_clone"
+    assert made_by_factory
+    assert restored.cache[0].offset == 700
