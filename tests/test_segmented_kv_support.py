@@ -260,3 +260,72 @@ def test_with_the_lse_kernel_there_is_no_note(monkeypatch, capsys) -> None:
     monkeypatch.setattr(module, "_SDPA_LSE", True)
     evaluate_model_support([_attn()])
     assert "no logsumexp output" not in capsys.readouterr().out
+
+
+def _llama_attention(head_dim=32, q=4, kv=2, hidden=64, bias=False):
+    from mlx_lm.models.llama import Attention, ModelArgs
+
+    args = ModelArgs(
+        model_type="mistral", hidden_size=hidden, num_hidden_layers=1, intermediate_size=64, num_attention_heads=q,
+        rms_norm_eps=1e-5, vocab_size=64, head_dim=head_dim, num_key_value_heads=kv, rope_theta=1e6,
+        attention_bias=bias, tie_word_embeddings=False,
+    )
+    mx.random.seed(0)
+    return Attention(args)
+
+
+def test_llama_style_attention_is_recognised_and_other_forms_are_not() -> None:
+    from mtplx.attention_split import (
+        _attention_has_gated_q_proj,
+        _attention_has_plain_q_proj,
+        _attention_has_unnormed_q_proj,
+    )
+
+    llama = _llama_attention()
+    assert _attention_has_unnormed_q_proj(llama)
+    assert not _attention_has_plain_q_proj(llama) and not _attention_has_gated_q_proj(llama)
+    assert not _attention_has_unnormed_q_proj(_qwen3_attention())  # has q/k norm: the plain form
+    assert not _attention_has_unnormed_q_proj(SimpleNamespace(q_proj=None, n_heads=4, head_dim=32))
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_llama_style_attention_is_hooked_for_segmented_caches_only_and_matches_the_stock_forward(bias) -> None:
+    """Llama/Mistral attention (no q/k norm) goes through the hook body only on a segmented cache; with
+    a stock cache, switch on or off, it is the unchanged mlx-lm forward bit for bit."""
+    from mtplx.attention_split import _install_split_attention_hook
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    attn = _llama_attention(bias=bias)
+
+    def run(cache):
+        outs = []
+        for seed, n in ((1, 40), (2, 9), (3, 1)):
+            x = mx.random.normal((1, n, 64), key=mx.random.key(seed))
+            outs.append(attn(x, mask="causal" if n > 1 else None, cache=cache))
+        mx.eval(outs)
+        return outs
+
+    before = run(KVCache())
+    _install_split_attention_hook(attn)
+    for enabled in (False, True):
+        attn._mtplx_split_full_attention_enabled = enabled
+        for a, b in zip(before, run(KVCache())):
+            assert mx.array_equal(a, b).item()
+    attn._mtplx_split_full_attention_enabled = True
+    cache = SegmentedKVCache()
+    seg = run(cache)
+    cache.seal()
+    for a, b in zip(before, seg):
+        assert float(mx.abs(a - b).max().item()) < 1e-4  # same math on the gathered rows (CPU: no kernel)
+    assert cache.offset == 50
+
+
+def test_the_hook_covers_llama_style_attention_in_the_support_check(monkeypatch) -> None:
+    from mtplx.attention_split import configure_split_full_attention
+
+    attn = _llama_attention(head_dim=128, q=8, kv=2, hidden=128)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)]))
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
+    stats = configure_split_full_attention(model)
+    assert stats["segmented_kv_supported"] is True
+    assert model_support()["head_dims"] == [128] and model_support()["gqa"] == [4]
