@@ -24,9 +24,10 @@ Env contract (all default-off):
 Binding: Qwen4's native MTP route takes the full-vocabulary wrapper through
 its bind hook; the generic ``mtp_patch`` route (dense Qwen3.5 / Qwen3.8)
 takes it in ``_mtplx_draft_lm_head`` (``_bind_full_head``). The server turns
-the builtin table on by default for Flash-Next packs with a Q8/g64 lm_head
-and for dense Qwen3.8 packs with a configured affine draft head; an explicit
-``MTPLX_FRSPEC_DRAFT=0`` export turns it off.
+the builtin table on by default only for Flash-Next packs with a Q8/g64
+lm_head (an explicit ``MTPLX_FRSPEC_DRAFT=0`` export turns it off there); on
+every other pack, dense Qwen3.5 / Qwen3.8 included, it stays opt-in with
+``MTPLX_FRSPEC_DRAFT=1``.
 """
 
 from __future__ import annotations
