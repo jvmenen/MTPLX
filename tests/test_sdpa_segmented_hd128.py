@@ -180,6 +180,60 @@ def test_attention_layer_at_head_dim_128_matches_the_stock_cache_through_turns_a
         assert float(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item()) / ulp <= 4
 
 
+@needs_nax
+def test_llama_style_attention_at_head_dim_128_matches_the_stock_cache_through_turns_and_rollback(monkeypatch) -> None:
+    """Mistral-7B shapes (32 query / 8 KV heads, head_dim 128, no q/k norm) through the attention_split ladder."""
+    from types import SimpleNamespace
+
+    from mlx.utils import tree_map
+    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.llama import Attention, ModelArgs
+
+    from mtplx.attention_split import configure_split_full_attention
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    for name in ("MTPLX_GQA_PACKED_SDPA", "MTPLX_NAX_FLASH_ROUTE"):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "0")
+    hidden = 256
+    args = ModelArgs(
+        model_type="mistral", hidden_size=hidden, num_hidden_layers=1, intermediate_size=64, num_attention_heads=HQ,
+        rms_norm_eps=1e-5, vocab_size=64, head_dim=D, num_key_value_heads=HK, rope_theta=1e6, tie_word_embeddings=False,
+    )
+    mx.random.seed(0)
+    attn = Attention(args)
+    attn.update(tree_map(lambda p: p.astype(mx.bfloat16), attn.parameters()))
+    mx.eval(attn.parameters())
+    configure_split_full_attention(SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])))
+
+    def x(seed, n):
+        return (mx.random.normal((1, n, hidden), key=mx.random.key(seed)) * 0.5).astype(mx.bfloat16)
+
+    def run(cache):
+        outs = [attn(x(1, 9000), mask="causal", cache=cache)]
+        if isinstance(cache, SegmentedKVCache):
+            state = cache.state
+            cache = SegmentedKVCache()
+            cache.state = state
+        outs.append(attn(x(2, 300), mask="causal", cache=cache))
+        for seed, window in ((4, 4), (5, 4), (6, 9), (7, 1)):
+            outs.append(attn(x(seed, window), mask="causal" if window > 1 else None, cache=cache))
+            cache.trim(max(1, window - 2))
+        mx.eval(outs)
+        return outs, cache
+
+    stock, _ = run(KVCache())
+    module.route_counts.clear()
+    seg, cache = run(SegmentedKVCache())
+    assert cache.segment_count >= 2
+    assert not any(k.startswith("gather_q") and k[8:].isdigit() for k in module.route_counts), module.route_counts
+    assert any(k.startswith("fused_q") for k in module.route_counts), module.route_counts
+    for a, b in zip(stock, seg):
+        top = float(mx.maximum(mx.abs(a).max(), mx.abs(b).max()).item())
+        ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
+        assert float(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item()) / ulp <= 4
+
+
 def _low_gqa_cache(hk: int, d: int, window: int, seed: int = 11):
     """Two sealed segments plus a tail whose last ``window`` rows are the verify window."""
     from mtplx.segmented_kv import SegmentedKVCache
