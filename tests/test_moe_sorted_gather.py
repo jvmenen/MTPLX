@@ -105,7 +105,11 @@ def test_pad_rule(guard_on, rows, pad):
     [("0.32.2", True), ("0.31.2", True), ("0.32.3", False), ("0.32.4", False),
      ("0.33.0", False), ("1.0.0", False), ("0.32.3.dev20260929", True),
      ("0.32.3rc1", True), ("0.32.3+local", False), ("v0.32.2", True),
-     ("unknown", True)],
+     ("unknown", True),
+     # Local build suffixes are words, not pre-release tags.
+     ("0.32.3.combo", False), ("0.32.3.combo-lse", False),
+     ("0.32.3.lse", False), ("0.32.3.beta1", True), ("0.32.3.a", True),
+     ("0.32.3.alpha2", True), ("0.32.3-rc.1", True)],
 )
 def test_mlx_release_rule(version, affected):
     assert msg.mlx_release_affected(version) is affected
