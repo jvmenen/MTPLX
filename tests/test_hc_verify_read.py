@@ -166,10 +166,9 @@ def test_the_tables_are_the_stock_lowerings_at_every_input():
     assert int(table[65536 + at]) == standalone
     # MLX 0.32.2 parts the two lowerings at this input, so one table would be
     # wrong at one of the sites there. MLX 0.32.3 gives both the same value;
-    # the rows follow whichever build is running.
-    from importlib.metadata import version
-
-    if version("mlx") == "0.32.2":
+    # the rows follow whichever build is running. The loaded build decides, not
+    # the installed wheel: the runtime can load another MLX through PYTHONPATH.
+    if mx.__version__.startswith("0.32.2"):
         assert table[at] != table[65536 + at]
 
 
