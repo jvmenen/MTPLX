@@ -26279,6 +26279,7 @@ def _request_observability(
         if key.lower()
         in {
             "x-mtplx-session-id",
+            "x-claude-code-session-id",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
             "x-openwebui-task",
