@@ -14,20 +14,21 @@ from .attention_context import (
 )
 from .attention_math import attention_gate
 from .compile_state import in_compiled_step_body, is_compile_trace_error
-from .segmented_kv import (
-    SegmentedKVCache,
-    VERIFY_WINDOW_MAX,
-    attend_segments_lse,
-    decode_segments_attention,
-    gathered_view,
-    _count as segmented_count,
-    prefill_route as segmented_prefill_route,
-)
 from .rope_origin import (
     cache_owns_rotary_origin,
     note_unowned_rotary_origin,
     rope_offset_of,
 )
+from .segmented_kv import (
+    VERIFY_WINDOW_MAX,
+    SegmentedKVCache,
+    attend_segments_lse,
+    decode_segments_attention,
+    gathered_view,
+    segmented_kv_requested,
+)
+from .segmented_kv import count_route as segmented_count
+from .segmented_kv import prefill_route as segmented_prefill_route
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -465,8 +466,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
             keys = self.rope(keys, offset=rope_offset)
             if isinstance(cache, SegmentedKVCache):
                 # Sealed segments plus a tail (MTPLX_SEGMENTED_KV): the new rows go to
-                # the tail. A verify window attends straight over the segments; every
-                # other call runs the ladder below on one gathered view of the rows.
+                # the tail. A prefill chunk over several segments takes the logsumexp
+                # route and a verify window attends straight over the segments; any
+                # other call runs the ladder below on one view of the rows (zero-copy
+                # for a single segment, gathered otherwise).
                 cache.append_rows(keys, values)
                 if (
                     int(queries.shape[2]) > VERIFY_WINDOW_MAX
@@ -498,7 +501,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     q_rows = int(queries.shape[2])
                     segmented_count(
                         f"{'single' if cache.segment_count == 1 else 'gather'}_q"
-                        f"{q_rows if q_rows <= 32 else 'prefill'}"
+                        f"{q_rows if q_rows <= VERIFY_WINDOW_MAX else 'prefill'}"
                     )
                     view = gathered_view(cache)
                     keys, values = view.keys, view.values
@@ -1002,7 +1005,7 @@ def configure_split_full_attention(
         attn._mtplx_split_full_attention_calls = 0
         stats["layers"] += 1
         stats["exact_gather_layers"] += int(exact_gather_layer)
-    if _env_enabled("MTPLX_SEGMENTED_KV"):
+    if segmented_kv_requested():
         # MTPLX_SEGMENTED_KV: decide once, from the hooked layers, whether this model can use
         # segments without ever falling back to a gather (mtplx/segmented_kv.py).
         from .segmented_kv import evaluate_model_support

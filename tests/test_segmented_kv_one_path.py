@@ -59,13 +59,6 @@ def test_segments_from_the_first_token_whatever_the_compiled_verify_settings(mon
         assert all(c.offset == 0 for c in cache)
 
 
-def test_there_is_no_boundary_setting() -> None:
-    import mtplx.segmented_kv as module
-
-    assert not hasattr(module, "segmented_kv_min_tokens")
-    assert "min_tokens" not in module.segmented_kv_health([])
-
-
 def test_a_layer_that_already_holds_rows_stays_stock() -> None:
     cache = [KVCache()]
     cache[0].update_and_fetch(*_rows(1, 60))
@@ -119,7 +112,7 @@ def test_a_stock_buffer_restored_as_a_segment_is_stored_as_exact_rows() -> None:
     assert mx.array_equal(flat, segment).item()
 
 
-def test_a_segmented_snapshot_restores_as_rows_into_an_untagged_stock_cache() -> None:
+def test_a_segmented_snapshot_restores_as_rows_into_a_stock_cache() -> None:
     src = _target_cache(1)
     src[0].update_and_fetch(*_rows(1, 150))
     snap = snapshot_cache(src)
@@ -129,7 +122,7 @@ def test_a_segmented_snapshot_restores_as_rows_into_an_untagged_stock_cache() ->
     assert _same(dest[0].state, src[0].gather())
 
 
-def test_untagged_caches_are_never_converted() -> None:
+def test_stock_caches_with_rows_are_never_converted() -> None:
     mtp = [KVCache()]
     mtp[0].update_and_fetch(*_rows(1, 150))
     snap = snapshot_cache(mtp)

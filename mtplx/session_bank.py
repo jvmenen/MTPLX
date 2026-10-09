@@ -38,8 +38,10 @@ from .runtime_options import block_prefix_restore_enabled
 from .segmented_kv import (
     SegmentedKVCache,
     SegmentedKVState,
+    segmented_kv_enabled,
     segmented_kv_health,
     segmented_ssd_enabled,
+    unique_state_bytes,
     walk_segmented_states,
 )
 
@@ -426,14 +428,9 @@ def _cache_has_segmented_kv(cache: list[Any] | None) -> bool:
 
 def _shared_segment_overcount(entries: list[Any]) -> int:
     """Bytes counted more than once because several snapshots reference the same segment."""
-    naive = 0
-    unique: dict[int, int] = {}
-    for entry in entries:
-        for state in _entry_segmented_states(entry):
-            naive += int(state.nbytes)
-            for ref in state.refs:
-                unique.setdefault(ref.segment.id, int(ref.segment.nbytes))
-    return max(0, naive - sum(unique.values()))
+    states = [state for entry in entries for state in _entry_segmented_states(entry)]
+    naive = sum(int(state.nbytes) for state in states)
+    return max(0, naive - unique_state_bytes(states))
 
 
 def _snapshot_nbytes(snapshot: CacheSnapshot) -> int:
@@ -1306,8 +1303,11 @@ class SessionBank:
         # dynamic ceiling (working set = active - weights - this total) took
         # the lease for working set and evicted the durable snapshots instead.
         entries = list(self._entries.values())
-        # A segment that several entries reference is held once (mtplx/segmented_kv.py).
-        return sum(entry.held_nbytes for entry in entries) - _shared_segment_overcount(entries)
+        total = sum(entry.held_nbytes for entry in entries)
+        if segmented_kv_enabled():
+            # A segment that several entries reference is held once (mtplx/segmented_kv.py).
+            total -= _shared_segment_overcount(entries)
+        return total
 
     @property
     def lease_entries(self) -> int:

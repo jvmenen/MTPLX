@@ -7,8 +7,6 @@ test_segmented_kv_bank.py.
 
 from __future__ import annotations
 
-import gc
-
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache
@@ -28,6 +26,7 @@ from mtplx.segmented_kv import (
     attend_segments_lse,
     install_segmented_attention_kv_cache,
     merge_segment_outputs,
+    route_counts,
     segment_sdpa_lse,
     segmented_kv_enabled,
     unique_state_bytes,
@@ -144,7 +143,7 @@ def test_verify_rollback_stays_in_the_tail_and_never_touches_sealed_segments() -
     cache.update_and_fetch(*_rows(3, 4))  # a verify window
     assert cache.offset == 414
     assert cache.trim(3) == 3  # accept one token, roll back three
-    assert cache.offset == 411 and cache.tail_rows == 11
+    assert cache.offset == 411 and cache._tail_n == 11
     cache.update_and_fetch(*_rows(4, 4))
     assert cache.offset == 415
     assert cache._sealed[0].segment is sealed
@@ -177,17 +176,18 @@ def test_seal_copies_only_the_tail_and_gives_it_its_exact_capacity() -> None:
     cache = SegmentedKVCache()
     _fill(cache, [(1, 300)])
     assert cache._tail.capacity > 300  # growth slack
+    copies = route_counts.get("seal_copy", 0)
     assert cache.seal() is True
     assert cache.seal() is False  # nothing left to seal
     ref = cache._sealed[0]
     assert ref.segment.sealed and ref.segment.capacity == ref.n == 300
-    assert cache.seal_copies == 1 and cache.seal_copy_rows == 300
+    assert route_counts.get("seal_copy", 0) == copies + 1
     # the history is not copied by a later seal
     _fill(cache, [(2, 40)])
     history = cache._sealed[0].segment.keys
     cache.seal()
     assert cache._sealed[0].segment.keys is history
-    assert cache.seal_copy_rows == 340
+    assert cache._sealed[1].segment.capacity == 40
 
 
 def test_state_is_a_list_of_references_and_a_snapshot_never_aliases_the_tail() -> None:
@@ -246,7 +246,6 @@ def test_fork_inside_a_segment_is_a_reference_without_a_copy() -> None:
     ref = KVCache()
     ref.update_and_fetch(*_rows(1, 400))
     assert _same(owner, ref)
-    assert segment.refcount >= 3  # owner, state, fork
 
 
 def test_state_setter_accepts_a_contiguous_pair() -> None:
@@ -260,28 +259,7 @@ def test_state_setter_accepts_a_contiguous_pair() -> None:
     assert cache.offset == 0
 
 
-def test_refcount_follows_the_holders_and_eviction_frees_the_segment() -> None:
-    cache = SegmentedKVCache()
-    _fill(cache, [(1, 300)])
-    state = cache.state
-    segment = state.refs[0].segment
-    assert segment.refcount == 2  # the cache and the snapshot
-    other = SegmentedKVState(state.refs)
-    assert segment.refcount == 3
-    del other
-    gc.collect()
-    assert segment.refcount == 2
-    cache.state = None
-    assert segment.refcount == 1
-    import weakref
-
-    probe = weakref.ref(segment)
-    del segment, state
-    gc.collect()
-    assert probe() is None  # nobody holds it: the buffers are free
-
-
-def test_tiered_merge_only_merges_small_recent_unshared_segments(monkeypatch) -> None:
+def test_tiered_merge_merges_small_recent_segments_and_leaves_the_history_alone(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "16384")
     cache = SegmentedKVCache()
     _fill(cache, [(1, 4096)])
@@ -312,9 +290,10 @@ def test_merge_also_merges_segments_a_snapshot_holds_and_leaves_the_snapshot_int
     held_segments = [ref.segment for ref in held.refs]
     before = [ref.segment for ref in cache._sealed]
     assert before == held_segments
+    merges = route_counts.get("merge", 0)
     _fill(cache, [(3, 300)])  # new tail: compact() merges the two equal-sized held segments
     assert len(cache._sealed) == 1 and cache._sealed[0].n == 600
-    assert cache.merges == 1 and cache.merge_rows == 600
+    assert route_counts.get("merge", 0) == merges + 1
     assert held.rows == 600 and [ref.segment for ref in held.refs] == held_segments  # the snapshot is untouched
     control = KVCache()
     for seed in (1, 2):
@@ -332,6 +311,7 @@ def test_segment_count_stays_bounded_over_many_turns_with_snapshots(monkeypatch)
     cache = SegmentedKVCache()
     _fill(cache, [(1, 20000)])
     cache.seal()
+    merges = route_counts.get("merge", 0)
     snapshots = [cache.state]
     peak = 0
     for turn in range(2, 26):
@@ -342,7 +322,7 @@ def test_segment_count_stays_bounded_over_many_turns_with_snapshots(monkeypatch)
         peak = max(peak, cache.segment_count)
     assert peak <= 12, peak
     assert cache.segment_count <= 12
-    assert cache.merges > 0
+    assert route_counts.get("merge", 0) > merges
 
 
 def test_nbytes_counts_each_shared_segment_once() -> None:

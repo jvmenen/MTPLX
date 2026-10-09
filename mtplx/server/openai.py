@@ -21780,7 +21780,7 @@ def _admission_restore_copies_prefix(
         return True
     from mtplx.session_bank import entry_has_segmented_kv
 
-    if entry_has_segmented_kv(entry):
+    if segmented_kv_enabled() and entry_has_segmented_kv(entry):
         # A segmented snapshot is a list of references to sealed segments: the restored
         # cache writes its turn into a new tail, so the history is never copied
         # (mtplx/segmented_kv.py; +4.95 GiB at 80K with a stock snapshot, +0.125 GiB with

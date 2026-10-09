@@ -85,7 +85,6 @@ def test_an_unsupported_model_keeps_stock_caches_and_never_builds_a_segmented_on
     cache = [KVCache(), KVCache()]
     configure_tail_owned_attention_kv_cache(cache)
     assert all(type(c) is KVCache for c in cache)
-    assert not any(getattr(c, "_mtplx_segmentable", False) for c in cache)
     for c in cache:
         c.update_and_fetch(mx.zeros((1, 2, 9000, 8)), mx.zeros((1, 2, 9000, 8)))
     configure_tail_owned_attention_kv_cache(cache)  # what the repage after a prefill runs
@@ -196,9 +195,11 @@ def _qwen3_attention(head_dim=32, q=4, kv=2, hidden=64):
 def test_plain_qwen3_attention_is_hooked_for_segmented_caches_only_and_matches_the_stock_forward() -> None:
     """A plain q/k-norm attention (no gate) goes through the hook body only on a segmented cache; with a
     stock cache it is the unchanged mlx-lm forward, so models without the switch keep their code."""
-    from mlx_lm.models.cache import KVCache
-
-    from mtplx.attention_split import _attention_has_gated_q_proj, _attention_has_plain_q_proj, _install_split_attention_hook
+    from mtplx.attention_split import (
+        _attention_has_gated_q_proj,
+        _attention_has_plain_q_proj,
+        _install_split_attention_hook,
+    )
     from mtplx.segmented_kv import SegmentedKVCache
 
     attn = _qwen3_attention()

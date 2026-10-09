@@ -226,10 +226,8 @@ def test_eviction_releases_the_segments(monkeypatch) -> None:
     gc.collect()
     mx.clear_cache()
     held = mx.get_active_memory()
-    segments = [state.refs[0].segment for state in entry.cache_snapshot.states]
-    assert all(segment.refcount >= 1 for segment in segments)
     assert bank.clear(session_id="s") == 1
-    del entry, segments
+    del entry
     gc.collect()
     mx.clear_cache()
     assert held - mx.get_active_memory() >= BASE * ROW_BYTES * 0.9
@@ -263,6 +261,7 @@ def test_ssd_tier_skips_segmented_entries_with_the_ssd_switch_off(monkeypatch) -
 def test_admission_prices_no_history_copy_for_a_segmented_entry(monkeypatch) -> None:
     from mtplx.server.openai import _admission_restore_copies_prefix
 
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV", "1")  # segmented entries only exist with the switch on
     bank = _bank(monkeypatch)
     _, seg_entry = _turn(bank, Runtime("segmented"), list(range(BASE)), BASE, 1, "x")
     stock_bank = _bank(monkeypatch)
@@ -277,7 +276,7 @@ def test_health_block_is_absent_with_the_switch_off_and_reports_segments_with_it
     bank = _bank(monkeypatch)
     runtime = Runtime("segmented")
     tokens = list(range(BASE))
-    _, entry = _turn(bank, runtime, tokens, BASE, 1, "s")
+    _turn(bank, runtime, tokens, BASE, 1, "s")
     tokens2 = tokens + list(range(BASE * 10, BASE * 10 + TURN))
     _turn(bank, runtime, tokens2, TURN, 2, "s", prev=tokens)
     assert "segmented_kv" not in bank.to_dict()

@@ -33,17 +33,17 @@ MLX kernel which returns the logsumexp can replace ``segment_sdpa_lse``.
 
 GatedDeltaNet (recurrent) layers keep their state objects as they are.
 
-Reference counts. A segment counts its holders (live caches and ``SegmentedKVState``
-snapshots) in a weak set: ``refcount`` is the number of holders still alive, an evicted or
-dropped bank entry releases its segments by going away, and the merge policy only merges
-segments that no snapshot holds.
+Sharing. Segments are shared by plain Python references: a segment lives as long as a cache
+or a ``SegmentedKVState`` snapshot references it, so an evicted or dropped bank entry releases
+its segments by going away. The merge policy (``SegmentedKVCache.compact``) also merges small
+segments that snapshots still hold: the snapshots keep their own pieces and the merged copy is
+the only new memory.
 """
 
 from __future__ import annotations
 
 import itertools
 import os
-import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -53,9 +53,19 @@ import mlx.core as mx
 _SEGMENT_IDS = itertools.count(1)
 
 
+def _env_on(name: str, *, default: bool = False) -> bool:
+    """A boolean switch: 1/true/yes/on and 0/false/no/off, anything else (or unset) is ``default``."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def segmented_kv_requested() -> bool:
     """MTPLX_SEGMENTED_KV (default off), read on every call: what the operator asked for."""
-    return os.environ.get("MTPLX_SEGMENTED_KV", "").strip().lower() in {"1", "true", "yes", "on"}
+    return _env_on("MTPLX_SEGMENTED_KV")
 
 
 #: Verdict on the loaded model (``evaluate_model_support``); None until a model was checked.
@@ -127,7 +137,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
             reasons.append(f"gqa_{q_heads}_{kv_heads}_unsupported")
     if not all(getattr(a, "_mtplx_gqa_packed_sdpa_enabled", False) for a in layers):
         reasons.append("gqa_packed_sdpa_off")
-    if os.environ.get("MTPLX_NAX_FLASH_ROUTE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    if not _env_on("MTPLX_NAX_FLASH_ROUTE"):
         reasons.append("nax_flash_route_off")
     if not nax_available():
         reasons.append("nax_unavailable")
@@ -172,7 +182,8 @@ def _int_env(name: str, default: int) -> int:
 route_counts: dict[str, int] = {}
 
 
-def _count(route: str) -> None:
+def count_route(route: str) -> None:
+    """One more call served by ``route`` (``route_counts``, reported on /health)."""
     route_counts[route] = route_counts.get(route, 0) + 1
 
 
@@ -224,14 +235,13 @@ class KVSegment:
     The tail of a cache is an unsealed segment: only its owner writes it.
     """
 
-    __slots__ = ("__weakref__", "_holders", "block_digests", "id", "keys", "sealed", "values")
+    __slots__ = ("block_digests", "id", "keys", "sealed", "values")
 
     def __init__(self, keys: mx.array, values: mx.array, *, sealed: bool = False) -> None:
         self.id = next(_SEGMENT_IDS)
         self.keys = keys
         self.values = values
         self.sealed = bool(sealed)
-        self._holders: weakref.WeakSet[Any] = weakref.WeakSet()
         # SSD tier: sha256 and size of the 256-row blocks of this (immutable) segment that a
         # spill already hashed, keyed (is_values, first_row, last_row) in segment rows.
         self.block_digests: dict[tuple[bool, int, int], dict[str, Any]] = {}
@@ -243,17 +253,6 @@ class KVSegment:
     @property
     def nbytes(self) -> int:
         return int(self.keys.nbytes) + int(self.values.nbytes)
-
-    @property
-    def refcount(self) -> int:
-        """Holders alive right now: live caches and snapshot states."""
-        return len(self._holders)
-
-    def hold(self, holder: Any) -> None:
-        self._holders.add(holder)
-
-    def release(self, holder: Any) -> None:
-        self._holders.discard(holder)
 
 
 @dataclass(frozen=True)
@@ -267,14 +266,12 @@ class SegRef:
 class SegmentedKVState:
     """An immutable snapshot of a segmented cache: references, no buffers of its own.
 
-    This is what the session bank stores as the cache snapshot of a segmented layer. It holds
-    its segments (reference counts) for as long as it lives.
+    This is what the session bank stores as the cache snapshot of a segmented layer. Its
+    references keep the segments alive for as long as it lives.
     """
 
     def __init__(self, refs: Iterable[SegRef]) -> None:
         self.refs: tuple[SegRef, ...] = tuple(refs)
-        for ref in self.refs:
-            ref.segment.hold(self)
 
     @property
     def rows(self) -> int:
@@ -283,44 +280,27 @@ class SegmentedKVState:
     @property
     def nbytes(self) -> int:
         """Bytes of the segments this state references, counted as if it were alone."""
-        return sum(ref.segment.nbytes for ref in _unique_refs(self.refs))
-
-    def segments(self) -> list[KVSegment]:
-        return [ref.segment for ref in self.refs]
-
-    def prefix(self, rows: int) -> SegmentedKVState:
-        """The first ``rows`` rows as a new state (shortens the last reference, no copy)."""
-        return SegmentedKVState(_prefix_refs(self.refs, rows))
+        return _unique_segment_bytes(self.refs)
 
     def to_arrays(self) -> tuple[mx.array, mx.array] | None:
         """One contiguous (keys, values) pair, the state a stock KV cache would give."""
         return _gather_refs(self.refs)
 
-    def __len__(self) -> int:
-        return len(self.refs)
 
-
-def _unique_refs(refs: Iterable[SegRef]) -> list[SegRef]:
-    seen: set[int] = set()
-    out: list[SegRef] = []
+def _unique_segment_bytes(refs: Iterable[SegRef]) -> int:
+    """Bytes of the segments behind ``refs``, each segment counted once."""
+    seen: dict[int, int] = {}
     for ref in refs:
-        if ref.segment.id not in seen:
-            seen.add(ref.segment.id)
-            out.append(ref)
-    return out
+        seen.setdefault(ref.segment.id, ref.segment.nbytes)
+    return sum(seen.values())
 
 
-def _prefix_refs(refs: Sequence[SegRef], rows: int) -> list[SegRef]:
-    rows = max(0, int(rows))
-    out: list[SegRef] = []
-    left = rows
-    for ref in refs:
-        if left <= 0:
-            break
-        take = min(int(ref.n), left)
-        out.append(SegRef(ref.segment, take) if take != ref.n else ref)
-        left -= take
-    return out
+def unique_state_bytes(states: Iterable[Any]) -> int:
+    """Bytes of the segments referenced by ``states`` (SegmentedKVState objects; anything else is
+    skipped), each segment counted once however many states share it."""
+    return _unique_segment_bytes(
+        ref for state in states if isinstance(state, SegmentedKVState) for ref in state.refs
+    )
 
 
 def _rows_view(array: mx.array, n: int) -> mx.array:
@@ -359,10 +339,6 @@ class SegmentedKVCache:
         self._sealed: list[SegRef] = []
         self._tail: KVSegment | None = None
         self._tail_n = 0
-        self.seal_copies = 0
-        self.seal_copy_rows = 0
-        self.merges = 0
-        self.merge_rows = 0
 
     # ---- shape ----------------------------------------------------------------------------
 
@@ -380,10 +356,6 @@ class SegmentedKVCache:
         self.trim(current - value)
 
     @property
-    def tail_rows(self) -> int:
-        return self._tail_n
-
-    @property
     def segment_count(self) -> int:
         return len(self._sealed) + (1 if self._tail_n else 0)
 
@@ -399,7 +371,7 @@ class SegmentedKVCache:
     @property
     def nbytes(self) -> int:
         """Bytes this cache keeps allocated: its unique segments plus the tail buffer."""
-        total = sum(ref.segment.nbytes for ref in _unique_refs(self._sealed))
+        total = _unique_segment_bytes(self._sealed)
         if self._tail is not None:
             total += self._tail.nbytes
         return total
@@ -461,14 +433,10 @@ class SegmentedKVCache:
 
     def gather(self) -> tuple[mx.array, mx.array] | None:
         """One contiguous (keys, values) over all rows (lazy; a view when there is one segment)."""
-        parts = self.attention_segments()
-        if not parts:
-            return None
-        keys = [_rows_view(k, n) for k, _, n in parts]
-        values = [_rows_view(v, n) for _, v, n in parts]
-        if len(parts) == 1:
-            return keys[0], values[0]
-        return mx.concatenate(keys, axis=2), mx.concatenate(values, axis=2)
+        refs = list(self._sealed)
+        if self._tail is not None and self._tail_n:
+            refs.append(SegRef(self._tail, self._tail_n))
+        return _gather_refs(refs)
 
     @property
     def keys(self) -> mx.array | None:
@@ -495,8 +463,6 @@ class SegmentedKVCache:
             ref = self._sealed[-1]
             if ref.n <= left:
                 self._sealed.pop()
-                if not any(r.segment is ref.segment for r in self._sealed):
-                    ref.segment.release(self)
                 left -= int(ref.n)
             else:
                 self._sealed[-1] = SegRef(ref.segment, int(ref.n) - left)
@@ -517,33 +483,32 @@ class SegmentedKVCache:
         if rows == 0:
             self._tail = None
             return False
-        _count("seal")
+        count_route("seal")
         if rows == tail.capacity:
             keys, values = tail.keys, tail.values
             mx.eval(keys, values)
         else:
-            _count("seal_copy")
+            count_route("seal_copy")
             keys = _own_copy(tail.keys[..., :rows, :])
             values = _own_copy(tail.values[..., :rows, :])
-            self.seal_copies += 1
-            self.seal_copy_rows += rows
         self._tail = None
         self._tail_n = 0
-        segment = KVSegment(keys, values, sealed=True)
-        segment.hold(self)
-        self._sealed.append(SegRef(segment, rows))
+        self._sealed.append(SegRef(KVSegment(keys, values, sealed=True), rows))
         return True
 
     @property
     def state(self) -> SegmentedKVState:
-        """The snapshot of this cache: seals the tail, then the list of references."""
+        """The snapshot of this cache: seals the tail, then the list of references.
+
+        Reading it has a side effect: the tail is sealed (a copy of the tail's rows). A caller
+        about to replace the state does not need to read it first; restores go to fresh caches,
+        where there is no tail to seal.
+        """
         self.seal()
         return SegmentedKVState(self._sealed)
 
     @state.setter
     def state(self, value: Any) -> None:
-        for ref in self._sealed:
-            ref.segment.release(self)
         self._sealed = []
         self._tail = None
         self._tail_n = 0
@@ -562,21 +527,19 @@ class SegmentedKVCache:
             refs = [SegRef(segment, int(keys.shape[2]))]
         else:
             raise ValueError(f"unsupported segmented KV state: {type(value).__name__}")
-        for ref in refs:
-            ref.segment.hold(self)
         self._sealed = refs
 
     # ---- merge policy ---------------------------------------------------------------------
 
-    def compact(self, *, max_segments: int | None = None) -> int:
+    def compact(self) -> int:
         """Merge small recent sealed segments among themselves (geometric tiers).
 
         Two adjacent sealed segments merge when the older is at most ``MTPLX_SEGMENTED_KV_TIER``
         times (default 2) the newer one and the result stays within
         ``MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS`` (default 16384) rows. The big history segment is
         never merged here: a full copy would bring the duplicate back while a snapshot, a
-        subagent or a lease references it. A segment that bank snapshots also hold (reference
-        count above 1) is merged too: the merged copy is new memory (at most the merged rows,
+        subagent or a lease references it. A segment that bank snapshots also hold is merged
+        too: the merged copy is new memory (at most the merged rows,
         released when the snapshots holding the originals go), and without it nothing would
         ever merge, because every turn's snapshot holds that turn's segments. The segment count
         is thereby bounded by the tier structure (logarithmic in the rows added) instead of
@@ -584,9 +547,11 @@ class SegmentedKVCache:
         4.1 ms (4096 + 4096 rows) for 16 layers (phase 1 measurement). Returns the number of
         merges.
         """
+        from .kernels.sdpa_segmented import MAX_FUSED_SEGMENTS
+
         tier = max(1, _int_env("MTPLX_SEGMENTED_KV_TIER", 2))
         cap_rows = _int_env("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", 16384)
-        limit = max_segments if max_segments is not None else _int_env("MTPLX_SEGMENTED_KV_MAX_SEGMENTS", 12)
+        limit = _int_env("MTPLX_SEGMENTED_KV_MAX_SEGMENTS", MAX_FUSED_SEGMENTS)
         merged = 0
         while len(self._sealed) >= 2:
             older, newer = self._sealed[-2], self._sealed[-1]
@@ -608,27 +573,8 @@ class SegmentedKVCache:
             [_rows_view(older.segment.values, older.n), _rows_view(newer.segment.values, newer.n)], axis=2
         )
         mx.eval(keys, values)
-        segment = KVSegment(keys, values, sealed=True)
-        segment.hold(self)
-        for ref in (older, newer):
-            ref.segment.release(self)
-        self._sealed[-2:] = [SegRef(segment, int(older.n) + int(newer.n))]
-        self.merges += 1
-        _count("merge")
-        self.merge_rows += int(older.n) + int(newer.n)
-
-    def stats(self) -> dict[str, int]:
-        return {
-            "segments": self.segment_count,
-            "sealed": len(self._sealed),
-            "tail_rows": self._tail_n,
-            "rows": self.offset,
-            "bytes": self.nbytes,
-            "seal_copies": self.seal_copies,
-            "seal_copy_rows": self.seal_copy_rows,
-            "merges": self.merges,
-            "merge_rows": self.merge_rows,
-        }
+        self._sealed[-2:] = [SegRef(KVSegment(keys, values, sealed=True), int(older.n) + int(newer.n))]
+        count_route("merge")
 
 
 class GatheredKVView:
@@ -727,11 +673,11 @@ def segment_sdpa_lse(queries, keys, values, n, *, scale, causal):
         except (ValueError, RuntimeError):
             # The fused kernel does not take this shape (the detection probe uses a tiny head
             # dim): the exact reference route serves the call, once counted.
-            _count("sdpa_lse_kernel_unsupported")
+            count_route("sdpa_lse_kernel_unsupported")
         else:
-            _count("sdpa_lse_kernel")
+            count_route("sdpa_lse_kernel")
             return out
-    _count("sdpa_lse_reference")
+    count_route("sdpa_lse_reference")
     return _segment_sdpa_lse_reference(queries, keys, values, n, scale=scale, causal=causal)
 
 
@@ -798,7 +744,7 @@ def decode_segments_attention(
         segments_supported,
     )
 
-    if os.environ.get("MTPLX_NAX_FLASH_ROUTE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    if not _env_on("MTPLX_NAX_FLASH_ROUTE"):
         return None
     if lane_disabled("nax_flash_dsplit_sdpa"):
         return None
@@ -823,7 +769,7 @@ def decode_segments_attention(
     if segments_supported(q_len, gqa, d):
         out = sdpa_nax_flash_dsplit_segments(queries=queries, segments=segments, scale=scale)
         if out is not None:
-            _count(f"fused_q{q_len}")
+            count_route(f"fused_q{q_len}")
         return out
     # A window the kernel does not take whole: sub-windows of the rows it does take (both
     # limits: gqa * rows <= 32 and rows <= 10, so GQA 1 and 2 split at 10 rows, GQA 4 at 8,
@@ -845,38 +791,33 @@ def decode_segments_attention(
         if part is None:
             return None
         outs.append(part)
-    _count(f"chunked_q{q_len}")
+    count_route(f"chunked_q{q_len}")
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
 # ---- install --------------------------------------------------------------------------------
 
 
-def is_segmented(entry: Any) -> bool:
-    return isinstance(entry, SegmentedKVCache)
-
-
 def _is_stock_plain_kv(entry: Any) -> bool:
     return type(entry).__name__ == "KVCache" and getattr(entry, "_idx", None) is None
 
 
-def adapt_layer_for_restore(cache: list[Any], idx: int, state: Any) -> tuple[Any, Any]:
-    """Prepare layer ``idx`` for a restore of ``state``; returns (entry, state).
+def adapt_layer_for_restore(entry: Any, state: Any) -> Any:
+    """The state to restore into ``entry``.
 
     A segment cache takes either snapshot kind (a stock snapshot, from the SSD tier or a stock
-    bank entry, becomes its rows). A stock layer that cannot hold segments (a layer that was
-    never tagged: MTP caches, recurrent layers, or one that already had rows at install) gets a
-    segmented snapshot as contiguous rows. The entry is never replaced: with the switch on, the
-    layout is decided once, when the cache is built (``install_segmented_attention_kv_cache``).
+    bank entry, becomes its rows). A stock layer (an MTP cache, a recurrent layer, or a layer
+    that already had rows when the cache was built) gets a segmented snapshot as contiguous
+    rows. The entry itself is never replaced: with the switch on, the layout is decided once,
+    when the cache is built (``install_segmented_attention_kv_cache``).
     """
-    entry = cache[idx]
     if isinstance(entry, SegmentedKVCache):
         if not isinstance(state, SegmentedKVState) and isinstance(state, (tuple, list)) and len(state) == 2 and state[0] is not None:
-            _count("restored_stock_as_segment")
-        return entry, state
+            count_route("restored_stock_as_segment")
+        return state
     if isinstance(state, SegmentedKVState):
-        state = state.to_arrays()
-    return entry, state
+        return state.to_arrays()
+    return state
 
 
 def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None = None) -> dict[str, int | str]:
@@ -904,9 +845,7 @@ def install_segmented_attention_kv_cache(cache: list[Any], *, step: int | None =
             and rows == 0
             and getattr(entry, "keys", None) is None
         ):
-            new = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
-            new._mtplx_segmentable = True
-            cache[idx] = new
+            cache[idx] = SegmentedKVCache(step=int(step or getattr(entry, "step", 256)))
             stats["entries"] = int(stats["entries"]) + 1
         else:
             stats["skipped"] = int(stats["skipped"]) + 1
@@ -920,7 +859,7 @@ def segmented_ssd_enabled() -> bool:
     """Segmented snapshots may go to the SSD tier (MTPLX_SEGMENTED_KV_SSD, default on with the switch)."""
     if not segmented_kv_enabled():
         return False
-    return os.environ.get("MTPLX_SEGMENTED_KV_SSD", "").strip().lower() not in {"0", "false", "no", "off"}
+    return _env_on("MTPLX_SEGMENTED_KV_SSD", default=True)
 
 
 class SegmentedRows:
@@ -1025,7 +964,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
             support = {"supported": False, "reasons": ["model_not_checked"]}
         return {"enabled": False, "requested": True, "model_support": support}
     per_entry: list[dict[str, Any]] = []
-    unique: dict[int, int] = {}
+    all_states: list[SegmentedKVState] = []
     for entry in entries:
         counts: list[int] = []
         sealed_bytes = 0
@@ -1033,8 +972,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         for state in walk_segmented_states(snapshot.states) if snapshot is not None else ():
             counts.append(len(state.refs))
             sealed_bytes += int(state.nbytes)
-            for ref in state.refs:
-                unique.setdefault(ref.segment.id, int(ref.segment.nbytes))
+            all_states.append(state)
         live = getattr(entry, "cache_ref", None)
         for layer in live or ():
             if isinstance(layer, SegmentedKVCache):
@@ -1058,7 +996,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         "prefill_route": prefill_route(),
         "entries": per_entry,
         "max_segments": max((e["segments"] for e in per_entry), default=0),
-        "sealed_bytes_unique": sum(unique.values()),
+        "sealed_bytes_unique": unique_state_bytes(all_states),
         "merges": counts_now.get("merge", 0),
         "seals": counts_now.get("seal", 0),
         "seal_copies": counts_now.get("seal_copy", 0),
@@ -1068,16 +1006,6 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
 
 
 # ---- accounting -----------------------------------------------------------------------------
-
-
-def unique_state_bytes(states: Iterable[Any]) -> int:
-    """Bytes of the segments referenced by ``states`` (SegmentedKVState objects), each counted once."""
-    seen: dict[int, int] = {}
-    for state in states:
-        if isinstance(state, SegmentedKVState):
-            for ref in state.refs:
-                seen.setdefault(ref.segment.id, ref.segment.nbytes)
-    return sum(seen.values())
 
 
 def walk_segmented_states(value: Any) -> Iterable[SegmentedKVState]:
