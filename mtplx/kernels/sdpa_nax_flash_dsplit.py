@@ -34,12 +34,7 @@ nax_flash_dsplit_bail_counts: dict[str, int] = {}
 # its bails) — the one-line receipt the #459 reports needed.
 nax_flash_dsplit_dispatch_counts: dict[str, int] = {}
 
-# Template params: InT, PartT, D, QL, GQA_F, NOMASK.
-# NOMASK=1 makes every key below ``offset`` visible to every query row (no tail-causal
-# mask): a sealed segment of a segmented KV cache sits entirely before the rows being
-# verified (mtplx/kernels/sdpa_segmented.py). The kernel derives ``tail_lo`` from the same
-# ``offset`` that bounds the keys, so the mask cannot be switched off through the inputs.
-# NOMASK=0 (every other caller) compiles to the previous kernel.
+# Template params: InT, PartT, D, QL, GQA_F.
 _SOURCE = r"""
     constexpr int TK = 32;
     constexpr int MROWS = 16;
@@ -177,7 +172,7 @@ _SOURCE = r"""
             for (short j = 0; j < kElemCols; j++) {
               const int gp = t0 + hh * 16 + sc.x + j;
               const float raw = s_raw[hh][i * kElemCols + j];
-              const bool vis = live && gp < kv_end && (NOMASK != 0 || gp <= row_limit);
+              const bool vis = live && gp < kv_end && gp <= row_limit;
               const float s = vis ? raw * scale : -1e38f;
               s_p[hh][i * kElemCols + j] = s;
               tmax[i] = metal::max(tmax[i], s);
@@ -371,7 +366,6 @@ def sdpa_nax_flash_dsplit(
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
-                ("NOMASK", 0),
             ],
             grid=(hk * nthreads, 1, blocks),
             threadgroup=(nthreads, 1, 1),
