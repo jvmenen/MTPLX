@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Claude Code requests resolve to their own session.** Claude Code (CLI and Agent SDK) sends `X-Claude-Code-Session-Id` on every `/v1/messages` request; MTPLX now takes it as the session id, next to the OpenCode and Open WebUI headers, instead of inferring the session from the prompt prefix. An explicit `x-mtplx-session-id` still comes first.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
