@@ -69,3 +69,41 @@ Workload (Qwen3.8-27B, bank cap at production default 25.7 GiB, no segmented KV)
 - The implied reserve (derived from the ceiling, limit, weights and working set, so an estimate) was lower with N=2 (median about 4 GiB vs 8 to 10 GiB with the option off), so the mechanism does forget the deep spike. It did not translate into a higher ceiling or more retained entries here, because the working set during requests and system memory pressure (guard actions `memory_pressure_critical`, `prefill_shed_before_abort` occurred in one N=2 run and one off run) dominate the ceiling on this 64 GB machine.
 - Side effect to note: with the option on, `peak_memory_bytes` means "since the engine was last idle".
 - Conclusion: no measurable benefit; do not file; do not enable.
+
+## 3a on Qwen3.6-35B-A3B (added later on 9 Oct)
+
+Model: Youssofal Qwen3.6-35B-A3B Optimized-Balance (6-bit, 40 layers, 28 GB). Same harness, prompts and method as the Qwen3.8 runs: X = production flags without rungs, Z = X + `MTPLX_PREFILL_ASYNC_RUNGS=4` + `MTPLX_PREFILL_ASYNC_RUNGS_STATES=1`; order X Z Z X, one server process per run, four cold prompts per run (two 16K, two 50K), greedy, 200 tokens, `/admin/cache/clear` before each prompt. Raw data: `~/Dev/laya-nl/opt-3a-3c/a3b-final/` (and `raw-B3-a3b-*.jsonl`).
+
+Note on the baseline: `config.json` had both rung variables switched on at 16:51 on 9 Oct, so a first A3B series (labels A-a3b-*, kept in `first-config-had-flags/`) ran with the flags on in both X and Z and is void as a comparison. The scripts now strip both variables from the launch command for X. The void series agrees with the final Z (same peaks), which doubles as a repeat of Z.
+
+### Proof that the rungs ran
+
+A small sitecustomize in my own directory (`opt-3a-3c/sc/`, not in the prod tree) wrote `mtplx.prefill_rungs.COUNTERS` to a file every 3 s. Final values per Z process: installed 1, wide_layer_calls 1,320, rungs_dispatched 330, state_arrays_dispatched 2,520 (both Z runs). Both X processes: installed 0, all counters 0. So the hook was installed and fired in Z, and not in X. (Not a change to /health; this is a measurement-side probe.)
+
+### Results (mean of 4 requests per cell; each value identical across repeats)
+
+| Prompt | Variant | Peak (`peak_memory_bytes`, GiB) | Sampled footprint (GiB) | Prefill time (s) | TTFT (s) | Decode (tok/s) |
+|---|---|---|---|---|---|---|
+| 16K | X | 30.30 | 34.0 | 6.0 | 6.1 | 75.7 |
+| 16K | Z | 28.83 | 33.5 | 6.0 | 6.0 | 75.7 |
+| 50K | X | 31.35 | 35.7 | 25.4 | 25.5 | 68.8 |
+| 50K | Z | 30.08 / 29.98 (a/b prompt) | 35.6 | 25.3 | 25.4 | 68.9 |
+
+- Peak: -1.47 GiB (-4.9%) at 16K, -1.27 and -1.37 GiB (-4.1% and -4.4%) at 50K. Larger than the 0.87 GiB of the synthetic 2,048-row check, because production prefill chunks are 4,096 rows.
+- Speed: no difference (prefill 6.0 vs 6.0 s and 25.4 vs 25.3 s, spread under 1%; decode equal).
+- Greedy output identical in X and Z on all four prompts (one distinct output per prompt across four processes).
+
+### Does the K4b slowdown (+3 to 4% on an agent workload) apply?
+
+From the data in hand: not on cold prefill. With states on, Qwen3.8-27B prefill was 2% (16K) and 1.7% (50K) faster than without, within the spread, and A3B showed 0 to 0.4%; neither shows a slowdown. An agent workload (many short, partly cached turns, where rungs fire on small forwards too) was not run here, so the earlier +3 to 4% neither is reproduced nor refuted there. Production now has the variables on, so agent TTFT in real use is the check to watch.
+
+### Numbers for "Results" in the PR
+
+Qwen3.6-35B-A3B Optimized-Balance (6-bit), 64 GB Mac, MLX 0.32.3 build, prod flags, cold prompts, greedy, stride 4, per-request peak after `/admin/cache/clear`, 4 requests per cell:
+
+- Peak 28.83 vs 30.30 GiB (16K, -4.9%) and 30.08 / 29.98 vs 31.35 GiB (50K, -4.1% / -4.4%).
+- Prefill 6.0 vs 6.0 s (16K) and 25.3 vs 25.4 s (50K); decode 75.7 vs 75.7 and 68.9 vs 68.8 tok/s.
+- Output identical to no rungs on all four prompts.
+- Engagement receipt: 330 rungs and 2,520 state arrays dispatched over 1,320 wide layer calls per process (0 in the baseline).
+
+Updated conclusion for 3a: on the model it targets the saving is 1.3 to 1.5 GiB per request at no measurable time cost, with identical output. The PR is justified as a memory option.
