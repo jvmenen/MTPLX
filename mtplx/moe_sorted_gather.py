@@ -70,11 +70,7 @@ ROW_ALIGN = 64
 #: The first MLX release whose sorted tensor-unit gather counts rows in 32 bits.
 FIXED_MLX_RELEASE = (0, 32, 3)
 
-# A pre-release tag is a whole word (optionally followed by digits): a local
-# build suffix such as ".combo" or ".lse" must not be read as pre-release "c" or "l".
-_PRE_RELEASE = re.compile(
-    r"^[.\-_]?(dev|a|b|c|rc|alpha|beta|pre|preview)(?![a-z])\d*", re.I
-)
+_PRE_RELEASE = re.compile(r"^[.\-_]?(dev|a|b|c|rc|alpha|beta|pre|preview)\d*", re.I)
 _GUARD_MARK = "_mtplx_sorted_rows_guard"
 
 _STATS: dict[str, int] = {"padded_calls": 0, "padded_rows": 0}
