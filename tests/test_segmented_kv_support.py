@@ -208,3 +208,20 @@ def test_the_hook_covers_plain_attention_in_the_support_check() -> None:
         os.environ.pop("MTPLX_GQA_PACKED_SDPA")
     assert stats["segmented_kv_supported"] is True
     assert model_support()["head_dims"] == [128] and model_support()["gqa"] == [4]
+
+
+def test_without_the_lse_kernel_one_line_says_prefill_gathers_and_the_feature_stays_on(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(module, "_SDPA_LSE", False)
+    monkeypatch.delenv("MTPLX_SEGMENTED_KV_PREFILL", raising=False)
+    verdict = evaluate_model_support([_attn()])
+    assert verdict["supported"] and segmented_kv_enabled()
+    assert module.prefill_route() == "gather"
+    assert capsys.readouterr().out.count("no logsumexp output") == 1
+    evaluate_model_support([_attn()])
+    assert "no logsumexp output" not in capsys.readouterr().out  # once per process
+
+
+def test_with_the_lse_kernel_there_is_no_note(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(module, "_SDPA_LSE", True)
+    evaluate_model_support([_attn()])
+    assert "no logsumexp output" not in capsys.readouterr().out
