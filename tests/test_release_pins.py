@@ -149,14 +149,25 @@ def test_editable_lock_version_matches_project_version():
     assert editable[0]["version"] == project["project"]["version"]
 
 
+# MLX base versions a process may load besides the pin. The fork's production
+# runs a custom MLX build through PYTHONPATH (v0.32.3 plus carried patches), not
+# the pinned wheel. 0.32.3 is accepted because the Flash-Next tests that were
+# bit-exact against 0.32.2 now compare to an fp32 reference on MLX >= 0.32.3
+# (stock gather_qmm changed in the last bit, CPU bf16 sum widens to fp32), and
+# the other suites run unchanged on it. The wheel pin and uv.lock stay 0.32.2.
+ACCEPTED_LOADED_MLX = ("0.32.3",)
+
+
 def test_installed_mlx_is_the_pinned_version():
     """Catches venv drift: an environment (the app runtime included) running
     another mlx than the pin runs a stack the release's receipts do not
-    cover, silently."""
+    cover, silently. The loaded build counts, not the wheel metadata, and the
+    fork's validated 0.32.3 build is the one accepted exception."""
     mlx = pytest.importorskip("mlx.core")
     installed = re.match(r"\d+\.\d+\.\d+", mlx.__version__).group(0)
-    assert installed == _pyproject_mlx_pin(), (
+    allowed = (_pyproject_mlx_pin(), *ACCEPTED_LOADED_MLX)
+    assert installed in allowed, (
         f"installed mlx {mlx.__version__} is not the pinned "
-        f"{_pyproject_mlx_pin()}: this venv is running a stack the "
-        "release's receipts do not cover"
+        f"{_pyproject_mlx_pin()} (or an accepted build {ACCEPTED_LOADED_MLX}): "
+        "this venv is running a stack the release's receipts do not cover"
     )
