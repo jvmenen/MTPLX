@@ -178,3 +178,73 @@ def test_attention_layer_at_head_dim_128_matches_the_stock_cache_through_turns_a
         top = float(mx.maximum(mx.abs(a).max(), mx.abs(b).max()).item())
         ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
         assert float(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item()) / ulp <= 4
+
+
+def _low_gqa_cache(hk: int, d: int, window: int, seed: int = 11):
+    """Two sealed segments plus a tail whose last ``window`` rows are the verify window."""
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    cache = SegmentedKVCache()
+    for i, n in enumerate((5000, 700, 40 + window)):
+        k = (mx.random.normal((1, hk, n, d), key=mx.random.key(seed + i)) * 0.5).astype(mx.bfloat16)
+        v = (mx.random.normal((1, hk, n, d), key=mx.random.key(seed + 50 + i)) * 0.5).astype(mx.bfloat16)
+        cache.append_rows(k, v)
+        if i < 2:
+            cache.seal()
+    return cache
+
+
+@pytest.mark.parametrize("gqa, expected_sub", [(1, 10), (2, 10), (4, 8), (6, 5), (8, 4)])
+@pytest.mark.parametrize("window", [11, 12, 17, 32])
+def test_sub_windows_respect_both_kernel_limits_at_every_gqa(monkeypatch, gqa, expected_sub, window) -> None:
+    """GQA 1 and 2 used sub-windows of 32 and 16 rows, which the kernel refuses (q_len <= 10): the
+    window then fell back to a gather. Every sub-window must be one the kernel takes."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+        hk, d = 2, 128
+        cache = _low_gqa_cache(hk, d, window)
+        rows: list[int] = []
+
+        def fake_kernel(*, queries, segments, scale):
+            q_len = int(queries.shape[2])
+            assert S.segments_supported(q_len, gqa, d), (q_len, gqa)
+            rows.append(q_len)
+            return mx.zeros(queries.shape, queries.dtype)
+
+        monkeypatch.setattr(S, "sdpa_nax_flash_dsplit_segments", fake_kernel)
+        monkeypatch.setattr("mtplx.kernel_selfcheck.lane_disabled", lambda name: False)
+        q = mx.zeros((1, hk * gqa, window, d), mx.bfloat16)
+        out = module.decode_segments_attention(q, cache, scale=0.1, mask="causal", packed_threshold=0)
+        assert out is not None and tuple(out.shape) == tuple(q.shape)
+        assert sum(rows) == window and max(rows) <= expected_sub
+        if window > expected_sub:
+            assert max(rows) == expected_sub
+    finally:
+        mx.set_default_device(previous)
+
+
+@needs_nax
+@pytest.mark.parametrize("gqa", [1, 2])
+@pytest.mark.parametrize("window", [12, 32])
+def test_low_gqa_wide_windows_run_on_the_segments_and_match_the_reference(monkeypatch, gqa, window) -> None:
+    """GQA 1 and 2 (4 and 8 query heads over 4 KV heads, head_dim 128) with a window above the
+    kernel's 10 rows: sub-windows over the segments, no gather, exact against fp32."""
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+    hk, d = 4, 128
+    cache = _low_gqa_cache(hk, d, window)
+    hq = hk * gqa
+    q = (mx.random.normal((1, hq, window, d), key=mx.random.key(99)) * 0.5).astype(mx.bfloat16)
+    module.route_counts.clear()
+    out = module.decode_segments_attention(q, cache, scale=1.0 / math.sqrt(d), mask="causal", packed_threshold=0)
+    assert out is not None
+    assert module.route_counts.get(f"chunked_q{window}") == 1, module.route_counts
+    keys, values = cache.gather()
+    total = int(keys.shape[2])
+    kf = mx.repeat(keys.astype(mx.float32), gqa, axis=1)
+    vf = mx.repeat(values.astype(mx.float32), gqa, axis=1)
+    s = (q.astype(mx.float32) @ kf.transpose(0, 1, 3, 2)) / math.sqrt(d)
+    vis = mx.arange(total)[None, :] <= (total - window + mx.arange(window))[:, None]
+    ref = mx.softmax(mx.where(vis[None, None], s, -mx.inf), axis=-1) @ vf
+    assert float(mx.abs(out.astype(mx.float32) - ref).max()) < 5e-3
