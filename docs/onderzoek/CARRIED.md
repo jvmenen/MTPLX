@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09d` (prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09e` (prod-2026-10-09d plus #580; before that `prod-2026-10-09d`: prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -24,6 +24,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | dd0cc3c1 | SSD cold tier: uint32 fingerprint mixer | #596 | open | matters with `MTPLX_SSD_INCREMENTAL_ENCODE=1` |
 | 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
 | 23468b07, 85d4a49a | Context-copy drafting for AR-only runtimes (models without an MTP head) | #599 | open | `MTPLX_CONTEXT_COPY_AR=1` (not used by Qwen3.8, which has an MTP head) |
+| 1fabab73, c3b138ee | `mtplx frspec build` and the table sidecar check: a table with a `.meta.json` is refused on a model whose tokenizer maps ids differently | #580 | open | default (production's `bink-64k.npy` has no sidecar, so no check) |
 | 10236d6d | `lock_wait_time_s` reports the serial scheduler's queue wait (slimmed version, reuses the `scheduler_queue` span) | #576 | open | default |
 | dfdffef2 | Forge: stamp the verified depth and a served id for forge-local packs | #575 | open | default |
 | 5fcb2051 | Claude Code's `X-Claude-Code-Session-Id` names the session | #606 | open | default |
