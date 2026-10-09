@@ -68,6 +68,20 @@ def segmented_kv_requested() -> bool:
     return _env_on("MTPLX_SEGMENTED_KV")
 
 
+def segment_route_switched_off() -> list[str]:
+    """The attention switches an operator set to 0 explicitly (kill switches for the segment route).
+
+    Segments do not need MTPLX_GQA_PACKED_SDPA or MTPLX_NAX_FLASH_ROUTE on (they run their own
+    kernel, under any profile); only an explicit 0 on either turns them off.
+    """
+    reasons = []
+    if not _env_on("MTPLX_GQA_PACKED_SDPA", default=True):
+        reasons.append("gqa_packed_sdpa_off")
+    if not _env_on("MTPLX_NAX_FLASH_ROUTE", default=True):
+        reasons.append("nax_flash_route_off")
+    return reasons
+
+
 #: Verdict on the loaded model (``evaluate_model_support``); None until a model was checked.
 _MODEL_SUPPORT: dict[str, Any] | None = None
 _UNSUPPORTED_LOGGED = False
@@ -111,7 +125,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
     from .kernels.sdpa_segmented import SUPPORTED_HEAD_DIMS, segments_supported
     from .nax_verify import nax_available
 
-    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED, _LSE_NOTE_LOGGED
+    global _MODEL_SUPPORT, _LSE_NOTE_LOGGED
     layers = list(layers)
     flags = list(hooked) if hooked is not None else [True] * len(layers)
     reasons: list[str] = []
@@ -135,10 +149,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
             reasons.append(f"head_dim_{head_dim}_unsupported")
         elif q_heads % kv_heads or not segments_supported(1, q_heads // kv_heads, head_dim):
             reasons.append(f"gqa_{q_heads}_{kv_heads}_unsupported")
-    if not all(getattr(a, "_mtplx_gqa_packed_sdpa_enabled", False) for a in layers):
-        reasons.append("gqa_packed_sdpa_off")
-    if not _env_on("MTPLX_NAX_FLASH_ROUTE"):
-        reasons.append("nax_flash_route_off")
+    reasons.extend(segment_route_switched_off())
     if not nax_available():
         reasons.append("nax_unavailable")
     reasons = list(dict.fromkeys(reasons))
@@ -151,14 +162,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
         "full_attention_layers": len(layers),
     }
     _MODEL_SUPPORT = verdict
-    if reasons and segmented_kv_requested() and not _UNSUPPORTED_LOGGED:
-        _UNSUPPORTED_LOGGED = True
-        print(
-            "[mtplx] MTPLX_SEGMENTED_KV is on but this model cannot use it ("
-            + ", ".join(reasons)
-            + "): keeping the stock KV cache",
-            flush=True,
-        )
+    _log_unsupported(reasons)
     if not reasons and segmented_kv_requested() and prefill_route() == "gather" and not _LSE_NOTE_LOGGED:
         _LSE_NOTE_LOGGED = True
         print(
@@ -168,6 +172,47 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
             flush=True,
         )
     return verdict
+
+
+def _log_unsupported(reasons: Sequence[str]) -> None:
+    global _UNSUPPORTED_LOGGED
+    if reasons and segmented_kv_requested() and not _UNSUPPORTED_LOGGED:
+        _UNSUPPORTED_LOGGED = True
+        print(
+            "[mtplx] MTPLX_SEGMENTED_KV is on but this model cannot use it ("
+            + ", ".join(reasons)
+            + "): keeping the stock KV cache",
+            flush=True,
+        )
+
+
+def kernel_probe_shapes() -> list[tuple[int, int]]:
+    """(head_dim, gqa) pairs the kernel self-check probes the segment kernel at.
+
+    Empty unless segments are requested and the loaded model passed the support check: the
+    self-check then tests the kernel at the model's own shapes before any cache is built.
+    """
+    from .kernels.sdpa_segmented import segments_supported
+
+    if not segmented_kv_enabled():
+        return []
+    support = _MODEL_SUPPORT or {}
+    pairs = [(int(d), int(g)) for d in support.get("head_dims", []) for g in support.get("gqa", [])]
+    return [(d, g) for d, g in pairs if segments_supported(1, g, d)]
+
+
+def note_kernel_selfcheck_failed() -> None:
+    """The self-check found the segment kernel wrong or failing on this GPU: stock caches from now on.
+
+    Without the kernel every call over several segments would gather the history, so the verdict
+    turns off (reason on /health, one log line) before the first cache is built.
+    """
+    global _MODEL_SUPPORT
+    if _MODEL_SUPPORT is None:
+        return
+    reasons = list(dict.fromkeys([*_MODEL_SUPPORT.get("reasons", []), "segment_kernel_selfcheck_failed"]))
+    _MODEL_SUPPORT = {**_MODEL_SUPPORT, "supported": False, "reasons": reasons}
+    _log_unsupported(reasons)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -725,9 +770,9 @@ def decode_segments_attention(
 ) -> mx.array | None:
     """Verify/decode attention straight over the segments, or None for the stock ladder.
 
-    Engages under the same conditions as the packed route over a dense cache, with the total
-    length where that route reads the buffer capacity: MTPLX_NAX_FLASH_ROUTE on, a verify
-    window of 1 to ``VERIFY_WINDOW_MAX`` (32) rows, a causal or no mask, and a total length of
+    Engages under any profile unless MTPLX_GQA_PACKED_SDPA or MTPLX_NAX_FLASH_ROUTE is set to 0
+    or the kernel self-check failed the segment kernel: a verify window of 1 to
+    ``VERIFY_WINDOW_MAX`` (32) rows, a causal or no mask, and a total length of
     at least ``packed_threshold`` when the cache is one segment (several segments take the
     kernel at any length). The head-dim-split segment kernel takes a window whole when
     ``gqa * q_len <= 32`` and ``q_len <= MAX_Q_LEN`` (10); a longer window runs as sub-windows
@@ -744,9 +789,7 @@ def decode_segments_attention(
         segments_supported,
     )
 
-    if not _env_on("MTPLX_NAX_FLASH_ROUTE"):
-        return None
-    if lane_disabled("nax_flash_dsplit_sdpa"):
+    if segment_route_switched_off() or lane_disabled("segmented_kv_sdpa"):
         return None
     q_len = int(queries.shape[2])
     if not 1 <= q_len <= VERIFY_WINDOW_MAX:

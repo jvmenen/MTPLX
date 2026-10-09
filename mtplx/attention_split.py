@@ -393,7 +393,11 @@ def _install_split_attention_hook(attn: Any) -> bool:
         cache: Any | None = None,
     ) -> mx.array:
         route_off = not getattr(self, "_mtplx_split_full_attention_enabled", False)
-        if route_off and not cache_owns_rotary_origin(cache):
+        if (
+            route_off
+            and not cache_owns_rotary_origin(cache)
+            and not isinstance(cache, SegmentedKVCache)
+        ):
             # No MTPLX attention route asked for, and the cache has no rotary
             # origin of its own: the stock forward, untouched. A cache that
             # owns one (an image request on a compiled route) rotates at it
@@ -414,6 +418,9 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # standalone sigmoid eagerly and a fused one inside the compiled
             # verifier's trace, which differ in the last bit of some bfloat16
             # and float32 values (mtplx/attention_math.py).
+            # A segmented cache always takes the body (the segment route
+            # below), under any profile: the stock forward would gather the
+            # history on every call.
         gated_q_proj = _attention_has_gated_q_proj(self)
         if not gated_q_proj and not (
             isinstance(cache, SegmentedKVCache) and _attention_has_ungated_q_proj(self)
@@ -506,11 +513,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     )
                     segmented_route = "segments_lse"
                     segmented_count("prefill_lse")
-                elif (
-                    getattr(self, "_mtplx_gqa_packed_sdpa_enabled", False)
-                    and not blockwise_enabled
-                    and not vllm_metal_paged_enabled
-                ):
+                else:
                     segmented_output = decode_segments_attention(
                         queries,
                         cache,
