@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09f` (prod-2026-10-09e without the bank spike reserve ca894734, dropped 9 Oct, see VONDSTEN 121; before that `prod-2026-10-09e`: prod-2026-10-09d plus #580; before that `prod-2026-10-09d`: prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-10` (prod-2026-10-09f plus the SSD restore layout fix #608 and the segmented KV cache, switched on in the launch command, config 10 Oct; before that `prod-2026-10-09f`: prod-2026-10-09e without the bank spike reserve ca894734, dropped 9 Oct, see VONDSTEN 121; before that `prod-2026-10-09e`: prod-2026-10-09d plus #580; before that `prod-2026-10-09d`: prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -29,6 +29,8 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | 10236d6d | `lock_wait_time_s` reports the serial scheduler's queue wait (slimmed version, reuses the `scheduler_queue` span) | #576 | open | default |
 | dfdffef2 | Forge: stamp the verified depth and a served id for forge-local packs | #575 | open | default |
 | 5fcb2051 | Claude Code's `X-Claude-Code-Session-Id` names the session | #606 | open | default |
+| 6eaec2c1 | SSD restore builds the request's cache layout (`cache_factory`) instead of `runtime.make_cache()` | #608 | open | default |
+| 62388115 | Segmented KV cache: segments from token 0, fused verify kernel derived from prod's dsplit kernel (DSPLIT4, WIDE, TG_M), SSD tier, merge, `/health`, head_dim 128, fail closed without a model verdict (reviewed `feat/segmented-kv` c3119c7f as one diff) | not filed yet (`feat/segmented-kv`) | fork only | `MTPLX_SEGMENTED_KV=1` (since 10 Oct) |
 | abfea975, c2facca3, df4f4f06, b46cf089 | Tests follow the loaded MLX build (0.32.3): Flash-Next fp32 references, bf16 slot sum spelled out, pin test accepts the validated 0.32.3 build (wheel pin stays 0.32.2). The pre-release regex change 5520cfd3 was reverted (2c8b5277): the misread came from our build name, now `0.32.3.lse` | not filed | fork only | n/a |
 | 0eae8d62, 69d17afc, d3a74424, dd28b920, 1da1470b | Changelog, lint, test fixes, dashboard bundle | n/a | n/a | n/a |
 
