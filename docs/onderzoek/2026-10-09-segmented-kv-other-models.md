@@ -96,9 +96,9 @@ Qwen3.6-35B-A3B Optimized-Speed (the sustained default), `sustained` profile, pk
 
 - Route counters `on`: no `gather_q*`; `fused_q1..4`, `chunked_q9/13/25`, `sdpa_lse_kernel` 1140, `merge` 210 (sums over 3 runs). Active memory after the turn 1.9 to 2.0 GiB lower with segments.
 - The ms per verify gain (24 to 28 % with segments, 20 to 27 % for `offsw`) comes from the attention kernel, not from the segments. Segments add the memory gain (peak above turn start 2.7 to 3.3 GiB down to 0.45 to 0.76) at the same speed as `offsw`. Decode tok/s differs more between variants than ms per verify because the outputs diverge and acceptance differs per trajectory.
-- Every variant is deterministic run to run. `on` and `offsw` both diverge from `off` (first divergence at 12 to 166 tokens): a different attention kernel, expected at bf16 ties; margins at the first divergence are queued (`out/sus-margin-*.json`).
+- Every variant is deterministic run to run. `on` and `offsw` both diverge from `off` (first divergence at 12 to 166 tokens): a different attention kernel, expected at bf16 ties; margins at the first divergence (turn 0) are 0.125 for both, one bf16 step at logits around 17 to 21 (`out/sus-margin-*.json`).
 
-### Proposed fix (smallest safe, not implemented)
+### Proposed fix (implemented 10 Oct, see the next section)
 
 Segments stop depending on the two switches and honour them only as kill switches:
 
@@ -110,3 +110,56 @@ Segments stop depending on the two switches and honour them only as kill switche
 With the switch off nothing changes (all four points sit behind `segmented_kv_requested()` or a segmented cache). With the switch on under sustained, the full-attention layers run on the same NAX kernel turbo already ships on M5-class GPUs; the dense attention of other layers and the MTP head keep sustained's routes. Cost per the table: none measured; faster verify and lower peak.
 
 Separate question, outside segments: the two switches alone gave 20 to 27 % fewer ms per verify on Qwen3.6-35B-A3B under sustained (one model, one context, M5 Max). That is a case for evaluating them for the sustained models upstream, under the flat-or-better rule; not part of the segmented KV PR.
+
+### Fix implemented and measured (10 Oct)
+
+`feat/segmented-kv` 71551773 (code and tests) and 0ae05ae4 (changelog), on top of 8e15baad; not pushed. As approved on 9 Oct, with one difference from the proposal: the self-check probes the segment kernel itself (`sdpa_nax_flash_dsplit_segments`, two segments against stock SDPA, lane `segmented_kv_sdpa`) rather than the stock `nax_flash_dsplit_sdpa`, at every (head_dim, GQA) of the loaded model.
+
+- Verdict: `gqa_packed_sdpa_off` and `nax_flash_route_off` only when the switch is set to 0 explicitly; `nax_unavailable` stays (M1 to M4: off).
+- Hook: a segmented cache always takes the segment route, also when the profile enables no attention route (the `route_off` early exit) and without the packed lane.
+- Self-check: runs whenever `MTPLX_SEGMENTED_KV` is on (also under sustained, where it did not run before); a failing probe or a self-check that cannot run turns the verdict off before the first cache is built: stock caches, reason `segment_kernel_selfcheck_failed` on /health, one log line. `MTPLX_KERNEL_SELFCHECK=0` still skips it (operator choice, as for every lane).
+- Flag off: no change (every path sits behind `segmented_kv_requested()` or a segmented cache).
+- Tests: segmented-KV files on stock MLX and pkg-lse green; full suite 11460 passed, 72 skipped, 1 xfailed, 0 failures.
+
+GPU recheck through gate.sh, same setup as the table above (Qwen3.6-35B-A3B Speed, `sustained`, pkg-lse MLX, 50K plus 4 turns, own mode), but `on` now sets only `MTPLX_SEGMENTED_KV=1` (log: both switches unset after the profile, `MTPLX_VLLM_METAL_PAGED_ATTN=1`). Order off on on off off on, medians of 3, thermal 0. Data `segment-kv/sustfix/out/sf-50000-*.json`, `python3 cmp3.py sf 50000`.
+
+| turn | ms per verify off / on | decode tok/s off / on | peak over turn start GiB off / on | prefill s off / on |
+|---|---|---|---|---|
+| 0 (cold) | 35.8 / 25.6 | 53.4 / 68.7 | 4.29 / 4.29 | 26.0 / 25.9 |
+| 1 | 39.6 / 30.3 | 66.8 / 82.9 | 2.68 / 0.73 | 1.0 / 1.0 |
+| 2 | 34.2 / 24.7 | 47.1 / 52.4 | 2.75 / 0.45 | 1.7 / 1.7 |
+| 3 | 41.1 / 30.4 | 50.0 / 64.5 | 2.79 / 0.60 | 2.8 / 2.7 |
+| 4 | 36.7 / 26.1 | 38.8 / 46.5 | 3.34 / 0.76 | 3.7 / 3.7 |
+
+- Verdict supported (head_dim 256, GQA 8, 10 full-attention layers); self-check lane `segmented_kv_sdpa` ok in both `on` runs (9 ms for the whole self-check).
+- Route counters `on` (sum over 3 runs): no `gather_q*`; `fused_q1..4`, `chunked_q9/13/25`, `sdpa_lse_kernel` 1140, `merge` 210, identical to the earlier run with the switches on.
+- The speed gain stays without the switches: it comes from the segment kernel on the 10 full-attention layers (also the cold turn, one segment above the 8192 threshold), not from the turbo attention lanes. The output of `on` is token-identical to the earlier `on` with the switches set, per turn; `off` is token-identical to the earlier `off`.
+
+## 5. Mistral 7B Instruct v0.3 (step 2)
+
+Code (`feat/segmented-kv`, 28009f8f and changelog 6707ab87, not pushed): `_attention_has_unnormed_q_proj` recognises the Llama-style attention (q/k/v/o projections and rope, no q/k norm, q_proj output = heads x head_dim); the hook body applies q/k norm only when the module has it, and takes an ungated attention on a segmented cache only. With a stock cache the forward stays mlx-lm's own, switch on or off. The support check counts the form as hooked, so Mistral is now "supported" (head_dim 128, GQA 4).
+
+Tests: detection of the three forms, flag-off and stock-cache identity bit for bit (with and without bias), support verdict, and a GPU test at Mistral shapes (32/8 heads, head_dim 128, bf16) through two turns, verify windows of 4/4/9/1 rows and rollback, with no gather and `fused_q*` routes. All segmented-KV test files green on stock MLX and on pkg-lse (one expected skip each). Full suite on the feature tree (6707ab87, stock MLX): 11,510 tests, 0 failures, 73 skipped.
+
+Measurement: `m3/arrun.py` (AR path, `runtime.load(mtp=False)`, `generate_ar`, real `SessionBank`, greedy, 256 tokens per turn, own mode), turbo env, pkg-lse MLX, order off on on off off on, medians of 3, thermal 0 throughout. `plain` (22K documentation, then 600 to 1500 new tokens per turn) on `feat/segmented-kv`; `code` (14K, then a source file to copy with one change; 14K because Mistral's context is 32K) and `prose` (22K, summarise) with `MTPLX_CONTEXT_COPY_AR=1` on the test branch `test/segkv-context-copy-ar` (feat plus the #599 commits f1d7d1e1 and ee63be4d, worktree `laya-nl/segkv-ccar`; context copy is not on feat). Data `other-models/out/mis-*.json`, `python cmp_mis.py`.
+
+| scenario | turn | ms per step off / on | tok/s off / on | peak over turn start GiB off / on | prefill s off / on |
+|---|---|---|---|---|---|
+| plain | 0 (cold 22K) | 28.2 / 28.5 | 35.6 / 35.3 | 5.75 / 3.35 | 15.7 / 15.7 |
+| plain | 1 | 28.6 / 28.5 | 35.1 / 35.3 | 3.20 / 0.69 | 0.7 / 0.8 |
+| plain | 2 | 29.3 / 28.9 | 34.3 / 34.7 | 3.35 / 1.10 | 1.1 / 1.1 |
+| plain | 3 | 30.1 / 29.7 | 33.3 / 33.8 | 6.67 / 1.29 | 1.6 / 1.5 |
+| plain | 4 | 31.0 / 30.8 | 32.3 / 32.6 | 7.01 / 1.08 | 2.0 / 2.1 |
+| code + CC | 1 | 29.8 / 28.5 | 42.1 / 44.1 | 4.70 / 1.38 | 2.7 / 2.8 |
+| code + CC | 2 | 29.3 / 28.4 | 39.6 / 40.7 | 5.07 / 1.08 | 1.2 / 1.3 |
+| code + CC | 3 | 49.8 / 44.3 | 70.4 / 79.2 | 5.77 / 1.69 | 3.3 / 3.5 |
+| code + CC | 4 | 37.2 / 35.4 | 58.3 / 61.4 | 6.16 / 0.93 | 1.3 / 1.4 |
+| prose + CC | 1 | 30.0 / 29.5 | 35.0 / 35.6 | 3.20 / 0.71 | 0.7 / 0.7 |
+| prose + CC | 2 | 37.9 / 36.0 | 67.6 / 71.0 | 3.38 / 1.12 | 1.1 / 1.1 |
+| prose + CC | 3 | 33.1 / 31.2 | 36.5 / 37.6 | 6.68 / 1.31 | 1.5 / 1.5 |
+| prose + CC | 4 | 32.4 / 31.1 | 34.0 / 34.7 | 7.02 / 1.09 | 2.0 / 1.9 |
+
+- Routes with segments: no `gather_q*` in any scenario. Plain: `fused_q1` only (plus merges); with context copy also `fused_q2`, `fused_q8`, `chunked_q9/15/19/25` (copy windows up to 25 rows as sub-windows of 8).
+- Memory: the peak above the turn start drops from 3.2 to 7.0 GiB to 0.7 to 1.7 GiB on every follow-up turn; the cold turn from 5.75 to 3.35 GiB. Mistral keeps 128 KiB of KV per token (twice Qwen3.8-27B), so the copy-on-write cost of the stock snapshot is large here.
+- Speed: plain equal (within 1 %); with context copy the steps are 2 to 11 % shorter (the copy windows run on the segment kernel instead of stock SDPA), tok/s 2 to 12 % higher. Prefill equal.
+- Greedy identity: off and on deterministic run to run. Plain and code: outputs identical in all 5 turns. Prose: identical in turns 0 to 2, one divergence at turn 3 position 18 (turn 4 then has a different prompt). The context-copy events (rounds, drafted, accepted) are identical wherever the outputs are. Margin at that divergence: 0.0 (two tokens with the same logit 19.1875, an exact tie; `out/mis-prose-margin.json`).
