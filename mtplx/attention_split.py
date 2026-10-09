@@ -358,6 +358,27 @@ def _attention_has_plain_q_proj(attn: Any) -> bool:
     return int(weight.shape[0]) == num_heads * int(norm_weight.shape[0])
 
 
+def _attention_has_unnormed_q_proj(attn: Any) -> bool:
+    """Llama-style attention (Llama, Mistral): q/k/v projections and rope, no q/k norm, no gate."""
+    if getattr(attn, "q_norm", None) is not None or getattr(attn, "k_norm", None) is not None:
+        return False
+    if any(getattr(attn, name, None) is None for name in ("k_proj", "v_proj", "o_proj", "rope")):
+        return False
+    weight = getattr(getattr(attn, "q_proj", None), "weight", None)
+    head_dim = getattr(attn, "head_dim", None)
+    if not head_dim and getattr(attn, "scale", None):
+        head_dim = round(float(attn.scale) ** -2)
+    num_heads = int(getattr(attn, "num_attention_heads", getattr(attn, "n_heads", 0)))
+    if weight is None or not head_dim or not num_heads:
+        return False
+    return int(weight.shape[0]) == num_heads * int(head_dim)
+
+
+def _attention_has_ungated_q_proj(attn: Any) -> bool:
+    """Ungated attention the hook body serves on a segmented cache (Qwen3, Llama, Mistral)."""
+    return _attention_has_plain_q_proj(attn) or _attention_has_unnormed_q_proj(attn)
+
+
 def _install_split_attention_hook(attn: Any) -> bool:
     cls = type(attn)
     if getattr(cls, "_mtplx_split_full_attention_installed", False):
@@ -395,11 +416,12 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # and float32 values (mtplx/attention_math.py).
         gated_q_proj = _attention_has_gated_q_proj(self)
         if not gated_q_proj and not (
-            isinstance(cache, SegmentedKVCache) and _attention_has_plain_q_proj(self)
+            isinstance(cache, SegmentedKVCache) and _attention_has_ungated_q_proj(self)
         ):
             # Only the gated (Qwen3-Next style) attention goes through this body, and, for
-            # MTPLX_SEGMENTED_KV, a plain q/k-norm attention (Qwen3, head_dim 128) on a
-            # segmented cache: the stock forward would gather the history on every call.
+            # MTPLX_SEGMENTED_KV, an ungated attention (Qwen3 with q/k norm, Llama and
+            # Mistral without) on a segmented cache: the stock forward would gather the
+            # history on every call.
             return original_call(self, x, mask=mask, cache=cache)
 
         from mlx_lm.models.base import scaled_dot_product_attention
@@ -420,10 +442,12 @@ def _install_split_attention_hook(attn: Any) -> bool:
 
         keys = self.k_proj(x)
         values = self.v_proj(x)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(B, L, n_kv_heads, -1)
-        ).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, n_kv_heads, -1)
+        if getattr(self, "q_norm", None) is not None:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, n_kv_heads, -1).transpose(
             0,
             2,
@@ -981,7 +1005,7 @@ def configure_split_full_attention(
         # The hook is installed once per attention class: later instances report False.
         hooked_layers.append(
             (newly_hooked or bool(getattr(type(attn), "_mtplx_split_full_attention_installed", False)))
-            and (_attention_has_gated_q_proj(attn) or _attention_has_plain_q_proj(attn))
+            and (_attention_has_gated_q_proj(attn) or _attention_has_ungated_q_proj(attn))
         )
         stats["installed"] += int(newly_hooked)
         attn._mtplx_split_full_attention_enabled = bool(
