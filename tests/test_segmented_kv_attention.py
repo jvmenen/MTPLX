@@ -110,17 +110,55 @@ def test_single_segment_is_bit_identical_to_the_stock_cache(lane) -> None:
 
 
 @pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
-def test_without_the_route_the_gather_fallback_is_the_stock_result(monkeypatch) -> None:
-    """No packed lane configured: segments gather into one array and the stock SDPA runs on it."""
+def test_with_the_route_switched_off_the_gather_fallback_is_the_stock_result(monkeypatch) -> None:
+    """Both attention switches set to 0 (the kill switch): segments gather into one array and the
+    stock SDPA runs on it. The support check keeps such a model on stock caches; this pins the
+    fallback's correctness."""
     for name in ("MTPLX_GQA_PACKED_SDPA", "MTPLX_NAX_FLASH_ROUTE"):
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "0")
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "0")
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_PREFILL", "gather")  # the LSE prefill route is not bitwise stock
     model, attn = _model()
     configure_split_full_attention(model)
     stock, _ = _run_turns(attn, KVCache(), False)
     seg, _ = _run_turns(attn, SegmentedKVCache(), False)
     for a, b in zip(stock, seg):
         assert mx.array_equal(a, b).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
+@pytest.mark.parametrize("profile_env", [{}, {"MTPLX_VLLM_METAL_PAGED_ATTN": "1"}])
+def test_without_the_attention_switches_the_segment_kernel_serves(monkeypatch, profile_env) -> None:
+    """The sustained profile sets neither MTPLX_GQA_PACKED_SDPA nor MTPLX_NAX_FLASH_ROUTE: a segmented
+    cache still takes the segment kernel and never gathers, and agrees with the stock cache."""
+    import mtplx.segmented_kv as module
+
+    for name in ("MTPLX_GQA_PACKED_SDPA", "MTPLX_NAX_FLASH_ROUTE", "MTPLX_VLLM_METAL_PAGED_ATTN"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in profile_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "0")
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_PREFILL", "lse")
+    model, attn = _model()
+    configure_split_full_attention(model)
+    stock, _ = _run_turns(attn, KVCache(), False)
+    S.segmented_dispatch_counts.clear()
+    module.route_counts.clear()
+    seg, _ = _run_turns(attn, SegmentedKVCache(), False)
+    assert not any(k.startswith("gather") for k in module.route_counts), module.route_counts
+    assert S.segmented_dispatch_counts.get("dispatched", 0) >= 3
+    for a, b in zip(stock, seg):
+        assert bool(mx.all(mx.isfinite(b)).item())
+        assert _top_ulps(a, b) <= 8
+
+
+@pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
+@pytest.mark.parametrize("head_dim, gqa", [(256, 6), (128, 4), (128, 1)])
+def test_the_selfcheck_probe_passes_on_the_real_segment_kernel(head_dim, gqa) -> None:
+    from mtplx.kernel_selfcheck import _SDPA_TOLERANCE, _check_segments
+
+    for dtype in (mx.bfloat16, mx.float16):
+        assert _check_segments(mx, dtype, d=head_dim, gqa=gqa) <= _SDPA_TOLERANCE
 
 
 @pytest.mark.skipif(not mx.metal.is_available() or not nax_available(), reason="TensorOps unavailable")
