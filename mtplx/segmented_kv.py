@@ -61,6 +61,7 @@ def segmented_kv_requested() -> bool:
 #: Verdict on the loaded model (``evaluate_model_support``); None until a model was checked.
 _MODEL_SUPPORT: dict[str, Any] | None = None
 _UNSUPPORTED_LOGGED = False
+_LSE_NOTE_LOGGED = False
 
 
 def segmented_kv_enabled() -> bool:
@@ -76,9 +77,10 @@ def model_support() -> dict[str, Any] | None:
 
 
 def reset_model_support() -> None:
-    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED
+    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED, _LSE_NOTE_LOGGED
     _MODEL_SUPPORT = None
     _UNSUPPORTED_LOGGED = False
+    _LSE_NOTE_LOGGED = False
 
 
 def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | None = None) -> dict[str, Any]:
@@ -94,7 +96,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
     from .kernels.sdpa_segmented import SUPPORTED_HEAD_DIMS, segments_supported
     from .nax_verify import nax_available
 
-    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED
+    global _MODEL_SUPPORT, _UNSUPPORTED_LOGGED, _LSE_NOTE_LOGGED
     layers = list(layers)
     flags = list(hooked) if hooked is not None else [True] * len(layers)
     reasons: list[str] = []
@@ -140,6 +142,14 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
             "[mtplx] MTPLX_SEGMENTED_KV is on but this model cannot use it ("
             + ", ".join(reasons)
             + "): keeping the stock KV cache",
+            flush=True,
+        )
+    if not reasons and segmented_kv_requested() and prefill_route() == "gather" and not _LSE_NOTE_LOGGED:
+        _LSE_NOTE_LOGGED = True
+        print(
+            "[mtplx] MTPLX_SEGMENTED_KV is on, but this MLX build has no logsumexp output on the fused "
+            "SDPA (return_lse): a prefill chunk over existing segments gathers the history first "
+            "(measured about 5 % slower prefill on follow-up turns; decode and verify are unaffected)",
             flush=True,
         )
     return verdict
