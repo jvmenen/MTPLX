@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09e` (prod-2026-10-09d plus #580; before that `prod-2026-10-09d`: prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09f` (prod-2026-10-09e without the bank spike reserve ca894734, dropped 9 Oct, see VONDSTEN 121; before that `prod-2026-10-09e`: prod-2026-10-09d plus #580; before that `prod-2026-10-09d`: prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -13,7 +13,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | 85a89e15 | Scoped reasoning history keeps the in-round postcommit | #570 | open | default |
 | 8b712048, e05f0b66, 503ee21f | Eager verify async chunk submits | #579 | open | `MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=8` |
 | 8e98ba2f, 2149d58a, de73c92a, ce6c5da6, 774967b8 | Short shared prompt prefixes, completions session bank, put-time stat | not filed | fork only | not in the command |
-| c6e5485a, 8bcc9246, ca894734 | Async rung states, short-request priority, spike reserve | not filed | fork only | not in the command |
+| c6e5485a, 8bcc9246 | Async rung states, short-request priority | not filed | fork only | not in the command (rung states: PR candidate after the 9 Oct server test) |
 | 71288758 | Prefill chunk plan (merge a small final chunk) | #597 | open | `MTPLX_PREFILL_MIN_CHUNK_ROWS=1024` |
 | 460191d0 | Multi-row 4-bit verify matmuls, 5 to 32 rows | #595 | open | `MTPLX_MULTIROW_QMM=1` |
 | b9b509ad | Wide verify attention, 9 to 32-row windows | #593 | open | `MTPLX_NAX_FLASH_WIDE=1` |
