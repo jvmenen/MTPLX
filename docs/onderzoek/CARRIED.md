@@ -25,7 +25,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
 | 23468b07, 85d4a49a | Context-copy drafting for AR-only runtimes (models without an MTP head) | #599 | open | `MTPLX_CONTEXT_COPY_AR=1` (not used by Qwen3.8, which has an MTP head) |
 | 5fcb2051 | Claude Code's `X-Claude-Code-Session-Id` names the session | #606 | open | default |
-| abfea975, c2facca3, df4f4f06, b46cf089 | Tests follow the loaded MLX build (0.32.3): Flash-Next fp32 references, bf16 slot sum spelled out, pin test accepts the validated 0.32.3 build (wheel pin stays 0.32.2). The pre-release regex change 5520cfd3 was reverted (3d5333a5): the misread came from our build name, now `0.32.3.lse` | not filed | fork only | n/a |
+| abfea975, c2facca3, df4f4f06, b46cf089 | Tests follow the loaded MLX build (0.32.3): Flash-Next fp32 references, bf16 slot sum spelled out, pin test accepts the validated 0.32.3 build (wheel pin stays 0.32.2). The pre-release regex change 5520cfd3 was reverted (2c8b5277): the misread came from our build name, now `0.32.3.lse` | not filed | fork only | n/a |
 | 0eae8d62, 69d17afc, d3a74424, dd28b920, 1da1470b | Changelog, lint, test fixes, dashboard bundle | n/a | n/a | n/a |
 
 **Production flags that are obsolete on v2.12.2** (drop at the switch): `MTPLX_MTP_HISTORY_CACHE_ONLY` (default on upstream), `MTPLX_POSTCOMMIT_AFTER_RESPONSE` and `MTPLX_PERSIST_QUEUE_MAX_GB` (superseded; use `MTPLX_PERSISTENCE_MAX_PENDING_BYTES`).
