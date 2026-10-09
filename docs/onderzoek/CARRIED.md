@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09c` (prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09d` (prod-2026-10-09c plus #576; before that `prod-2026-10-09c`: prod-2026-10-09b plus #575; before that `prod-2026-10-09b`: prod-2026-10-09 with the pre-release regex change reverted; before that prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -24,6 +24,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | dd0cc3c1 | SSD cold tier: uint32 fingerprint mixer | #596 | open | matters with `MTPLX_SSD_INCREMENTAL_ENCODE=1` |
 | 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
 | 23468b07, 85d4a49a | Context-copy drafting for AR-only runtimes (models without an MTP head) | #599 | open | `MTPLX_CONTEXT_COPY_AR=1` (not used by Qwen3.8, which has an MTP head) |
+| 10236d6d | `lock_wait_time_s` reports the serial scheduler's queue wait (slimmed version, reuses the `scheduler_queue` span) | #576 | open | default |
 | dfdffef2 | Forge: stamp the verified depth and a served id for forge-local packs | #575 | open | default |
 | 5fcb2051 | Claude Code's `X-Claude-Code-Session-Id` names the session | #606 | open | default |
 | abfea975, c2facca3, df4f4f06, b46cf089 | Tests follow the loaded MLX build (0.32.3): Flash-Next fp32 references, bf16 slot sum spelled out, pin test accepts the validated 0.32.3 build (wheel pin stays 0.32.2). The pre-release regex change 5520cfd3 was reverted (2c8b5277): the misread came from our build name, now `0.32.3.lse` | not filed | fork only | n/a |
