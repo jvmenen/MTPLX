@@ -2,7 +2,7 @@
 
 Commits on `prod` that are not in the maker's release it is based on. Policy: [FORK-POLICY.md](FORK-POLICY.md).
 
-**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-08` (prod-2026-10-06 plus AR context-copy #599, off by default; config unchanged since 2b6c81f). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
+**Base:** v2.12.2 (9882703f). **Built:** 4 October 2026, from `perf/definitief-2122` plus the work below it. **Deployed:** tag `prod-2026-10-09` (prod-2026-10-08 plus MLX 0.32.3 test compatibility and the Claude Code session header #606; config 9 Oct switches MLX to jvmenen/mlx `prod-2026-10-09`). **Previous production:** `perf/definitief` (v2.12.0 base), kept as fallback.
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
@@ -24,9 +24,11 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 | dd0cc3c1 | SSD cold tier: uint32 fingerprint mixer | #596 | open | matters with `MTPLX_SSD_INCREMENTAL_ENCODE=1` |
 | 10cee526, 7eab5dd4 | Dashboard: refused requests shown as "507 memory" (with reason and retry hint) instead of MISS / 0 | #600 | open | dashboard; server copies `refusal_reason`, `retry_when` into the request row |
 | 23468b07, 85d4a49a | Context-copy drafting for AR-only runtimes (models without an MTP head) | #599 | open | `MTPLX_CONTEXT_COPY_AR=1` (not used by Qwen3.8, which has an MTP head) |
+| 5fcb2051 | Claude Code's `X-Claude-Code-Session-Id` names the session | #606 | open | default |
+| abfea975, 5520cfd3, c2facca3, df4f4f06, b46cf089 | Tests follow the loaded MLX build (0.32.3): Flash-Next fp32 references, bf16 slot sum spelled out, pre-release regex ignores local build suffixes, pin test accepts the validated 0.32.3 build (wheel pin stays 0.32.2) | not filed | fork only | n/a |
 | 0eae8d62, 69d17afc, d3a74424, dd28b920, 1da1470b | Changelog, lint, test fixes, dashboard bundle | n/a | n/a | n/a |
 
 **Production flags that are obsolete on v2.12.2** (drop at the switch): `MTPLX_MTP_HISTORY_CACHE_ONLY` (default on upstream), `MTPLX_POSTCOMMIT_AFTER_RESPONSE` and `MTPLX_PERSIST_QUEUE_MAX_GB` (superseded; use `MTPLX_PERSISTENCE_MAX_PENDING_BYTES`).
 
-**MLX:** production runs branch `prod-0.32.2` of [jvmenen/mlx](https://github.com/jvmenen/mlx) (tag `prod-2026-10-04`, build `pkg-combo`). The switch to `prod` / tag `prod-2026-10-09` (build `pkg-combo-0323`) was made and reverted on 9 Oct: the MTPLX suite fails 8 kernel and pin tests on 0.32.3 that pass on 0.32.2 (under investigation). Branch `prod` was rebuilt on v0.32.3 on 8 Oct (the two patches, minq adapted to upstream #4416, plus `return_lse` for segmented KV and array-mask tests, 9 Oct; [mlx-0323-rebuild](2026-10-08-mlx-0323-rebuild.md)), built into `~/Dev/mlx-sdpa/pkg-combo-0323` (marker `0.32.3.combo-lse`, one build for production and segmented KV); validated (tests green, 8K e2e on the lse build equal and token-identical, no gain measured). `sdpa-lse-0.32.3` carries `return_lse` for the segmented KV work (`pkg-lse-0323`). Upstream forms: branches `sdpa-d256-short-query-v2` (on main with #4416, with array-mask tests) and `qmm-large-m-tile` (not filed; MLX wants an issue first and a description written by Jeroen).
+**MLX:** production runs branch `prod` of [jvmenen/mlx](https://github.com/jvmenen/mlx), tag `prod-2026-10-09`: v0.32.3 plus the minq patch (adapted to upstream #4416), the qmm tile patch, `return_lse` and array-mask tests, built into `~/Dev/mlx-sdpa/pkg-combo-0323` (marker `0.32.3.lse`) with `MLX_SDPA_D256_MINQ=64`; one build for production and segmented KV ([mlx-0323-rebuild](2026-10-08-mlx-0323-rebuild.md)). Fallback: branch `prod-0.32.2`, tag `prod-2026-10-04`, build `pkg-combo`. Upstream forms: branches `sdpa-d256-short-query-v2` (on main with #4416, with array-mask tests) and `qmm-large-m-tile` (not filed; MLX wants an issue first and a description written by Jeroen).
 
