@@ -308,19 +308,25 @@ def test_slot_order_changes_the_renormalised_scores(toy_block, toy_x):
     retained routed-down kernel a reduction tree it was not validated against.
     """
 
-    # GPU stream, like the kernel: since MLX 0.32.3 (#4387) the CPU ``sum``
-    # accumulates bf16 in fp32, which is order-independent enough that this
-    # effect no longer shows there; the GPU ``sum`` still rounds per add.
-    with mx.stream(mx.gpu):
-        gates = mx.softmax(toy_block.gate(toy_x), axis=-1, precise=True).reshape(
-            ROWS, NUM_EXPERTS
-        )
-        ids = mx.argsort(gates, axis=-1)[..., -TOP_K:]
-        picked = mx.take_along_axis(gates, ids, axis=-1)
-        ascending = picked / picked.sum(axis=-1, keepdims=True)
-        reversed_ = picked[:, ::-1]
-        descending = (reversed_ / reversed_.sum(axis=-1, keepdims=True))[:, ::-1]
-        assert not _same_bits(ascending, descending)
+    # The denominator is summed add by add in bf16, the rule
+    # test_topk_sum_accumulates_in_bf16_in_slot_order pins for the kernel.
+    # Spelled out instead of ``picked.sum``: since MLX 0.32.3 (#4387) the CPU
+    # ``sum`` widens bf16 to fp32 and no longer shows the slot-order effect.
+    def slot_sum(scores):
+        total = scores[:, :1]
+        for i in range(1, scores.shape[-1]):
+            total = (total + scores[:, i : i + 1]).astype(mx.bfloat16)
+        return total
+
+    gates = mx.softmax(toy_block.gate(toy_x), axis=-1, precise=True).reshape(
+        ROWS, NUM_EXPERTS
+    )
+    ids = mx.argsort(gates, axis=-1)[..., -TOP_K:]
+    picked = mx.take_along_axis(gates, ids, axis=-1)
+    ascending = picked / slot_sum(picked)
+    reversed_ = picked[:, ::-1]
+    descending = (reversed_ / slot_sum(reversed_))[:, ::-1]
+    assert not _same_bits(ascending, descending)
 
 
 def test_metal_order_reference_scores_are_ascending(toy_block, toy_x):
