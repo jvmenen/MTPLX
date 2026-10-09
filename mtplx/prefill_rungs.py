@@ -38,6 +38,11 @@ from typing import Any
 
 import mlx.core as mx
 
+# Attribute an in-forward GDN boundary capture lives under on a cache entry
+# (set by gdn_inforward_boundaries, where that lane is installed). Named here
+# so this module does not depend on the lane.
+BOUNDARY_CAPTURE_ATTR = "_mtplx_boundary_captures"
+
 logger = logging.getLogger(__name__)
 
 COUNTERS: dict[str, int] = {
@@ -109,13 +114,11 @@ def recurrent_state_arrays(entries: list) -> list:
 
     from mlx_lm.models.cache import ArraysCache
 
-    from .gdn_inforward_boundaries import _CAPTURE_ATTR
-
     found: list = []
     for entry in entries:
         if isinstance(entry, ArraysCache):
             _collect_arrays(getattr(entry, "cache", None), found)
-            _collect_arrays(getattr(entry, _CAPTURE_ATTR, None), found)
+            _collect_arrays(getattr(entry, BOUNDARY_CAPTURE_ATTR, None), found)
     return found
 
 

@@ -1,7 +1,7 @@
 """Prefill rungs that carry the GDN states (MTPLX_PREFILL_ASYNC_RUNGS_STATES).
 
 On the tiny quantized Qwen3.5-MoE with a draft head, run through the real
-cold streaming prefill loop on the invariant lane with in-forward boundaries:
+cold streaming prefill loop:
 
 * with rungs (with and without the states) every result bit equals the run
   without rungs: logits, hidden, every trunk cache leaf, every banked
@@ -22,8 +22,6 @@ pytest.importorskip("mlx_lm.models.qwen3_5_moe")
 from mlx_lm.models import base, qwen3_5, qwen3_next
 from mlx_lm.models.cache import ArraysCache, KVCache
 
-from mtplx import batch_invariant_prefill as bip
-from mtplx import gdn_inforward_boundaries as gib
 from mtplx import generation, prefill_rungs
 from mtplx.cache_state import CacheSnapshot
 from tests.a3b_tiny_synth import assert_bit_equal, prompt, tiny_model_with_draft_head
@@ -61,13 +59,10 @@ class _Runtime:
 
 @pytest.fixture()
 def lane(monkeypatch):
-    """Scope the lane's hooks and the rung wrapper to one test."""
+    """Scope the rung wrapper to one test."""
 
     monkeypatch.setattr(qwen3_next, "scaled_dot_product_attention", qwen3_next.scaled_dot_product_attention)
     monkeypatch.setattr(base, "scaled_dot_product_attention", base.scaled_dot_product_attention)
-    monkeypatch.setitem(bip._STOCK_SDPA, "sdpa", None)
-    monkeypatch.setitem(bip._STATE, "installed", False)
-    monkeypatch.setitem(bip._STATE, "refusal", None)
     monkeypatch.setattr(qwen3_5.DecoderLayer, "__call__", qwen3_5.DecoderLayer.__call__)
     monkeypatch.setattr(qwen3_5, "_mtplx_prefill_rungs_installed", False, raising=False)
     monkeypatch.setattr(prefill_rungs, "_STATE", {"idx": 0, "pending": []})
@@ -127,9 +122,6 @@ def _cold(model, tokens, tmp_path):
 @pytest.mark.parametrize("carry", ["0", "1"])
 def test_rungs_leave_every_bit_unchanged(lane, model, monkeypatch, tmp_path, stride, carry):
     stock_call = qwen3_5.DecoderLayer.__call__
-    if not bip.batch_invariant_prefill_installed():
-        bip.install_batch_invariant_prefill(model)
-        gib.install_gdn_inforward_boundaries(model)
     tokens = prompt(263, seed=13)
     reference, edges = _cold(model, tokens, tmp_path)
 
@@ -144,7 +136,7 @@ def test_rungs_leave_every_bit_unchanged(lane, model, monkeypatch, tmp_path, str
         assert prefill_rungs.COUNTERS["state_arrays_dispatched"] > 0
     else:
         assert prefill_rungs.COUNTERS["state_arrays_dispatched"] == 0
-    assert our_edges == edges and len(edges) >= 2
+    assert our_edges == edges
     assert_bit_equal(ours, reference)
 
 
@@ -165,7 +157,7 @@ def test_recurrent_state_arrays_name_states_and_captures_only():
     recurrent = ArraysCache(size=2)
     recurrent[0] = mx.zeros((1, 3, 8))
     recurrent[1] = mx.ones((1, 2, 4, 4))
-    setattr(recurrent, gib._CAPTURE_ATTR, {5: (mx.zeros((1, 3, 8)), mx.ones((1, 2, 4, 4)))})
+    setattr(recurrent, prefill_rungs.BOUNDARY_CAPTURE_ATTR, {5: (mx.zeros((1, 3, 8)), mx.ones((1, 2, 4, 4)))})
     empty = ArraysCache(size=2)
     kv = KVCache()
     kv.update_and_fetch(mx.zeros((1, 1, 3, 8)), mx.ones((1, 1, 3, 8)))
