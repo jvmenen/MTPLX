@@ -107,9 +107,43 @@ def test_health_of_a_supported_model_carries_the_verdict() -> None:
     assert block["enabled"] is True and block["model_support"]["supported"] is True
 
 
-def test_nothing_is_decided_before_a_model_is_checked() -> None:
-    assert model_support() is None and segmented_kv_enabled() is True
-    assert module._MODEL_SUPPORT is None
+def test_without_a_verdict_on_the_model_the_feature_stays_off() -> None:
+    """A model that loads without configure_split_full_attention (Laguna, a script) has no hook: with
+    segment caches its attention would gather every segment on every call, so no verdict means off."""
+    assert model_support() is None and module._MODEL_SUPPORT is None
+    assert segmented_kv_enabled() is False and segmented_ssd_enabled() is False
+
+
+def test_a_load_route_without_a_verdict_builds_stock_caches_and_health_says_why() -> None:
+    cache = [KVCache(), KVCache()]
+    stats = configure_tail_owned_attention_kv_cache(cache)
+    assert all(type(c) is KVCache for c in cache)
+    assert stats.get("mode") != "segmented"
+    block = segmented_kv_health([])
+    assert block["enabled"] is False and block["requested"] is True
+    assert block["model_support"]["reasons"] == ["model_not_checked"]
+    evaluate_model_support([_attn()])  # the verdict a supported model gets at load
+    cache = [KVCache()]
+    configure_tail_owned_attention_kv_cache(cache)
+    from mtplx.segmented_kv import SegmentedKVCache
+
+    assert isinstance(cache[0], SegmentedKVCache)
+
+
+def test_every_runtime_load_starts_without_a_verdict() -> None:
+    """runtime.load resets the verdict before the model's own check, so a Laguna load after a
+    supported model does not inherit that model's verdict."""
+    import inspect
+
+    from mtplx import runtime
+
+    evaluate_model_support([_attn()])
+    assert segmented_kv_enabled() is True
+    source = inspect.getsource(runtime)
+    reset_at = source.index("reset_model_support()")
+    assert "if not _is_laguna_s_2_1_mlx_4bit_config(config):" in source[reset_at : reset_at + 400]
+    reset_model_support()
+    assert segmented_kv_enabled() is False
 
 
 def test_configure_split_full_attention_decides_from_the_hooked_layers(monkeypatch) -> None:

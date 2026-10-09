@@ -65,11 +65,16 @@ _LSE_NOTE_LOGGED = False
 
 
 def segmented_kv_enabled() -> bool:
-    """MTPLX_SEGMENTED_KV, unless the loaded model cannot use segments (then everything behaves
-    as with the switch off: stock caches, stock bank, stock SSD path)."""
+    """MTPLX_SEGMENTED_KV, once the loaded model was checked and can use segments.
+
+    Without a verdict everything behaves as with the switch off (stock caches, stock bank, stock
+    SSD path): the verdict is made in ``configure_split_full_attention``, and a model that loads
+    without it (Laguna, a script that builds its own model) has no split-attention hook, so its
+    attention would gather every segment on every call.
+    """
     if not segmented_kv_requested():
         return False
-    return _MODEL_SUPPORT is None or bool(_MODEL_SUPPORT.get("supported", True))
+    return _MODEL_SUPPORT is not None and bool(_MODEL_SUPPORT.get("supported", False))
 
 
 def model_support() -> dict[str, Any] | None:
@@ -1013,8 +1018,12 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
     if not segmented_kv_requested():
         return None
     if not segmented_kv_enabled():
-        # Asked for, but the loaded model cannot use it: say so (and why) instead of staying silent.
-        return {"enabled": False, "requested": True, "model_support": model_support()}
+        # Asked for, but the loaded model cannot use it or was never checked: say so (and why)
+        # instead of staying silent.
+        support = model_support()
+        if support is None:
+            support = {"supported": False, "reasons": ["model_not_checked"]}
+        return {"enabled": False, "requested": True, "model_support": support}
     per_entry: list[dict[str, Any]] = []
     unique: dict[int, int] = {}
     for entry in entries:

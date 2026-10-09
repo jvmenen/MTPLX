@@ -11,14 +11,22 @@ import gc
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 from mlx_lm.models.cache import KVCache
 
+import mtplx.segmented_kv as segmented_kv_module
 from mtplx.segmented_kv import SegmentedKVCache, SegmentedKVState
 from mtplx.session_bank import SessionBank, entry_has_segmented_kv
 
 LAYERS, HEADS, DIM = 4, 4, 256
 BASE, TURN = 4096, 512
 ROW_BYTES = LAYERS * HEADS * DIM * 2 * 2  # K and V, bf16
+
+
+@pytest.fixture(autouse=True)
+def _model_checked(monkeypatch):
+    # segmented_kv_enabled() needs a verdict on the loaded model (without one it stays off).
+    monkeypatch.setattr(segmented_kv_module, "_MODEL_SUPPORT", {"supported": True, "reasons": []})
 
 
 class Runtime:

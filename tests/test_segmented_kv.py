@@ -13,6 +13,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache
 
+import mtplx.segmented_kv as segmented_kv_module
 from mtplx.cache_state import (
     configure_tail_owned_attention_kv_cache,
     restore_cache,
@@ -41,6 +42,12 @@ def _no_merge_by_default(monkeypatch):
     # Merge-policy tests opt back in; the others count segments.
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_MERGE_MAX_ROWS", "0")
     monkeypatch.setenv("MTPLX_SEGMENTED_KV_MAX_SEGMENTS", "1000")
+
+
+@pytest.fixture(autouse=True)
+def _model_checked(monkeypatch):
+    # segmented_kv_enabled() needs a verdict on the loaded model (without one it stays off).
+    monkeypatch.setattr(segmented_kv_module, "_MODEL_SUPPORT", {"supported": True, "reasons": []})
 
 
 def _rows(seed: int, n: int) -> tuple[mx.array, mx.array]:

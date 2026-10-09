@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from mlx_lm.models.cache import KVCache
 
+import mtplx.segmented_kv as segmented_kv_module
 from mtplx.cache_bank.codec import decode_payload, encode_payload
 from mtplx.cache_bank.cold_tier import SessionBankColdTier
 from mtplx.cache_state import CacheSnapshot, restore_cache
@@ -21,6 +22,12 @@ from mtplx.segmented_kv import (
 )
 
 HEADS, DIM = 2, 16
+
+
+@pytest.fixture(autouse=True)
+def _model_checked(monkeypatch):
+    # segmented_kv_enabled() needs a verdict on the loaded model (without one it stays off).
+    monkeypatch.setattr(segmented_kv_module, "_MODEL_SUPPORT", {"supported": True, "reasons": []})
 
 
 def _rand(seed, n):
@@ -314,7 +321,9 @@ class _FakeRuntime:
 @pytest.mark.parametrize("flag", ["1", ""])
 def test_ssd_restore_builds_the_requests_cache_layout_with_and_without_the_switch(monkeypatch, tmp_path, flag) -> None:
     """The SSD restore builds the request's cache layout, with or without segments (the fix itself and
-    its own tests are in tests/test_ssd_restore_cache_layout.py)."""
+    its own tests are in tests/test_ssd_restore_cache_layout.py): with the switch on that layout is the
+    segmented one, and the stock entry on disk becomes its rows."""
+    from mtplx.cache_state import configure_tail_owned_attention_kv_cache
     from mtplx.session_bank import SessionBank
 
     if flag:
@@ -335,9 +344,13 @@ def test_ssd_restore_builds_the_requests_cache_layout_with_and_without_the_switc
 
     def factory():
         made_by_factory.append(1)
-        return [KVCache() for _ in range(2)]
+        layers = [KVCache() for _ in range(2)]
+        configure_tail_owned_attention_kv_cache(layers)  # as rt.make_cache() does for the dense layout
+        return layers
 
     restored = fresh.restore(runtime, tokens + [701, 702], session_id="s", cache_factory=factory)
     assert restored is not None and restored.restore_mode == "ssd_clone"
     assert made_by_factory
+    assert all(isinstance(c, SegmentedKVCache) for c in restored.cache) == bool(flag)
     assert restored.cache[0].offset == 700
+    assert mx.array_equal(restored.cache[0].keys[..., :700, :], cache[0].state[0]).item()
