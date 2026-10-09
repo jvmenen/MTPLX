@@ -39,7 +39,6 @@ from .runtime_options import (
     near_prefix_min_match_tokens,
     prefix_block_size,
 )
-from .memory_plan import RecentSpikes
 
 
 logger = logging.getLogger(__name__)
@@ -196,32 +195,6 @@ def session_bank_idle_ttl_s() -> float:
         return float(DEFAULT_IDLE_TTL_S)
     # SessionBank rejects <= 0 (idle_ttl_s must be > 0); infinity is "never".
     return value if value > 0 else float("inf")
-
-
-SESSION_BANK_SPIKE_BURSTS_ENV = "MTPLX_SESSION_BANK_SPIKE_BURSTS"
-
-
-def _session_bank_recent_spikes() -> RecentSpikes | None:
-    """MTPLX_SESSION_BANK_SPIKE_BURSTS: how many request bursts the bank's
-    transient reserve remembers (memory_plan.RecentSpikes). Unset or ``0``
-    keeps the lifetime high-water, the behaviour since 2026-08-29. A
-    positive count restarts MLX's peak counter whenever the engine goes
-    idle, so ``peak_memory_bytes`` everywhere then reads "since the last
-    idle moment" instead of "since start"; that is why it is opt-in.
-    """
-    raw = os.environ.get(SESSION_BANK_SPIKE_BURSTS_ENV)
-    if raw is None or not str(raw).strip():
-        return None
-    try:
-        bursts = int(str(raw).strip())
-    except ValueError:
-        logger.warning(
-            "%s=%r is not a whole number; keeping the lifetime peak",
-            SESSION_BANK_SPIKE_BURSTS_ENV,
-            raw,
-        )
-        return None
-    return RecentSpikes(bursts) if bursts > 0 else None
 
 
 def _default_per_session_max_bytes() -> int:
@@ -1907,7 +1880,6 @@ class EngineSessionManager:
         model_weights_bytes: int | None = None,
         memory_plan: Any | None = None,
     ) -> None:
-        self._recent_spikes: RecentSpikes | None = None
         if idle_ttl_s is None:
             idle_ttl_s = session_bank_idle_ttl_s()
         # Byte caps resolve model-aware by default (v2): unset or "auto" env
@@ -1954,9 +1926,6 @@ class EngineSessionManager:
                     transient_reserve_bytes,
                 )
 
-                recent_spikes = _session_bank_recent_spikes()
-                self._recent_spikes = recent_spikes
-
                 def _dynamic_ceiling(
                     _bank: SessionBank = bank, _plan: Any = memory_plan
                 ) -> int:
@@ -1975,11 +1944,8 @@ class EngineSessionManager:
                     # allocator peak kissed 0.99+ of the Metal limit —
                     # tripping the warning banner on every long coding turn
                     # (2026-08-29 receipts).
-                    peak = int(mx.get_peak_memory())
-                    if recent_spikes is not None:
-                        peak = active + recent_spikes.observe(peak, active)
                     reserve = transient_reserve_bytes(
-                        peak,
+                        int(mx.get_peak_memory()),
                         active,
                         play_bytes=int(_plan.usable_bytes)
                         - int(_plan.model_weights_bytes),
@@ -2030,21 +1996,6 @@ class EngineSessionManager:
         self._sessions: dict[str, EngineSession] = {}
         self._lock = Lock()
         self.last_prefix_diagnostic: dict[str, Any] | None = None
-
-    def close_spike_burst(self) -> None:
-        """The engine went idle: remember this burst's spike, restart the peak.
-
-        Only with MTPLX_SESSION_BANK_SPIKE_BURSTS set; otherwise MLX's peak
-        counter stays a lifetime high-water, as every reader expects.
-        """
-        spikes = self._recent_spikes
-        if spikes is None:
-            return
-        import mlx.core as mx
-
-        spikes.observe(int(mx.get_peak_memory()), int(mx.get_active_memory()))
-        spikes.close_burst()
-        mx.reset_peak_memory()
 
     def resolve_session_id(
         self,
