@@ -205,19 +205,26 @@ def test_cpu_argpartition_agrees_on_the_set_but_not_the_slot_order():
 
 
 def test_topk_sum_accumulates_in_bf16_in_slot_order():
-    """``row_reduce_small_1_reduce_sumbfloat16`` instantiates T == U == bf16."""
+    """``row_reduce_small_1_reduce_sumbfloat16`` instantiates T == U == bf16.
 
-    mx.random.seed(9)
-    a = (mx.random.normal((256, TOP_K)) * 0.1).astype(mx.bfloat16)
-    sequential = a[:, 0]
-    for i in range(1, TOP_K):
-        sequential = (sequential + a[:, i]).astype(mx.bfloat16)
-    assert _same_bits(sequential, mx.sum(a, axis=-1))
-    widened = mx.sum(a.astype(mx.float32), axis=-1).astype(mx.bfloat16)
-    assert not _same_bits(widened, mx.sum(a, axis=-1)), (
-        "an fp32 accumulation is NOT the same tensor; the kernel's bf16 loop "
-        "is not cosmetic"
-    )
+    Runs on the GPU stream: that is the rule the Metal kernel copies. Since
+    MLX 0.32.3 (upstream #4387) the CPU ``sum`` widens bf16 to fp32, so the
+    CPU stream no longer shows the bf16 add-by-add rule; the GPU ``sum`` is
+    unchanged and bit-identical between 0.32.2 and 0.32.3.
+    """
+
+    with mx.stream(mx.gpu):
+        mx.random.seed(9)
+        a = (mx.random.normal((256, TOP_K)) * 0.1).astype(mx.bfloat16)
+        sequential = a[:, 0]
+        for i in range(1, TOP_K):
+            sequential = (sequential + a[:, i]).astype(mx.bfloat16)
+        assert _same_bits(sequential, mx.sum(a, axis=-1))
+        widened = mx.sum(a.astype(mx.float32), axis=-1).astype(mx.bfloat16)
+        assert not _same_bits(widened, mx.sum(a, axis=-1)), (
+            "an fp32 accumulation is NOT the same tensor; the kernel's bf16 loop "
+            "is not cosmetic"
+        )
 
 
 def test_renormalize_divide_rounds_once():
@@ -301,15 +308,19 @@ def test_slot_order_changes_the_renormalised_scores(toy_block, toy_x):
     retained routed-down kernel a reduction tree it was not validated against.
     """
 
-    gates = mx.softmax(toy_block.gate(toy_x), axis=-1, precise=True).reshape(
-        ROWS, NUM_EXPERTS
-    )
-    ids = mx.argsort(gates, axis=-1)[..., -TOP_K:]
-    picked = mx.take_along_axis(gates, ids, axis=-1)
-    ascending = picked / picked.sum(axis=-1, keepdims=True)
-    reversed_ = picked[:, ::-1]
-    descending = (reversed_ / reversed_.sum(axis=-1, keepdims=True))[:, ::-1]
-    assert not _same_bits(ascending, descending)
+    # GPU stream, like the kernel: since MLX 0.32.3 (#4387) the CPU ``sum``
+    # accumulates bf16 in fp32, which is order-independent enough that this
+    # effect no longer shows there; the GPU ``sum`` still rounds per add.
+    with mx.stream(mx.gpu):
+        gates = mx.softmax(toy_block.gate(toy_x), axis=-1, precise=True).reshape(
+            ROWS, NUM_EXPERTS
+        )
+        ids = mx.argsort(gates, axis=-1)[..., -TOP_K:]
+        picked = mx.take_along_axis(gates, ids, axis=-1)
+        ascending = picked / picked.sum(axis=-1, keepdims=True)
+        reversed_ = picked[:, ::-1]
+        descending = (reversed_ / reversed_.sum(axis=-1, keepdims=True))[:, ::-1]
+        assert not _same_bits(ascending, descending)
 
 
 def test_metal_order_reference_scores_are_ascending(toy_block, toy_x):
