@@ -157,3 +157,48 @@ The two t2 turns ended in a 507 during their suffix prefill, after their admissi
 **Q6 (limit 35.0 GB)** [measured]: no 507. Only one idle release (B t2 released A, written first, 4.3 s). Before that, A was dropped by the pressure trim instead: the allocator at 0.997 of the limit during B's cold prefill (warning level, deferred 60 s while busy, then trimmed 2 entries) cancelled A's queued write, and A t1 re-read 63,881 tokens (173 s). The pressure trim runs on the asyncio thread and is left unchanged on purpose; it is a second way to lose an unwritten conversation (in production it evicted entries in 4 of 46 ticks at level 4).
 
 Conclusion: the fix does what it should. An idle conversation whose SSD copy is not written is written first and then released, and its next turn restores from SSD (4 of 4 releases in Q5; 2 returning turns checked, both `ssd_clone` with 97-98 % cached). Open: no run where all six turns pass at once (Q5: 507s at t2 from the test limit; Q6: the trim got there first); the pressure-trim path.
+
+## 11. The pressure trim keeps an unwritten conversation at WARNING: built (10 Oct, evening)
+
+Branch `fix/trim-keeps-unwritten` (stacked on `fix/spill-before-idle-release`, worktree `~/Dev/laya-nl/mtplx-trim-keeps-unwritten`, commit 944fc42d, not pushed). On production as `test/prod-trim-keeps-unwritten` (prod-2026-10-10c, which already has the spill-before-release fix, + 741ac03f; worktree `~/Dev/laya-nl/mtplx-prod-trimfix`).
+
+### How the trim works [read]
+
+- `_memory_pressure_loop` is an asyncio task on the server's event loop, not on the model-owner thread. Every 10 s (2 s while the Mac is under its shed floor) it takes the worst of three levels: macOS memorystatus, the engine's allocator (active + pool >= 0.97 of the Metal limit is WARNING, >= 1.02 CRITICAL) and the Mac's available memory (shed floor WARNING, abort floor or fast compressor/swap growth CRITICAL).
+- `_MemoryPressureGuard.decide`: acts on the rising edge, then at most every 120 s while the level stays up. WARNING waits for an idle engine up to 60 s, then trims anyway, while the request runs; CRITICAL never waits.
+- Victims: `SessionBank.shrink_to_bytes`, never a session in flight, least recently used first. WARNING target = half of what the bank holds; CRITICAL target = 0 (everything idle). Each evicted entry's own queued SSD write is cancelled (`cancel_queued_persistence=True`): a queued job holds the entry's arrays until the idle lane runs it, so an eviction that leaves the job frees nothing.
+- What it protects against: WARNING is the early signal, before the allocator or the Mac runs out; CRITICAL is the last step before swap or a kernel panic (the docstrings cite #144/#305 and two machines that ended in a watchdog panic). Within a request the admission, the per-chunk check (`_PrefillSystemGuard`, 507 on the next chunk that does not fit) and the sustained abort (three CRITICAL ticks) hold the request itself. If the trim did nothing at CRITICAL, the next step is the abort; at WARNING the other guards still stand.
+- Difference with the admission release (#618): that runs on the model-owner thread, between work items, holding the released session, when a concrete request needs the memory; there a bounded write is safe. The trim runs on another thread while a prefill may be using the GPU, and is meant to give memory back now.
+
+### How often in production [measured, `var/mtplx.log` last server run 02:26-08:00 + `request-log-8000.jsonl`]
+
+46 trim ticks, 4 took entries (03:29 level 4, 1 entry; 04:34 level 2, 6 entries; 07:19 and 07:41 level 4, 1 entry each). The receipt did not say whether those entries were on SSD. Following each conversation's next turn: the only one that came back after the 04:34 WARNING trim restored 106,815 tokens from SSD (so it was written); in the other three the next turns of the conversations still alive were RAM hits (the evicted entry was not the one they needed) or the conversation did not come back (03:29: the 158K conversation that was being refused with 507s anyway). In this log no re-read caused by the trim was found; the loss was seen only in the GPU run Q6. All 7 lost conversations of section 4 came from the admission's step 6.
+
+### Options weighed [read + assumed]
+
+- (b) write out from the trim, like #618: rejected. `spill_entry` reads MLX arrays and evaluates the encode's slices; on the asyncio thread that would run next to the model-owner thread's prefill (MTPLX keeps all MLX work on one owner thread), and at 0.997 of the limit the write's units come on top.
+- (c) let the trim queue a priority write and drop afterwards: the write would run after the current work item, which is when the admission (#618) already writes out a conversation it must release. The scheduler also deliberately has no "overdue" bypass for persistence work. Duplicate machinery, no gain.
+- (a) + (d), built: at WARNING the trim passes over an entry whose own SSD write is still queued (`_awaits_queued_write`, the #618 helper) and takes entries on SSD or that nothing will write; CRITICAL unchanged (take everything idle, memory comes first). The conversation leaves RAM later: its write runs in the next quiet window and a later trim takes it, or a request that does not fit writes it out in its admission. Cost: with only unwritten conversations idle, a WARNING trim takes nothing (receipt `bank_unwritten_kept`).
+- Receipt: `bank_unwritten_kept` and `bank_unwritten_dropped` (an entry taken with its queued write cancelled, at CRITICAL), so a future log answers question 2 directly.
+
+### Tests [measured]
+
+`tests/test_pressure_trim_keeps_unwritten.py` (5 tests, real loop, `SessionBank` and `SessionBankColdTier`, engine busy): WARNING keeps the unwritten conversation and its queued write; WARNING takes the conversation on SSD instead of an older unwritten one; once its write has run a later trim takes it; without an SSD cache the entry is taken as before; CRITICAL still takes it and counts it. On #618 alone all 5 fail (3 by behaviour, 2 on the missing receipt fields). The first full-suite run found 10 failures: three loop tests' stand-in banks did not accept the new keywords; fixed in the same commit. Re-run (`m3/server/spill/trim/unit.log`): related 261 passed (main+#618+fix) and 275 passed (prod-10c+fix); full suites 11,265 passed / 0 failed and 12,084 passed / 0 failed. Ruff (default rules) adds no findings to the changed files; AI-attribution check clean.
+
+### GPU check Q7: correctness only [measured]
+
+prod-2026-10-10c + fix, production's flags, limit 35.0 GB, same driver as Q6 (`trim/run-Q7.log`, `server-Q7.out`).
+
+| | Q6 (without) | Q7 (with) |
+|---|---|---|
+| Trim | WARNING, allocator 0.997, deferred 60 s, 2 entries, A's write cancelled | WARNING, allocator 0.998, deferred 60 s, 1 entry, `bank_unwritten_kept 1`, `bank_unwritten_dropped 0` |
+| A t1 | cold, 63,881 tokens re-read, TTFT 173 s | RAM clone, 62,336 of 63,881 cached, TTFT 7.6 s |
+| Idle release | B t2 released A (written) | A t2 released B: 1 entry written first (4.3 s), 1 sibling dropped |
+| B t2 | RAM | SSD clone, 60,907 of 61,950 cached, TTFT 7.2 s |
+| 507 / errors | 0 | 0 |
+
+The conversation the trim kept stayed in RAM and its next turn was a RAM hit; the conversation that later had to go was written to SSD first and its next turn restored from SSD. No 507. Which entry the trim did take is not in the receipt (the eviction log is in memory only); `bank_unwritten_dropped 0` says it was not an unwritten one.
+
+### PR choice
+
+Separate PR, stacked on #618: #618's text already says the trim is "left for a separate change", the mechanism differs (a keep rule, no write) and has its own trade-off (a WARNING trim can take nothing) that deserves its own review and its own revert. It uses #618's `_awaits_queued_write`, so it merges after #618.
