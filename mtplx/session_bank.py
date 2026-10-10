@@ -3969,6 +3969,8 @@ class SessionBank:
         protect_keys: Any = None,
         protect_session_ids: Any = None,
         cancel_queued_persistence: bool = True,
+        protect_unwritten: bool = False,
+        receipt_out: dict[str, Any] | None = None,
     ) -> int:
         """Evict least-recently-used entries until the bank fits the target.
 
@@ -3998,6 +4000,17 @@ class SessionBank:
         each evicted entry's own queued settle and SSD encode are cancelled
         with it (``_evict_entry``); ``cancel_queued_persistence=False`` keeps
         them.
+
+        ``protect_unwritten=True`` (the WARNING pressure trim) never takes an
+        entry whose own SSD write is still queued (``_awaits_queued_write``):
+        taking it cancels that write, RAM held the only copy, and the
+        conversation's next turn re-reads everything. The idle lane writes
+        it in the next quiet window, and a later trim can take it then; a
+        request that does not fit writes it out before its admission lets it
+        go (``release_sessions``). ``receipt_out`` receives
+        ``unwritten_kept`` (entries spared that the target would have taken)
+        and ``unwritten_dropped`` (entries taken with their queued write
+        cancelled).
         """
 
         evicted = 0
@@ -4006,6 +4019,16 @@ class SessionBank:
         active = self._active_session_ids()
         keep_keys = {tuple(key) for key in (protect_keys or ())}
         keep_sessions = {str(sid) for sid in (protect_session_ids or ()) if sid}
+        unwritten: set[int] = set()
+        if cancel_queued_persistence and (protect_unwritten or receipt_out is not None):
+            # Read once: the durability check is a manifest lookup per entry.
+            unwritten = {
+                id(entry)
+                for entry in list(self._entries.values())
+                if self._awaits_queued_write(entry)
+            }
+        unwritten_kept = 0
+        unwritten_dropped = 0
         while self._entries and self.total_nbytes > target:
             candidates = self._entries.values()
             if keep_keys or keep_sessions:
@@ -4021,6 +4044,11 @@ class SessionBank:
                     for entry in candidates
                     if entry.session_id not in active
                 ]
+            if protect_unwritten and unwritten:
+                written = [entry for entry in candidates if id(entry) not in unwritten]
+                if not written:
+                    unwritten_kept = len(list(candidates))
+                candidates = written
             if not candidates:
                 break
             victim = min(
@@ -4046,6 +4074,8 @@ class SessionBank:
                 # The entry left RAM; its queued job did not. Keep giving
                 # memory back, then report the failure.
                 cancel_failure = cancel_failure or exc
+            else:
+                unwritten_dropped += int(id(victim) in unwritten)
             if len(self._entries) >= before:
                 # Defensive: an entry whose dict key drifted from its
                 # token_ids would make this loop spin forever while
@@ -4055,6 +4085,9 @@ class SessionBank:
                 # never an acceptable failure mode for a pressure responder.
                 break
             evicted += 1
+        if receipt_out is not None:
+            receipt_out["unwritten_kept"] = int(unwritten_kept)
+            receipt_out["unwritten_dropped"] = int(unwritten_dropped)
         if cancel_failure is not None:
             cancel_failure.receipt = evicted
             raise cancel_failure
