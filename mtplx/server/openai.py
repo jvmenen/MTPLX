@@ -24248,8 +24248,10 @@ async def _memory_pressure_loop(
     request, the per-chunk check reserves the next chunk against the abort
     floor and the engine's limit. A WARNING trim halves what the
     bank holds, not its budget, so it cannot be a no-op when the bank already
-    sits under half (#525: 421 WARNING trims in a row evicted nothing). The
-    sustained abort still needs three CRITICAL ticks; within a request, the
+    sits under half (#525: 421 WARNING trims in a row evicted nothing). It
+    passes over an idle conversation whose SSD write is still queued, so it
+    takes nothing when only such conversations are left (the receipt's
+    ``bank_unwritten_kept``). The sustained abort still needs three CRITICAL ticks; within a request, the
     prefill reads the supply itself before every chunk (_PrefillSystemGuard)
     and stops at once.
     """
@@ -24371,6 +24373,7 @@ async def _memory_pressure_loop(
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
                 trim_error: BaseException | None = None
+                unwritten: dict[str, Any] = {}
                 if bank is not None:
                     target = (
                         0
@@ -24388,6 +24391,19 @@ async def _memory_pressure_loop(
                     # holds), where the old half-the-budget target took
                     # nothing. The request's own growth is held by its
                     # admission, the per-chunk check and the sustained abort.
+                    #
+                    # A WARNING trim never takes an idle conversation whose
+                    # SSD write is still queued: the trim cancels that write,
+                    # and the conversation's next turn re-reads everything.
+                    # The write waits for a quiet window that two clients
+                    # taking turns never leave, so this loss came exactly
+                    # when the trim ran during a request (a 64K conversation
+                    # dropped after the 60 s deferral, its next turn a 173 s
+                    # re-read). WARNING is the early signal; a request that
+                    # does not fit writes such a conversation out before its
+                    # admission lets it go, and CRITICAL still takes
+                    # everything idle. No write here: this loop runs off the
+                    # model-owner thread, while a request may be running.
                     try:
                         evicted = bank.shrink_to_bytes(
                             target,
@@ -24397,6 +24413,8 @@ async def _memory_pressure_loop(
                                 else "memory_pressure_warning"
                             ),
                             protect_session_ids=_in_flight_session_ids(state),
+                            protect_unwritten=level < 4,
+                            receipt_out=unwritten,
                         )
                     except Exception as exc:  # noqa: BLE001
                         # The trim gives back what it can (a queued job it
@@ -24453,6 +24471,10 @@ async def _memory_pressure_loop(
                     ),
                     "phys_footprint_bytes": phys_footprint_bytes(),
                     "bank_entries_evicted": evicted,
+                    "bank_unwritten_kept": int(unwritten.get("unwritten_kept") or 0),
+                    "bank_unwritten_dropped": int(
+                        unwritten.get("unwritten_dropped") or 0
+                    ),
                     "bank_bytes_after": int(
                         getattr(bank, "total_nbytes", 0) or 0
                     ),
