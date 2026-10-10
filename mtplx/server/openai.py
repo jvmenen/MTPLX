@@ -22405,6 +22405,8 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
         "entries": 0,
         "held_bytes": 0,
         "dropped_entries": 0,
+        "written_out_entries": 0,
+        "write_out_s": 0.0,
         "persistence_cancelled": 0,
         "queued_persistence_entries": 0,
         "queued_persistence_bytes": 0,
@@ -22421,8 +22423,12 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
             "queued_persistence_entries",
             "queued_persistence_bytes",
             "postcommits_aborted",
+            "written_out_entries",
         ):
             merged[key] += int(receipt.get(key) or 0)
+        merged["write_out_s"] = round(
+            float(merged["write_out_s"]) + float(receipt.get("write_out_s") or 0.0), 3
+        )
         merged["session_records_dropped"].extend(
             receipt.get("session_records_dropped") or ()
         )
@@ -23680,6 +23686,12 @@ def _run_prefill_admission(
                         protect_tokens=probe_ids,
                         restore_identity=identity,
                         reason="prefill_admission_idle_release",
+                        # A conversation whose newest state is not on SSD
+                        # yet is written there before it goes: its queued
+                        # write waits for a quiet window that two clients
+                        # taking turns never leave, and without it the
+                        # conversation's next turn re-reads everything.
+                        write_out_before_release=True,
                     )
                 )
                 clear_pool()
