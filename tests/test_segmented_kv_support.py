@@ -94,9 +94,44 @@ def test_an_attention_switch_set_to_0_is_a_kill_switch(monkeypatch, name, reason
     assert segmented_kv_enabled() is False
 
 
-def test_missing_nax_is_a_reason(monkeypatch) -> None:
+def test_missing_nax_selects_the_lse_route_instead_of_switching_segments_off(monkeypatch) -> None:
     monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: False)
-    assert "nax_unavailable" in evaluate_model_support([_attn()])["reasons"]
+    verdict = evaluate_model_support([_attn()])
+    assert verdict["supported"] and verdict["reasons"] == [] and verdict["decode_route"] == "lse"
+    assert segmented_kv_enabled() is True
+    assert module.kernel_probe_shapes() == []  # no segment kernel runs, nothing to probe
+
+
+def test_the_lse_route_takes_shapes_the_segment_kernel_does_not(monkeypatch) -> None:
+    monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: False)
+    assert evaluate_model_support([_attn(head_dim=64, q=16, kv=4), _attn(head_dim=80, q=40, kv=1)])["supported"]
+    assert not evaluate_model_support([_attn(head_dim=64, q=15, kv=4)])["supported"]  # GQA must divide
+
+
+def test_the_attention_kill_switches_only_apply_to_the_kernel_route(monkeypatch) -> None:
+    monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: False)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "0")
+    assert evaluate_model_support([_attn()])["supported"]
+
+
+def test_the_lse_route_can_be_selected_on_a_tensor_unit_gpu(monkeypatch) -> None:
+    assert module.decode_route() == "kernel"
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_DECODE", "lse")
+    assert module.decode_route() == "lse"
+    assert evaluate_model_support([_attn(head_dim=64, q=16, kv=4)])["supported"]
+
+
+def test_the_kernel_route_cannot_be_forced_onto_a_gpu_without_tensor_units(monkeypatch) -> None:
+    monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: False)
+    monkeypatch.setenv("MTPLX_SEGMENTED_KV_DECODE", "kernel")
+    assert module.decode_route() == "lse"
+
+
+def test_the_rehearsal_switch_selects_the_lse_route(monkeypatch) -> None:
+    """MTPLX_FORCE_GPU_FAMILY_FALLBACK=1 (an M5 acting as an M1 to M4) reaches the route choice."""
+    monkeypatch.undo()  # drop the nax_available patch of the autouse fixture
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    assert module.decode_route() == "lse"
 
 
 def test_an_unsupported_model_keeps_stock_caches_and_never_builds_a_segmented_one() -> None:
