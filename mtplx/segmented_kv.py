@@ -167,7 +167,7 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
         _LSE_NOTE_LOGGED = True
         print(
             "[mtplx] MTPLX_SEGMENTED_KV is on, but this MLX build has no logsumexp output on the fused "
-            "SDPA (return_lse): a prefill chunk over existing segments gathers the history first "
+            "SDPA (neither mx.fast.scaled_dot_product_attention_with_lse nor return_lse): a prefill chunk over existing segments gathers the history first "
             "(measured about 5 % slower prefill on follow-up turns; decode and verify are unaffected)",
             flush=True,
         )
@@ -233,22 +233,58 @@ def count_route(route: str) -> None:
 
 
 _SDPA_LSE: bool | None = None
+_SDPA_LSE_API: str | None = None
+
+#: The two MLX spellings of "fused SDPA that also returns the logsumexp", in order of preference.
+LSE_API_FUNCTION = "scaled_dot_product_attention_with_lse"
+LSE_API_KEYWORD = "scaled_dot_product_attention(return_lse=True)"
+
+
+def _lse_api_name() -> str | None:
+    """Which logsumexp API this MLX build offers: the separate function (proposed upstream
+    public API) when present, else the ``return_lse=True`` keyword of the patched build, else None.
+    The keyword form cannot be told apart by attribute: ``_probe_sdpa_lse`` runs it."""
+    if hasattr(mx.fast, LSE_API_FUNCTION):
+        return LSE_API_FUNCTION
+    return LSE_API_KEYWORD
+
+
+def sdpa_with_lse(queries, keys, values, *, scale, mask=None):
+    """Fused SDPA returning ``(out, lse)``; lse is natural log, float32, (B, Hq, Q, 1).
+
+    The one place that knows the API. Prefers ``mx.fast.scaled_dot_product_attention_with_lse``
+    and falls back to ``scaled_dot_product_attention(..., return_lse=True)``. Stock released
+    MLX raises TypeError on the keyword, which callers treat as "no fused lse".
+    """
+    kwargs = {} if mask is None else {"mask": mask}
+    function = getattr(mx.fast, LSE_API_FUNCTION, None)
+    if function is not None:
+        return function(queries, keys, values, scale=scale, **kwargs)
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, return_lse=True, **kwargs
+    )
 
 
 def _probe_sdpa_lse() -> bool:
-    """Whether this MLX build's fused SDPA can return the logsumexp (fork branch sdpa-lse).
+    """Whether this MLX build's fused SDPA can return the logsumexp.
 
-    The one place that knows the API: ``mx.fast.scaled_dot_product_attention(..., return_lse=True)``
-    returning ``(out, lse)``. Stock released MLX raises TypeError on the keyword, which is the
-    "absent" answer; any other failure also counts as absent.
+    Records which API answered in ``_SDPA_LSE_API`` (``lse_api_found``). Any failure counts as absent.
     """
+    global _SDPA_LSE_API
     try:
         q = mx.zeros((1, 1, 1, 64), dtype=mx.bfloat16)
-        result = mx.fast.scaled_dot_product_attention(q, q, q, scale=1.0, return_lse=True)
+        result = sdpa_with_lse(q, q, q, scale=1.0)
         mx.eval(result)
-        return isinstance(result, (tuple, list)) and len(result) == 2
+        ok = isinstance(result, (tuple, list)) and len(result) == 2
     except Exception:  # noqa: BLE001
-        return False
+        ok = False
+    _SDPA_LSE_API = _lse_api_name() if ok else None
+    return ok
+
+
+def lse_api_found() -> str | None:
+    """Name of the logsumexp API the probe found (None when absent or not probed yet)."""
+    return _SDPA_LSE_API if sdpa_lse_available() else None
 
 
 def sdpa_lse_available() -> bool:
@@ -690,7 +726,8 @@ def _segment_sdpa_lse_reference(
             visible = mx.arange(int(n))[None, :] <= limit[:, None]
             scores = mx.where(visible[None, None], scores, -mx.inf)
         lse = mx.logsumexp(scores, axis=-1)
-        p = mx.exp(scores - lse[..., None])
+        # A row without any visible key has lse -inf: weights 0 and output 0 (not -inf - -inf = NaN).
+        p = mx.exp(scores - _finite_or_zero(lse)[..., None])
         out = (p @ v).reshape(b, hq, rows, d)
         outs.append(out.astype(queries.dtype))
         lses.append(lse.reshape(b, hq, rows))
@@ -700,12 +737,9 @@ def _segment_sdpa_lse_reference(
 
 
 def _segment_sdpa_lse_fast(queries, keys, values, n, *, scale, causal):
-    """Per-segment attention on the MLX kernel that returns the logsumexp (fork only)."""
+    """Per-segment attention on the MLX kernel that returns the logsumexp (``sdpa_with_lse``)."""
     k, v = _rows_view(keys, n), _rows_view(values, n)
-    kwargs = {"mask": "causal"} if causal else {}
-    out, lse = mx.fast.scaled_dot_product_attention(
-        queries, k, v, scale=scale, return_lse=True, **kwargs
-    )
+    out, lse = sdpa_with_lse(queries, k, v, scale=scale, mask="causal" if causal else None)
     # The kernel's logsumexp is (B, Hq, Q, 1); the merge works on (B, Hq, Q).
     return out, lse.astype(mx.float32).reshape(out.shape[:-1])
 
@@ -726,16 +760,24 @@ def segment_sdpa_lse(queries, keys, values, n, *, scale, causal):
     return _segment_sdpa_lse_reference(queries, keys, values, n, scale=scale, causal=causal)
 
 
+def _finite_or_zero(x: mx.array) -> mx.array:
+    """x with +-inf replaced by 0, so ``exp(lse - x)`` is 0 instead of NaN for lse = -inf."""
+    return mx.where(mx.isinf(x), 0.0, x)
+
+
 def merge_segment_outputs(outs: Sequence[mx.array], lses: Sequence[mx.array]) -> mx.array:
     """Exact merge of per-segment (out, lse): sum_s exp(lse_s - L) * out_s with L = logsumexp(lse)."""
     if len(outs) == 1:
         return outs[0]
     stacked = mx.stack([l.astype(mx.float32) for l in lses], axis=0)
-    total = mx.logsumexp(stacked, axis=0)
+    total = _finite_or_zero(mx.logsumexp(stacked, axis=0))
     merged = None
     for out, lse in zip(outs, lses):
-        weight = mx.exp(lse.astype(mx.float32) - total)[..., None]
-        term = out.astype(mx.float32) * weight
+        # lse -inf (no visible key in this segment): weight 0 and the segment's out is ignored,
+        # even if a kernel left NaN there. A row that is -inf in every segment merges to zeros.
+        lse = lse.astype(mx.float32)
+        weight = mx.exp(lse - total)[..., None]
+        term = mx.where(mx.isinf(lse)[..., None], 0.0, out.astype(mx.float32) * weight)
         merged = term if merged is None else merged + term
     return merged.astype(outs[0].dtype)
 
@@ -1037,6 +1079,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         "model_support": model_support(),
         "ssd": segmented_ssd_enabled(),
         "prefill_route": prefill_route(),
+        "lse_api": lse_api_found(),
         "entries": per_entry,
         "max_segments": max((e["segments"] for e in per_entry), default=0),
         "sealed_bytes_unique": unique_state_bytes(all_states),
