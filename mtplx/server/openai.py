@@ -119,6 +119,7 @@ from mtplx.chat_encode_cache import (
     ChatSegmentEncodeMemo,
 )
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+from mtplx.token_prefix import common_prefix_len
 from mtplx.server.stream_recovery import (
     _ATTEMPT_PROMPT_IDS_KEY,
     _metric_for_request,
@@ -321,7 +322,7 @@ try:
         system_prompt_hash,
     )
     from mtplx.runtime import load
-    from mtplx.session_bank import CacheMissReason, common_prefix_len
+    from mtplx.session_bank import CacheMissReason
     from mtplx.cache_state import restore_cache, snapshot_cache
 
     _RUNTIME_IMPORT_ERROR: Exception | None = None
@@ -343,7 +344,6 @@ except Exception as exc:
     _default_stop_tokens = _missing_runtime
     _sample_from_logits = _missing_runtime
     _strip_terminal_stop = _missing_runtime
-    common_prefix_len = _missing_runtime
     restore_cache = _missing_runtime
     snapshot_cache = _missing_runtime
     load = _missing_runtime
@@ -6023,7 +6023,7 @@ def _vision_gate_canonicalization(
     receipt["canonicalized"] = served is not None
     served_keyed = canonicalized[1] if served is not None else raw_keyed
     receipt["session_committed_tokens"] = len(committed)
-    receipt["committed_prefix_tokens"] = int(_common_prefix_len(served_keyed, committed))
+    receipt["committed_prefix_tokens"] = int(common_prefix_len(served_keyed, committed))
     if not committed and receipt.get("refused") is None:
         receipt["refused"] = "no_committed_stream"
     return served
@@ -14327,14 +14327,6 @@ def _committed_reasoning_canonicalization_enabled() -> bool:
     return str(raw).strip().lower() not in {"off", "0", "false", "no"}
 
 
-def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] != b[i]:
-            return i
-    return n
-
-
 _COMMITTED_SPLICE_WINDOW = 8
 _COMMITTED_SPLICE_MAX_SPANS = 256
 
@@ -14393,7 +14385,7 @@ def _splice_committed_token_ids(
     receipt: dict[str, Any] = {"spans": 0, "tokens_in": 0, "tokens_out": 0}
     if not prompt or not stream:
         return prompt, receipt
-    common = _common_prefix_len(prompt, stream)
+    common = common_prefix_len(prompt, stream)
     if common >= len(prompt) or common >= len(stream):
         return prompt, receipt
 
@@ -14474,7 +14466,7 @@ def _splice_committed_token_ids(
     receipt["spans"] = spans
     if spans:
         receipt["first_divergence"] = int(common)
-        receipt["cp_after"] = int(_common_prefix_len(out, stream))
+        receipt["cp_after"] = int(common_prefix_len(out, stream))
     return out, receipt
 
 
@@ -14951,7 +14943,7 @@ def _maybe_canonicalize_committed_reasoning(
     if compare_ids is None:
         _declined("image_keying_failed", session_id=session_id)
         return None
-    cp_raw = _common_prefix_len(compare_ids, committed)
+    cp_raw = common_prefix_len(compare_ids, committed)
     if cp_raw >= min(len(committed), len(compare_ids)):
         # already extends (or is contained in) the committed stream: the
         # healthy no-op, silent by contract (byte-identical resend test)
@@ -15050,7 +15042,7 @@ def _maybe_canonicalize_committed_reasoning(
             _record(template_observability)
             _record(request_observability)
             return spliced
-    cp_canon = _common_prefix_len(canon_ids, committed)
+    cp_canon = common_prefix_len(canon_ids, committed)
     outcome["cp_canon"] = int(cp_canon)
     if cp_canon <= cp_raw:
         # A tie here is not yet "the canonical encode is no better". When the

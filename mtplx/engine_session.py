@@ -34,6 +34,7 @@ from .session_bank import (
     block_aligned_prefix_len,
 )
 from .runtime_options import block_prefix_restore_enabled
+from .token_prefix import common_prefix_len
 
 
 logger = logging.getLogger(__name__)
@@ -510,14 +511,6 @@ def _common_prefix_reuse_threshold(prompt_len: int) -> int:
 
 def _new_anon_session_id() -> str:
     return f"anon-{secrets.token_hex(8)}"
-
-
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def _message_role(message: Any) -> str:
