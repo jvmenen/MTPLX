@@ -22,7 +22,9 @@ same follow-up turn costs the new segment only (+0.125 GiB for 1,024 tokens plus
 2026-10-07 phase 1 measurement) and a branch from the same history costs 0.
 
 Attention over the segments: ``mtplx/kernels/sdpa_segmented.py`` (exact split-softmax merge,
-one launch for up to 12 segments) for the verify/decode window. A cache with a single segment
+one launch for up to 12 segments) for the verify/decode window on GPUs with tensor units (M5
+class). On M1 to M4 (or with ``MTPLX_SEGMENTED_KV_DECODE=lse``) the window attends per segment
+with its logsumexp and one exact merge instead (``decode_route``, ``attend_segments_lse``). A cache with a single segment
 (a cold prompt, or a conversation not yet sealed) runs the stock route on that segment's rows,
 a zero-copy view of the buffer the stock cache would have (counter ``single_q<rows>``). Only
 a call over several segments that no kernel takes (a masked or oversized window, a missing
@@ -82,6 +84,23 @@ def segment_route_switched_off() -> list[str]:
     return reasons
 
 
+def decode_route() -> str:
+    """How verify/decode attention reads several segments: ``kernel`` or ``lse``.
+
+    ``kernel``: the fused segment kernel (``mtplx/kernels/sdpa_segmented.py``), which needs the
+    Metal 4 tensor units of an M5-class GPU. ``lse``: per segment attention with its logsumexp
+    plus one exact merge (``attend_segments_lse``), which runs on any Mac. Automatic: ``kernel``
+    where the tensor units exist, ``lse`` elsewhere. ``MTPLX_SEGMENTED_KV_DECODE=lse`` selects
+    the ``lse`` route on any Mac (the way to test it on an M5); ``kernel`` cannot be forced onto
+    a GPU without tensor units.
+    """
+    from .nax_verify import nax_available
+
+    if os.environ.get("MTPLX_SEGMENTED_KV_DECODE", "").strip().lower() == "lse":
+        return "lse"
+    return "kernel" if nax_available() else "lse"
+
+
 #: Verdict on the loaded model (``evaluate_model_support``); None until a model was checked.
 _MODEL_SUPPORT: dict[str, Any] | None = None
 _UNSUPPORTED_LOGGED = False
@@ -123,11 +142,11 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
     stored; it switches the feature off (``segmented_kv_enabled``) and is reported on /health.
     """
     from .kernels.sdpa_segmented import SUPPORTED_HEAD_DIMS, segments_supported
-    from .nax_verify import nax_available
 
     global _MODEL_SUPPORT, _LSE_NOTE_LOGGED
     layers = list(layers)
     flags = list(hooked) if hooked is not None else [True] * len(layers)
+    route = decode_route()
     reasons: list[str] = []
     shapes: set[tuple[int, int, int]] = set()
     if not layers:
@@ -145,17 +164,21 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
             continue
         shapes.add((int(head_dim), int(q_heads), int(kv_heads)))
     for head_dim, q_heads, kv_heads in sorted(shapes):
-        if head_dim not in SUPPORTED_HEAD_DIMS:
-            reasons.append(f"head_dim_{head_dim}_unsupported")
-        elif q_heads % kv_heads or not segments_supported(1, q_heads // kv_heads, head_dim):
+        if q_heads % kv_heads:
             reasons.append(f"gqa_{q_heads}_{kv_heads}_unsupported")
-    reasons.extend(segment_route_switched_off())
-    if not nax_available():
-        reasons.append("nax_unavailable")
+        elif route == "kernel":
+            # Only the segment kernel has shape limits; the lse route takes any head dim and GQA.
+            if head_dim not in SUPPORTED_HEAD_DIMS:
+                reasons.append(f"head_dim_{head_dim}_unsupported")
+            elif not segments_supported(1, q_heads // kv_heads, head_dim):
+                reasons.append(f"gqa_{q_heads}_{kv_heads}_unsupported")
+    if route == "kernel":
+        reasons.extend(segment_route_switched_off())
     reasons = list(dict.fromkeys(reasons))
     verdict = {
         "supported": not reasons,
         "reasons": reasons,
+        "decode_route": route,
         "head_dims": sorted({s[0] for s in shapes}),
         "gqa": sorted({s[1] // s[2] for s in shapes if s[2] and s[1] % s[2] == 0}),
         "supported_head_dims": list(SUPPORTED_HEAD_DIMS),
@@ -163,6 +186,14 @@ def evaluate_model_support(layers: Iterable[Any], *, hooked: Sequence[bool] | No
     }
     _MODEL_SUPPORT = verdict
     _log_unsupported(reasons)
+    if not reasons and route == "lse" and segmented_kv_requested():
+        print(
+            "[mtplx] MTPLX_SEGMENTED_KV is on without the segment kernel (no tensor units, or "
+            "MTPLX_SEGMENTED_KV_DECODE=lse): attention over several segments runs one exact "
+            "attention call per segment plus a logsumexp merge. The memory gain is the same; the "
+            "speed on this Mac is not measured yet",
+            flush=True,
+        )
     if not reasons and segmented_kv_requested() and prefill_route() == "gather" and not _LSE_NOTE_LOGGED:
         _LSE_NOTE_LOGGED = True
         print(
@@ -197,6 +228,8 @@ def kernel_probe_shapes() -> list[tuple[int, int]]:
     if not segmented_kv_enabled():
         return []
     support = _MODEL_SUPPORT or {}
+    if support.get("decode_route") == "lse":
+        return []  # no segment kernel runs on this route, nothing to probe
     pairs = [(int(d), int(g)) for d in support.get("head_dims", []) for g in support.get("gqa", [])]
     return [(d, g) for d, g in pairs if segments_supported(1, g, d)]
 
@@ -840,11 +873,14 @@ def decode_segments_attention(
         segments_supported,
     )
 
-    if segment_route_switched_off() or lane_disabled("segmented_kv_sdpa"):
+    lse_route = decode_route() == "lse"
+    if not lse_route and (segment_route_switched_off() or lane_disabled("segmented_kv_sdpa")):
         return None
     q_len = int(queries.shape[2])
     if not 1 <= q_len <= VERIFY_WINDOW_MAX:
         return None
+    if lse_route:
+        return _decode_segments_attention_lse(queries, cache, scale=scale, mask=mask)
     if cache.segment_count == 1 and cache.offset < int(packed_threshold):
         # One segment below the packed threshold: the stock route over a zero-copy view,
         # exactly what the stock cache does there (several segments always take the kernel,
@@ -887,6 +923,31 @@ def decode_segments_attention(
         outs.append(part)
     count_route(f"chunked_q{q_len}")
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+
+
+def _decode_segments_attention_lse(
+    queries: mx.array, cache: SegmentedKVCache, *, scale: float, mask: Any
+) -> mx.array | None:
+    """The ``lse`` decode route (Macs without tensor units): per segment (out, lse) plus one merge.
+
+    Same contract as the kernel route: a verify window of 1 to ``VERIFY_WINDOW_MAX`` rows whose
+    rows are the cache's last ones, a causal or no mask, any number of segments, so no sub-windows
+    and no ``MAX_FUSED_SEGMENTS`` limit. One segment returns None: the stock route on a zero-copy
+    view of its rows is the fastest and exact there. Each segment runs the MLX kernel with
+    logsumexp output when the build has it and the exact float32 reference otherwise
+    (``segment_sdpa_lse``); the merge is exact, so the result equals the dense attention up to
+    the rounding of the per-segment outputs to the query dtype.
+    """
+    if cache.segment_count == 1:
+        return None
+    if not (mask is None or (isinstance(mask, str) and mask == "causal")):
+        return None
+    segments = cache.attention_segments()
+    if not segments or int(segments[-1][2]) < int(queries.shape[2]):
+        return None
+    out = attend_segments_lse(queries, cache, scale=scale)
+    count_route(f"lse_q{int(queries.shape[2])}")
+    return out
 
 
 # ---- install --------------------------------------------------------------------------------
@@ -1089,6 +1150,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         "ssd": segmented_ssd_enabled(),
         "prefill_route": prefill_route(),
         "lse_api": lse_api_found(),
+        "decode_route": decode_route(),
         "entries": per_entry,
         "max_segments": max((e["segments"] for e in per_entry), default=0),
         "sealed_bytes_unique": unique_state_bytes(all_states),
