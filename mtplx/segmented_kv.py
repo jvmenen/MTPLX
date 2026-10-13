@@ -935,8 +935,9 @@ def _decode_segments_attention_lse(
     and no ``MAX_FUSED_SEGMENTS`` limit. One segment returns None: the stock route on a zero-copy
     view of its rows is the fastest and exact there. Each segment runs the MLX kernel with
     logsumexp output when the build has it and the exact float32 reference otherwise
-    (``segment_sdpa_lse``); the merge is exact, so the result equals the dense attention up to
-    the rounding of the per-segment outputs to the query dtype.
+    (``segment_sdpa_lse``). The reference keeps every segment's output in float32 and the merge
+    rounds once, so the result is the dense float32 attention rounded to the query dtype, as
+    close to the stock kernel as that one is to the exact result.
     """
     if cache.segment_count == 1:
         return None
