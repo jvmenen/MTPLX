@@ -34,7 +34,7 @@ from .cache_state import (
 from .cache_bank.codec import ColdEncodeInterrupted
 from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
-from .token_ids import as_token_tuple
+from .token_ids import TokenTuple, as_token_tuple
 from .runtime_options import block_prefix_restore_enabled
 
 
@@ -325,6 +325,37 @@ def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tupl
     return limit
 
 
+_SHARED_LEN_MEMO_MAX = 128
+_shared_len_memo: dict[tuple[int, int], tuple[Any, Any, int]] = {}
+_shared_len_memo_lock = threading.Lock()
+
+
+def shared_prefix_len(tokens: Any, prefix: Any) -> int:
+    """``common_prefix_len`` that remembers its answer per (prompt, entry).
+
+    One request asks the same question of every RAM entry several times (the
+    dominant-prefix estimate, the exact lookup, the near-prefix lane, its
+    diagnostics, the reread receipt); at 80K tokens each pass costs ~0.45 ms
+    per entry. Both inputs are immutable ``TokenTuple`` objects, so the answer
+    is keyed on their identity; the memo holds both objects, which keeps the
+    identities from being reused while an answer is stored. Anything else
+    takes the plain compare.
+    """
+    if type(tokens) is not TokenTuple or type(prefix) is not TokenTuple:
+        return common_prefix_len(tokens, prefix)
+    key = (id(tokens), id(prefix))
+    with _shared_len_memo_lock:
+        hit = _shared_len_memo.get(key)
+    if hit is not None and hit[0] is tokens and hit[1] is prefix:
+        return hit[2]
+    matched = common_prefix_len(tokens, prefix)
+    with _shared_len_memo_lock:
+        if len(_shared_len_memo) >= _SHARED_LEN_MEMO_MAX:
+            _shared_len_memo.pop(next(iter(_shared_len_memo)), None)
+        _shared_len_memo[key] = (tokens, prefix, matched)
+    return matched
+
+
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
@@ -485,7 +516,7 @@ def _near_prefix_candidate_len(
     prefix = entry.token_ids
     if not prefix:
         return None
-    matched = common_prefix_len(tokens, prefix)
+    matched = shared_prefix_len(tokens, prefix)
     # An image prompt is matched in its content-keyed view: the match is
     # content-true, but a restore never cuts an image (image_safe_restore_len).
     # A cut back to an image's start is no tiny gap; the block rules judge it.
@@ -1897,7 +1928,7 @@ class SessionBank:
         for prefix, entry in self._entries.items():
             if session_id is not None and entry.session_id != session_id:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             if matched > best:
                 best = matched
         return best
@@ -1951,7 +1982,7 @@ class SessionBank:
             prefix = entry.token_ids
             if not prefix:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             gap = len(prefix) - matched
             safe_block = min(
                 block_aligned_prefix_len(matched, block_size=block),
@@ -2124,7 +2155,7 @@ class SessionBank:
                 "prompt_len": len(tokens),
                 "session_id": entry.session_id,
                 "stored_prefix_len": entry.prefix_len,
-                "common_prefix_tokens": int(common_prefix_len(tokens, entry.token_ids)),
+                "common_prefix_tokens": int(shared_prefix_len(tokens, entry.token_ids)),
                 "nearest_boundary_tokens": int(matched),
                 "new_prefill_tokens": max(0, len(tokens) - int(matched)),
                 "miss_reason": None,
@@ -4284,7 +4315,7 @@ class SessionBank:
                 continue
             seen.add(id(entry))
             length = len(entry.token_ids)
-            shared = common_prefix_len(tokens, entry.token_ids)
+            shared = shared_prefix_len(tokens, entry.token_ids)
             if length <= 0 or shared <= 0 or 2 * shared < length:
                 continue
             rows.append(
