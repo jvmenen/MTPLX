@@ -145,6 +145,7 @@ from .sampling import (
     sample_from_distribution,
 )
 from .session_bank import _boundary_true_restore_enabled
+from .token_ids import as_token_tuple
 from .runtime_options import (
     block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
@@ -5173,7 +5174,7 @@ def _restore_near_prefix_prompt_state(
     # prefill too.
     pending = list(
         candidates(
-            match_ids if image_keyed else prompt_ids,
+            match_ids if image_keyed else as_token_tuple(prompt_ids),
             max_token_gap=max_gap,
             min_matched_tokens=min_match,
             **_candidates_kwargs,
@@ -5512,7 +5513,7 @@ def _restore_near_prefix_prompt_state(
                     logits=logits[:, -1, :],
                     hidden=hidden[:, -1:, :] if hidden is not None else None,
                     committed_mtp_cache=mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    token_prefix=as_token_tuple(prompt_ids),
                     prompt_eval_time_s=repair_time + repage_time,
                     cache_restore_time_s=total_cache_restore_time_s,
                     mtp_history_policy=mtp_history_policy,
@@ -5597,7 +5598,7 @@ def _restore_near_prefix_prompt_state(
                 logits=suffix_logits,
                 hidden=suffix_hidden,
                 committed_mtp_cache=mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
+                token_prefix=as_token_tuple(prompt_ids),
                 prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
                 cache_restore_time_s=total_cache_restore_time_s,
@@ -6771,6 +6772,9 @@ def restore_or_prefill_prompt_state(
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
+    # Normalized once: the bank's per-entry compares are shared across its
+    # lookups when they are handed the same tuple object.
+    prompt_tuple = as_token_tuple(prompt_ids)
     os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
     mtp_history_policy = _resolve_mtp_history_policy(
         mtp_history_policy,
@@ -7008,7 +7012,9 @@ def restore_or_prefill_prompt_state(
         )
         # The bank only ever sees the content-keyed view of a vision prompt;
         # for text prompts the two views are the same list.
-        bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
+        bank_match_ids = (
+            as_token_tuple(bank_key_ids) if bank_key_ids is not None else prompt_tuple
+        )
         if stable_prefix_len is None and vision_splice is None:
             stable_prefix_len = _shared_prefix_edge(session_bank, prompt_ids)
         exact_prefix_len = 0
@@ -7095,7 +7101,7 @@ def restore_or_prefill_prompt_state(
             tried_larger_near_prefix = True
             near_prompt_state = _restore_near_prefix_prompt_state(
                 rt,
-                prompt_ids,
+                prompt_tuple,
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
@@ -7209,7 +7215,7 @@ def restore_or_prefill_prompt_state(
                     logits=restored.logits,
                     hidden=restored.hidden,
                     committed_mtp_cache=restored.mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    token_prefix=prompt_tuple,
                     prompt_eval_time_s=repage_time,
                     cache_restore_time_s=restore_elapsed_s,
                     mtp_history_policy=mtp_history_policy,
@@ -7307,7 +7313,7 @@ def restore_or_prefill_prompt_state(
                 logits=suffix_logits,
                 hidden=suffix_hidden,
                 committed_mtp_cache=restored.mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
+                token_prefix=prompt_tuple,
                 prompt_eval_time_s=suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
                 cache_restore_time_s=restore_elapsed_s,
@@ -7504,7 +7510,7 @@ def restore_or_prefill_prompt_state(
         logits=logits,
         hidden=hidden,
         committed_mtp_cache=mtp_history_cache,
-        token_prefix=tuple(int(token) for token in prompt_ids),
+        token_prefix=prompt_tuple,
         prompt_eval_time_s=prompt_eval_time,
         prompt_mtp_history_time_s=prompt_history_time,
         mtp_history_policy=mtp_history_policy,
