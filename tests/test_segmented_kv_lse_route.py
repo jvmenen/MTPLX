@@ -84,6 +84,44 @@ def test_the_lse_route_equals_the_dense_attention(cpu, dtype, tol, hq, hk, d, q_
     assert module.route_counts.get(f"lse_q{q_len}") == 1
 
 
+def _differing(a, b) -> float:
+    """Fraction of elements that differ between two bfloat16 arrays."""
+    return float(mx.mean(a.astype(mx.float32) != b.astype(mx.float32)).item())
+
+
+@pytest.mark.parametrize("q_len", [1, 4, 9])
+@pytest.mark.parametrize("sizes", [[3000, 200], [2000, 1024, 600, 40]])
+def test_the_lse_route_rounds_once_like_the_stock_attention(cpu, q_len, sizes) -> None:
+    """bfloat16 is what the model runs: the route must be the float32 attention rounded once.
+
+    A tolerance of one ulp does not see a second rounding (each segment rounded to bfloat16 before
+    the merge), which puts a quarter or more of the elements one ulp off; on real Qwen3.8-27B
+    tensors it showed as about one element in three differing from the stock kernel, against one
+    in six for the exact result.
+    """
+    cache, k, v = _cache(4, 256, sizes, mx.bfloat16)
+    q = mx.random.normal((1, 24, q_len, 256)).astype(mx.bfloat16)
+    scale = 1.0 / math.sqrt(256)
+    out = decode_segments_attention(q, cache, scale=scale, mask="causal", packed_threshold=8192)
+    exact = _dense(q, k, v, scale, sum(sizes))
+    assert out.dtype == mx.bfloat16
+    assert _differing(out, exact) <= 0.005
+
+
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_the_lse_route_is_as_close_to_stock_sdpa_as_the_exact_result(cpu, q_len) -> None:
+    """Against the stock fused SDPA on the gathered rows, the route may differ only where the
+    exact result itself differs from it (the stock kernel's own rounding)."""
+    sizes = [3000, 1000, 200]
+    cache, k, v = _cache(4, 256, sizes, mx.bfloat16)
+    q = mx.random.normal((1, 24, q_len, 256)).astype(mx.bfloat16)
+    scale = 1.0 / math.sqrt(256)
+    out = decode_segments_attention(q, cache, scale=scale, mask="causal", packed_threshold=8192)
+    stock = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal" if q_len > 1 else None)
+    exact = _dense(q, k, v, scale, sum(sizes))
+    assert _differing(out, stock) <= _differing(exact, stock) + 0.005
+
+
 def test_rows_without_a_visible_key_in_a_segment_merge_without_nan(cpu) -> None:
     """The merge ignores segments whose logsumexp is -inf (the shared -inf-safe merge): a tail shorter
     than the window masks its first rows entirely, and those rows take the earlier segments only."""
