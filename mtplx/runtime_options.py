@@ -392,6 +392,17 @@ def prefix_block_size() -> int:
 
 
 def block_prefix_min_match_tokens() -> int:
+    """Shortest shared prefix a block-prefix restore may serve.
+
+    Every caller (generation, engine_session, session_bank, cold_tier) uses
+    ``max(prefix_block_size(), block_prefix_min_match_tokens())``, so the
+    effective floor never drops below one block even when this env is set
+    lower. That is deliberate and the same on every lane: the restore
+    rewinds to a block edge, and the lanes that restore at any token (entries
+    without recurrent state) would otherwise serve a match shorter than the
+    block that the block lane itself refuses.
+    """
+
     return env_int_at_least(
         "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
         DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,

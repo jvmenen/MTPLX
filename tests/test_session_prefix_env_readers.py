@@ -91,3 +91,13 @@ def test_session_bank_knobs_follow_the_readers(monkeypatch):
     assert knobs["block_min_match"] == 128
     assert session_bank.DEFAULT_PREFIX_BLOCK_SIZE == 256
     assert session_bank.DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS == 512
+
+
+def test_block_prefix_floor_is_rounded_up_to_a_block_on_every_lane(monkeypatch):
+    """Every lane combines the two readers as max(block, min_match)."""
+    from mtplx import session_bank
+
+    monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "256")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "128")
+    assert ro.block_prefix_min_match_tokens() == 128
+    assert session_bank._near_prefix_knobs()["block_min_match"] == 256
