@@ -484,3 +484,79 @@ def test_real_lse_kernel_matches_the_reference_route() -> None:
     keys, values = cache.gather()
     want = mx.fast.scaled_dot_product_attention(q, keys, values, scale=0.25, mask="causal")
     assert float(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max()) < 2e-2
+
+
+def _fake_lse_api(calls, tag):
+    def fake(q, k, v, *, scale, mask=None, **extra):
+        calls.append((tag, mask, extra))
+        out = mx.zeros(q.shape, dtype=q.dtype)
+        return out, mx.zeros((*q.shape[:-1], 1), dtype=mx.float32)
+
+    return fake
+
+
+def test_sdpa_with_lse_prefers_the_separate_function(monkeypatch) -> None:
+    import mtplx.segmented_kv as module
+
+    calls: list = []
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention_with_lse", _fake_lse_api(calls, "func"), raising=False)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api(calls, "kw"))
+    q = mx.zeros((1, 1, 1, 64), dtype=mx.bfloat16)
+    module.sdpa_with_lse(q, q, q, scale=1.0, mask="causal")
+    module.sdpa_with_lse(q, q, q, scale=1.0)
+    assert calls == [("func", "causal", {}), ("func", None, {})]
+    monkeypatch.setattr(module, "_SDPA_LSE", None)
+    assert module.sdpa_lse_available() is True
+    assert module.lse_api_found() == module.LSE_API_FUNCTION
+
+
+def test_sdpa_with_lse_falls_back_to_the_return_lse_keyword(monkeypatch) -> None:
+    import mtplx.segmented_kv as module
+
+    calls: list = []
+    monkeypatch.delattr(mx.fast, "scaled_dot_product_attention_with_lse", raising=False)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api(calls, "kw"))
+    q = mx.zeros((1, 1, 1, 64), dtype=mx.bfloat16)
+    module.sdpa_with_lse(q, q, q, scale=1.0, mask="causal")
+    assert calls == [("kw", "causal", {"return_lse": True})]
+    monkeypatch.setattr(module, "_SDPA_LSE", None)
+    assert module.sdpa_lse_available() is True
+    assert module.lse_api_found() == module.LSE_API_KEYWORD
+
+
+def test_no_lse_api_reports_unavailable(monkeypatch) -> None:
+    import mtplx.segmented_kv as module
+
+    monkeypatch.delattr(mx.fast, "scaled_dot_product_attention_with_lse", raising=False)
+
+    def stock(q, k, v, *, scale, mask=None):
+        raise TypeError("unexpected keyword return_lse")
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", stock)
+    monkeypatch.setattr(module, "_SDPA_LSE", None)
+    assert module.sdpa_lse_available() is False
+    assert module.lse_api_found() is None
+
+
+def test_merge_of_fully_masked_rows_is_zero_not_nan() -> None:
+    from mtplx.segmented_kv import merge_segment_outputs
+
+    ninf = float("-inf")
+    out_a = mx.array([[[[1.0, 2.0], [float("nan"), float("nan")], [3.0, 4.0]]]])
+    out_b = mx.array([[[[5.0, 6.0], [float("nan"), float("nan")], [0.0, 0.0]]]])
+    lse_a = mx.array([[[0.0, ninf, 0.0]]])
+    lse_b = mx.array([[[0.0, ninf, ninf]]])
+    merged = merge_segment_outputs([out_a, out_b], [lse_a, lse_b]).astype(mx.float32)
+    assert merged.tolist() == [[[[3.0, 4.0], [0.0, 0.0], [3.0, 4.0]]]]
+
+
+def test_reference_route_fully_masked_row_is_zero_not_nan() -> None:
+    import mtplx.segmented_kv as module
+
+    q = mx.random.normal((1, 2, 4, 64), key=mx.random.key(1)).astype(mx.bfloat16)
+    k = mx.random.normal((1, 2, 2, 64), key=mx.random.key(2)).astype(mx.bfloat16)
+    # 4 queries over a 2-row causal segment: the first two rows see nothing.
+    out, lse = module._segment_sdpa_lse_reference(q, k, k, 2, scale=0.125, causal=True)
+    assert lse[..., :2].tolist() == [[[float("-inf")] * 2] * 2]
+    assert not mx.isnan(out.astype(mx.float32)).any().item()
+    assert float(mx.abs(out[:, :, :2].astype(mx.float32)).max()) == 0.0
