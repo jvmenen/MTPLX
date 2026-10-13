@@ -6,6 +6,7 @@ import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "..
 import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
 import { refusalOf } from "../lib/requestRefusal";
+import { cacheMissBadge } from "../lib/cacheMiss";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -140,13 +141,15 @@ export function Row({
     ? {
         label: refusal.label,
         color: "text-[var(--accent-hot)] bg-[var(--accent-hot)]/10",
+        tooltip: undefined as string | undefined,
       }
     : row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
-    : {
-        label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
-        color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
-      };
+    ? {
+        label: "HIT",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: "Served from the session cache.",
+      }
+    : cacheMissBadge(row.cache_miss_reason);
   const wait = requestWait(row);
   const waitTitle = wait
     ? wait.parts.length > 0
@@ -182,6 +185,7 @@ export function Row({
         <Td align="right">{refusal ? "—" : fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
