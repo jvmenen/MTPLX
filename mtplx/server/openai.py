@@ -173,11 +173,13 @@ from mtplx.profiles import (
     resolve_long_context_mtp_depth,
 )
 from mtplx.runtime_options import (
+    DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
     apply_paged_kv_quantization_env,
     block_prefix_restore_enabled,
     canonicalize_flag_tokens,
     normalize_paged_kv_quantization,
     resolve_api_key,
+    store_on_prefill_min_suffix,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
 from mtplx import request_capture
@@ -19512,7 +19514,12 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
             getattr(args, "ssd_session_cache_max_size", "auto")
         ),
         "ssd_session_cache_min_prefix_tokens": int(
-            getattr(args, "ssd_session_cache_min_prefix_tokens", 512) or 512
+            getattr(
+                args,
+                "ssd_session_cache_min_prefix_tokens",
+                DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
+            )
+            or DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
         ),
         "paged_kv_quantization": _effective_paged_kv_quantization(),
         "restart_required_settings": [
@@ -22872,7 +22879,6 @@ def _run_prefill_admission(
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
-        _store_on_prefill_min_suffix,
         prefill_cache_layout,
     )
     from mtplx.session_bank import QueuedPersistenceCancelError
@@ -22964,7 +22970,7 @@ def _run_prefill_admission(
         _dynamic_paged_kv_initial_new_token_budget(max_new_tokens)[0]
     ) + max(0, int(mtp_depth or 0))
     store_on_prefill = _store_on_prefill_env_enabled()
-    store_min_suffix = _store_on_prefill_min_suffix()
+    store_min_suffix = store_on_prefill_min_suffix()
     per_session_cap = getattr(session_bank, "per_session_max_bytes", None)
     flags = {"skip_publish": False}
 
@@ -24942,8 +24948,11 @@ def _commit_prompt_prefix_for_request(
     tier = getattr(state, "session_bank_cold_tier", None)
     if tier is None or not bool(getattr(tier, "enabled", False)):
         return False
-    min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
-    return len(prompt_ids) >= max(512, min_prefix_tokens)
+    min_prefix_tokens = int(
+        getattr(tier, "min_prefix_tokens", DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS)
+        or DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
+    )
+    return len(prompt_ids) >= max(DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS, min_prefix_tokens)
 
 
 def _anonymous_coding_agent_tool_request(
@@ -29534,7 +29543,8 @@ def _build_mtp_batch_session_hooks(
         return None, None
     rt = state.runtime
     tokens = [int(token) for token in prompt_ids]
-    min_restore_tokens = 512  # matches the batched-lane cold-tier floor
+    # matches the batched-lane cold-tier floor
+    min_restore_tokens = DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
 
     def session_restore() -> Any | None:
         outcome: dict[str, Any] = {"hit": False}
@@ -43881,7 +43891,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ssd-session-cache-min-prefix-tokens",
         type=int,
-        default=_env_int("MTPLX_SSD_SESSION_CACHE_MIN_PREFIX_TOKENS", 512),
+        default=_env_int(
+            "MTPLX_SSD_SESSION_CACHE_MIN_PREFIX_TOKENS",
+            DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
+        ),
         help="Minimum committed prefix length before writing to the SSD SessionBank cache.",
     )
     parser.add_argument(
