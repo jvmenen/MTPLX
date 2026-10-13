@@ -257,6 +257,7 @@ def test_sub_windows_respect_both_kernel_limits_at_every_gqa(monkeypatch, gqa, e
     mx.set_default_device(mx.cpu)
     try:
         monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+        monkeypatch.setattr("mtplx.nax_verify.nax_available", lambda: True)  # this test is about the kernel route
         hk, d = 2, 128
         cache = _low_gqa_cache(hk, d, window)
         rows: list[int] = []
