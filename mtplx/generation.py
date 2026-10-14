@@ -6365,8 +6365,7 @@ def _store_on_prefill_env_enabled() -> bool:
     """Default ON (2026-07-02 A/B: agent turn-2 TTFT 40s -> 1.3s, e2e 1.7 ->
     33.6 tok/s at 25k ctx; cost is one bank snapshot copy on large cold
     prefills). MTPLX_SESSION_STORE_ON_PREFILL=0 is the kill switch."""
-    raw = str(os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL", "1")).strip().lower()
-    return raw not in {"0", "false", "off", "no"}
+    return not _env_falsey("MTPLX_SESSION_STORE_ON_PREFILL")
 
 
 def _store_on_prefill_min_suffix() -> int:
