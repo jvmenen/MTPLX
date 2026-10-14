@@ -108,3 +108,28 @@ def test_prompt_prefix_commit_follows_a_higher_tier_minimum():
     commit = openai._commit_prompt_prefix_for_request
     assert not commit(state, prompt_ids=list(range(2047)), tools_active=False)
     assert commit(state, prompt_ids=list(range(2048)), tools_active=False)
+
+
+def test_block_prefix_floor_is_rounded_up_to_a_block_on_every_lane(monkeypatch):
+    """Every lane combines the two readers as max(block, min_match)."""
+    from mtplx import session_bank
+
+    monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "256")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "128")
+    assert runtime_options.block_prefix_min_match_tokens() == 128
+    assert session_bank._near_prefix_knobs()["block_min_match"] == 256
+
+
+def test_session_bank_knobs_follow_the_readers(monkeypatch):
+    from mtplx import session_bank
+
+    monkeypatch.setenv("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", "3")
+    monkeypatch.setenv("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", "40")
+    monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "128")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "300")
+    assert session_bank._near_prefix_knobs() == {
+        "gap_limit": 3,
+        "min_match": 40,
+        "block": 128,
+        "block_min_match": 300,
+    }

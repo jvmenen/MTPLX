@@ -40,7 +40,11 @@ from .runtime_options import (
     DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
     DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
     DEFAULT_PREFIX_BLOCK_SIZE,
+    block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
+    near_prefix_max_token_gap,
+    near_prefix_min_match_tokens,
+    prefix_block_size,
 )
 from .segmented_kv import (
     SegmentedKVCache,
@@ -513,25 +517,12 @@ def _near_prefix_knobs() -> dict[str, int]:
     """The near-prefix lane's matching knobs, read as the restore reads them
     (generation._restore_near_prefix_prompt_state)."""
 
-    def env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        try:
-            return int(str(raw).strip()) if raw is not None and str(raw).strip() else default
-        except ValueError:
-            return default
-
-    block = max(1, env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", DEFAULT_PREFIX_BLOCK_SIZE))
+    block = prefix_block_size()
     return {
-        "gap_limit": max(0, env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8)),
-        "min_match": max(1, env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64)),
+        "gap_limit": near_prefix_max_token_gap(),
+        "min_match": near_prefix_min_match_tokens(),
         "block": block,
-        "block_min_match": max(
-            block,
-            env_int(
-                "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
-                DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
-            ),
-        ),
+        "block_min_match": max(block, block_prefix_min_match_tokens()),
     }
 
 
