@@ -116,6 +116,7 @@ def test_prefill_lse_falls_back_to_the_reference_route_when_the_kernel_refuses_a
             raise ValueError("unsupported head dim for return_lse")
 
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", refuses)
+        monkeypatch.setattr(mx.fast, module.LSE_API_FUNCTION, refuses, raising=False)
         q = mx.random.normal((1, 4, 6, 8)).astype(mx.bfloat16)
         keys = mx.random.normal((1, 2, 40, 8)).astype(mx.bfloat16)
         out, lse = module.segment_sdpa_lse(q, keys, keys, 40, scale=0.35, causal=False)
