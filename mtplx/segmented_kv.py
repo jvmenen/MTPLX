@@ -699,7 +699,10 @@ def _segment_sdpa_lse_reference(
 ) -> tuple[mx.array, mx.array]:
     """Exact attention of ``queries`` over the first ``n`` rows of one segment, with its logsumexp.
 
-    ``queries`` (1, Hq, Q, D); returns (out in the query dtype, lse float32 (1, Hq, Q)).
+    ``queries`` (1, Hq, Q, D); returns (out float32, lse float32 (1, Hq, Q)). The output stays
+    float32 so that the merge rounds once, like the stock attention, instead of rounding every
+    segment to the query dtype first (that second rounding put about one element in three one
+    bf16 ulp away from the stock output at 20K, against about one in six for the exact result).
     ``causal=True`` marks the segment holding the Q new rows as its last Q rows (query row i
     sees keys up to ``n - Q + i``); otherwise every key is visible. Scores run in float32 and
     are bounded by chunking the query rows: this is the slow, exact reference route (QK^T plus
@@ -729,7 +732,7 @@ def _segment_sdpa_lse_reference(
         # A row without any visible key has lse -inf: weights 0 and output 0 (not -inf - -inf = NaN).
         p = mx.exp(scores - _finite_or_zero(lse)[..., None])
         out = (p @ v).reshape(b, hq, rows, d)
-        outs.append(out.astype(queries.dtype))
+        outs.append(out)
         lses.append(lse.reshape(b, hq, rows))
     if len(outs) == 1:
         return outs[0], lses[0]
@@ -765,10 +768,16 @@ def _finite_or_zero(x: mx.array) -> mx.array:
     return mx.where(mx.isinf(x), 0.0, x)
 
 
-def merge_segment_outputs(outs: Sequence[mx.array], lses: Sequence[mx.array]) -> mx.array:
-    """Exact merge of per-segment (out, lse): sum_s exp(lse_s - L) * out_s with L = logsumexp(lse)."""
+def merge_segment_outputs(
+    outs: Sequence[mx.array], lses: Sequence[mx.array], *, dtype: mx.Dtype | None = None
+) -> mx.array:
+    """Exact merge of per-segment (out, lse): sum_s exp(lse_s - L) * out_s with L = logsumexp(lse).
+
+    The sum runs in float32 and is rounded once, to ``dtype`` (default: the first output's dtype).
+    """
+    dtype = outs[0].dtype if dtype is None else dtype
     if len(outs) == 1:
-        return outs[0]
+        return outs[0] if outs[0].dtype == dtype else outs[0].astype(dtype)
     stacked = mx.stack([l.astype(mx.float32) for l in lses], axis=0)
     total = _finite_or_zero(mx.logsumexp(stacked, axis=0))
     merged = None
@@ -779,7 +788,7 @@ def merge_segment_outputs(outs: Sequence[mx.array], lses: Sequence[mx.array]) ->
         weight = mx.exp(lse - total)[..., None]
         term = mx.where(mx.isinf(lse)[..., None], 0.0, out.astype(mx.float32) * weight)
         merged = term if merged is None else merged + term
-    return merged.astype(outs[0].dtype)
+    return merged.astype(dtype)
 
 
 def attend_segments_lse(queries: mx.array, cache: SegmentedKVCache, *, scale: float) -> mx.array:
@@ -792,7 +801,7 @@ def attend_segments_lse(queries: mx.array, cache: SegmentedKVCache, *, scale: fl
         )
         outs.append(out)
         lses.append(lse)
-    return merge_segment_outputs(outs, lses)
+    return merge_segment_outputs(outs, lses, dtype=queries.dtype)
 
 
 # ---- the decode/verify route used by attention_split -----------------------------------
