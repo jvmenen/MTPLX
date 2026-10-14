@@ -267,10 +267,13 @@ def count_route(route: str) -> None:
 
 _SDPA_LSE: bool | None = None
 _SDPA_LSE_API: str | None = None
+_SDPA_LSE_F32: bool | None = None
 
 #: The two MLX spellings of "fused SDPA that also returns the logsumexp", in order of preference.
 LSE_API_FUNCTION = "scaled_dot_product_attention_with_lse"
 LSE_API_KEYWORD = "scaled_dot_product_attention(return_lse=True)"
+#: Keyword of our MLX build (fork branch prod-lse-f32out) for a float32 output next to the lse.
+LSE_FLOAT32_OUTPUT_KEYWORD = "float32_output"
 
 
 def _lse_api_name() -> str | None:
@@ -282,14 +285,27 @@ def _lse_api_name() -> str | None:
     return LSE_API_KEYWORD
 
 
-def sdpa_with_lse(queries, keys, values, *, scale, mask=None):
+def sdpa_with_lse(queries, keys, values, *, scale, mask=None, float32_output=False):
     """Fused SDPA returning ``(out, lse)``; lse is natural log, float32, (B, Hq, Q, 1).
 
     The one place that knows the API. Prefers ``mx.fast.scaled_dot_product_attention_with_lse``
     and falls back to ``scaled_dot_product_attention(..., return_lse=True)``. Stock released
     MLX raises TypeError on the keyword, which callers treat as "no fused lse".
+    ``float32_output=True`` asks for the output in float32 instead of the query dtype (keyword
+    ``float32_output`` next to ``return_lse``, only in our MLX build; see
+    ``sdpa_lse_float32_output_available``).
     """
     kwargs = {} if mask is None else {"mask": mask}
+    if float32_output:
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            return_lse=True,
+            **{LSE_FLOAT32_OUTPUT_KEYWORD: True},
+            **kwargs,
+        )
     function = getattr(mx.fast, LSE_API_FUNCTION, None)
     if function is not None:
         return function(queries, keys, values, scale=scale, **kwargs)
@@ -326,6 +342,34 @@ def sdpa_lse_available() -> bool:
     if _SDPA_LSE is None:
         _SDPA_LSE = _probe_sdpa_lse()
     return _SDPA_LSE
+
+
+def _probe_sdpa_lse_float32_output() -> bool:
+    """Whether the lse kernel can also return its output in float32 (unrounded).
+
+    Runs the call on a bfloat16 chunk large enough for the fused kernel (more than 8 query
+    rows) and requires a float32 output. Any failure, or a build that ignores the keyword,
+    counts as absent.
+    """
+    try:
+        q = mx.zeros((1, 1, 16, 64), dtype=mx.bfloat16)
+        result = sdpa_with_lse(q, q, q, scale=1.0, mask="causal", float32_output=True)
+        mx.eval(result)
+        return (
+            isinstance(result, (tuple, list))
+            and len(result) == 2
+            and result[0].dtype == mx.float32
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sdpa_lse_float32_output_available() -> bool:
+    """Feature detection of the float32 output option, once per process (first use)."""
+    global _SDPA_LSE_F32
+    if _SDPA_LSE_F32 is None:
+        _SDPA_LSE_F32 = sdpa_lse_available() and _probe_sdpa_lse_float32_output()
+    return _SDPA_LSE_F32
 
 
 def prefill_route() -> str:
@@ -773,9 +817,21 @@ def _segment_sdpa_lse_reference(
 
 
 def _segment_sdpa_lse_fast(queries, keys, values, n, *, scale, causal):
-    """Per-segment attention on the MLX kernel that returns the logsumexp (``sdpa_with_lse``)."""
+    """Per-segment attention on the MLX kernel that returns the logsumexp (``sdpa_with_lse``).
+
+    When the build offers it, the kernel returns the output in float32, like the reference
+    route, so that ``merge_segment_outputs`` rounds once; otherwise in the query dtype (the
+    merge then rounds a second time).
+    """
     k, v = _rows_view(keys, n), _rows_view(values, n)
-    out, lse = sdpa_with_lse(queries, k, v, scale=scale, mask="causal" if causal else None)
+    out, lse = sdpa_with_lse(
+        queries,
+        k,
+        v,
+        scale=scale,
+        mask="causal" if causal else None,
+        float32_output=sdpa_lse_float32_output_available(),
+    )
     # The kernel's logsumexp is (B, Hq, Q, 1); the merge works on (B, Hq, Q).
     return out, lse.astype(mx.float32).reshape(out.shape[:-1])
 
@@ -1152,6 +1208,7 @@ def segmented_kv_health(entries: Iterable[Any]) -> dict[str, Any] | None:
         "prefill_route": prefill_route(),
         "lse_api": lse_api_found(),
         "decode_route": decode_route(),
+        "lse_float32_output": sdpa_lse_float32_output_available(),
         "entries": per_entry,
         "max_segments": max((e["segments"] for e in per_entry), default=0),
         "sealed_bytes_unique": unique_state_bytes(all_states),

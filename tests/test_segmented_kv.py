@@ -511,6 +511,7 @@ def test_lse_kernel_path_plumbing_with_mocked_detection(monkeypatch) -> None:
     import mtplx.segmented_kv as module
 
     monkeypatch.setattr(module, "_SDPA_LSE", True)
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", None)  # the fake below has no float32_output
     monkeypatch.delenv("MTPLX_SEGMENTED_KV_PREFILL", raising=False)
     assert module.prefill_route() == "lse"
     calls = []
@@ -630,3 +631,106 @@ def test_reference_route_fully_masked_row_is_zero_not_nan() -> None:
     assert lse[..., :2].tolist() == [[[float("-inf")] * 2] * 2]
     assert not mx.isnan(out.astype(mx.float32)).any().item()
     assert float(mx.abs(out[:, :, :2].astype(mx.float32)).max()) == 0.0
+
+
+def test_sdpa_with_lse_float32_output_uses_the_return_lse_keyword(monkeypatch) -> None:
+    import mtplx.segmented_kv as module
+
+    calls: list = []
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention_with_lse", _fake_lse_api(calls, "func"), raising=False)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api(calls, "kw"))
+    q = mx.zeros((1, 1, 16, 64), dtype=mx.bfloat16)
+    module.sdpa_with_lse(q, q, q, scale=1.0, mask="causal", float32_output=True)
+    module.sdpa_with_lse(q, q, q, scale=1.0)
+    assert calls == [("kw", "causal", {"return_lse": True, "float32_output": True}), ("func", None, {})]
+
+
+def _fake_lse_api_f32(calls):
+    def fake(q, k, v, *, scale, mask=None, return_lse=False, float32_output=False):
+        calls.append(float32_output)
+        out = mx.zeros(q.shape, dtype=mx.float32 if float32_output else q.dtype)
+        return out, mx.zeros((*q.shape[:-1], 1), dtype=mx.float32)
+
+    return fake
+
+
+def test_float32_output_probe(monkeypatch) -> None:
+    import mtplx.segmented_kv as module
+
+    monkeypatch.delattr(mx.fast, "scaled_dot_product_attention_with_lse", raising=False)
+    calls: list = []
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api_f32(calls))
+    monkeypatch.setattr(module, "_SDPA_LSE", True)
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", None)
+    assert module.sdpa_lse_float32_output_available() is True
+    assert module.sdpa_lse_float32_output_available() is True  # probed once
+    assert calls == [True]
+
+    # A build that takes the keyword but still returns the query dtype does not count.
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api(calls, "kw"))
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", None)
+    assert module.sdpa_lse_float32_output_available() is False
+
+    # Without the lse kernel there is nothing to probe.
+    calls.clear()
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", _fake_lse_api_f32(calls))
+    monkeypatch.setattr(module, "_SDPA_LSE", False)
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", None)
+    assert module.sdpa_lse_float32_output_available() is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("float32_output", [True, False])
+def test_lse_kernel_route_rounds_once_with_the_float32_output(monkeypatch, float32_output) -> None:
+    """Mocked kernel (the exact reference per segment): with the float32 output the route is the
+    float32 attention rounded once; without it every segment is rounded first, as before.
+
+    Runs on the CPU: a float32 GEMM of 16 rows on a NAX GPU uses TF32 operands by default
+    (MLX_ENABLE_TF32), which is not the exact float32 result this test compares against."""
+    import mtplx.segmented_kv as module
+
+    def kernel(q, k, v, *, scale, mask=None, return_lse=False, float32_output=False):
+        out, lse = module._segment_sdpa_lse_reference(q, k, v, int(k.shape[2]), scale=scale, causal=mask == "causal")
+        return (out if float32_output else out.astype(q.dtype)), lse[..., None]
+
+    monkeypatch.delattr(mx.fast, "scaled_dot_product_attention_with_lse", raising=False)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", kernel)
+    monkeypatch.setattr(module, "_SDPA_LSE", True)
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", float32_output)
+    with mx.stream(mx.cpu):
+        cache, q, _, _, scale, exact = _rounding_case([2000, 1024, 600, 40], 16)
+        module.route_counts.clear()
+        got = attend_segments_lse(q, cache, scale=scale)
+        mx.eval(got)
+    assert module.route_counts.get("sdpa_lse_kernel") == 4
+    assert got.dtype == mx.bfloat16
+    if float32_output:
+        assert _differing(got, exact) <= 0.005
+    else:
+        assert _differing(got, exact) > 0.05
+
+
+def test_real_lse_kernel_float32_output_rounds_once(monkeypatch) -> None:
+    """Our MLX build (float32_output next to return_lse): the fused route rounds once, so it is
+    closer to the exact attention and to the stock kernel than the route that rounds every
+    segment first. Not equal to the exact result: the NAX kernel's P @ V runs at reduced
+    precision (about one bf16 ulp in eight), the stock kernel's as well. The exact reference
+    runs on the CPU (true float32 GEMMs)."""
+    import mtplx.segmented_kv as module
+
+    monkeypatch.setattr(module, "_SDPA_LSE", None)
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", None)
+    if not module.sdpa_lse_float32_output_available():
+        pytest.skip("MLX build without float32_output for return_lse")
+    with mx.stream(mx.cpu):
+        cache, q, keys, values, scale, exact = _rounding_case([3000, 1000, 200], 16)
+        mx.eval(exact)
+    module.route_counts.clear()
+    after = attend_segments_lse(q, cache, scale=scale)
+    assert module.route_counts.get("sdpa_lse_kernel") == 3
+    monkeypatch.setattr(module, "_SDPA_LSE_F32", False)
+    before = attend_segments_lse(q, cache, scale=scale)
+    stock = mx.fast.scaled_dot_product_attention(q, keys, values, scale=scale, mask="causal")
+    assert after.dtype == mx.bfloat16
+    assert _differing(after, exact) < 0.6 * _differing(before, exact)
+    assert _differing(after, stock) < 0.6 * _differing(before, stock)
