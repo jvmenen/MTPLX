@@ -386,6 +386,76 @@ def test_lse_merge_equals_attention_over_the_concatenated_rows() -> None:
     assert float(mx.abs(got.astype(mx.float32) - ref).max()) < 0.02
 
 
+@pytest.fixture
+def cpu():
+    """The exactness tests run on the CPU: MLX float32 GEMM on a tensor-unit GPU rounds like TF32."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    yield
+    mx.set_default_device(previous)
+
+
+def _rounding_case(sizes, q_len, dim=64, heads_q=8):
+    cache = SegmentedKVCache()
+    for i, n in enumerate(sizes[:-1]):
+        k = mx.random.normal((1, HEADS, n, dim), key=mx.random.key(10 + i)).astype(mx.bfloat16)
+        v = mx.random.normal((1, HEADS, n, dim), key=mx.random.key(50 + i)).astype(mx.bfloat16)
+        cache.update_and_fetch(k, v)
+        cache.seal()
+    k = mx.random.normal((1, HEADS, sizes[-1], dim), key=mx.random.key(7)).astype(mx.bfloat16)
+    v = mx.random.normal((1, HEADS, sizes[-1], dim), key=mx.random.key(8)).astype(mx.bfloat16)
+    cache.update_and_fetch(k, v)
+    q = mx.random.normal((1, heads_q, q_len, dim), key=mx.random.key(9)).astype(mx.bfloat16)
+    keys, values = cache.gather()
+    scale = dim ** -0.5
+    kf = mx.repeat(keys.astype(mx.float32), heads_q // HEADS, axis=1)
+    vf = mx.repeat(values.astype(mx.float32), heads_q // HEADS, axis=1)
+    s = (q.astype(mx.float32) @ kf.transpose(0, 1, 3, 2)) * scale
+    total = keys.shape[2]
+    vis = mx.arange(total)[None, :] <= (total - q_len + mx.arange(q_len))[:, None]
+    s = mx.where(vis[None, None], s, -mx.inf)
+    exact = (mx.softmax(s, axis=-1) @ vf).astype(mx.bfloat16)
+    return cache, q, keys, values, scale, exact
+
+
+def _differing(a, b) -> float:
+    return float(mx.mean(a.astype(mx.float32) != b.astype(mx.float32)).item())
+
+
+@pytest.mark.parametrize("q_len", [1, 6])
+@pytest.mark.parametrize("sizes", [[3000, 200], [2000, 1024, 600, 40]])
+def test_reference_lse_route_rounds_once(cpu, monkeypatch, q_len, sizes) -> None:
+    """The reference route must be the float32 attention rounded once to the query dtype.
+
+    A tolerance of one bf16 ulp does not see a second rounding (every segment rounded to bf16
+    before the merge), which puts a quarter or more of the elements one ulp off.
+    """
+    monkeypatch.setattr(segmented_kv_module, "sdpa_lse_available", lambda: False)
+    cache, q, _, _, scale, exact = _rounding_case(sizes, q_len)
+    got = attend_segments_lse(q, cache, scale=scale)
+    assert got.dtype == mx.bfloat16
+    assert _differing(got, exact) <= 0.005
+
+
+@pytest.mark.parametrize("q_len", [1, 6])
+def test_reference_lse_route_is_as_close_to_stock_sdpa_as_the_exact_result(cpu, monkeypatch, q_len) -> None:
+    monkeypatch.setattr(segmented_kv_module, "sdpa_lse_available", lambda: False)
+    cache, q, keys, values, scale, exact = _rounding_case([3000, 1000, 200], q_len)
+    got = attend_segments_lse(q, cache, scale=scale)
+    stock = mx.fast.scaled_dot_product_attention(q, keys, values, scale=scale, mask="causal" if q_len > 1 else None)
+    assert _differing(got, stock) <= _differing(exact, stock) + 0.005
+
+
+def test_merge_rounds_float32_segment_outputs_once_to_the_requested_dtype(cpu) -> None:
+    a = mx.random.normal((1, 2, 3, 4), key=mx.random.key(1))
+    b = mx.random.normal((1, 2, 3, 4), key=mx.random.key(2))
+    la, lb = mx.zeros((1, 2, 3)), mx.zeros((1, 2, 3))
+    merged = merge_segment_outputs([a, b], [la, lb], dtype=mx.bfloat16)
+    assert merged.dtype == mx.bfloat16
+    assert mx.array_equal(merged, ((a + b) / 2).astype(mx.bfloat16)).item()
+    assert merge_segment_outputs([a], [la], dtype=mx.bfloat16).dtype == mx.bfloat16
+
+
 def test_merge_of_one_segment_is_the_segment_output() -> None:
     out = mx.ones((1, 2, 3, 4), dtype=mx.bfloat16)
     lse = mx.zeros((1, 2, 3))
