@@ -124,9 +124,53 @@ def test_only_the_last_segment_is_tail_causal() -> None:
     assert float(mx.abs(out.astype(mx.float32) - ref).max()) < 5e-3
 
 
-def test_unsupported_shapes_bail_without_a_kernel_launch() -> None:
-    q, k, v = _data(9000, 6)  # 6 rows x GQA 6 = 36 > 32
+def test_unsupported_shapes_bail_without_a_kernel_launch(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    q, k, v = _data(9000, 33)  # past the wide route's 32 rows
     before = dict(S.segmented_bail_counts)
     assert S.sdpa_nax_flash_dsplit_segments(queries=q, segments=_split(k, v, _lens(9000, 2)), scale=SCALE) is None
-    assert S.segmented_bail_counts.get("m_rows_gt_32", 0) == before.get("m_rows_gt_32", 0) + 1
-    assert S.segments_supported(5, 6, 256) and not S.segments_supported(6, 6, 256)
+    assert S.segmented_bail_counts.get("route_shape", 0) == before.get("route_shape", 0) + 1
+    assert S.segments_supported(5, 6, 256) and S.segments_supported(6, 6, 256)
+    assert S.segments_supported(9, 6, 256) and S.segments_supported(32, 6, 256)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "0")
+    assert not S.segments_supported(6, 6, 256) and not S.segments_supported(9, 6, 256)
+
+
+def _stock(q, k, v, total):
+    return mx.fast.scaled_dot_product_attention(
+        q, k[:, :, :total], v[:, :, :total], scale=SCALE, mask="causal"
+    ).astype(mx.float32)
+
+
+@pytest.mark.parametrize("q_len", [6, 7, 8, 9, 13, 17, 25, 32])
+@pytest.mark.parametrize("nseg", [1, 3, 9])
+@pytest.mark.parametrize("dsplit4", ["0", "1"])
+def test_wide_windows_take_one_launch_within_the_halves_envelope_of_stock(
+    monkeypatch, q_len, nseg, dsplit4
+) -> None:
+    """6 to 32-row windows (6 to 8 used to run as two sub-windows) take the wide route in one
+    launch: one segment bit-identical to the contiguous wide kernel, several within bf16 ulps of
+    it, and no further from stock SDPA than the contiguous halves route plus one ulp."""
+    from mtplx.kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit_wide
+
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE", "1")
+    monkeypatch.delenv("MTPLX_NAX_FLASH_WIDE_TGM", raising=False)
+    total = 12000
+    q, k, v = _data(total, q_len, seed=q_len)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "0")
+    halves = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=total, scale=SCALE)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", dsplit4)
+    contiguous = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=total, scale=SCALE)
+    before = S.segmented_dispatch_counts.get("dispatched", 0)
+    out = S.sdpa_nax_flash_dsplit_segments(queries=q, segments=_split(k, v, _lens(total, nseg)), scale=SCALE)
+    assert out is not None
+    if nseg == 1:
+        assert mx.array_equal(out, contiguous).item()
+    else:
+        assert S.segmented_dispatch_counts.get("dispatched", 0) == before + 1
+        assert _ulps(out, contiguous) <= 3
+    stock = _stock(q, k, v, total)
+    err = float(mx.abs(out.astype(mx.float32) - stock).max())
+    err_halves = float(mx.abs(halves.astype(mx.float32) - stock).max())
+    ulp = 2.0 ** (math.floor(math.log2(float(mx.abs(stock).max()))) - 7)
+    assert err <= err_halves + ulp, (err, err_halves)

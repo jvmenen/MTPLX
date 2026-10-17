@@ -253,7 +253,9 @@ def _low_gqa_cache(hk: int, d: int, window: int, seed: int = 11):
 @pytest.mark.parametrize("window", [11, 12, 17, 32])
 def test_sub_windows_respect_both_kernel_limits_at_every_gqa(monkeypatch, gqa, expected_sub, window) -> None:
     """GQA 1 and 2 used sub-windows of 32 and 16 rows, which the kernel refuses (q_len <= 10): the
-    window then fell back to a gather. Every sub-window must be one the kernel takes."""
+    window then fell back to a gather. Every sub-window must be one the kernel takes (sub-windows
+    are the route with MTPLX_NAX_FLASH_WIDE off)."""
+    monkeypatch.delenv("MTPLX_NAX_FLASH_WIDE", raising=False)
     previous = mx.default_device()
     mx.set_default_device(mx.cpu)
     try:
@@ -285,8 +287,10 @@ def test_sub_windows_respect_both_kernel_limits_at_every_gqa(monkeypatch, gqa, e
 @pytest.mark.parametrize("window", [12, 32])
 def test_low_gqa_wide_windows_run_on_the_segments_and_match_the_reference(monkeypatch, gqa, window) -> None:
     """GQA 1 and 2 (4 and 8 query heads over 4 KV heads, head_dim 128) with a window above the
-    kernel's 10 rows: sub-windows over the segments, no gather, exact against fp32."""
+    kernel's 10 rows: sub-windows over the segments (MTPLX_NAX_FLASH_WIDE off), no gather, exact
+    against fp32."""
     monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+    monkeypatch.delenv("MTPLX_NAX_FLASH_WIDE", raising=False)
     hk, d = 4, 128
     cache = _low_gqa_cache(hk, d, window)
     hq = hk * gqa

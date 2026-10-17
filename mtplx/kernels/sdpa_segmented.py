@@ -25,10 +25,15 @@ kernel); cost per extra segment at q_len 4 is 0 to 0.005 ms/layer fused up to 12
 (0.012 to 0.016 with one launch per segment); a verify forward over 6 or 20 segments at 50K
 and 80K costs 0 to 1.1 % more than the contiguous one.
 
-The kernel takes a window of ``q_len <= MAX_Q_LEN`` rows with ``gqa_factor * q_len <=
-MAX_M_ROWS``; ``segmented_kv.decode_segments_attention`` runs a longer verify window (up to 32
-rows) as sub-windows within both limits. A call no segment route takes (a mask, a kernel
-bail) runs the stock route on the gathered rows (``segmented_kv.gathered_view``).
+The kernel follows the contiguous dispatcher's configuration: halves, or quarters with
+``MTPLX_NAX_FLASH_DSPLIT4=1``, for a window of ``q_len <= MAX_Q_LEN`` rows with ``gqa_factor *
+q_len <= MAX_M_ROWS``, and the wide route's split and row groups (``wide_shape``) for a wider
+window of up to 32 rows with ``MTPLX_NAX_FLASH_WIDE=1``, from 6 rows at GQA 6 (the contiguous
+dispatcher gives 6 to 8 rows to another kernel; here they would run as two sub-windows, 5 rows
+plus the rest, each a full walk over the keys). With the wide route off
+``segmented_kv.decode_segments_attention`` runs a longer verify window as sub-windows within
+both limits. A call no segment route takes (a mask, a kernel bail) runs the stock route on the
+gathered rows (``segmented_kv.gathered_view``).
 """
 
 from __future__ import annotations
@@ -52,8 +57,9 @@ SUPPORTED_HEAD_DIMS = (128, 256)
 
 #: Metal allows 31 buffer bindings: queries + 2 per segment + meta + scale + 3 outputs.
 MAX_FUSED_SEGMENTS = 12
-#: Query rows per launch: the head-dim-split kernel's tile takes at most 32 rows of
-#: ``gqa_factor * q_len`` and at most 10 verify rows.
+#: Query rows of a window the shipping split takes whole: ``gqa_factor * q_len <= MAX_M_ROWS``
+#: and ``q_len <= MAX_Q_LEN``; a wider window takes the wide route (``_route_shape``) or runs as
+#: sub-windows within both limits (``segmented_kv.decode_segments_attention``).
 MAX_M_ROWS = 32
 MAX_Q_LEN = 10
 #: The reduce kernel binds one partial buffer per launch group plus sums, maxs, starts, out.
@@ -203,14 +209,60 @@ def _reduce_kernel(ngroups: int):
         return None
 
 
-def segment_block_counts(rows: Sequence[int]) -> list[int]:
-    """Key blocks per segment: the chunk the contiguous dispatcher uses for the same total."""
+def segment_block_counts(rows: Sequence[int], *, ndh: int = 2, wide_rows: int = 0) -> list[int]:
+    """Key blocks per segment: the chunk the contiguous dispatcher uses for the same total.
+
+    ``ndh`` 4 reads the quarter-split table (``MTPLX_NAX_FLASH_DSPLIT4``), ``wide_rows`` > 0 the
+    wide route's table for that many live query rows per KV head.
+    """
     total = sum(int(n) for n in rows)
     override = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0)
-    base = override or _dsplit._default_dsplit_blocks(total)
+    if wide_rows:
+        default = _dsplit._default_wide_blocks(total, wide_rows)
+    elif ndh == 4:
+        default = _dsplit._default_dsplit4_blocks(total)
+    else:
+        default = _dsplit._default_dsplit_blocks(total)
+    base = override or default
     base = max(32, (base // 32) * 32)
     chunk = (-(-total // base) + 31) // 32 * 32
     return [max(1, -(-int(n) // chunk)) for n in rows]
+
+
+def _route_shape(q_len: int, gqa_factor: int, head_dim: int = 256) -> tuple[bool, int, int] | None:
+    """(wide, ndh, tg_m) the contiguous dispatcher would pick for this window, or None.
+
+    Mirrors ``sdpa_nax_flash_dsplit._dsplit_dispatch`` and the call order in ``attention_split``:
+    windows of up to 32 live rows per KV head take the shipping contract (halves, or quarters
+    with ``MTPLX_NAX_FLASH_DSPLIT4=1`` unless the quarter self-check lane is off); a wider
+    window of up to 32 query rows takes the wide contract (``wide_shape``: the same split choice,
+    row groups) when ``MTPLX_NAX_FLASH_WIDE=1``. One segment then calls the contiguous wide
+    entry with the same shape, so it stays bit-identical to the contiguous kernel.
+    """
+    live = gqa_factor * q_len
+    if live <= 32 and 1 <= q_len <= 10:
+        # head_dim 128 keeps the halves split (quarters would leave 32 dims per simdgroup, untuned).
+        ndh = 4 if head_dim == 256 and os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
+        if ndh == 4:
+            from ..kernel_selfcheck import lane_disabled
+
+            if lane_disabled("nax_flash_dsplit4_sdpa"):
+                ndh = 2
+        return False, ndh, (live + 15) // 16
+    if (
+        # From 2 rows: a decode row past the shipping contract (GQA above 32) stays unsupported.
+        2 <= q_len <= _dsplit.WIDE_MAX_Q
+        and live <= _dsplit.WIDE_MAX_ROWS
+        and os.environ.get("MTPLX_NAX_FLASH_WIDE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    ):
+        from ..kernel_selfcheck import lane_disabled
+
+        if lane_disabled("nax_flash_dsplit_wide_sdpa"):
+            return None
+        # head_dim 128 keeps the halves split here too.
+        ndh, tg_m = _dsplit.wide_shape(live, quarters=head_dim == 256)
+        return True, ndh, tg_m
+    return None
 
 
 def sdpa_nax_flash_dsplit_segments(
@@ -243,10 +295,11 @@ def sdpa_nax_flash_dsplit_segments(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    if gqa_factor * q_len > MAX_M_ROWS:
-        return _bail("m_rows_gt_32")
-    if q_len < 1 or q_len > MAX_Q_LEN:
-        return _bail("q_len")
+    shape = _route_shape(q_len, gqa_factor, d)
+    if shape is None:
+        return _bail("route_shape")
+    wide, ndh, tg_m = shape
+    live = gqa_factor * q_len
     if queries.dtype not in (mx.bfloat16, mx.float16):
         return _bail("query_dtype")
     for keys, values, n in segments:
@@ -268,21 +321,20 @@ def sdpa_nax_flash_dsplit_segments(
         # One segment is the contiguous kernel's input (bit-identical). The contiguous
         # dispatcher is 256 only; a head_dim-128 segment goes through the fused path below.
         keys, values, n = segments[0]
-        return _dsplit.sdpa_nax_flash_dsplit(
-            queries=queries, keys=keys, values=values, offset=int(n), scale=scale
-        )
+        entry = _dsplit.sdpa_nax_flash_dsplit_wide if wide else _dsplit.sdpa_nax_flash_dsplit
+        return entry(queries=queries, keys=keys, values=values, offset=int(n), scale=scale)
 
     groups = [segments[i:i + MAX_FUSED_SEGMENTS] for i in range(0, len(segments), MAX_FUSED_SEGMENTS)]
     if len(groups) > MAX_GROUPS:
         return _bail("too_many_segments")
     rows = [int(n) for _, _, n in segments]
-    blocks = segment_block_counts(rows)
+    blocks = segment_block_counts(rows, ndh=ndh, wide_rows=live if wide else 0)
     reduce_kernel = _reduce_kernel(len(groups))
     if reduce_kernel is None:
         return _bail("kernel_unavailable")
 
-    nsgm = (gqa_factor * q_len + 15) // 16
-    nthreads = 32 * nsgm * 2
+    nthreads = 32 * tg_m * ndh
+    row_groups = (live + 16 * tg_m - 1) // (16 * tg_m)
     pdt = unnormalized_partials_dtype(queries.dtype)
     parts, sums, maxs, counts = [], [], [], []
     first = 0
@@ -311,9 +363,11 @@ def sdpa_nax_flash_dsplit_segments(
                     ("D", d),
                     ("QL", q_len),
                     ("GQA_F", gqa_factor),
+                    ("TG_M", tg_m),
+                    ("NDH", ndh),
                     ("NLAST", nseg - 1 if last_group else nseg),
                 ],
-                grid=(hk * nthreads, 1, total_blocks),
+                grid=(hk * nthreads, row_groups, total_blocks),
                 threadgroup=(nthreads, 1, 1),
                 output_shapes=[
                     (bsz, hq, q_len, total_blocks, d),
@@ -348,5 +402,4 @@ def sdpa_nax_flash_dsplit_segments(
 
 def segments_supported(q_len: int, gqa_factor: int, head_dim: int) -> bool:
     """Static part of the contract (no device work), for the route gate in attention_split."""
-    return head_dim in SUPPORTED_HEAD_DIMS and 1 <= q_len <= MAX_Q_LEN and gqa_factor * q_len <= MAX_M_ROWS
-
+    return head_dim in SUPPORTED_HEAD_DIMS and _route_shape(q_len, gqa_factor, head_dim) is not None

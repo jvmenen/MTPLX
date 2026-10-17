@@ -831,8 +831,10 @@ def decode_segments_attention(
     ``VERIFY_WINDOW_MAX`` (32) rows, a causal or no mask, and a total length of
     at least ``packed_threshold`` when the cache is one segment (several segments take the
     kernel at any length). The head-dim-split segment kernel takes a window whole when
-    ``gqa * q_len <= 32`` and ``q_len <= MAX_Q_LEN`` (10); a longer window runs as sub-windows
-    of the rows the kernel takes, each over the segments, so the history is never gathered.
+    ``gqa * q_len <= 32`` and ``q_len <= MAX_Q_LEN`` (10), and a wider one through the wide
+    route (``MTPLX_NAX_FLASH_WIDE=1``, one launch); otherwise a longer window runs as
+    sub-windows of the rows the kernel takes, each over the segments, so the history is never
+    gathered.
     None (the call then runs the stock ladder: on a zero-copy view when the cache is one
     segment, on gathered rows otherwise) comes from a mask, an unsupported shape or a kernel
     bail.
@@ -870,10 +872,11 @@ def decode_segments_attention(
         if out is not None:
             count_route(f"fused_q{q_len}")
         return out
-    # A window the kernel does not take whole: sub-windows of the rows it does take (both
-    # limits: gqa * rows <= 32 and rows <= 10, so GQA 1 and 2 split at 10 rows, GQA 4 at 8,
-    # GQA 6 at 5), each over the keys up to its own last row, so the history is read once per
-    # sub-window and never gathered. Row i of the window sees keys up to n - Q + i.
+    # A window the kernel does not take whole (the wide route off or its lane disabled):
+    # sub-windows of the rows it does take (both limits: gqa * rows <= 32 and rows <= 10, so
+    # GQA 1 and 2 split at 10 rows, GQA 4 at 8, GQA 6 at 5), each over the keys up to its own
+    # last row, so the history is read once per sub-window and never gathered. Row i of the
+    # window sees keys up to n - Q + i.
     sub = max(1, min(MAX_Q_LEN, MAX_M_ROWS // gqa))
     if not segments_supported(sub, gqa, d):
         return None
