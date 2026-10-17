@@ -290,7 +290,7 @@ def _gdn_norm_gate_kernel(dtype: mx.Dtype):
         constant constexpr int N_READS = 4;
 
         inline float sigmoid_stable(float x) {
-          float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+          float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
           return (x < 0.0f) ? y : 1.0f - y;
         }
     """

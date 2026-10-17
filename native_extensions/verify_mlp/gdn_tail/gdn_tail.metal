@@ -11,7 +11,7 @@ constant constexpr int RESULTS_PER_SIMDGROUP8 = 4;
 
 template <typename T>
 inline float sigmoid_stable_native(float x) {
-  float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+  float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
   return (x < 0.0f) ? y : 1.0f - y;
 }
 

@@ -445,7 +445,7 @@ def test_tail_source_uses_fast_exp_in_the_softmax():
 
 def test_tail_source_uses_the_mlx_bf16_sigmoid_decomposition():
     src = route_kernel.tail_source()
-    assert "1 / (1 + metal::exp(metal::abs(sx)))" in src
+    assert "1 / (1 + metal::precise::exp(metal::abs(sx)))" in src
     assert "bfloat(1 - sigmoid_y)" in src
 
 
