@@ -633,7 +633,7 @@ def _target_stage2_source() -> str:
                     bfloat gate_value = bfloat(gate_sum);
                     bfloat up_value = bfloat(up_sum);
                     auto sigmoid_y = 1 / (
-                        1 + metal::exp(metal::abs(gate_value)));
+                        1 + metal::precise::exp(metal::abs(gate_value)));
                     bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                         ? bfloat(sigmoid_y)
                         : bfloat(1 - sigmoid_y);
@@ -751,7 +751,7 @@ def _target_m2_stage2_source() -> str:
                         bfloat gate_value = bfloat(gate_sum);
                         bfloat up_value = bfloat(up_sum);
                         auto sigmoid_y = 1 / (
-                            1 + metal::exp(metal::abs(gate_value)));
+                            1 + metal::precise::exp(metal::abs(gate_value)));
                         bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                             ? bfloat(sigmoid_y)
                             : bfloat(1 - sigmoid_y);
@@ -875,7 +875,7 @@ def _target_m2_stage2_source() -> str:
                         bfloat gate_value = bfloat(gate_sum);
                         bfloat up_value = bfloat(up_sum);
                         auto sigmoid_y = 1 / (
-                            1 + metal::exp(metal::abs(gate_value)));
+                            1 + metal::precise::exp(metal::abs(gate_value)));
                         bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                             ? bfloat(sigmoid_y)
                             : bfloat(1 - sigmoid_y);
@@ -1006,7 +1006,7 @@ def _mtp_stage2_source() -> str:
                     bfloat gate_value = bfloat(gate_sum);
                     bfloat up_value = bfloat(up_sum);
                     auto sigmoid_y = 1 / (
-                        1 + metal::exp(metal::abs(gate_value)));
+                        1 + metal::precise::exp(metal::abs(gate_value)));
                     bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                         ? bfloat(sigmoid_y)
                         : bfloat(1 - sigmoid_y);
@@ -1219,7 +1219,7 @@ def _target_m2_stage3_source() -> str:
             if (lane == 0) {
                 bfloat gate_value0 = shared_gate[0];
                 auto sigmoid_y0 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value0)));
+                    1 + metal::precise::exp(metal::abs(gate_value0)));
                 bfloat sigmoid_mlx_exact0 = gate_value0 < bfloat(0.0f)
                     ? bfloat(sigmoid_y0)
                     : bfloat(1 - sigmoid_y0);
@@ -1228,7 +1228,7 @@ def _target_m2_stage3_source() -> str:
                     sigmoid_mlx_exact0 * shared_value0);
                 bfloat gate_value1 = shared_gate[1];
                 auto sigmoid_y1 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value1)));
+                    1 + metal::precise::exp(metal::abs(gate_value1)));
                 bfloat sigmoid_mlx_exact1 = gate_value1 < bfloat(0.0f)
                     ? bfloat(sigmoid_y1)
                     : bfloat(1 - sigmoid_y1);
@@ -1408,7 +1408,7 @@ def _target_m3_stage3_source() -> str:
             if (lane == 0) {
                 bfloat gate_value0 = shared_gate[0];
                 auto sigmoid_y0 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value0)));
+                    1 + metal::precise::exp(metal::abs(gate_value0)));
                 bfloat sigmoid_mlx_exact0 = gate_value0 < bfloat(0.0f)
                     ? bfloat(sigmoid_y0)
                     : bfloat(1 - sigmoid_y0);
@@ -1417,7 +1417,7 @@ def _target_m3_stage3_source() -> str:
                     sigmoid_mlx_exact0 * shared_value0);
                 bfloat gate_value1 = shared_gate[1];
                 auto sigmoid_y1 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value1)));
+                    1 + metal::precise::exp(metal::abs(gate_value1)));
                 bfloat sigmoid_mlx_exact1 = gate_value1 < bfloat(0.0f)
                     ? bfloat(sigmoid_y1)
                     : bfloat(1 - sigmoid_y1);
@@ -1426,7 +1426,7 @@ def _target_m3_stage3_source() -> str:
                     sigmoid_mlx_exact1 * shared_value1);
                 bfloat gate_value2 = shared_gate[2];
                 auto sigmoid_y2 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value2)));
+                    1 + metal::precise::exp(metal::abs(gate_value2)));
                 bfloat sigmoid_mlx_exact2 = gate_value2 < bfloat(0.0f)
                     ? bfloat(sigmoid_y2)
                     : bfloat(1 - sigmoid_y2);
@@ -1537,7 +1537,7 @@ def _target_m2r1_stage3_source() -> str:
             if (lane == 0) {
                 bfloat gate_value0 = shared_gate[0];
                 auto sigmoid_y0 = 1 / (
-                    1 + metal::exp(metal::abs(gate_value0)));
+                    1 + metal::precise::exp(metal::abs(gate_value0)));
                 bfloat sigmoid_mlx_exact0 = gate_value0 < bfloat(0.0f)
                     ? bfloat(sigmoid_y0)
                     : bfloat(1 - sigmoid_y0);
@@ -1688,7 +1688,7 @@ def _target_stage3_source() -> str:
                     bfloat shared_value = bfloat(shared_sum);
                     bfloat gate_value = shared_gate[row];
                     auto sigmoid_y = 1 / (
-                        1 + metal::exp(metal::abs(gate_value)));
+                        1 + metal::precise::exp(metal::abs(gate_value)));
                     bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                         ? bfloat(sigmoid_y)
                         : bfloat(1 - sigmoid_y);
@@ -1804,7 +1804,7 @@ def _mtp_stage3_source() -> str:
                     bfloat shared_value = bfloat(shared_sum);
                     bfloat gate_value = shared_gate[row];
                     auto sigmoid_y = 1 / (
-                        1 + metal::exp(metal::abs(gate_value)));
+                        1 + metal::precise::exp(metal::abs(gate_value)));
                     bfloat sigmoid_mlx_exact = gate_value < bfloat(0.0f)
                         ? bfloat(sigmoid_y)
                         : bfloat(1 - sigmoid_y);

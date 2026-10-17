@@ -127,28 +127,31 @@ not a rounding-class difference.
 
 6. SHARED GATE SIGMOID -- ``unary_ops.h`` ``Sigmoid`` at T = bfloat16_t:
 
-       auto y = 1 / (1 + metal::exp(metal::abs(x)));
+       auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
        return (x < 0) ? y : 1 - y;
 
-   ``metal::abs``/``metal::exp`` on bfloat are the bf16_math.h overloads that
-   round the result back to bfloat, so ``exp`` rounds to bf16 BEFORE the
-   reciprocal; the ``1 +`` and ``1 -`` then run in fp32 (bfloat promotes) and
-   round once at the return.  An fp32 sigmoid rounded once disagrees on ~13%
-   of bf16 inputs (measured on the CPU backend, test in the suite).  This is
-   the same idiom the retained ``qwen4_m4_routed_glu`` kernel already ships.
+   ``metal::abs``/``metal::precise::exp`` on bfloat are the bf16_math.h
+   overloads that round the result back to bfloat, so ``exp`` rounds to bf16
+   BEFORE the reciprocal; the ``1 +`` and ``1 -`` then run in fp32 (bfloat
+   promotes) and round once at the return.  An fp32 sigmoid rounded once
+   disagrees on ~13% of bf16 inputs (measured on the CPU backend, test in the
+   suite).  This is the same idiom the retained ``qwen4_m4_routed_glu`` kernel
+   already ships.
 
 RESIDUAL RISK (cannot be closed without a GPU)
 ----------------------------------------------
-``metal::exp`` and ``1.0f/x`` resolve to ``__METAL_MAYBE_FAST_MATH__``; the
-kernel therefore uses the SAME spelling MLX uses (plain ``metal::exp``, plain
-``fast::exp`` inside the softmax) so both compile under whatever flag
-``mx.fast.metal_kernel`` and the shipped metallib share.  Metal's ``simd_sum``
-and ``simd_max`` reduction trees are reproduced by CALLING the same intrinsics
-with the same lane assignment rather than by modelling them.  The gate is
-construction-bound: ``install`` compares the kernel's whole tuple against the
-stock scaffold on the real per-layer weights with ``mx.array_equal`` and raises
-on the first mismatch, so an untrue assumption fails loudly at model build
-instead of silently changing which experts run.
+``1.0f/x`` resolves to ``__METAL_MAYBE_FAST_MATH__``; the kernel uses the
+SAME spelling MLX uses (``metal::precise::exp`` in the sigmoid since MLX 0.32.3,
+ml-explore/mlx#4461, plain ``fast::exp`` inside the softmax).  A plain
+``metal::exp`` would not do: ``mx.fast.metal_kernel`` resolves it to the fast
+approximation, while the shipped metallib (``-fno-fast-math``) resolves it to
+the precise one.  Metal's ``simd_sum`` and ``simd_max`` reduction trees are
+reproduced by CALLING the same intrinsics with the same lane assignment rather
+than by modelling them.  The gate is construction-bound: ``install`` compares
+the kernel's whole tuple against the stock scaffold on the real per-layer
+weights with ``mx.array_equal`` and raises on the first mismatch, so an untrue
+assumption fails loudly at model build instead of silently changing which
+experts run.
 """
 
 from __future__ import annotations
@@ -468,7 +471,7 @@ _TAIL_SOURCE = """
         }
         // unary_ops.h Sigmoid at T = bfloat16_t, exactly as spelled there.
         const bfloat sx = shared_logits[gid];
-        auto sigmoid_y = 1 / (1 + metal::exp(metal::abs(sx)));
+        auto sigmoid_y = 1 / (1 + metal::precise::exp(metal::abs(sx)));
         shared_factor[gid] = sx < bfloat(0.0f)
             ? bfloat(sigmoid_y)
             : bfloat(1 - sigmoid_y);

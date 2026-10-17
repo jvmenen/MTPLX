@@ -91,7 +91,7 @@ def _gate_up_swiglu_qmv4_kernel(group_size: int, dtype: mx.Dtype):
 
         template <typename T>
         inline T sigmoid_mlx_exact(T x) {
-          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
           return (x < T(0)) ? y : 1 - y;
         }
 
@@ -336,7 +336,7 @@ def _gate_up_swiglu_qmv4_rowwise_kernel(
 
         template <typename T>
         inline T sigmoid_mlx_exact(T x) {
-          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
           return (x < T(0)) ? y : 1 - y;
         }
 
@@ -576,7 +576,7 @@ def _gate_up_swiglu_qmv4_split_kernel(group_size: int, dtype: mx.Dtype):
 
         template <typename T>
         inline T sigmoid_mlx_exact(T x) {
-          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
           return (x < T(0)) ? y : 1 - y;
         }
 
