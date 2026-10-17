@@ -185,6 +185,27 @@ def _check_qmm_lane(mx, fn, m: int, bits: int, group_size: int, dtype) -> float:
     return _max_abs_diff(mx, y, ref)
 
 
+def _check_q8_nax_pad(mx, dtype) -> float:
+    """The padded 8-bit lane at 13 rows (padded to 33) against stock at 13 rows.
+
+    N = 8192 is the narrowest width at K = 1024 where 13 rows stay on the split-K
+    tile and 33 rows reach the NAX tile, the case the lane exists for.
+    """
+    from . import nax_verify
+
+    m, n, group_size = 13, 8192, 64
+    rows = nax_verify.q8_nax_pad_rows(m, _K, n, group_size)
+    if rows is None:
+        return float("inf")
+    w_q, scales, biases = _quantized_fixture(mx, _K, n, 8, group_size, dtype)
+    x = (mx.random.normal((m, _K), dtype=mx.float32) * 0.5).astype(dtype)
+    y = nax_verify.nax_qmm_q8_padded(x, w_q, scales, biases, rows=rows, group_size=group_size)
+    ref = _qmm_reference(mx, x, w_q, scales, biases, bits=8, group_size=group_size)
+    if tuple(y.shape) != tuple(ref.shape):
+        return float("inf")
+    return _max_abs_diff(mx, y, ref)
+
+
 def _check_qwen_row_owned_router(mx, dtype) -> float:
     """Require bitwise stock routing for every installed M1-M16 row count."""
 
@@ -987,6 +1008,15 @@ def run_kernel_selfcheck(
     else:
         for lane in ("qmm_m4", "qmm_m4_wide", "qmm_m6", "qmm_m6_wide", "qmm_m16_nax"):
             lanes[lane] = _STATUS_SKIPPED
+
+    if nax_on and nax_verify.q8_nax_pad_enabled():
+        # Opt-in padded 8-bit lane (MTPLX_Q8_NAX_PAD=1), probed whatever the
+        # model's main bit width: mixed models (Qwen3.8-27B Optimized-Speed)
+        # keep their GDN out-projections, last MLPs and lm_head at 8 bits.
+        if nax_verify.nax_available():
+            _record("qmm_q8_nax_pad", _QMM_TOLERANCE, lambda: _check_q8_nax_pad(mx, dtype))
+        else:
+            lanes["qmm_q8_nax_pad"] = _STATUS_SKIPPED
 
     # lm_head_topk kernels exist but are not routed on the serve path.
     lanes["lm_head_topk"] = _STATUS_SKIPPED
