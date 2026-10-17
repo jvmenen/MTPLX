@@ -1089,16 +1089,17 @@ def fused_moe_combine(
 #
 #   - `mtplx_sigmoid` is `struct Sigmoid` from
 #     mlx/backend/metal/kernels/unary_ops.h verbatim —
-#     `auto y = 1 / (1 + metal::exp(metal::abs(x))); return (x < 0) ? y : 1 - y;`
+#     `auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));`
+#     `return (x < 0) ? y : 1 - y;` (MLX 0.32.3 and later, ml-explore/mlx#4461)
 #     Written that way for the rounding, not the algebra: at T = bfloat16_t,
-#     `metal::exp` resolves to bf16_math.h's overload, which is
+#     `metal::precise::exp` resolves to bf16_math.h's overload, which is
 #     `static_cast<bfloat16_t>(__metal_exp(static_cast<float>(x), ...))` — so the
 #     exponential is ROUNDED TO BFLOAT16 before the reciprocal, and a version
 #     that kept it in float would be a different number, not a different last
 #     bit.  Custom kernels get the same preamble (`metal::utils()`, which
-#     includes bf16_math.h) and the same compile options as MLX's own kernels
-#     (device.cpp builds every JIT library with `setFastMathEnabled(false)`), so
-#     `__METAL_MAYBE_FAST_MATH__` resolves identically on both sides.
+#     includes bf16_math.h).  They do not get the metallib's `-fno-fast-math`:
+#     a plain `metal::exp` is the fast approximation in an
+#     `mx.fast.metal_kernel`, so the precise flavour is spelled out.
 #   - The two multiplies are `struct Multiply`'s `T operator()(T x, T y)` from
 #     binary_ops.h, applied in the stock order: `silu(gate)` lands in a T
 #     variable first, which is the rounding `nn.silu`'s own output carries,
@@ -1124,7 +1125,7 @@ _GLU_OPS = """
     // mlx/backend/metal/kernels/unary_ops.h, struct Sigmoid, verbatim.
     template <typename T>
     inline T mtplx_sigmoid(T x) {
-        auto y = 1 / (1 + metal::exp(metal::abs(x)));
+        auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
         return (x < 0) ? y : 1 - y;
     }
 

@@ -162,7 +162,7 @@ def _router_bitonic_kernel(experts: int, top_k: int):
         threadgroup float xchg_scores[NUM_EXPERTS];
 
         float x = float(logits[row * NUM_EXPERTS + lane]);
-        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
         float my_score = x < 0.0f ? y : 1.0f - y;
         float my_key   = -(my_score + correction_bias[lane]);
         uint  my_index = lane;

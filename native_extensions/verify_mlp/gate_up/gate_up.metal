@@ -14,7 +14,7 @@ constant constexpr int RESULTS_PER_SIMDGROUP = 4;
 
 template <typename T>
 inline T sigmoid_mlx_exact_native(T x) {
-  auto y = 1 / (1 + metal::exp(metal::abs(x)));
+  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
   return (x < T(0)) ? y : 1 - y;
 }
 

@@ -10,6 +10,10 @@ from mtplx.kernels.qwen4_m4_routed_down import bind_residual_tail
 from mtplx.kernels.qwen4_m4_routed_glu import bind as bind_routed_glu
 
 
+def _mlx_version() -> tuple[int, ...]:
+    return tuple(int(part) for part in mx.__version__.split(".")[:3])
+
+
 def _u32_pack(shape):
     size = 1
     for extent in shape:
@@ -54,7 +58,13 @@ def test_paired_routed_glu_is_bit_exact_at_physical_m4_shape() -> None:
         sorted_indices=False,
     )
     gate, up = mx.split(gu, 2, axis=-1)
-    expected_h = (nn.silu(gate) * up).reshape(4, 10, 640)
+    # The eager chain is stock's SiLU at every MLX version: the kernel and
+    # eager Sigmoid both spell metal::precise::exp. Compiled nn.silu used the
+    # fast exp up to MLX 0.32.2 and agrees from 0.32.3 (ml-explore/mlx#4461).
+    expected_h = ((gate * mx.sigmoid(gate)) * up).reshape(4, 10, 640)
+    if _mlx_version() >= (0, 32, 3):
+        compiled_h = (nn.silu(gate) * up).reshape(4, 10, 640)
+        assert bool(mx.array_equal(expected_h, compiled_h).item())
     actual_h = bind_routed_glu()(
         value.reshape(4, 2560),
         weights,

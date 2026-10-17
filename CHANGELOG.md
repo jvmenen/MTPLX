@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Kernel copies of stock MLX's sigmoid and GDN decay use the precise exponential, as stock does.** In a runtime-compiled Metal kernel a plain `metal::exp` is the fast approximation, while stock `mx.exp` and, since MLX 0.32.3 (ml-explore/mlx#4461), stock `mx.sigmoid` use the precise one. The A3B GDN post-conv recurrences (inline-g and headquarter) therefore did not reproduce mlx-lm's `compute_g`: about 5% of the recurrent-state values differed from stock on every MLX version; they are now bit for bit stock's. The copied bf16 sigmoids (fused SwiGLU, A3B whole-MoE, Flash-Next route and routed GLU, GDN norm gate, Laguna GLU and router) differed at one bf16 input value (-6.84375, one bf16 step) and now match eager `mx.sigmoid`, and compiled `nn.silu` from MLX 0.32.3. Speed is unchanged, except the multi-row SwiGLU-down probe kernel (not used at runtime), which is 15% slower. A source test fails if such a copy uses the fast exp again.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

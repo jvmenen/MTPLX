@@ -155,7 +155,7 @@ _SOURCE = """
         for (uint out = 0; out < OUTPUTS_PER_SIMD; ++out) {
             bfloat gate_value = bfloat(gate_result[out]);
             bfloat up_value = bfloat(up_result[out]);
-            auto sigmoid_y = 1 / (1 + metal::exp(metal::abs(gate_value)));
+            auto sigmoid_y = 1 / (1 + metal::precise::exp(metal::abs(gate_value)));
             bfloat sigmoid_value = gate_value < bfloat(0.0f)
                 ? bfloat(sigmoid_y) : bfloat(1 - sigmoid_y);
             bfloat silu = bfloat(gate_value * sigmoid_value);

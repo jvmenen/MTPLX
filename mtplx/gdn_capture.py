@@ -1126,7 +1126,7 @@ def _make_linear_gated_delta_from_conv_inline_g_kernel():
 
           if (dk_idx == 0 && local_dv_idx == 0) {
             InT b_val = b_t[hv_idx];
-            auto beta_y = 1 / (1 + metal::exp(metal::abs(b_val)));
+            auto beta_y = 1 / (1 + metal::precise::exp(metal::abs(b_val)));
             InT beta_val = (b_val < InT(0)) ? beta_y : 1 - beta_y;
 
             InT a_val = a_t[hv_idx] + dt_bias[hv_idx];
@@ -1136,9 +1136,9 @@ def _make_linear_gated_delta_from_conv_inline_g_kernel():
             InT softplus_val = (minval == -inf || maxval == inf)
               ? maxval
               : (maxval + log1p(metal::exp(minval - maxval)));
-            float decay_a = metal::exp(float(A_log[hv_idx]));
+            float decay_a = metal::precise::exp(float(A_log[hv_idx]));
             beta_shared = static_cast<float>(beta_val);
-            g_shared = metal::exp(-decay_a * float(softplus_val));
+            g_shared = metal::precise::exp(-decay_a * float(softplus_val));
           }
 
           if (local_dv_idx == 0) {
@@ -1270,7 +1270,7 @@ def _make_linear_gated_delta_from_conv_headquarter_kernel():
       if (simd_id == 0u) {
         if (dk_idx == 0u) {
           InT b_val = b_t[hv_idx];
-          auto beta_y = 1 / (1 + metal::exp(metal::abs(b_val)));
+          auto beta_y = 1 / (1 + metal::precise::exp(metal::abs(b_val)));
           InT beta_val = (b_val < InT(0)) ? beta_y : 1 - beta_y;
 
           InT a_val = a_t[hv_idx] + dt_bias[hv_idx];
@@ -1280,9 +1280,9 @@ def _make_linear_gated_delta_from_conv_headquarter_kernel():
           InT softplus_val = (minval == -inf || maxval == inf)
             ? maxval
             : (maxval + log1p(metal::exp(minval - maxval)));
-          float decay_a = metal::exp(float(A_log[hv_idx]));
+          float decay_a = metal::precise::exp(float(A_log[hv_idx]));
           beta_shared = static_cast<float>(beta_val);
-          g_shared = metal::exp(-decay_a * float(softplus_val));
+          g_shared = metal::precise::exp(-decay_a * float(softplus_val));
         }
 
         float q_sum = 0.0f;
