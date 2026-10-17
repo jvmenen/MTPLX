@@ -262,7 +262,7 @@ def test_a_live_reset_leaves_no_history_pending(tiny_pack, monkeypatch):
         tiny_pack,
         monkeypatch,
         max_tokens=60,
-        env={"MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "8"},
+        env={"MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD": "4"},
     )
     assert run.out.stats.mtp_history_live_resets > 0
     _assert_bounded(run)

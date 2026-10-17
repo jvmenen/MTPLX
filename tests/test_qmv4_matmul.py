@@ -45,11 +45,12 @@ def test_parity_family_shapes(group_size, m):
         )
         got = qmv4_matmul(x, q)
         # fp32 oracle from the dequantized weights: the honest yardstick.
-        # Measured 2026-08-27: M=1 is BYTE-IDENTICAL to stock (same qmv
-        # accumulation); M>=2 stock switches to a tiled qmm kernel with a
-        # different summation tree, so both paths carry bf16-ulp-class noise
-        # against the oracle — gate ours to stock's own noise class instead
-        # of to stock's bytes.
+        # Measured 2026-08-27: M=1 was BYTE-IDENTICAL to stock (same qmv
+        # accumulation) up to MLX 0.32.3; MLX 0.32.4 (#4516) accumulates the
+        # stock qmv in float32, so M=1 now differs in the last bit as well.
+        # M>=2 stock switches to a tiled qmm kernel with a different
+        # summation tree. Every M is gated to stock's own noise class
+        # against the oracle instead of to stock's bytes.
         wf = mx.dequantize(
             q.weight, q.scales, q.biases, group_size=group_size, bits=4
         ).astype(mx.float32)
@@ -58,15 +59,10 @@ def test_parity_family_shapes(group_size, m):
         scale = mx.abs(oracle).max().item() + 1e-6
         e_stock = (mx.abs(stock.astype(mx.float32) - oracle) / scale).max().item()
         e_ours = (mx.abs(got.astype(mx.float32) - oracle) / scale).max().item()
-        if m == 1:
-            assert (got == stock).all().item(), (
-                f"M=1 must be byte-identical to stock (gs={group_size} N={n})"
-            )
-        else:
-            assert e_ours <= e_stock * 3.5 + 1e-3, (
-                f"N={n} K={k} gs={group_size} M={m}: ours->oracle {e_ours:.5f} "
-                f"outside stock's noise class ({e_stock:.5f})"
-            )
+        assert e_ours <= e_stock * 3.5 + 1e-3, (
+            f"N={n} K={k} gs={group_size} M={m}: ours->oracle {e_ours:.5f} "
+            f"outside stock's noise class ({e_stock:.5f})"
+        )
 
 
 def test_leading_batch_dims_roundtrip():
