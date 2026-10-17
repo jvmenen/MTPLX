@@ -6,6 +6,7 @@ Commits on `prod` that are not in the maker's release it is based on. Policy: [F
 
 | Commit(s) on `prod` | Change | PR | State | Switch in the launch command |
 |---|---|---|---|---|
+| 7a500018 | Claude Code's `output_config.effort` on `/v1/messages` maps onto `reasoning_effort` (Anthropic `max` to `xhigh`; a flat `reasoning_effort` wins; unknown values fall back to the server default). Cherry-picked from the PR head b30efa2e by Manish Mathai, not our own work | #634 (not ours) | open | default; on prod from 17 Oct, not yet deployed |
 | f49fb74f, 5b6e36e5, 2929bd7a | Segmented KV lse route: per-segment output in float32 from `mx.fast.scaled_dot_product_attention_with_lse` (merge rounds once); `return_lse` stays the fallback (= feat/segkv-lse-f32out 0bc68034, ab430ef3, 261ef7ed; not pushed). Needs an MLX build with the function, otherwise the lse routes round twice | (with #610) | local | with `MTPLX_SEGMENTED_KV=1` |
 | 3ad71b5b, 38ff9872, cbcf7226 | Segmented KV on Macs without tensor units: per-segment attention with a logsumexp merge, `decode_route()` kernel/lse; M5 keeps the kernel route by default | #630 | open | with `MTPLX_SEGMENTED_KV=1` |
 | 2149d58a, de1a06e5 | Token prefixes compared chunk by chunk, one `common_prefix_len`; bank prefix knobs through the shared readers, block-prefix floor documented (adapted from refactor/prefix-helpers-2: 581e5324/eba7ec5c conflicted, only the missing parts taken; the 512 constant left out) | #628 | open, adapted | default |
