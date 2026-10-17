@@ -908,10 +908,11 @@ def decode_segments_attention(
         if out is not None:
             count_route(f"fused_q{q_len}")
         return out
-    # A window the kernel does not take whole (the wide route off or its lane disabled): sub-windows of the rows it does take (both
-    # limits: gqa * rows <= 32 and rows <= 10, so GQA 1 and 2 split at 10 rows, GQA 4 at 8,
-    # GQA 6 at 5), each over the keys up to its own last row, so the history is read once per
-    # sub-window and never gathered. Row i of the window sees keys up to n - Q + i.
+    # A window the kernel does not take whole (the wide route off or its lane disabled):
+    # sub-windows of the rows it does take (both limits: gqa * rows <= 32 and rows <= 10, so
+    # GQA 1 and 2 split at 10 rows, GQA 4 at 8, GQA 6 at 5), each over the keys up to its own
+    # last row, so the history is read once per sub-window and never gathered. Row i of the
+    # window sees keys up to n - Q + i.
     sub = max(1, min(MAX_Q_LEN, MAX_M_ROWS // gqa))
     if not segments_supported(sub, gqa, d):
         return None
