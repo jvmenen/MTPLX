@@ -154,8 +154,9 @@ def test_editable_lock_version_matches_project_version():
 # the pinned wheel. 0.32.3 is accepted because the Flash-Next tests that were
 # bit-exact against 0.32.2 now compare to an fp32 reference on MLX >= 0.32.3
 # (stock gather_qmm changed in the last bit, CPU bf16 sum widens to fp32), and
-# the other suites run unchanged on it. The wheel pin and uv.lock stay 0.32.2.
-ACCEPTED_LOADED_MLX = ("0.32.3",)
+# the other suites run unchanged on it. 0.32.4 is the next base of that build.
+# The wheel pin and uv.lock stay 0.32.2.
+ACCEPTED_LOADED_MLX = ("0.32.3", "0.32.4")
 
 
 def test_installed_mlx_is_the_pinned_version():
