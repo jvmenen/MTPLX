@@ -29,10 +29,14 @@ Accumulation order differs from the halves kernel (four partial sums), so result
 within fp32 rounding but are not bit-identical to the 2-way route; the 2-way route itself
 is bit-identical to before when the switch is off.
 
-The quarter split applies to the shipping contract only (q_len <= 5, ``wide=False``).
-The wide route (q_len 9..32, row groups tiled over TG_M) keeps its halves configuration;
 NDH and TG_M are independent template parameters, so the two compose
-(``NSGM = TG_M`` row blocks, each split ``NDH`` ways).
+(``NSGM = TG_M`` row blocks, each split ``NDH`` ways). The wide route (q_len 9..32, row
+groups tiled over TG_M) takes the quarter split with the same switch (``wide_shape``):
+wide windows are not limited by what they read but by the work per 16-row block (every
+block walks every key; one group of 32 or 64 rows per threadgroup instead of 32 rows in
+two groups is not faster, and neither is reusing each K/V fragment for two blocks), and
+quarters take 11 to 19% less time per window (9 to 25 rows at 100K). Row groups are 32 rows when the window's
+16-row blocks pair up, otherwise 16 rows, so no group carries an empty block.
 """
 
 from __future__ import annotations
@@ -331,13 +335,31 @@ def _default_dsplit4_blocks(capacity: int) -> int:
     return 128 if capacity >= 65536 else 64
 
 
-def _wide_rows_per_tg() -> int:
-    """16-row blocks per threadgroup for the wide route (MTPLX_NAX_FLASH_WIDE_TGM, default 2)."""
+def wide_shape(live: int, *, quarters: bool = True) -> tuple[int, int]:
+    """(NDH, TG_M) of the wide route for ``live`` query rows per KV head.
+
+    Quarters with ``MTPLX_NAX_FLASH_DSPLIT4=1`` (unless its self-check lane failed), halves
+    otherwise or with ``quarters=False``. TG_M: ``MTPLX_NAX_FLASH_WIDE_TGM`` when set (1 to 4, at most 2 with quarters:
+    the score exchange holds 2 x 2 KB per simdgroup in 32 KB); else 2 with halves, as before,
+    and with quarters 2 when the 16-row blocks pair up, 1 otherwise (an odd block count in
+    groups of two leaves the last group one empty block, which costs as much as a full one).
+    """
+    ndh = 2
+    if quarters and os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1":
+        from ..kernel_selfcheck import lane_disabled
+
+        if not lane_disabled("nax_flash_dsplit4_sdpa"):
+            ndh = 4
+    m_blocks = (live + 15) // 16
     raw = (os.environ.get("MTPLX_NAX_FLASH_WIDE_TGM") or "").strip()
     try:
-        return min(4, max(1, int(raw))) if raw else 2
+        tg_m = min(4, max(1, int(raw))) if raw else None
     except ValueError:
-        return 2
+        tg_m = None
+    if tg_m is None:
+        tg_m = 2 if ndh == 2 or m_blocks % 2 == 0 else 1
+    tg_m = min(tg_m, 8 // ndh)
+    return ndh, min(tg_m, m_blocks)
 
 
 def _default_wide_blocks(capacity: int, rows: int) -> int:
@@ -361,7 +383,7 @@ def _dsplit_dispatch(
 
     ``ndh`` (head-dim parts per M block, shipping contract only): None reads the switch
     (``MTPLX_NAX_FLASH_DSPLIT4=1`` selects 4, otherwise 2); the kernel self-check passes 4
-    explicitly. The wide route always uses 2.
+    explicitly. The wide route ignores it and takes ``wide_shape``.
     """
     if os.environ.get("MTPLX_NAX_FLASH_DSPLIT", "1") == "0":
         return _bail("env_disabled")
@@ -409,7 +431,7 @@ def _dsplit_dispatch(
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
     if wide:
-        ndh = 2
+        ndh, wide_tg_m = wide_shape(live)
     elif ndh is None:
         ndh = 4 if os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
         if ndh == 4:
@@ -436,7 +458,7 @@ def _dsplit_dispatch(
 
     # 16-row blocks per threadgroup and number of row groups (grid.y). The shipping
     # contract (live <= 32) is one group covering every row, as before.
-    tg_m = min(_wide_rows_per_tg(), (live + 15) // 16) if wide else (live + 15) // 16
+    tg_m = wide_tg_m if wide else (live + 15) // 16
     row_groups = (live + 16 * tg_m - 1) // (16 * tg_m)
     nthreads = 32 * tg_m * ndh
     partial_shape = (bsz, hq, q_len, blocks, d)
