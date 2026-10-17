@@ -14,8 +14,10 @@ verify rows (an exact 5-row split-K lane, a pipelined m16 tile and a two-tile
 32-row variant; default-off switches, ``MTPLX_MULTIROW_QMM=1`` turns all three
 on, see ``m5_rows_lane_enabled``, ``m16_pipelined_enabled`` and
 ``m32_tile_enabled``), M-padding dispatch (verify rows 2..16 pad to the 16-row NAX
-tile; weight streaming dominates so padded rows are nearly free), env gating,
-and availability probes. Exactness vs stock mx.quantized_matmul is enforced by
+tile; weight streaming dominates so padded rows are nearly free), the same
+padding for 8-bit verify rows onto MLX's own NAX tile (``MTPLX_Q8_NAX_PAD``,
+default off, see ``q8_nax_pad_rows``), env gating, and availability probes.
+Exactness vs stock mx.quantized_matmul is enforced by
 the capture-commit/R1b gates before any product use.
 """
 
@@ -1044,6 +1046,111 @@ def nax_qmm_m5(
     )
 
 
+def q8_nax_pad_enabled() -> bool:
+    """Opt in to the padded 8-bit NAX lane (default off, read per call)."""
+    return str(os.environ.get("MTPLX_Q8_NAX_PAD", "")).strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+# Rows from which the padded 8-bit lane engages by default. In the Qwen3.8-27B
+# verify forward (M5 Pro) 9- and 10-row windows got 0.4 to 2.9% slower although
+# the matmuls alone are faster, 12 rows and up 2 to 6% faster. From
+# _Q8_NAX_PAD_TWO_TILE_MIN_ROWS a narrow shape pads to 33 rows (two 32-row tiles);
+# see q8_nax_pad_rows.
+_Q8_NAX_PAD_MIN_ROWS = 12
+_Q8_NAX_PAD_TWO_TILE_MIN_ROWS = 9
+
+
+def _q8_nax_pad_min_rows() -> int:
+    try:
+        return max(7, int(os.environ.get("MTPLX_Q8_NAX_PAD_MIN_ROWS", _Q8_NAX_PAD_MIN_ROWS)))
+    except ValueError:
+        return _Q8_NAX_PAD_MIN_ROWS
+
+
+def _mlx_qmv_batch_limit(K: int, N: int) -> int:
+    """MLX's ``get_qmv_batch_limit`` for a generation-17 GPU (not the ``d`` class)."""
+    if K <= 2048 and N <= 2048:
+        return 33
+    if K <= 4096 and N <= 4096:
+        return 25
+    return 13
+
+
+def mlx_qmm_takes_nax(M: int, K: int, N: int, group_size: int) -> bool:
+    """Whether MLX runs a transposed affine quantized matmul of M rows on its NAX tile.
+
+    Mirrors ``QuantizedMatmul::eval_gpu`` in MLX 0.32.2 to 0.32.4 for a 2-D weight on a
+    generation-17 GPU: below the qmv batch limit it takes ``qmv``/``qmv_wide``; from
+    there ``qmm_splitk``, which splits K whenever the 32x32 tile grid has 256 or fewer
+    threadgroups and only otherwise falls through to ``qmm``, which takes ``qmm_t_nax``
+    when K is a multiple of 64.
+    """
+    if M < _mlx_qmv_batch_limit(K, N) or K % 64 != 0:
+        return False
+    tiles = ((N + 31) // 32) * ((M + 31) // 32)
+    split_k = max(1, 512 // tiles)
+    k_align = max(int(group_size), 32)
+    split_k = min(split_k, K // k_align)
+    while split_k > 1 and K % (split_k * k_align) != 0:
+        split_k -= 1
+    return split_k <= 1
+
+
+def q8_nax_pad_rows(M: int, K: int, N: int, group_size: int) -> int | None:
+    """Rows to pad an M-row 8-bit verify matmul to so MLX takes ``qmm_t_nax``, or None.
+
+    Between 7 and 32 rows stock MLX runs these shapes on ``qmv_wide`` (below 13 rows)
+    or on the split-K tile ``qmm_t_splitk`` (narrow N, such as the 5120-wide GDN
+    out-projection and MLP down of Qwen3.8-27B), neither of which uses the tensor
+    units; at 13 to 32 rows those two shapes take 2.6 to 2.7 times their weight-read
+    time. Zero rows appended to the input reach the NAX tile and read no more weight
+    bytes. Wide shapes pad to the qmv limit (13 rows, one 32-row tile); a narrow
+    shape needs 33 rows (two tiles), which costs more than ``qmv_wide`` below 9 rows
+    (M5 Pro, Qwen3.8-27B shapes: GDN out-projection 0.185 against 0.201 ms at 7 rows,
+    0.220 against 0.201 ms at 9). None where stock already takes the NAX tile (the
+    wide shapes from 13 rows) or where padding does not pay.
+    """
+    if not 7 <= M <= 32:
+        return None
+    if mlx_qmm_takes_nax(M, K, N, group_size):
+        return None
+    rows = max(M, _mlx_qmv_batch_limit(K, N))
+    if rows <= 32 and mlx_qmm_takes_nax(rows, K, N, group_size):
+        return rows
+    if M >= _Q8_NAX_PAD_TWO_TILE_MIN_ROWS and mlx_qmm_takes_nax(33, K, N, group_size):
+        return 33
+    return None
+
+
+def nax_qmm_q8_padded(
+    x2: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    rows: int,
+    group_size: int = 64,
+) -> mx.array:
+    """Run an 8-bit verify matmul with x2 (M, K) padded to ``rows`` zero-filled rows."""
+    M = int(x2.shape[0])
+    pad = mx.zeros((int(rows) - M, int(x2.shape[1])), dtype=x2.dtype)
+    y = mx.quantized_matmul(
+        mx.concatenate([x2, pad], axis=0),
+        w_q,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=group_size,
+        bits=8,
+    )
+    return y[:M]
+
+
 _QLINEAR_PATCH: dict[str, object] = {"installed": False, "original": None}
 
 # F23b (2026-08-16): verify-shaped QuantizedLinear calls that entered the
@@ -1158,6 +1265,30 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                         y = y + self["bias"]
                     return y
                 _count_qlinear_fallback(bits, m)
+            elif (
+                _q8_nax_pad_min_rows() <= m <= 32
+                and q8_nax_pad_enabled()
+                and not lane_disabled("qmm_q8_nax_pad")
+                and x.dtype in (mx.bfloat16, mx.float16)
+                and getattr(self, "mode", "affine") == "affine"
+                and nax_available()
+            ):
+                # Wide verify windows (context-copy blocks), opt-in
+                # (MTPLX_Q8_NAX_PAD=1): zero rows take stock MLX to its NAX
+                # tile where it would run qmv_wide or the split-K tile.
+                w_q = self["weight"]
+                k = int(x.shape[-1])
+                n = int(w_q.shape[0])
+                rows = q8_nax_pad_rows(m, k, n, group_size)
+                if rows is not None:
+                    y = nax_qmm_q8_padded(
+                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        rows=rows, group_size=group_size,
+                    )
+                    y = y.reshape(*x.shape[:-1], n)
+                    if "bias" in self:
+                        y = y + self["bias"]
+                    return y
         if bits == 6 and x.ndim >= 2 and current_attention_phase() != "prefill":
             # 6-bit affine (9B tier), added 2026-07-07: split-K hexpack
             # kernels, exactness-gated vs stock across {bf16,fp16} x
