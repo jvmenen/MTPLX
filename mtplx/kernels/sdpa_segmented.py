@@ -12,8 +12,7 @@ Two kernels:
   derived from its source at import (``_fused_source``), launched ONCE for up to
   ``MAX_FUSED_SEGMENTS`` segments: grid.z walks the blocks of all segments, a ``meta`` array
   (block starts, row counts, capacities) selects the segment and its K/V buffers inside the
-  kernel. The stock kernel file is not touched: the tail-causal mask is switched off for every
-  segment before the last one in the derived source (``nomask_seg``). Segments before the last one run with every key visible (no tail-causal mask);
+  kernel. Segments before the last one run with every key visible (no tail-causal mask);
   only the last segment, which holds the rows being verified, keeps the mask;
 * the reduce kernel is ``_paged_reduce_kernel`` generalised to a list of partial buffers
   with arbitrary block counts (blocks are addressed through a ``starts`` prefix table).
@@ -26,13 +25,15 @@ kernel); cost per extra segment at q_len 4 is 0 to 0.005 ms/layer fused up to 12
 (0.012 to 0.016 with one launch per segment); a verify forward over 6 or 20 segments at 50K
 and 80K costs 0 to 1.1 % more than the contiguous one.
 
-Routes that cannot take segments yet fall back to ``segmented_kv.gather_attention`` (one
-contiguous copy of the history per call, then the stock kernel) only on a kernel bail; a window
-of more than 32 live rows with ``MTPLX_NAX_FLASH_WIDE`` off runs as sub-windows. The kernel
-follows the contiguous dispatcher's configuration: halves or quarters (``MTPLX_NAX_FLASH_DSPLIT4``)
-for ``gqa_factor * q_len <= 32``, the wide route's split and row groups (``wide_shape``) above
-that, from 6 query rows at GQA 6 (the contiguous dispatcher gives 6 to 8 rows to another
-kernel; here they ran as two sub-windows, 5 rows plus the rest, each a full walk over the keys).
+The kernel follows the contiguous dispatcher's configuration: halves, or quarters with
+``MTPLX_NAX_FLASH_DSPLIT4=1``, for a window of ``q_len <= MAX_Q_LEN`` rows with ``gqa_factor *
+q_len <= MAX_M_ROWS``, and the wide route's split and row groups (``wide_shape``) for a wider
+window of up to 32 rows with ``MTPLX_NAX_FLASH_WIDE=1``, from 6 rows at GQA 6 (the contiguous
+dispatcher gives 6 to 8 rows to another kernel; here they would run as two sub-windows, 5 rows
+plus the rest, each a full walk over the keys). With the wide route off
+``segmented_kv.decode_segments_attention`` runs a longer verify window as sub-windows within
+both limits. A call no segment route takes (a mask, a kernel bail) runs the stock route on the
+gathered rows (``segmented_kv.gathered_view``).
 """
 
 from __future__ import annotations
@@ -49,17 +50,16 @@ from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_nax_flash import _HEADER
 
 #: Head dimensions the segment kernel serves (the head-dim-split TensorOps kernel; ``D`` is a
-#: template parameter, 128 runs at the halves split, 64 dims per simdgroup). The contiguous
+#: template parameter, 128 gives 64 dims per simdgroup at the halves split). The contiguous
 #: dispatcher in sdpa_nax_flash_dsplit stays 256 only: a model with head_dim 128 that does not
 #: use segments keeps exactly the routes it has today.
 SUPPORTED_HEAD_DIMS = (128, 256)
 
 #: Metal allows 31 buffer bindings: queries + 2 per segment + meta + scale + 3 outputs.
 MAX_FUSED_SEGMENTS = 12
-#: Query rows of a window the halves kernel takes whole: ``gqa_factor * q_len <= MAX_M_ROWS`` and
-#: ``q_len <= MAX_Q_LEN`` (the quarter split and the wide route follow the contiguous dispatcher
-#: on this tree, see ``_route_shape``); ``segmented_kv.decode_segments_attention`` runs a longer
-#: window as sub-windows within both limits.
+#: Query rows of a window the shipping split takes whole: ``gqa_factor * q_len <= MAX_M_ROWS``
+#: and ``q_len <= MAX_Q_LEN``; a wider window takes the wide route (``_route_shape``) or runs as
+#: sub-windows within both limits (``segmented_kv.decode_segments_attention``).
 MAX_M_ROWS = 32
 MAX_Q_LEN = 10
 #: The reduce kernel binds one partial buffer per launch group plus sums, maxs, starts, out.
@@ -85,7 +85,11 @@ def _fused_source(nseg: int) -> str:
     """The partial kernel over ``nseg`` segment buffers in one launch.
 
     Same body as ``sdpa_nax_flash_dsplit._SOURCE``; only the prologue (segment lookup,
-    buffer selection, per-segment mask flag) and the partial/stat indexing change.
+    buffer selection, per-segment mask flag) and the partial/stat indexing change, and the
+    tail-causal mask is skipped for every segment before the last one (``nomask_seg``: a
+    sealed segment lies entirely before the rows being verified; the stock kernel derives the
+    mask from the same ``offset`` that bounds the keys, so it cannot be switched off through
+    the inputs).
     ``meta`` = bstart[nseg+1] | n[nseg] | cap[nseg] (int32).
     """
     src = _dsplit._SOURCE
@@ -269,10 +273,10 @@ def sdpa_nax_flash_dsplit_segments(
 ) -> mx.array | None:
     """Exact attention of ``queries`` over ``segments`` = [(keys, values, n), ...], oldest first.
 
-    ``keys``/``values`` are (1, Hk, capacity, 256) buffers of which the first ``n`` rows are
+    ``keys``/``values`` are (1, Hk, capacity, D) buffers, D in SUPPORTED_HEAD_DIMS, of which the first ``n`` rows are
     live. Every segment but the last is fully visible; the last holds the rows being verified
     as its final ``q_len`` rows and keeps the tail-causal mask. None when the contract is not
-    met (the caller falls back to ``segmented_kv.gather_attention``).
+    met (the caller then runs the stock route, see ``segmented_kv.decode_segments_attention``).
     """
     if os.environ.get("MTPLX_NAX_FLASH_DSPLIT", "1") == "0":
         return _bail("env_disabled")
@@ -314,8 +318,8 @@ def sdpa_nax_flash_dsplit_segments(
         return _bail("tail_shorter_than_q")
 
     if len(segments) == 1 and d == 256:
-        # One segment is the contiguous kernel's input (bit-identical). The contiguous dispatcher is
-        # 256 only; a head_dim-128 segment goes through the fused path below.
+        # One segment is the contiguous kernel's input (bit-identical). The contiguous
+        # dispatcher is 256 only; a head_dim-128 segment goes through the fused path below.
         keys, values, n = segments[0]
         entry = _dsplit.sdpa_nax_flash_dsplit_wide if wide else _dsplit.sdpa_nax_flash_dsplit
         return entry(queries=queries, keys=keys, values=values, offset=int(n), scale=scale)
