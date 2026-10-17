@@ -323,3 +323,29 @@ def test_health_payload_before_any_run_is_safe() -> None:
     payload = report_for_health()
     assert payload == {"ran": False}
     json.dumps(payload)
+
+
+def test_q8_nax_pad_lane_is_probed_for_any_model_bits(monkeypatch) -> None:
+    """MTPLX_Q8_NAX_PAD adds its own probe, also for a 4-bit model (mixed
+    models keep 8-bit layers); a corrupted lane falls back and stops routing."""
+    monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
+    monkeypatch.delenv("MTPLX_Q8_NAX_PAD", raising=False)
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert "qmm_q8_nax_pad" not in report["lanes"]
+
+    monkeypatch.setenv("MTPLX_Q8_NAX_PAD", "1")
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    expect = "ok" if nax_verify.nax_available() else "skipped"
+    assert report["lanes"]["qmm_q8_nax_pad"] == expect
+    if not nax_verify.nax_available():
+        return
+    original = nax_verify.nax_qmm_q8_padded
+
+    def corrupted(*a, **k):
+        return original(*a, **k) + 1000.0
+
+    monkeypatch.setattr(nax_verify, "nax_qmm_q8_padded", corrupted)
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["qmm_q8_nax_pad"] == "fallback"
+    assert lane_disabled("qmm_q8_nax_pad")
+    assert report_for_health()["qmm_q8_nax_pad"] == "fallback"

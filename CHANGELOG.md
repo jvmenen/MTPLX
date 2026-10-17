@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **8-bit verify matmuls of 12 to 32 rows reach MLX's tensor-unit (NAX) tile, behind `MTPLX_Q8_NAX_PAD=1` (off by default).** Stock MLX runs an 8-bit matmul of 7 to 12 rows on `qmv_wide` and, for narrow outputs (N = 5120 on Qwen3.8-27B: the GDN out-projection and the MLP down-projection of the 8-bit layers), 13 to 32 rows on the split-K tile, neither of which uses the tensor units; those two shapes then take 2.6 to 2.7 times their weight-read time. The lane appends zero rows (to 13 rows for wide outputs, 33 for narrow ones) so MLX picks `qmm_t_nax`, and slices the real rows back; shapes that already reach the NAX tile are left alone. Measured on an M5 Pro with Qwen3.8-27B Optimized-Speed: a verify forward of 12 to 25 rows is 4.6 to 5.4% faster at 32K context (6.4 to 7.5 ms) and 2.3 to 3.8% at 100K (5.0 to 7.2 ms); 4 to 10 rows are untouched. Results differ from stock by accumulation order only (per layer at most 7e-3 relative); on 26 real context-copy windows the expected accepted tokens per window are equal (4.825 against 4.825). `MTPLX_Q8_NAX_PAD_MIN_ROWS` moves the floor; the kernel self-check probes the lane.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

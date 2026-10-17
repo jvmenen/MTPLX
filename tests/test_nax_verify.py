@@ -251,3 +251,118 @@ def test_m5_falls_through_to_stock_by_default(monkeypatch) -> None:
         assert mx.array_equal(y, ref), "M=5 default must be the stock result"
     finally:
         uninstall_nax_qlinear_patch()
+
+
+def test_q8_nax_pad_rows_follow_the_mlx_dispatch() -> None:
+    """The padded 8-bit lane pads only where stock MLX misses its NAX tile
+    (Qwen3.8-27B 8-bit shapes, group size 64)."""
+    from mtplx.nax_verify import mlx_qmm_takes_nax, q8_nax_pad_rows
+
+    gdn_out, mlp_down, gate_up, lm_head = (6144, 5120), (17408, 5120), (5120, 17408), (5120, 248320)
+    # Narrow N: split-K tile from 13 rows; 33 rows (two 32-row tile rows) reach NAX.
+    for k, n in (gdn_out, mlp_down):
+        for m in (13, 17, 25, 32):
+            assert not mlx_qmm_takes_nax(m, k, n, 64)
+            assert q8_nax_pad_rows(m, k, n, 64) == 33
+        assert mlx_qmm_takes_nax(33, k, n, 64)
+        # Two tiles cost more than qmv_wide below 9 rows: stock there.
+        assert q8_nax_pad_rows(9, k, n, 64) == 33
+        assert q8_nax_pad_rows(8, k, n, 64) is None
+    # Wide N: stock already takes NAX from 13 rows, qmv_wide below.
+    for k, n in (gate_up, lm_head):
+        for m in (13, 17, 25, 32):
+            assert mlx_qmm_takes_nax(m, k, n, 64)
+            assert q8_nax_pad_rows(m, k, n, 64) is None
+        for m in (7, 9, 12):
+            assert q8_nax_pad_rows(m, k, n, 64) == 13
+    # Outside 7..32 rows and K not a multiple of 64: never padded.
+    for m in (4, 6, 33, 64):
+        assert q8_nax_pad_rows(m, *gdn_out, 64) is None
+    assert q8_nax_pad_rows(13, 6144 + 32, 5120, 32) is None
+
+
+def _q8_layer(K: int, N: int):
+    mx.random.seed(5)
+    layer = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=8)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        (mx.random.normal((N, K), dtype=mx.float32) * 0.02).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    mx.eval(layer.parameters())
+    return layer
+
+
+def _q8_stock(layer, x):
+    return mx.quantized_matmul(
+        x, layer["weight"], scales=layer["scales"], biases=layer["biases"],
+        transpose=True, group_size=64, bits=8,
+    )
+
+
+def test_q8_nax_pad_is_off_by_default(monkeypatch) -> None:
+    from mtplx import nax_verify
+    from mtplx.attention_context import attention_phase
+
+    monkeypatch.delenv("MTPLX_Q8_NAX_PAD", raising=False)
+    calls = {"n": 0}
+    original = nax_verify.nax_qmm_q8_padded
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return original(*a, **k)
+
+    monkeypatch.setattr(nax_verify, "nax_qmm_q8_padded", counting)
+    report = install_nax_qlinear_patch()
+    assert report["installed"] is True
+    try:
+        layer = _q8_layer(1024, 8192)
+        x = (mx.random.normal((13, 1024), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        with attention_phase("decode_verify"):
+            y = layer(x)
+        assert calls["n"] == 0
+        assert mx.array_equal(y, _q8_stock(layer, x)), "switch off must give the stock result"
+    finally:
+        uninstall_nax_qlinear_patch()
+
+
+@pytest.mark.skipif(not nax_available(), reason="requires Apple G17 + macOS >= 26.2")
+def test_q8_nax_pad_routes_wide_verify_rows_only(monkeypatch) -> None:
+    """With the switch on, 13 verify rows of a split-K shape take the padded
+    lane and stay within the qmm tolerance of stock; prefill, rows below the
+    floor and shapes that already reach NAX stay stock bit for bit."""
+    from mtplx import nax_verify
+    from mtplx.attention_context import attention_phase
+
+    monkeypatch.setenv("MTPLX_Q8_NAX_PAD", "1")
+    calls = {"n": 0}
+    original = nax_verify.nax_qmm_q8_padded
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return original(*a, **k)
+
+    monkeypatch.setattr(nax_verify, "nax_qmm_q8_padded", counting)
+    report = install_nax_qlinear_patch()
+    assert report["installed"] is True
+    try:
+        layer = _q8_layer(1024, 8192)
+        x = (mx.random.normal((1, 13, 1024), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        ref = _q8_stock(layer, x)
+        with attention_phase("decode_verify"):
+            y = layer(x)
+        assert calls["n"] == 1
+        assert y.shape == (1, 13, 8192)
+        diff = float(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max())
+        assert diff < 0.1, f"padded 8-bit lane drift too large: {diff}"
+        with attention_phase("prefill"):
+            assert mx.array_equal(layer(x), ref)
+        assert calls["n"] == 1, "prefill took the padded lane"
+        wide = _q8_layer(1024, 16384)  # 13 rows already reach NAX here
+        with attention_phase("decode_verify"):
+            assert mx.array_equal(wide(x), _q8_stock(wide, x))
+        assert calls["n"] == 1
+        monkeypatch.setenv("MTPLX_Q8_NAX_PAD_MIN_ROWS", "14")
+        with attention_phase("decode_verify"):
+            assert mx.array_equal(layer(x), ref)
+        assert calls["n"] == 1, "rows below MTPLX_Q8_NAX_PAD_MIN_ROWS took the padded lane"
+    finally:
+        uninstall_nax_qlinear_patch()
