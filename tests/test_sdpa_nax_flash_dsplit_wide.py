@@ -1,8 +1,9 @@
 """Correctness gate for the wide-window dsplit flash kernel (GPU required).
 
 ``sdpa_nax_flash_dsplit_wide`` tiles the 6 x q_len query rows of a KV head in groups of
-16 * TG_M rows inside one launch (grid.y), so q_len 9..32 read the KV cache once per row
-group. Compared against an fp32 tail-causal reference and the stock MLX route.
+16 * TG_M rows inside one launch (grid.y), split in halves or (``MTPLX_NAX_FLASH_DSPLIT4=1``)
+quarters of the head dimension. Compared against an fp32 tail-causal reference and the stock
+MLX route.
 """
 
 import math
@@ -55,9 +56,11 @@ def _stock(q, k, v, offset, scale):
 
 @pytest.mark.parametrize("ctx", [512, 2048, 1000, 4097])
 @pytest.mark.parametrize("q_len", [1, 5, 6, 8, 9, 12, 13, 16, 17, 24, 25, 32])
-@pytest.mark.parametrize("tgm", [1, 2, 4])
-def test_wide_matches_reference(monkeypatch, ctx, q_len, tgm):
-    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE_TGM", str(tgm))
+@pytest.mark.parametrize("tgm", ["", "1", "2", "4"])
+@pytest.mark.parametrize("dsplit4", ["0", "1"])
+def test_wide_matches_reference(monkeypatch, ctx, q_len, tgm, dsplit4):
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE_TGM", tgm)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", dsplit4)
     q, k, v, scale = _inputs(ctx, q_len)
     out = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=ctx, scale=scale)
     assert out is not None, "wide kernel bailed on a supported shape"
@@ -68,6 +71,41 @@ def test_wide_matches_reference(monkeypatch, ctx, q_len, tgm):
     stock_err = mx.abs(stock.astype(mx.float32) - ref).max().item()
     # bf16 output rounding bounds both; the kernel must be inside the stock route's envelope.
     assert err <= max(2.5e-3, 1.5 * stock_err), (err, stock_err)
+
+
+def test_wide_shape(monkeypatch):
+    """Halves keep 32-row groups; quarters pair 16-row blocks only when none is left empty."""
+    monkeypatch.delenv("MTPLX_NAX_FLASH_WIDE_TGM", raising=False)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "0")
+    assert [module.wide_shape(6 * q) for q in (6, 9, 13, 17, 25)] == [(2, 2)] * 5
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "1")
+    # 36, 54, 78, 102, 150, 192 rows: 3, 4, 5, 7, 10, 12 blocks.
+    assert [module.wide_shape(6 * q)[1] for q in (6, 9, 13, 17, 25, 32)] == [1, 2, 1, 1, 2, 2]
+    assert module.wide_shape(6 * 9)[0] == 4
+    assert module.wide_shape(6 * 9, quarters=False) == (2, 2)
+    monkeypatch.setenv("MTPLX_NAX_FLASH_WIDE_TGM", "4")
+    assert module.wide_shape(6 * 32) == (4, 2)  # the score exchange fits 8 simdgroups
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "0")
+    assert module.wide_shape(6 * 32) == (2, 4)
+
+
+@pytest.mark.parametrize("ctx", [1000, 4097, 20000])
+@pytest.mark.parametrize("q_len", [6, 7, 8, 9, 13, 17, 25, 32])
+def test_wide_quarters_within_halves_envelope_of_stock(monkeypatch, ctx, q_len):
+    """Parity: the quarter split is no further from stock SDPA than the halves route,
+    up to one bf16 ulp of the output's magnitude (four partial score sums instead of two)."""
+    monkeypatch.delenv("MTPLX_NAX_FLASH_WIDE_TGM", raising=False)
+    q, k, v, scale = _inputs(ctx, q_len, seed=ctx + q_len)
+    stock = _stock(q, k, v, ctx, scale).astype(mx.float32)
+    errs = {}
+    for dsplit4 in ("0", "1"):
+        monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", dsplit4)
+        out = sdpa_nax_flash_dsplit_wide(queries=q, keys=k, values=v, offset=ctx, scale=scale)
+        assert out is not None
+        errs[dsplit4] = mx.abs(out.astype(mx.float32) - stock).max().item()
+    top = mx.abs(stock).max().item()
+    ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
+    assert errs["1"] <= errs["0"] + ulp, errs
 
 
 def test_wide_blocks_and_tensor_offset(monkeypatch):
