@@ -27,11 +27,12 @@ kernel); cost per extra segment at q_len 4 is 0 to 0.005 ms/layer fused up to 12
 and 80K costs 0 to 1.1 % more than the contiguous one.
 
 Routes that cannot take segments yet fall back to ``segmented_kv.gather_attention`` (one
-contiguous copy of the history per call, then the stock kernel): windows the contiguous
-dispatcher does not give to the head-dim-split kernel either (q_len 6 to 8 at GQA 6, or the
-wide route with ``MTPLX_NAX_FLASH_WIDE`` off). The kernel follows the contiguous dispatcher's
-configuration: halves or quarters (``MTPLX_NAX_FLASH_DSPLIT4``) for ``gqa_factor * q_len <= 32``,
-row groups of the wide route (``MTPLX_NAX_FLASH_WIDE``) for 9 to 32 query rows.
+contiguous copy of the history per call, then the stock kernel) only on a kernel bail; a window
+of more than 32 live rows with ``MTPLX_NAX_FLASH_WIDE`` off runs as sub-windows. The kernel
+follows the contiguous dispatcher's configuration: halves or quarters (``MTPLX_NAX_FLASH_DSPLIT4``)
+for ``gqa_factor * q_len <= 32``, the wide route's split and row groups (``wide_shape``) above
+that, from 6 query rows at GQA 6 (the contiguous dispatcher gives 6 to 8 rows to another
+kernel; here they ran as two sub-windows, 5 rows plus the rest, each a full walk over the keys).
 """
 
 from __future__ import annotations
@@ -229,8 +230,10 @@ def _route_shape(q_len: int, gqa_factor: int, head_dim: int = 256) -> tuple[bool
 
     Mirrors ``sdpa_nax_flash_dsplit._dsplit_dispatch`` and the call order in ``attention_split``:
     windows of up to 32 live rows per KV head take the shipping contract (halves, or quarters
-    with ``MTPLX_NAX_FLASH_DSPLIT4=1`` unless the quarter self-check lane is off); 9 to 32 query
-    rows take the wide contract (halves, row groups) when ``MTPLX_NAX_FLASH_WIDE=1``.
+    with ``MTPLX_NAX_FLASH_DSPLIT4=1`` unless the quarter self-check lane is off); a wider
+    window of up to 32 query rows takes the wide contract (``wide_shape``: the same split choice,
+    row groups) when ``MTPLX_NAX_FLASH_WIDE=1``. One segment then calls the contiguous wide
+    entry with the same shape, so it stays bit-identical to the contiguous kernel.
     """
     live = gqa_factor * q_len
     if live <= 32 and 1 <= q_len <= 10:
@@ -243,8 +246,8 @@ def _route_shape(q_len: int, gqa_factor: int, head_dim: int = 256) -> tuple[bool
                 ndh = 2
         return False, ndh, (live + 15) // 16
     if (
-        q_len >= 9
-        and q_len <= _dsplit.WIDE_MAX_Q
+        # From 2 rows: a decode row past the shipping contract (GQA above 32) stays unsupported.
+        2 <= q_len <= _dsplit.WIDE_MAX_Q
         and live <= _dsplit.WIDE_MAX_ROWS
         and os.environ.get("MTPLX_NAX_FLASH_WIDE", "0").strip().lower() in {"1", "true", "yes", "on"}
     ):
@@ -252,7 +255,9 @@ def _route_shape(q_len: int, gqa_factor: int, head_dim: int = 256) -> tuple[bool
 
         if lane_disabled("nax_flash_dsplit_wide_sdpa"):
             return None
-        return True, 2, min(_dsplit._wide_rows_per_tg(), (live + 15) // 16)
+        # head_dim 128 keeps the halves split here too.
+        ndh, tg_m = _dsplit.wide_shape(live, quarters=head_dim == 256)
+        return True, ndh, tg_m
     return None
 
 
