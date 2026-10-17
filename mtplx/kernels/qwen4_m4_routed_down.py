@@ -43,7 +43,7 @@ _HEADER = f"""
         thread float* x_thread) {{
         float sum = 0.0f;
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {{
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -58,7 +58,7 @@ _HEADER = f"""
         int count) {{
         float sum = 0.0f;
         for (int i = 0; i < count; i += 4) {{
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;

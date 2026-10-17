@@ -73,7 +73,7 @@ def _multi3_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -252,7 +252,7 @@ def _smalln_pair_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -452,7 +452,7 @@ def _multi3_dual_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -695,7 +695,7 @@ def _multi3_parallel_dual_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -933,7 +933,7 @@ def _multi3_swiglu_down_qmv4_kernel(group_size: int, dtype: mx.Dtype):
             T x1 = swiglu_mlx_exact<T>(gate[i + 1], up[i + 1]);
             T x2 = swiglu_mlx_exact<T>(gate[i + 2], up[i + 2]);
             T x3 = swiglu_mlx_exact<T>(gate[i + 3], up[i + 3]);
-            sum += x0 + x1 + x2 + x3;
+            sum += float(x0) + float(x1) + float(x2) + float(x3);
             x_thread[i] = x0;
             x_thread[i + 1] = x1 / 16.0f;
             x_thread[i + 2] = x2 / 256.0f;
@@ -1125,7 +1125,7 @@ def _stocklike_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
