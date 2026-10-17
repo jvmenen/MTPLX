@@ -105,7 +105,7 @@ def _gate_up_swiglu_qmv4_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -350,7 +350,7 @@ def _gate_up_swiglu_qmv4_rowwise_kernel(
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -590,7 +590,7 @@ def _gate_up_swiglu_qmv4_split_kernel(group_size: int, dtype: mx.Dtype):
         inline float load_vector4_exact(const device T* x, thread float* x_thread) {
           float sum = 0.0f;
           for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             x_thread[i] = x[i];
             x_thread[i + 1] = x[i + 1] / 16.0f;
             x_thread[i + 2] = x[i + 2] / 256.0f;

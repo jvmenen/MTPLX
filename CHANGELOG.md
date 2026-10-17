@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The custom 4-bit qmv kernels add their inputs in float, as stock MLX 0.32.4 does.** These kernels fold the quantization bias in through the sum of the input values. They added four bf16 inputs together before adding the result to that float sum, so every partial sum was rounded to bf16 first. MLX 0.32.4 (ml-explore/mlx#4516) changed stock qmv to cast each input to float first, and since then single-row outputs of these kernels no longer matched stock `mx.quantized_matmul` bit for bit (on Qwen 3.8 27B weights most output values differed by one or more bf16 steps). The float sum is also the more accurate one: against a float64 reference the largest single-row error drops from 2.5e-2 to 4.6e-3 of the largest output, the same as stock. Speed is unchanged. Each input is now cast to float before it is added. Covers the qmv4 matmul, the verify qmv probes, the fused gate/up SwiGLU kernels, the 4-bit LM-head top-k, the Flash-Next M4 routed GLU and down kernels, the DeepSeek V4 three-row attention projection and the native gate/up probe. A source test fails if a kernel adds raw 16-bit inputs again.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

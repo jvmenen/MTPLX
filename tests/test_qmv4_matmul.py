@@ -6,11 +6,20 @@ shipped group sizes, and a ragged-N tile edge. Ineligible shapes must route
 to the stock fallback and stay byte-identical to it.
 """
 
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
 from mtplx.kernels.qmv4_matmul import qmv4_eligible, qmv4_matmul
+
+
+def _stock_qmv_sums_in_float() -> bool:
+    """MLX 0.32.4 (ml-explore/mlx#4516) adds each activation to the qmv bias
+    sum as float; earlier builds add them in the input dtype first."""
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", mx.__version__)
+    return tuple(int(part) for part in match.groups()) >= (0, 32, 4)
 
 
 def _qlinear(n, k, group_size, seed):
@@ -45,11 +54,12 @@ def test_parity_family_shapes(group_size, m):
         )
         got = qmv4_matmul(x, q)
         # fp32 oracle from the dequantized weights: the honest yardstick.
-        # Measured 2026-08-27: M=1 is BYTE-IDENTICAL to stock (same qmv
-        # accumulation); M>=2 stock switches to a tiled qmm kernel with a
-        # different summation tree, so both paths carry bf16-ulp-class noise
-        # against the oracle — gate ours to stock's own noise class instead
-        # of to stock's bytes.
+        # M=1 is BYTE-IDENTICAL to stock (same qmv accumulation, input sum
+        # in float as in MLX 0.32.4); on an older MLX the stock sum rounds
+        # through bf16, so M=1 is held to stock's noise class there. M>=2
+        # stock switches to a tiled qmm kernel with a different summation
+        # tree, so both paths carry bf16-ulp-class noise against the oracle
+        # — gate ours to stock's own noise class instead of to stock's bytes.
         wf = mx.dequantize(
             q.weight, q.scales, q.biases, group_size=group_size, bits=4
         ).astype(mx.float32)
@@ -58,7 +68,7 @@ def test_parity_family_shapes(group_size, m):
         scale = mx.abs(oracle).max().item() + 1e-6
         e_stock = (mx.abs(stock.astype(mx.float32) - oracle) / scale).max().item()
         e_ours = (mx.abs(got.astype(mx.float32) - oracle) / scale).max().item()
-        if m == 1:
+        if m == 1 and _stock_qmv_sums_in_float():
             assert (got == stock).all().item(), (
                 f"M=1 must be byte-identical to stock (gs={group_size} N={n})"
             )
