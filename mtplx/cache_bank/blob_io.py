@@ -15,9 +15,14 @@ Page cache. On a Mac the unified buffer cache lives in the same memory as
 the model. A 4 GB restore through buffered reads leaves 4 GB of cached file
 pages next to the 4 GB of decoded arrays, and the pressure lands on the
 model's wired weights; a cold-tier write does the same with data that is
-read back, if ever, long after it would have been evicted. With
-``F_NOCACHE`` (macOS) both go past the cache. ``MTPLX_SSD_NOCACHE=0`` turns
-that off; on other platforms it is a no-op.
+read back, if ever, long after it would have been evicted.
+
+``F_NOCACHE`` (macOS) sends I/O past that cache. By default only writes use
+it: on an M5 Pro, cold reads of a real store ran at 3.9 GiB/s through the
+cache against 2.6 GiB/s with ``F_NOCACHE`` (8 threads), so restores keep the
+cache's read-ahead. ``MTPLX_SSD_NOCACHE`` picks the side: ``write`` (default),
+``read``, ``all`` (``1``) or ``off`` (``0``). On other platforms it is a
+no-op.
 """
 
 from __future__ import annotations
@@ -49,8 +54,29 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def nocache_enabled() -> bool:
-    return sys.platform == "darwin" and _env_flag("MTPLX_SSD_NOCACHE", default=True)
+_NOCACHE_SIDES = {
+    "write": frozenset({"write"}),
+    "read": frozenset({"read"}),
+    "all": frozenset({"read", "write"}),
+    "off": frozenset(),
+}
+_NOCACHE_ALIASES = {
+    "1": "all", "true": "all", "yes": "all", "on": "all", "both": "all",
+    "0": "off", "false": "off", "no": "off", "none": "off",
+}
+DEFAULT_NOCACHE = "write"
+
+
+def nocache_mode() -> str:
+    """``MTPLX_SSD_NOCACHE`` as one of write / read / all / off."""
+    raw = (os.environ.get("MTPLX_SSD_NOCACHE") or "").strip().lower()
+    mode = _NOCACHE_ALIASES.get(raw, raw)
+    return mode if mode in _NOCACHE_SIDES else DEFAULT_NOCACHE
+
+
+def nocache_enabled(side: str) -> bool:
+    """Whether ``side`` ("read" or "write") goes past the page cache."""
+    return sys.platform == "darwin" and side in _NOCACHE_SIDES[nocache_mode()]
 
 
 def read_threads() -> int:
@@ -62,9 +88,9 @@ def read_threads() -> int:
     return max(1, min(64, value))
 
 
-def bypass_page_cache(fd: int) -> None:
+def bypass_page_cache(fd: int, side: str) -> None:
     """Best effort: a refused hint only costs the page-cache copy again."""
-    if not nocache_enabled():
+    if not nocache_enabled(side):
         return
     try:
         import fcntl
@@ -125,7 +151,7 @@ def write_file(path: Path, raw: bytes | bytearray | memoryview) -> None:
     """
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
     try:
-        bypass_page_cache(fd)
+        bypass_page_cache(fd, "write")
         view = memoryview(raw).cast("B")
         while view:
             written = os.write(fd, view)
@@ -142,7 +168,7 @@ def _read_range(path: Path, view: memoryview, offset: int, file_nbytes: int) -> 
                 f"SSD blob size mismatch for {path}: {size} bytes on disk, "
                 f"{file_nbytes} expected"
             )
-        bypass_page_cache(handle.fileno())
+        bypass_page_cache(handle.fileno(), "read")
         if offset:
             handle.seek(offset)
         while view:
