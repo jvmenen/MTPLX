@@ -3292,6 +3292,7 @@ class SessionBankColdTier:
                 require_exact_prefix=require_exact_prefix,
                 include_gdn_boundaries=include_gdn_boundaries,
                 prefix_restore_tokens=prefix_restore_tokens,
+                min_restore_point=min_restore_point,
             )
         finally:
             staging.release()
@@ -3307,6 +3308,7 @@ class SessionBankColdTier:
         require_exact_prefix: bool,
         include_gdn_boundaries: bool,
         prefix_restore_tokens: int | None,
+        min_restore_point: int,
     ) -> ColdRestoreRecord | None:
         payload_spec = payload["payload_spec"]
         partial_restore = (
