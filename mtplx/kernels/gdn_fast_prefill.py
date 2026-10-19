@@ -12,8 +12,11 @@ The op casts ``g`` and ``beta`` to the type of ``q``. With bf16 activations
 the decay ``g``, which sits close to 1, is then rounded to steps of 1/256
 before the kernel takes its log, and on real Qwen3.8 activations the output
 moves 4% and the state 6 to 9% (relative L2 against a float64 reference).
-This route therefore runs the op on float32 q, k, v, g and beta, and casts
-the output back to the input type. The state is float32 on both sides, as on
+This route therefore passes g and beta as float32. On an MLX build that keeps
+them float32 (``mlx_keeps_float32_gates``, probed once) q, k and v go in as
+they are; on one that rounds them (0.32.4 as released) q, k and v go in as
+float32 too and the output is cast back to the input type, which costs about
+1.1 ms of the 4.8 ms saved per call. The state is float32 on both sides, as on
 the stock path. Against float64 the state then lands at ~1e-3 relative,
 inside bf16 rounding (3.9e-3) but not bit-equal to the stock sequential
 kernel (~1e-6): the chunked form sums in another order.
@@ -109,6 +112,40 @@ def fast_prefill_eligible(q: mx.array, v: mx.array, a: mx.array, mask, state) ->
     return state is None or state.dtype == mx.float32
 
 
+_FLOAT32_GATES: dict = {"probed": False, "value": False}
+
+
+def mlx_keeps_float32_gates() -> bool:
+    """True when this MLX build passes g and beta to the kernel as float32.
+
+    MLX 0.32.4 casts them to the type of q. A fixed build keeps them float32,
+    and then 16-bit q, k and v can go in as they are. Probed once on the CPU
+    stream (the cast sits in front of every backend): a decay of 0.9995
+    rounds to 1.0 in bfloat16, so the two calls below only agree when the
+    gates stayed float32.
+    """
+    if _FLOAT32_GATES["probed"]:
+        return _FLOAT32_GATES["value"]
+    value = False
+    if fast_prefill_available():
+        shape = (1, 2, 16, 128)
+        q = mx.full(shape, 0.0625, dtype=mx.bfloat16)
+        k = mx.full(shape, 0.0625, dtype=mx.bfloat16)
+        v = mx.ones((1, 2, 16, 128), dtype=mx.bfloat16)
+        g = mx.full((1, 2, 16), 0.9995, dtype=mx.float32)
+        beta = mx.full((1, 2, 16), 0.5, dtype=mx.float32)
+        state = mx.ones((1, 16, 128, 128), dtype=mx.float32)
+        f32 = mx.float32
+        with mx.stream(mx.cpu):
+            _, s16 = mx.fast.gated_delta_update(q, k, v, g, beta, state)
+            _, s32 = mx.fast.gated_delta_update(
+                q.astype(f32), k.astype(f32), v.astype(f32), g, beta, state
+            )
+            value = bool(mx.array_equal(s16, s32).item())
+    _FLOAT32_GATES.update(probed=True, value=value)
+    return value
+
+
 def gated_delta_fast_prefill(
     q: mx.array,
     k: mx.array,
@@ -117,20 +154,20 @@ def gated_delta_fast_prefill(
     beta: mx.array,
     state: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
-    """``mx.fast.gated_delta_update`` on float32 inputs; y in the input type.
+    """``mx.fast.gated_delta_update`` with float32 g and beta; y in the input type.
 
     q and k are already normalized and scaled (mlx-lm's contract), g is the
-    linear decay in (0, 1], state is [B, Hv, Dv, Dk] float32.
+    linear decay in (0, 1], state is [B, Hv, Dv, Dk] float32. On an MLX build
+    that rounds g and beta to the type of q, q, k and v go in as float32 too.
     """
-    in_dtype = q.dtype
     f32 = mx.float32
+    g = g.astype(f32)
+    beta = beta.astype(f32)
+    if mlx_keeps_float32_gates():
+        return mx.fast.gated_delta_update(q, k, v, g, beta, state)
+    in_dtype = q.dtype
     y, state_out = mx.fast.gated_delta_update(
-        q.astype(f32),
-        k.astype(f32),
-        v.astype(f32),
-        g.astype(f32),
-        beta.astype(f32),
-        state,
+        q.astype(f32), k.astype(f32), v.astype(f32), g, beta, state
     )
     return y.astype(in_dtype), state_out
 
@@ -139,6 +176,8 @@ def _route_identity() -> str:
     # The chunk width (GATED_DELTA_CHUNK, 16 with tensor units and 8 without)
     # and the MLX build both change the arithmetic.
     chunk = os.environ.get("GATED_DELTA_CHUNK", "auto").strip() or "auto"
+    # 16-bit and float32 activations give bit-equal results once the gates
+    # are float32 (the kernels convert on load), so the build is enough.
     return f"{_ROUTE_VERSION}:mlx{mx.__version__}:chunk{chunk}"
 
 

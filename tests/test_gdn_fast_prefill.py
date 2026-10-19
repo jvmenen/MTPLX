@@ -141,6 +141,46 @@ def test_patch_routes_prefill_calls_and_keeps_the_rest(monkeypatch):
     assert gd.gated_delta_update is stock
 
 
+@needs_fast_op
+def test_float32_gates_probe_matches_the_build():
+    q, k, v, a, b, A_log, dt_bias, state = _inputs(64)
+    g = gd.compute_g(A_log, a, dt_bias)
+    beta = mx.sigmoid(b).astype(mx.float32)
+    f32 = mx.float32
+    _, s16 = mx.fast.gated_delta_update(q, k, v, g, beta, state)
+    _, s32 = mx.fast.gated_delta_update(
+        q.astype(f32), k.astype(f32), v.astype(f32), g, beta, state
+    )
+    keeps = module.mlx_keeps_float32_gates()
+    # A build that rounds the gates to bf16 is far off (~5e-2 on this decay).
+    assert (_rel(s16, s32) < 1e-3) == keeps
+
+
+@needs_fast_op
+@pytest.mark.parametrize("keeps", [True, False])
+def test_route_passes_16_bit_activations_only_when_the_gates_stay_float32(
+    monkeypatch, keeps
+):
+    seen = []
+    real = mx.fast.gated_delta_update
+
+    def spy(q, k, v, g, beta, state=None):
+        seen.append((q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype))
+        return real(q, k, v, g, beta, state)
+
+    monkeypatch.setitem(module._FLOAT32_GATES, "probed", True)
+    monkeypatch.setitem(module._FLOAT32_GATES, "value", keeps)
+    monkeypatch.setattr(module.mx.fast, "gated_delta_update", spy)
+    q, k, v, a, b, A_log, dt_bias, state = _inputs(64)
+    y, s = gated_delta_fast_prefill(
+        q, k, v, gd.compute_g(A_log, a, dt_bias), mx.sigmoid(b), state
+    )
+    mx.eval(y, s)
+    act = mx.bfloat16 if keeps else mx.float32
+    assert seen == [(act, act, act, mx.float32, mx.float32)]
+    assert y.dtype == mx.bfloat16
+
+
 def test_without_the_mlx_op_nothing_is_installed(monkeypatch):
     monkeypatch.setattr(module, "fast_prefill_available", lambda: False)
     stock = gd.gated_delta_update
