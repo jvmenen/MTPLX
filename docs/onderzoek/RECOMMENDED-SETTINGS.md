@@ -45,7 +45,7 @@ From [profiles.py](../../mtplx/profiles.py) on `prod` and `docs/profiles.md`:
 | `MTPLX_PREFILL_CHUNK_SIZE_DENSE/REPAGE=2048` | We override this with 4096 (section per model). |
 | `MTPLX_WARMUP_LADDER=512,2560`, `MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT=1024`, committed MTP history | Defaults. |
 | Context-copy (`MTPLX_CONTEXT_COPY`, min n-gram 6) | On by default on all MTP lanes. Measured on Qwen3.8: agent Edit 2.1x, code edit +23 to +38%, extraction and prose unchanged ([qwen38-speed-options](2026-10-02-qwen38-speed-options.md) section 1). Do not lower the minimum n-gram to 3 (worse). |
-| Dense KV for decode up to about 157K tokens, depth and draft temperature 0.6 per family | Family defaults, not ours. |
+| Dense KV for decode up to about 157K tokens, depth and draft temperature per family (Qwen3.8: 1.0, see VONDSTEN 143) | Family defaults, not ours. |
 
 ## 3. The production launch command (current Qwen3.8 recipe)
 
