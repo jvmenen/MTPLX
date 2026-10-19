@@ -32,6 +32,7 @@ from .cache_state import (
     snapshot_cache_lazy_hybrid,
 )
 from .cache_bank.codec import ColdEncodeInterrupted
+from .cache_bank.telemetry import RestoreLandings
 from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
 from .token_prefix import common_prefix_len
@@ -1173,6 +1174,8 @@ class SessionBankRestore:
     ssd_cached_tokens: int = 0
     ssd_restore_s: float = 0.0
     extra_state: dict[str, Any] | None = None
+    # Where ssd_restore_s went (cold_tier.ColdRestoreRecord.restore_split).
+    ssd_restore_split: dict[str, Any] | None = None
 
 
 class QueuedPersistenceCancelError(RuntimeError):
@@ -1286,7 +1289,10 @@ class SessionBank:
         self._persistence_pending_lock = threading.Lock()
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
+        self.last_ssd_restore_split: dict[str, Any] | None = None
         self.last_prefix_diagnostic: dict[str, Any] | None = None
+        # Where served restores land (record_restore_landing).
+        self.restore_landings = RestoreLandings()
         # Dynamic budget ceiling (memory_plan.bank_dynamic_ceiling): the
         # bank takes all free memory while live KV is small and yields as a
         # long-context request's KV actually materializes — the #305 fix's
@@ -2408,6 +2414,7 @@ class SessionBank:
         setattr(entry, "ssd_cache_hit", True)
         setattr(entry, "ssd_cached_tokens", matched)
         setattr(entry, "ssd_restore_s", float(getattr(record, "restore_s", 0.0) or 0.0))
+        setattr(entry, "ssd_restore_split", dict(getattr(record, "restore_split", None) or {}))
         return entry, matched
 
     def _record_oversized_skip(
@@ -2724,6 +2731,7 @@ class SessionBank:
             entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
+        self.last_ssd_restore_split = None
         lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
@@ -3073,6 +3081,11 @@ class SessionBank:
             boundary_hidden if boundary_snapshot is not None else None,
         )
 
+    def record_restore_landing(self, landing: dict[str, Any]) -> None:
+        """Count where a served restore landed (telemetry.RestoreLandings);
+        generation calls this once per prompt state a restore served."""
+        self.restore_landings.record(landing)
+
     def clear(self, *, session_id: str | None = None) -> int:
         # Cleared entries let go of their live caches like evicted ones do
         # (see _evict_entry): /admin/cache/clear and the admission shed's
@@ -3152,6 +3165,8 @@ class SessionBank:
             "last_oversized_skip": self.last_oversized_skip,
             "last_restore_source": self.last_restore_source,
             "last_ssd_restore_s": self.last_ssd_restore_s,
+            "last_ssd_restore_split": self.last_ssd_restore_split,
+            "restore_landings": self.restore_landings.snapshot(),
             "last_prefix_diagnostic": self.last_prefix_diagnostic,
             "active_pin_ttl_s": self.active_pin_ttl_s,
             "active_sessions": sorted(self._active_session_ids()),
@@ -3781,6 +3796,7 @@ class SessionBank:
         self._evict_if_needed(protected_tokens=entry.token_ids)
         self.last_restore_source = "ssd"
         self.last_ssd_restore_s = float(getattr(record, "restore_s", 0.0) or 0.0)
+        self.last_ssd_restore_split = dict(getattr(record, "restore_split", None) or {})
         self.last_miss_reason = None
         lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
@@ -3808,6 +3824,7 @@ class SessionBank:
             ssd_cached_tokens=entry.prefix_len,
             ssd_restore_s=self.last_ssd_restore_s,
             extra_state=_clone_tree(entry.extra_state),
+            ssd_restore_split=self.last_ssd_restore_split,
         )
 
     def _purge_expired(self) -> None:
