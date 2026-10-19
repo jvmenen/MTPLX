@@ -95,17 +95,38 @@ def test_write_file_matches_write_bytes(tmp_path):
         blob_io.write_file(tmp_path / "no-such-dir" / "x.bin", data)
 
 
-def test_nocache_hint_only_on_darwin_and_switchable(monkeypatch):
+def test_nocache_defaults_to_writes_only_on_darwin(monkeypatch):
     monkeypatch.setattr(blob_io.sys, "platform", "linux")
-    assert not blob_io.nocache_enabled()
+    monkeypatch.setenv("MTPLX_SSD_NOCACHE", "all")
+    assert not blob_io.nocache_enabled("read")
+    assert not blob_io.nocache_enabled("write")
     monkeypatch.setattr(blob_io.sys, "platform", "darwin")
     monkeypatch.delenv("MTPLX_SSD_NOCACHE", raising=False)
-    assert blob_io.nocache_enabled()
-    monkeypatch.setenv("MTPLX_SSD_NOCACHE", "0")
-    assert not blob_io.nocache_enabled()
+    assert blob_io.nocache_mode() == "write"
+    assert blob_io.nocache_enabled("write")
+    assert not blob_io.nocache_enabled("read")
 
 
-def test_nocache_hint_sets_f_nocache(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("value", "read", "write"),
+    [
+        ("write", False, True),
+        ("read", True, False),
+        ("all", True, True),
+        ("1", True, True),
+        ("0", False, False),
+        ("off", False, False),
+        ("bogus", False, True),
+    ],
+)
+def test_nocache_side_is_switchable(monkeypatch, value, read, write):
+    monkeypatch.setattr(blob_io.sys, "platform", "darwin")
+    monkeypatch.setenv("MTPLX_SSD_NOCACHE", value)
+    assert blob_io.nocache_enabled("read") is read
+    assert blob_io.nocache_enabled("write") is write
+
+
+def test_nocache_hint_sets_f_nocache_on_writes_only_by_default(monkeypatch, tmp_path):
     fcntl = pytest.importorskip("fcntl")
     calls = []
     monkeypatch.setattr(blob_io.sys, "platform", "darwin")
@@ -113,6 +134,11 @@ def test_nocache_hint_sets_f_nocache(monkeypatch, tmp_path):
     monkeypatch.setattr(fcntl, "fcntl", lambda fd, cmd, arg: calls.append((cmd, arg)))
     blob_io.write_file(tmp_path / "x.bin", b"abc")
     assert calls == [(getattr(fcntl, "F_NOCACHE", 48), 1)]
+    calls.clear()
+    out = memoryview(bytearray(3))
+    blob_io.read_into_many([(tmp_path / "x.bin", out)])
+    assert bytes(out) == b"abc"
+    assert calls == []
 
 
 def test_staging_buffer_is_reused_until_released():

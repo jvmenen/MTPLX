@@ -109,7 +109,7 @@ def main() -> int:
         return 1
     print(
         f"{len(paths)} blobs, threads={blob_io.read_threads()}, "
-        f"nocache={blob_io.nocache_enabled()}, purge={args.purge}"
+        f"nocache={blob_io.nocache_mode()}, purge={args.purge}"
     )
     for round_index in range(args.rounds):
         for label, run in (
