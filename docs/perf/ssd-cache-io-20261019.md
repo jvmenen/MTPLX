@@ -10,6 +10,7 @@ geheugen worden gezet. Dit document bevat:
 - hoe de SSD-cache nu werkt;
 - de overige opties;
 - de uitzoeking van punt 8, gequantiseerde KV;
+- het idee om bestanden af te stemmen op de restore-punten van Qwen 3.8;
 - een voorstel voor de volgorde.
 
 Alles hieronder komt uit het lezen van de code en uit simulaties in een
@@ -287,14 +288,115 @@ leases en alle restorepaden.
 
 ---
 
-## 5. Voorstel voor de volgorde
+## 5. Idee: bestanden afstemmen op de restore-punten van Qwen 3.8
+
+Dit idee is nog niet gebouwd en niet gemeten.
+
+### Waarom het past
+
+Qwen 3.8 is een hybride model: naast attention heeft het een recurrente
+GDN-state. Zo'n model kan alleen hervatten op een opgeslagen checkpoint, een
+"restore-punt". De KV wordt dan teruggeknipt tot dat punt en de rest van de
+prompt wordt opnieuw berekend. Zie `mtplx/checkpoint_anchors.py` en
+`_boundary_true_restore_enabled` in `mtplx/session_bank.py`, die standaard
+aanstaat.
+
+De SSD-cache knipt de KV nu in blokken van 256 tokens. Bij een hybride model
+kan een restore nooit tussen twee checkpoints beginnen, dus die fijne
+indeling levert voor het herstellen niets op. Het geeft alleen veel kleine
+bestanden, met als enige winst dat identieke blokken gedeeld kunnen worden.
+
+### De checkpoints zijn stabiel
+
+Sinds 30 september 2026 kiest `retain_checkpoints` ankers die niet
+verschuiven als het gesprek groeit:
+
+- een vast raster van één checkpoint per 8.192 tokens (`GRID_TOKENS`). Bij
+  krapte dunt dat uit naar 16K, 32K enzovoort, en een bewaard ankerpunt
+  blijft op zijn plek;
+- het einde van de stabiele prompt-prefix;
+- het restorepunt van de vorige beurt;
+- het einde van de prompt, 64 tokens ervoor (`tail_backoff`);
+- het nieuwste checkpoint.
+
+Standaard houdt een gesprek er acht (`MTPLX_GDN_BOUNDARY_MAX`), of zoveel als
+het budget in bytes toelaat. Eén checkpoint is ~90 MB op de 27B en
+~115,6 MB op Flash-Next.
+
+### Het ontwerp: segmenten van checkpoint tot checkpoint
+
+- **Indeling.** Eén bestand per stuk tussen twee opeenvolgende checkpoints.
+  Daarin staan de KV-rijen van alle attention-lagen voor dat tokenbereik,
+  aaneengesloten per laag, met de MTP-history-rijen erbij. De recurrente
+  state van het checkpoint aan het eind is een eigen bestand, of hangt achter
+  aan het segment.
+- **Inlezen.** Een restore op checkpoint k leest precies segment 1 tot en
+  met k en één recurrente state. Dat zijn een paar grote, sequentiële
+  bestanden, met niets te veel. Bij het raster van 8K zijn de segmenten
+  honderden MB groot in plaats van duizenden bestanden van een halve MB, en
+  dat is precies waar een NVMe goed in is. Dit maakt optie 4 uit §3
+  concreet.
+- **Schrijven.** Segmenten vóór het vorige restorepunt veranderen tussen
+  beurten niet. Maak de sleutel van een segment de token-keten tot dat
+  checkpoint (`chain_block_hashes` bestaat al) plus de identiteit van model,
+  epoch en dtype. Dan schrijft een nieuwe beurt alleen de nieuwe segmenten
+  aan het eind, zonder de oude segmenten naar de host te kopiëren of te
+  hashen. Voor hybride modellen bereikt dat het doel van incremental encode
+  (§3, punt 1) zonder GPU-fingerprint, en dus zonder het
+  sign-flip-probleem.
+- **Exacte restores** lezen nog steeds alle segmenten. Dat gaat wel sneller,
+  omdat het grote sequentiële bestanden zijn, en de parallelle reader uit §1
+  kan een groot segment in stukken tegelijk lezen.
+
+### Waar je op moet letten
+
+- **Bit-gelijkheid.** Een sleutel op basis van tokens gaat ervan uit dat de
+  KV vóór een checkpoint bit-gelijk is aan die van de vorige entry. Binnen
+  één sessie is dat zo, omdat die rijen uit dezelfde live cache komen. Na
+  een cache-miss met opnieuw berekende KV, bijvoorbeeld met een andere
+  chunk-indeling, is het semantisch gelijk, maar niet gegarandeerd
+  bit-gelijk. Er zijn twee keuzes: accepteren, of één goedkope controle per
+  segment, zoals de echte sha van het eerste en laatste blok vergelijken.
+- **Een prompteinde dat verschuift.** Het segment rond het oude prompteinde
+  kan per beurt anders liggen. Dat is alleen een klein segment aan de staart
+  dat opnieuw geschreven wordt.
+- **Checkpoints die uitdunnen.** Als het raster van 8K naar 16K gaat, kun je
+  twee bestaande segmenten laten staan en een restore op het 16K-punt beide
+  laten lezen. De segmentgrenzen hoeven dus geen exacte kopie te zijn van de
+  checkpoints die nu bewaard worden. Ze moeten alleen op checkpoints vallen.
+- **Modellen zonder recurrente state** hebben geen checkpoints. Daar is de
+  prefix-restore per blok wel nuttig. Die krijgen een vast raster,
+  bijvoorbeeld ook 8.192 tokens, of houden de huidige blokken.
+- **Flash Next** heeft daarnaast QSA-state en een n-gram-tabel. Bekijk apart
+  welke state per segment of per checkpoint mee moet.
+- **Formaat.** Dit is een nieuwe `COLD_TIER_FORMAT_VERSION`. Oude stores gaan
+  via de bestaande archiveer- of migratieroute (`_archive_legacy_store_if_needed`).
+  Opruimen en verwijderen (`reconcile.py`, `_evict_until_room`) moeten
+  segmenten met refcounts kennen, net als blobs nu.
+
+### Eerste stappen
+
+1. Meten hoe vaak SSD-restores exact zijn en hoe vaak ze een prefix
+   gebruiken, en op welke checkpoints prefix-restores landen. De tellers
+   `restore_hits` en `prefix_restores_*` staan al in de stats van de cold
+   tier.
+2. Een prototype van alleen de leeskant: bij het schrijven de blokken
+   per checkpoint-bereik bundelen in één bestand, met de bestaande spec en
+   offsets. Daarna vergelijken met `restore_s` op dezelfde gesprekken.
+3. Dan de schrijfkant met sleutels op basis van de token-keten.
+
+---
+
+## 6. Voorstel voor de volgorde
 
 1. Branch `ccr-b1c48c0b-dv7vfp` testen op de Mac (§1). Is het goed: PR
    openen. Is het niet goed: met de benchmark uitzoeken of de threads of
    `F_NOCACHE` het probleem is.
 2. Tijdsverdeling per restore in de log (§3, "Eerst meten").
-3. Incremental encode repareren (§3, punt 1), voor de grootste besparing op
-   schrijfwerk.
-4. Afhankelijk van de meting: segmentbestanden (punt 4) of
-   lezen-en-kopiëren laten overlappen (punt 5).
-5. Gequantiseerde opslag (§4), alleen als je zelf met `--kv-quant` draait.
+3. Segmenten op restore-punten (§5). Voor Qwen 3.8 regelt dit grotere
+   bestanden (optie 4) en minder schrijven (optie 1) in één keer.
+4. Incremental encode repareren (§3, punt 1), voor modellen zonder
+   recurrente state of als §5 niet doorgaat.
+5. Lezen en kopiëren laten overlappen (§3, punt 5), afhankelijk van de
+   meting.
+6. Gequantiseerde opslag (§4), alleen als je zelf met `--kv-quant` draait.
