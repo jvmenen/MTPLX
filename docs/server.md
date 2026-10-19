@@ -269,6 +269,8 @@ stored once.
 | `MTPLX_SSD_WRITE_BUDGET_PER_HOUR` | `128G` | Rolling one-hour byte budget for SSD writes (SSD wear); writes beyond it are skipped for the hour. |
 | `MTPLX_SSD_WRITER_BACKLOG_BYTES` | `4G` | Bytes of encoded snapshots the writer may hold in RAM while waiting to write; larger single entries stream to disk instead. |
 | `MTPLX_SSD_FOREIGN_MAX_AGE_DAYS` | `7` | Entries this server can never restore (see below) that nobody used for this many days are removed when the cache opens and every few hours after writes. `0` turns the removal off. |
+| `MTPLX_SSD_READ_THREADS` | `8` | Threads that read a restore's blobs in parallel (1 to 64); each tensor's blocks land in one reused buffer. |
+| `MTPLX_SSD_NOCACHE` | `1` | macOS: read and write SSD cache blobs with `F_NOCACHE`, so they do not also fill the file cache that shares memory with the model. `0` turns it off. |
 
 **Orphaned files.** A crash between a blob write and its manifest row, an
 interrupted write, or a blob whose last entry was evicted while a sibling
