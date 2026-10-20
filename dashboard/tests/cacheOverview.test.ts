@@ -77,6 +77,15 @@ describe("followUpHits", () => {
     expect(hits).toEqual({ followUps: 4, ram: 2, ssd: 1, missed: 1, ramFraction: 0.5 });
   });
 
+  test("cancelled requests count neither as a hit nor as a miss", () => {
+    const hits = followUpHits([
+      row({ session_cache_hit: true, session_restore_mode: "clone" }),
+      row({ request_cancelled: true, session_cache_hit: true, session_restore_mode: "clone" }),
+      row({ request_cancelled: true, session_cache_hit: false, cache_miss_reason: "evicted" }),
+    ]);
+    expect(hits).toEqual({ followUps: 1, ram: 1, ssd: 0, missed: 0, ramFraction: 1 });
+  });
+
   test("no follow-ups means no rate", () => {
     expect(followUpHits([]).ramFraction).toBeNull();
   });

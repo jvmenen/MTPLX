@@ -1,3 +1,4 @@
+import { countsTowardHitRate } from "./requestCancel";
 import type { ColdTierStats, MetricsLatest, SessionBank } from "./types";
 
 // Totals behind the Cache tab's overview: what the warm bank holds in RAM and
@@ -42,13 +43,14 @@ export type FollowUpHits = {
 
 // Where follow-up turns found their prefix. A follow-up is a request that
 // either hit the cache or missed for a reason other than being the first
-// turn of its conversation; first turns have nothing to find.
+// turn of its conversation; first turns have nothing to find. A cancelled
+// request does not count either way.
 export function followUpHits(recent: MetricsLatest[]): FollowUpHits {
   let ram = 0;
   let ssd = 0;
   let missed = 0;
   for (const row of recent) {
-    if (!row.session_id) continue;
+    if (!row.session_id || !countsTowardHitRate(row)) continue;
     if (row.session_cache_hit) {
       if (String(row.session_restore_mode ?? "").startsWith("ssd")) ssd += 1;
       else ram += 1;
