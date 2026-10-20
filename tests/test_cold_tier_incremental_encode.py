@@ -719,3 +719,33 @@ def test_spill_and_queued_writes_share_the_session_memo(tmp_path, monkeypatch):
         assert tier.stats()["incremental_reused_blobs"] > after_spill
     finally:
         tier.close()
+
+
+def test_fingerprints_run_in_bounded_chunks_with_the_same_keys():
+    """Block fingerprints are taken per chunk of at most one unit, with the same
+    content keys as one pass over the whole tensor."""
+    turn1, _ = _turns()
+    kwargs = {
+        "cache_snapshot": turn1.cache_snapshot,
+        "logits": turn1.logits,
+        "hidden": turn1.hidden,
+        "mtp_history_snapshot": turn1.mtp_history_snapshot,
+        "has_recurrent": True,
+        "block_size": 256,
+        "reuse": {},
+    }
+    units = []
+    whole = encode_payload(**kwargs)
+    small = encode_payload(
+        **kwargs,
+        unit_bytes=2 * 2 * 256 * 64 * 2,  # two K blocks
+        on_unit=lambda kind, seconds, nbytes: units.append((kind, nbytes)),
+    )
+    assert small.fingerprints == whole.fingerprints
+    assert small.spec == whole.spec and small.tensors == whole.tensors
+    block_fingerprints = [n for kind, n in units if kind == "fingerprint"]
+    # K and V: 4 full blocks in 2 chunks each; the MTP history (2 KiB a block
+    # row of 32 dims) fits in one chunk; the 1 MiB recurrent state is whole.
+    assert sorted(block_fingerprints) == sorted(
+        [2 * 2 * 256 * 64 * 2] * 4 + [4 * 256 * 32 * 2] + [1024 * 1024]
+    )
