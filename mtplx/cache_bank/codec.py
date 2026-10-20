@@ -59,6 +59,8 @@ class EncodedPayload:
     reused: dict[str, dict[str, Any]] = field(default_factory=dict)
     reused_nbytes: int = 0
     fingerprints: dict[str, tuple] = field(default_factory=dict)
+    # Seconds of eval and host copy per captured name (telemetry.WriteSplit).
+    capture_s: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -207,6 +209,11 @@ class TreeCodec:
         # on_block records the digest of every block that was hashed.
         self.known_blob: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
         self.on_block: Callable[[Any, int, int, str], None] | None = None
+        # Seconds of eval and host copy behind each captured name, set just
+        # before the name's bytes land in ``tensors``, so a streaming sink can
+        # read its own blob's cost there.
+        self.capture_s: dict[str, float] = {}
+        self._unit_s = 0.0
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -230,14 +237,22 @@ class TreeCodec:
         started = time.perf_counter()
         mx.eval(array)
         raw = bytes(memoryview(array))
+        elapsed = time.perf_counter() - started
+        self._unit_s += elapsed
         observer = self.on_unit
         if observer is not None:
             try:
-                observer(kind, time.perf_counter() - started, len(raw))
+                observer(kind, elapsed, len(raw))
             except Exception:
                 pass
         self._check_abort()
         return raw
+
+    def _store(self, name: str, raw: bytes) -> None:
+        """Hand a captured blob to ``tensors`` with the units it took."""
+        self.capture_s[name] = self._unit_s
+        self._unit_s = 0.0
+        self.tensors[name] = raw
 
     def _fingerprints(self, value: Any, *, rows: int | None) -> list[int] | None:
         """One bounded unit like _materialize: a single GPU reduction over
@@ -347,7 +362,7 @@ class TreeCodec:
                         "nbytes": int(hit["nbytes"]),
                     }
         raw = self._tensor_bytes(value, shape)
-        self.tensors[name] = raw
+        self._store(name, raw)
         return {
             "kind": "tensor",
             "name": name,
@@ -451,7 +466,7 @@ class TreeCodec:
                 )
                 continue
             raw = self._materialize("block", chunk)
-            self.tensors[name] = raw
+            self._store(name, raw)
             if seg_rows is not None and self.on_block is not None:
                 _count_ssd("ssd_blocks_hashed")
                 self.on_block(seg_rows, int(start), int(end), name)
@@ -590,6 +605,7 @@ def encode_payload(
         reused=dict(codec.reused),
         reused_nbytes=sum(int(blob["nbytes"]) for blob in codec.reused.values()),
         fingerprints=dict(codec.fingerprints),
+        capture_s=dict(codec.capture_s),
     )
 
 
