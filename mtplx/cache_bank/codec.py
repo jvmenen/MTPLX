@@ -293,19 +293,19 @@ class TreeCodec:
         full: int,
         chunk_blocks: int,
         block_fps: dict[int, int | None],
-        named: Callable[[int], bool] | None,
+        skip: Callable[[int], bool] | None,
     ) -> int | None:
         """The content fingerprint of one full block, or None (no memo key).
 
         The first block that needs one is fingerprinted with the blocks after
         it, at most ``chunk_blocks`` in one unit; for segmented rows the run
-        stops before a block a segment names (``named``), which needs none."""
+        stops before a block that needs none (``skip``)."""
         if (block_index + 1) * self.block_size > full:
             return None
         if block_index not in block_fps:
             stop = block_index + 1
             limit = min(full // self.block_size, block_index + chunk_blocks)
-            while stop < limit and (named is None or not named(stop)):
+            while stop < limit and (skip is None or not skip(stop)):
                 stop += 1
             slices = [slice(None)] * len(shape)
             slices[2] = slice(block_index * self.block_size, stop * self.block_size)
@@ -465,11 +465,16 @@ class TreeCodec:
         chunk_blocks = self._fingerprint_chunk_blocks(value, shape)
         seg_rows = value if hasattr(value, "known_digest") and self.known_blob is not None else None
 
-        def segment_named(index: int) -> bool:
-            lo = index * self.block_size
-            return seg_rows.known_digest(lo, lo + self.block_size) is not None
+        def needs_no_fingerprint(index: int) -> bool:
+            lo, hi = index * self.block_size, (index + 1) * self.block_size
+            if seg_rows.known_digest(lo, hi) is not None:
+                return True
+            # With an empty memo nothing can hit, and a block inside one sealed segment is named
+            # by its segment once captured: its fingerprint would only cost (a session's first
+            # spill would read the whole history for it).
+            return not self.reuse and seg_rows.in_one_sealed_segment(lo, hi)
 
-        named = segment_named if seg_rows is not None else None
+        skip = needs_no_fingerprint if seg_rows is not None else None
         for start in range(0, shape[axis], self.block_size):
             # No check here: _encode_tensor checked before the first block and
             # _materialize checks after every block.
@@ -490,10 +495,10 @@ class TreeCodec:
                 if hit is not None:
                     _count_ssd("ssd_blocks_reused")
                     self.segment_reused.add(name)
-            if hit is None and block_fps is not None:
+            if hit is None and block_fps is not None and (skip is None or not skip(block_index)):
                 fingerprint = self._block_fingerprint(
                     value, shape, block_index, full=full, chunk_blocks=chunk_blocks,
-                    block_fps=block_fps, named=named,
+                    block_fps=block_fps, skip=skip,
                 )
                 if fingerprint is not None:
                     chunk_shape = [int(dim) for dim in chunk.shape]
