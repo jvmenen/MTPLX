@@ -171,6 +171,12 @@ class TreeCodec:
         self.reuse = reuse
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
+        # Streaming writer hook (cold_tier.spill_entry): a memo hit is
+        # referenced only once known_blob confirms the blob (it claims the
+        # digest and requires it on disk, returning the blob, or None to
+        # capture the bytes after all). The staged writer checks its
+        # referenced blobs itself and leaves this unset.
+        self.known_blob: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -220,6 +226,11 @@ class TreeCodec:
                 pass
         self._check_abort()
         return fps
+
+    def _confirmed(self, hit: dict[str, Any] | None) -> dict[str, Any] | None:
+        if hit is None or self.known_blob is None:
+            return hit
+        return self.known_blob(hit)
 
     def _check_abort(self) -> None:
         check = self.should_abort
@@ -283,7 +294,7 @@ class TreeCodec:
             if fps:
                 key = (dtype, tuple(shape), -1, fps[0])
                 self.fingerprints[name] = key
-                hit = self.reuse.get(key)
+                hit = self._confirmed(self.reuse.get(key))
                 if hit is not None:
                     self.reused[name] = dict(hit)
                     return {
@@ -359,7 +370,9 @@ class TreeCodec:
                 chunk_shape = [int(dim) for dim in chunk.shape]
                 key = (dtype, tuple(chunk_shape), int(start), block_fps[block_index])
                 self.fingerprints[name] = key
-                hit = self.reuse.get(key) if self.reuse is not None else None
+                hit = self._confirmed(
+                    self.reuse.get(key) if self.reuse is not None else None
+                )
                 if hit is not None:
                     nbytes = int(hit["nbytes"])
                     self.reused[name] = dict(hit)
