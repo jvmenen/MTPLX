@@ -7,6 +7,7 @@ import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
 import { refusalOf } from "../lib/requestRefusal";
 import { cacheMissBadge } from "../lib/cacheMiss";
+import { cancellationOf } from "../lib/requestCancel";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -137,11 +138,18 @@ export function Row({
 }) {
   const sessionId = row.session_id ?? "—";
   const refusal = refusalOf(row);
+  const cancellation = refusal ? null : cancellationOf(row);
   const cacheBadge = refusal
     ? {
         label: refusal.label,
         color: "text-[var(--accent-hot)] bg-[var(--accent-hot)]/10",
         tooltip: undefined as string | undefined,
+      }
+    : cancellation
+    ? {
+        label: cancellation.label,
+        color: "text-[var(--text-muted)] bg-[var(--text-muted)]/10",
+        tooltip: cancellation.tooltip,
       }
     : row.session_cache_hit
     ? {
@@ -190,6 +198,11 @@ export function Row({
           >
             {cacheBadge.label}
           </span>
+          {cancellation?.cacheHint ? (
+            <span className="ml-2 text-[10px] text-[var(--text-muted)]">
+              {cancellation.cacheHint}
+            </span>
+          ) : null}
         </Td>
         <Td align="right" highlight={false}>
           <span className="text-[var(--text-muted)] text-xs">
