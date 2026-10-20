@@ -117,11 +117,17 @@ class WriteSplit:
         "new_hash_s",
         "referenced_blobs",
         "referenced_bytes",
+        "segment_blobs",
+        "segment_bytes",
     )
 
     def __init__(self) -> None:
         self.referenced_blobs = 0
         self.referenced_bytes = 0
+        # Of the referenced: blocks a segment named (MTPLX_SEGMENTED_KV); the
+        # rest were incremental-memo hits.
+        self.segment_blobs = 0
+        self.segment_bytes = 0
         self.duplicate_blobs = 0
         self.duplicate_bytes = 0
         self.duplicate_capture_s = 0.0
@@ -131,9 +137,12 @@ class WriteSplit:
         self.new_capture_s = 0.0
         self.new_hash_s = 0.0
 
-    def referenced(self, nbytes: int) -> None:
+    def referenced(self, nbytes: int, *, segment: bool = False) -> None:
         self.referenced_blobs += 1
         self.referenced_bytes += int(nbytes)
+        if segment:
+            self.segment_blobs += 1
+            self.segment_bytes += int(nbytes)
 
     def hashed(
         self, nbytes: int, *, capture_s: float, hash_s: float, on_disk: bool
@@ -154,6 +163,8 @@ class WriteSplit:
         return {
             "write_referenced_blobs": self.referenced_blobs,
             "write_referenced_bytes": self.referenced_bytes,
+            "write_referenced_segment_blobs": self.segment_blobs,
+            "write_referenced_segment_bytes": self.segment_bytes,
             "write_hashed_duplicate_blobs": self.duplicate_blobs,
             "write_hashed_duplicate_bytes": self.duplicate_bytes,
             "write_hashed_duplicate_capture_s": self.duplicate_capture_s,
@@ -169,6 +180,8 @@ class WriteSplit:
             "referenced": {
                 "blobs": self.referenced_blobs,
                 "bytes": self.referenced_bytes,
+                "segment_blobs": self.segment_blobs,
+                "segment_bytes": self.segment_bytes,
             },
             "hashed_duplicate": {
                 "blobs": self.duplicate_blobs,

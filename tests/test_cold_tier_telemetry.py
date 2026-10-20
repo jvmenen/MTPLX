@@ -286,7 +286,8 @@ class TestWriteSplit:
         assert last["hashed_duplicate"]["hash_s"] > 0.0
         assert last["hashed_duplicate"]["capture_s"] > 0.0
         assert last["hashed_new"]["blobs"] == 0
-        assert last["referenced"] == {"blobs": 0, "bytes": 0}
+        assert last["referenced"]["blobs"] == 0
+        assert last["referenced"]["segment_blobs"] == 0
         assert second["write_hashed_duplicate_bytes"] == nbytes
         assert second["deduped_blob_hits"] == blobs
         volume = second["write_volume"]
