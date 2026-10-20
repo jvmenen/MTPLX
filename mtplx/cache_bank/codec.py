@@ -274,6 +274,48 @@ class TreeCodec:
         self._check_abort()
         return fps
 
+    def _fingerprint_chunk_blocks(self, value: Any, shape: list[int]) -> int:
+        """Blocks per fingerprint run: as many as fit in one unit, and for
+        segmented rows at most _SEGMENTED_FINGERPRINT_BLOCKS."""
+        rows = max(1, int(shape[2]))
+        block_bytes = max(1, int(getattr(value, "nbytes", 0) or 0) // rows) * self.block_size
+        blocks = max(1, self.unit_bytes // block_bytes)
+        if hasattr(value, "rows_slice"):
+            blocks = min(blocks, _SEGMENTED_FINGERPRINT_BLOCKS)
+        return blocks
+
+    def _block_fingerprint(
+        self,
+        value: Any,
+        shape: list[int],
+        block_index: int,
+        *,
+        full: int,
+        chunk_blocks: int,
+        block_fps: dict[int, int | None],
+        named: Callable[[int], bool] | None,
+    ) -> int | None:
+        """The content fingerprint of one full block, or None (no memo key).
+
+        The first block that needs one is fingerprinted with the blocks after
+        it, at most ``chunk_blocks`` in one unit; for segmented rows the run
+        stops before a block a segment names (``named``), which needs none."""
+        if (block_index + 1) * self.block_size > full:
+            return None
+        if block_index not in block_fps:
+            stop = block_index + 1
+            limit = min(full // self.block_size, block_index + chunk_blocks)
+            while stop < limit and (named is None or not named(stop)):
+                stop += 1
+            slices = [slice(None)] * len(shape)
+            slices[2] = slice(block_index * self.block_size, stop * self.block_size)
+            part = self._fingerprints(value[tuple(slices)], rows=self.block_size)
+            for offset in range(stop - block_index):
+                block_fps[block_index + offset] = (
+                    part[offset] if part is not None and offset < len(part) else None
+                )
+        return block_fps.get(block_index)
+
     def _confirmed(self, hit: dict[str, Any] | None) -> dict[str, Any] | None:
         if hit is None or self.known_blob is None:
             return hit
@@ -289,37 +331,6 @@ class TreeCodec:
             return
         if interrupted:
             raise ColdEncodeInterrupted()
-
-    def _block_fingerprint(
-        self,
-        value: Any,
-        block_index: int,
-        *,
-        full: int,
-        block_fps: dict[int, int | None],
-        named: Callable[[int], bool] | None,
-    ) -> int | None:
-        """The content fingerprint of one full block, or None (no memo key).
-
-        For segmented rows the first block that needs one is fingerprinted with the blocks
-        after it, at most _SEGMENTED_FINGERPRINT_BLOCKS in one unit; the run stops before a
-        block a segment names (``named``), which needs none."""
-        if (block_index + 1) * self.block_size > full:
-            return None
-        if block_index not in block_fps and hasattr(value, "rows_slice"):
-            stop = block_index + 1
-            limit = min(full // self.block_size, block_index + _SEGMENTED_FINGERPRINT_BLOCKS)
-            while stop < limit and (named is None or not named(stop)):
-                stop += 1
-            part = self._fingerprints(
-                value.rows_slice(block_index * self.block_size, stop * self.block_size),
-                rows=self.block_size,
-            )
-            for offset in range(stop - block_index):
-                block_fps[block_index + offset] = (
-                    part[offset] if part is not None and offset < len(part) else None
-                )
-        return block_fps.get(block_index)
 
     def encode(self, value: Any) -> Any:
         if value is None:
@@ -443,18 +454,15 @@ class TreeCodec:
         blocks: list[dict[str, Any]] = []
         total = 0
         full = (shape[axis] // self.block_size) * self.block_size
-        # block index -> content fingerprint. Segmented rows are fingerprinted per run of at
-        # most _SEGMENTED_FINGERPRINT_BLOCKS blocks, the first time a block of the run needs
-        # one, so the pass never builds the whole history and skips blocks a segment names.
-        block_fps: dict[int, int | None] | None = None
-        if self.reuse is not None and full:
-            if hasattr(value, "rows_slice"):
-                block_fps = {}
-            else:
-                slices = [slice(None)] * len(shape)
-                slices[axis] = slice(0, full)
-                fps = self._fingerprints(value[tuple(slices)], rows=self.block_size)
-                block_fps = dict(enumerate(fps)) if fps is not None else None
+        # block index -> content fingerprint, taken per run of whole blocks the first time a
+        # block of the run needs one: at most one unit (_fingerprint_chunk_blocks), so the
+        # pass is a bounded unit like every capture and its temporaries stay a run's size on
+        # the streaming writer, which also runs when memory is short. For segmented rows the
+        # run never builds the whole history and stops before a block a segment names.
+        block_fps: dict[int, int | None] | None = (
+            {} if self.reuse is not None and full else None
+        )
+        chunk_blocks = self._fingerprint_chunk_blocks(value, shape)
         seg_rows = value if hasattr(value, "known_digest") and self.known_blob is not None else None
 
         def segment_named(index: int) -> bool:
@@ -484,15 +492,16 @@ class TreeCodec:
                     self.segment_reused.add(name)
             if hit is None and block_fps is not None:
                 fingerprint = self._block_fingerprint(
-                    value, block_index, full=full, block_fps=block_fps, named=named
+                    value, shape, block_index, full=full, chunk_blocks=chunk_blocks,
+                    block_fps=block_fps, named=named,
                 )
                 if fingerprint is not None:
                     chunk_shape = [int(dim) for dim in chunk.shape]
                     key = (dtype, tuple(chunk_shape), int(start), fingerprint)
                     self.fingerprints[name] = key
-                    hit = self.reuse.get(key) if self.reuse is not None else None
-                    if hit is not None and self.known_blob is not None:
-                        hit = self.known_blob(hit)
+                    hit = self._confirmed(
+                        self.reuse.get(key) if self.reuse is not None else None
+                    )
                     if hit is not None and seg_rows is not None:
                         # The segment names the block from now on (a block across two
                         # segments has no segment to name it and keeps its memo key).
