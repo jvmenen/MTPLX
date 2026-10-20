@@ -692,7 +692,14 @@ class SegmentedKVCache:
             [_rows_view(older.segment.values, older.n), _rows_view(newer.segment.values, newer.n)], axis=2
         )
         mx.eval(keys, values)
-        self._sealed[-2:] = [SegRef(KVSegment(keys, values, sealed=True), int(older.n) + int(newer.n))]
+        merged = KVSegment(keys, values, sealed=True)
+        # The merged rows are a copy of both segments' rows: a block an earlier spill hashed in
+        # either keeps its digest, at rows shifted by the older segment's rows for the newer one.
+        for ref, shift in ((older, 0), (newer, int(older.n))):
+            for (is_values, lo, hi), blob in ref.segment.block_digests.items():
+                if hi <= int(ref.n):
+                    merged.block_digests[(is_values, lo + shift, hi + shift)] = dict(blob)
+        self._sealed[-2:] = [SegRef(merged, int(older.n) + int(newer.n))]
         count_route("merge")
 
 
