@@ -354,3 +354,124 @@ def test_ssd_restore_builds_the_requests_cache_layout_with_and_without_the_switc
     assert all(isinstance(c, SegmentedKVCache) for c in restored.cache) == bool(flag)
     assert restored.cache[0].offset == 700
     assert mx.array_equal(restored.cache[0].keys[..., :700, :], cache[0].state[0]).item()
+
+
+# ---- what a spill finds already on disk: segment digests, merges and the memo -------------
+
+
+def _stock_of(seg):
+    out = []
+    for layer in seg:
+        k, v = layer.gather()
+        c = KVCache()
+        c.keys, c.values, c.offset = k, v, k.shape[2]
+        out.append(c)
+    return out
+
+
+def test_merge_digests_follow_the_shifted_rows() -> None:
+    seg, _ = _segmented_and_stock(lens=(300, 600), layers=1)
+    cache = seg[0]
+    cache.seal()
+    older, newer = cache.state.refs
+    older.segment.block_digests[(False, 0, 256)] = {"sha256": "a", "nbytes": 1}
+    newer.segment.block_digests[(True, 212, 468)] = {"sha256": "b", "nbytes": 1}
+    newer.segment.block_digests[(True, 500, 700)] = {"sha256": "past-rows", "nbytes": 1}
+    cache._merge_last_two()
+    (ref,) = cache.state.refs
+    assert ref.segment.block_digests == {
+        (False, 0, 256): {"sha256": "a", "nbytes": 1},
+        (True, 512, 768): {"sha256": "b", "nbytes": 1},
+    }
+
+
+def test_a_spill_after_a_merge_does_not_rehash_the_merged_blocks(monkeypatch, tmp_path) -> None:
+    seg, _ = _segmented_and_stock(lens=(2048, 1024, 512))
+    for layer in seg:
+        layer.seal()
+    tier = _tier(tmp_path / "seg")
+    assert tier.spill_entry(_Entry(seg, range(3584)))
+    grown = _grown(seg, 512, 600)
+    for layer in grown:
+        layer.compact()
+    assert all(len(layer.state.refs) < 4 for layer in grown)  # something merged
+    calls = _count_block_units(monkeypatch)
+    assert tier.spill_entry(_Entry(grown, range(4096)))
+    # Only the 2 new blocks of K and V in both layers are read back and hashed.
+    assert calls.count("block") == 2 * 2 * 2
+    ref = _tier(tmp_path / "stock")
+    stock = _stock_of(grown)
+    assert ref.spill_entry(_Entry(stock, range(4096)))
+    a, b = _entry_json(tier, _Entry(grown, range(4096))), _entry_json(ref, _Entry(stock, range(4096)))
+    assert a["payload_spec"] == b["payload_spec"] and a["tensor_blobs"] == b["tensor_blobs"]
+    record = tier.lookup(list(range(4096)), model_path="models/example", mtp_enabled=True)
+    assert record is not None
+    for layer in range(2):
+        k, v = record.cache_snapshot.states[layer]
+        gk, gv = grown[layer].gather()
+        assert mx.array_equal(k, gk).item() and mx.array_equal(v, gv).item()
+
+
+def _streaming_codec(memo):
+    from mtplx.cache_bank.codec import TreeCodec
+
+    codec = TreeCodec(block_size=256, reuse=dict(memo))
+    codec.known_blob = lambda blob: blob
+
+    def on_block(rows, start, end, name):
+        rows.remember_digest(start, end, {"sha256": f"digest-{name}", "nbytes": len(codec.tensors[name])})
+
+    codec.on_block = on_block
+    return codec
+
+
+def test_named_blocks_first_then_the_memo_for_blocks_across_segments(monkeypatch) -> None:
+    """With a memo and a segment's digests both at hand, a block a segment names takes no
+    fingerprint; a block across two segments is referenced through the memo, and the
+    segment that holds a memo hit names it from then on."""
+    from mtplx.cache_bank import codec as codec_module
+
+    seg, _ = _segmented_and_stock(lens=(700, 311, 90), layers=1)
+    snap = _snap(seg)
+    first = _streaming_codec({})
+    first.encode(snap.states)
+    memo = {key: {"sha256": f"memo-{name}", "nbytes": 1} for name, key in first.fingerprints.items()}
+    rows = []
+    original = codec_module.content_fingerprints
+
+    def counting(value, **kw):
+        rows.append(int(value.shape[2]) if len(value.shape) >= 3 else 0)
+        return original(value, **kw)
+
+    monkeypatch.setattr(codec_module, "content_fingerprints", counting)
+    second = _streaming_codec(memo)
+    second.encode(snap.states)
+    # Blocks 0 and 1 lie in the first segment and the partial block 4 in the third (named);
+    # blocks 2 and 3 cross the segment boundaries at 700 and 1011 and come from the memo.
+    assert len(second.segment_reused) == 3 * 2
+    memo_hits = set(second.reused) - second.segment_reused
+    assert len(memo_hits) == 2 * 2
+    assert sum(rows) == 2 * 2 * 256  # one run of the two unnamed blocks per tensor
+    assert len(second.tensors) == 1  # only the small recurrent state is captured
+
+
+def test_a_memo_hit_inside_a_segment_is_named_next_time() -> None:
+    seg, _ = _segmented_and_stock(lens=(1024,), layers=1)
+    snap = _snap(seg)
+    first = _streaming_codec({})
+    first.encode(snap.states)
+    memo = {key: {"sha256": f"memo-{name}", "nbytes": 1} for name, key in first.fingerprints.items()}
+    # A fresh cache over the same rows (as after a restore): no digests, every block a memo hit.
+    fresh = []
+    for layer in seg:
+        c = SegmentedKVCache()
+        k, v = layer.gather()
+        c.state = (k, v)
+        fresh.append(c)
+    snap = _snap(fresh)
+    second = _streaming_codec(memo)
+    second.encode(snap.states)
+    assert len(second.reused) == 2 * 4 and not second.segment_reused
+    third = _streaming_codec({})
+    third.encode(snap.states)
+    assert len(third.segment_reused) == 2 * 4 and not third.fingerprints
