@@ -274,6 +274,11 @@ class TreeCodec:
         self._check_abort()
         return fps
 
+    def _confirmed(self, hit: dict[str, Any] | None) -> dict[str, Any] | None:
+        if hit is None or self.known_blob is None:
+            return hit
+        return self.known_blob(hit)
+
     def _check_abort(self) -> None:
         check = self.should_abort
         if check is None:
@@ -384,7 +389,7 @@ class TreeCodec:
             if fps:
                 key = (dtype, tuple(shape), -1, fps[0])
                 self.fingerprints[name] = key
-                hit = self.reuse.get(key)
+                hit = self._confirmed(self.reuse.get(key))
                 if hit is not None:
                     self.reused[name] = dict(hit)
                     return {
