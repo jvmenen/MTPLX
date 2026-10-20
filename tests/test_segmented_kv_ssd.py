@@ -475,3 +475,129 @@ def test_a_memo_hit_inside_a_segment_is_named_next_time() -> None:
     third = _streaming_codec({})
     third.encode(snap.states)
     assert len(third.segment_reused) == 2 * 4 and not third.fingerprints
+
+
+# ---- write memo on the spill path: segment digests, merges and the incremental memo --------
+
+
+def _compacted(seg, extra_rows, seed):
+    """The next turn after the cache merged its recent segments (geometric tiers)."""
+    out = _grown(seg, extra_rows, seed)
+    for layer in out:
+        layer.compact()
+    return out
+
+
+def _assert_spill_equals_stock(tmp_path, tier, seg, tokens, label):
+    ref = _tier(tmp_path / f"stock-{label}")
+    stock = _stock_of(seg)
+    try:
+        assert ref.spill_entry(_Entry(stock, tokens))
+        a = _entry_json(tier, _Entry(seg, tokens))
+        b = _entry_json(ref, _Entry(stock, tokens))
+        assert a["payload_spec"] == b["payload_spec"] and a["tensor_blobs"] == b["tensor_blobs"]
+        assert _blobs(tier).keys() >= _blobs(ref).keys()
+    finally:
+        ref.close()
+
+
+def test_a_merge_keeps_the_digests_of_its_segments(monkeypatch, tmp_path) -> None:
+    """After a merge the blocks either segment's spill hashed are still named by the merged
+    segment: the next spill references them instead of hashing them again."""
+    monkeypatch.delenv("MTPLX_SSD_INCREMENTAL_ENCODE", raising=False)
+    seg, _ = _segmented_and_stock(lens=(700, 311, 90))
+    for layer in seg:
+        layer.seal()
+    tier = _tier(tmp_path / "seg")
+    try:
+        assert tier.spill_entry(_Entry(seg, range(1101)))
+        merged = _compacted(seg, 300, 800)
+        assert all(len(layer.state.refs) == 1 for layer in merged)
+        assert tier.spill_entry(_Entry(merged, range(1401)))
+        last = tier.stats()["last_write_split"]
+        # Blocks 0 and 1 (inside the first segment) of K and V in both layers; the blocks
+        # across the old segment boundaries (2 and 3) are hashed and found on disk.
+        assert last["referenced"]["segment_blobs"] == 2 * 2 * 2
+        assert last["referenced"]["blobs"] == 2 * 2 * 2
+        assert last["hashed_duplicate"]["blobs"] >= 2 * 2 * 2
+        assert tier.stats()["incremental_reused_blobs"] == 0
+        _assert_spill_equals_stock(tmp_path, tier, merged, range(1401), "merged")
+        record = tier.lookup(list(range(1401)), model_path="models/example", mtp_enabled=True)
+        assert record is not None
+        for layer in range(2):
+            k, v = record.cache_snapshot.states[layer]
+            gk, gv = merged[layer].gather()
+            assert mx.array_equal(k, gk).item() and mx.array_equal(v, gv).item()
+    finally:
+        tier.close()
+
+
+@pytest.mark.parametrize("incremental", ["1", "0"])
+def test_the_memo_names_a_block_across_segments(monkeypatch, tmp_path, incremental) -> None:
+    """A block across two segments is never named by a segment; with the incremental memo the
+    next spill references it (content fingerprint) instead of hashing it again."""
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", incremental)
+    seg, _ = _segmented_and_stock(lens=(700, 311, 90))
+    for layer in seg:
+        layer.seal()
+    tier = _tier(tmp_path / "seg")
+    try:
+        assert tier.spill_entry(_Entry(seg, range(1101)))
+        grown = _grown(seg, 300, 900)
+        assert tier.spill_entry(_Entry(grown, range(1401)))
+        stats = tier.stats()
+        last = stats["last_write_split"]
+        assert last["referenced"]["segment_blobs"] == 2 * 2 * 2
+        if incremental == "1":
+            # Blocks 2 and 3, across the segment boundaries at 700 and 1011, in K and V of
+            # both layers.
+            assert stats["incremental_reused_blobs"] == 2 * 2 * 2
+            assert last["referenced"]["blobs"] == 4 * 2 * 2
+        else:
+            assert stats["incremental_reused_blobs"] == 0
+            assert last["referenced"]["blobs"] == 2 * 2 * 2
+            assert last["hashed_duplicate"]["blobs"] >= 2 * 2 * 2
+        _assert_spill_equals_stock(tmp_path, tier, grown, range(1401), f"grown-{incremental}")
+        # A memo hit is remembered by the segments too: after a merge, the third spill
+        # references every full block of the old rows without a fingerprint.
+        merged = _compacted(grown, 256, 950)
+        assert tier.spill_entry(_Entry(merged, range(1657)))
+        _assert_spill_equals_stock(tmp_path, tier, merged, range(1657), f"merged-{incremental}")
+        record = tier.lookup(list(range(1657)), model_path="models/example", mtp_enabled=True)
+        assert record is not None
+        for layer in range(2):
+            k, v = record.cache_snapshot.states[layer]
+            gk, gv = merged[layer].gather()
+            assert mx.array_equal(k, gk).item() and mx.array_equal(v, gv).item()
+    finally:
+        tier.close()
+
+
+def test_segment_named_blocks_skip_the_fingerprint(monkeypatch, tmp_path) -> None:
+    """With the memo on, blocks a segment names take no fingerprint: only chunks with a block
+    the segments do not name are fingerprinted."""
+    from mtplx.cache_bank import codec as codec_module
+
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    seg, _ = _segmented_and_stock(lens=(8192, 4096))
+    for layer in seg:
+        layer.seal()
+    tier = _tier(tmp_path / "seg")
+    try:
+        assert tier.spill_entry(_Entry(seg, range(12288)))
+        rows = []
+        original = codec_module.content_fingerprints
+
+        def counting(value, *, rows_=None, **kw):
+            rows.append(int(value.shape[2]) if len(value.shape) >= 3 else 0)
+            return original(value, **kw)
+
+        monkeypatch.setattr(
+            codec_module, "content_fingerprints", lambda value, **kw: counting(value, **kw)
+        )
+        grown = _grown(seg, 256, 990)
+        assert tier.spill_entry(_Entry(grown, range(12544)))
+        # Only the chunk holding the new block, for K and V of both layers.
+        assert sum(r for r in rows if r) == 4 * 256
+    finally:
+        tier.close()
