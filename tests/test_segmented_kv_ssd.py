@@ -456,10 +456,9 @@ def test_named_blocks_first_then_the_memo_for_blocks_across_segments(monkeypatch
 
 
 def test_a_memo_hit_inside_a_segment_is_named_next_time() -> None:
-    seg, _ = _segmented_and_stock(lens=(1024,), layers=1)
-    snap = _snap(seg)
-    first = _streaming_codec({})
-    first.encode(snap.states)
+    seg, stock = _segmented_and_stock(lens=(1024,), layers=1)
+    # The memo of an earlier write that fingerprinted every block (a queued write).
+    first = _encode(_snap(stock), reuse={})
     memo = {key: {"sha256": f"memo-{name}", "nbytes": 1} for name, key in first.fingerprints.items()}
     # A fresh cache over the same rows (as after a restore): no digests, every block a memo hit.
     fresh = []
@@ -574,8 +573,8 @@ def test_the_memo_names_a_block_across_segments(monkeypatch, tmp_path, increment
 
 
 def test_segment_named_blocks_skip_the_fingerprint(monkeypatch, tmp_path) -> None:
-    """With the memo on, blocks a segment names take no fingerprint: only chunks with a block
-    the segments do not name are fingerprinted."""
+    """With the memo on, blocks a segment names take no fingerprint, and while the memo is
+    empty neither do blocks inside one sealed segment: here nothing is fingerprinted."""
     from mtplx.cache_bank import codec as codec_module
 
     monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
@@ -597,7 +596,29 @@ def test_segment_named_blocks_skip_the_fingerprint(monkeypatch, tmp_path) -> Non
         )
         grown = _grown(seg, 256, 990)
         assert tier.spill_entry(_Entry(grown, range(12544)))
-        # Only the chunk holding the new block, for K and V of both layers.
-        assert sum(r for r in rows if r) == 4 * 256
+        # Every old block is named; the new one lies inside the new sealed segment.
+        assert sum(r for r in rows if r) == 0
     finally:
         tier.close()
+
+
+def test_a_first_spill_fingerprints_only_blocks_across_segments(monkeypatch) -> None:
+    """With an empty memo, a block inside one sealed segment takes no fingerprint (its segment
+    names it once captured); a block across two segments does, for the next spill's memo."""
+    from mtplx.cache_bank import codec as codec_module
+
+    seg, _ = _segmented_and_stock(lens=(2048, 700, 300), layers=1)
+    rows = []
+    original = codec_module.content_fingerprints
+
+    def counting(value, **kw):
+        rows.append(int(value.shape[2]) if len(value.shape) >= 3 else 0)
+        return original(value, **kw)
+
+    monkeypatch.setattr(codec_module, "content_fingerprints", counting)
+    codec = _streaming_codec({})
+    codec.encode(_snap(seg).states)
+    # The boundary at 2048 falls between blocks; only [2560, 2816), across the boundary at
+    # 2748, is fingerprinted, in K and V. The partial last block never is.
+    assert sum(rows) == 2 * 256
+    assert len(codec.fingerprints) == 2

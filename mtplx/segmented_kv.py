@@ -1083,6 +1083,10 @@ class SegmentedRows:
             offset = hi
         return None
 
+    def in_one_sealed_segment(self, start: int, stop: int) -> bool:
+        """True when rows [start, stop) lie inside one sealed segment, which can name the block."""
+        return self._block_home(start, stop) is not None
+
     def known_digest(self, start: int, stop: int) -> dict[str, Any] | None:
         """The blob a spill already wrote for this block, when it lies inside one sealed segment."""
         home = self._block_home(start, stop)
