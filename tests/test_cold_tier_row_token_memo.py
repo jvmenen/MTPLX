@@ -231,3 +231,54 @@ def test_memo_is_bounded(tier, monkeypatch):
     assert tier._row_tokens_memo_tokens == sum(
         len(t) for _, t in tier._row_tokens_memo.values()
     )
+
+
+def test_full_memo_keeps_residents_so_repeated_scans_still_hit(tier, monkeypatch):
+    """A scan over more tokens than the cap must not evict every row before its reuse."""
+    monkeypatch.setattr(cold_tier_module, "_ROW_TOKENS_MEMO_MAX_TOKENS", 500)
+    for i in range(6):
+        tier._insert_manifest(_meta(f"e{i}", list(range(i, i + 200))))
+    parses = []
+    real = json.loads
+
+    def counting(text, *a, **k):
+        parses.append(1)
+        return real(text, *a, **k)
+
+    monkeypatch.setattr(cold_tier_module.json, "loads", counting)
+    query = tuple(range(300))
+    _lookup(tier, query, 0)
+    first = len(parses)
+    _lookup(tier, query, 0)
+    second = len(parses) - first
+    assert len(tier._row_tokens_memo) == 2
+    assert second == first - 2
+
+
+def test_memo_holds_compact_arrays(tier):
+    tier._insert_manifest(_meta("a", list(range(200))))
+    _lookup(tier, tuple(range(195)) + (9, 9, 9, 9, 9), 0)
+    (_, tokens), = tier._row_tokens_memo.values()
+    assert isinstance(tokens, cold_tier_module.array)
+    assert tokens.typecode == "I"
+
+
+def test_token_array_falls_back_to_a_tuple_for_ids_that_do_not_fit():
+    assert cold_tier_module._token_array([1, 2**40]) == (1, 2**40)
+    assert cold_tier_module._token_array([-1]) == (-1,)
+
+
+@pytest.mark.parametrize(
+    "tokens, prefix, expected",
+    [
+        ((1, 2, 3, 4), (1, 2, 3), True),
+        ((1, 2, 3, 4), (1, 2, 4), False),
+        ((1, 2), (1, 2, 3), False),
+        ((1, 2, 3), (), True),
+        ((-1, 2), (-1,), True),
+    ],
+)
+def test_starts_with_matches_tuple_slicing_for_arrays_and_tuples(tokens, prefix, expected):
+    as_stored = cold_tier_module._token_array(list(prefix))
+    assert cold_tier_module._starts_with(tokens, as_stored) is expected
+    assert (tokens[: len(prefix)] == prefix) is expected

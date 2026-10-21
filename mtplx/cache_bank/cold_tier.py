@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from array import array
 import hashlib
 from collections import Counter, OrderedDict, deque
 import json
@@ -399,6 +400,26 @@ def token_hash(token_ids: tuple[int, ...]) -> str:
     return h.hexdigest()
 
 
+def _token_array(token_ids: list[int]) -> array | tuple[int, ...]:
+    """Token ids as a compact ``array('I')``; a tuple if an id does not fit."""
+    try:
+        return array("I", token_ids)
+    except (OverflowError, TypeError):
+        return tuple(int(token) for token in token_ids)
+
+
+def _starts_with(tokens: tuple[int, ...], prefix: array | tuple[int, ...]) -> bool:
+    if len(tokens) < len(prefix):
+        return False
+    head = tokens[: len(prefix)]
+    if isinstance(prefix, array):
+        try:
+            return array(prefix.typecode, head) == prefix
+        except (OverflowError, TypeError):
+            return False
+    return tuple(head) == tuple(prefix)
+
+
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
@@ -417,9 +438,10 @@ def _block_restore_match(matched: int, safe_block: int) -> int:
 
     return int(matched) if session_head_anchor_enabled() else int(safe_block)
 
-# Upper bound on token ids held by the parsed-row memo (a few hundred MB at
-# most for the largest rows; typical stores stay far below it).
-_ROW_TOKENS_MEMO_MAX_TOKENS = 2_500_000
+# Upper bound on token ids held by the parsed-row memo. Rows are held as
+# 4-byte arrays, so the cap is about 128 MB; a full 100 GB store of long agent
+# conversations stays below it (5.7M tokens in 79 rows measured).
+_ROW_TOKENS_MEMO_MAX_TOKENS = 32_000_000
 
 # Ranked SSD rows a prefix lookup opens before it gives up: each refusal
 # costs only its payload.json read.
@@ -594,7 +616,7 @@ class SessionBankColdTier:
         # entry_id -> (token_hash, parsed token ids) for manifest rows. A row's
         # token list is immutable, so a prefix lookup parses each one once
         # instead of on every request; bounded by total cached tokens.
-        self._row_tokens_memo: OrderedDict[str, tuple[str, tuple[int, ...]]] = OrderedDict()
+        self._row_tokens_memo: dict[str, tuple[str, array | tuple[int, ...]]] = {}
         self._row_tokens_memo_tokens = 0
         self._row_tokens_memo_lock = threading.Lock()
         self._stop = threading.Event()
@@ -3340,7 +3362,7 @@ class SessionBankColdTier:
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = self._row_token_ids(row)
-        if require_exact_prefix and lookup_tokens[: len(token_ids)] != token_ids:
+        if require_exact_prefix and not _starts_with(lookup_tokens, token_ids):
             return None
         if int(metadata["format_version"]) != COLD_TIER_FORMAT_VERSION:
             self._set_last_miss("ssd_format_mismatch")
@@ -3544,7 +3566,9 @@ class SessionBankColdTier:
         )
         return ColdRestoreRecord(
             entry_id=str(metadata["entry_id"]),
-            token_ids=token_ids,
+            # The memo holds a compact array; a restored record carries the
+            # tuple its callers have always received.
+            token_ids=tuple(token_ids),
             cache_snapshot=decoded.cache_snapshot,
             logits=decoded.logits,
             hidden=decoded.hidden,
@@ -3603,26 +3627,29 @@ class SessionBankColdTier:
                 compatible.append(row)
         return compatible
 
-    def _row_token_ids(self, row: sqlite3.Row) -> tuple[int, ...]:
-        """Token ids of a manifest row, parsed once per (entry_id, token_hash)."""
+    def _row_token_ids(self, row: sqlite3.Row) -> array | tuple[int, ...]:
+        """Token ids of a manifest row, parsed once per (entry_id, token_hash).
+
+        Held as an ``array('I')`` (4 bytes per id; a tuple of ints costs about
+        40). A full memo keeps its residents and hands a newcomer back
+        unmemoized: prefix lookups walk the rows in the same order every
+        time, so evicting the oldest row would drop each row just before its
+        next use and the memo would never hit.
+        """
         entry_id = str(row["entry_id"])
         token_hash = str(row["token_hash"])
         with self._row_tokens_memo_lock:
             hit = self._row_tokens_memo.get(entry_id)
             if hit is not None and hit[0] == token_hash:
-                self._row_tokens_memo.move_to_end(entry_id)
                 return hit[1]
-        tokens = tuple(int(token) for token in json.loads(str(row["token_ids_json"])))
+        tokens = _token_array(json.loads(str(row["token_ids_json"])))
         with self._row_tokens_memo_lock:
             old = self._row_tokens_memo.pop(entry_id, None)
             if old is not None:
                 self._row_tokens_memo_tokens -= len(old[1])
-            if len(tokens) <= _ROW_TOKENS_MEMO_MAX_TOKENS:
+            if self._row_tokens_memo_tokens + len(tokens) <= _ROW_TOKENS_MEMO_MAX_TOKENS:
                 self._row_tokens_memo[entry_id] = (token_hash, tokens)
                 self._row_tokens_memo_tokens += len(tokens)
-                while self._row_tokens_memo_tokens > _ROW_TOKENS_MEMO_MAX_TOKENS:
-                    _, (_, evicted) = self._row_tokens_memo.popitem(last=False)
-                    self._row_tokens_memo_tokens -= len(evicted)
         return tokens
 
     def _forget_row_tokens(self, entry_id: str) -> None:
