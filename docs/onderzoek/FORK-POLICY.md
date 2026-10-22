@@ -20,6 +20,7 @@ Agreed 4 October 2026. Applies to both forks; MLX-specific notes at the end.
 5. **Keep [CARRIED.md](CARRIED.md) current**: per carried commit the PR number, its state (open, merged, closed, not filed) and the switch in the launch command. A merged PR leaves the list at the next rebuild; a closed PR is either dropped or kept with a reason.
 6. **Clean up** feature branches whose PR was merged or closed, only after Jeroen agrees.
 7. **No production change without measurement**: a new switch in the launch command needs a measured gain on the production stack, and its result goes into `VONDSTEN.md`.
+8. **Keep the local branch in step with the fork after every push.** When a fork branch is updated from another worktree or ref (`git push fork <commit>:<branch>`, often after a rebase), move the local branch right after the push: `git branch -f <branch> fork/<branch>` (or `git reset --hard fork/<branch>` in the worktree that has it checked out). Otherwise the local branch keeps pointing at the old commits and no longer shows what the PR contains.
 
 ## MLX
 
