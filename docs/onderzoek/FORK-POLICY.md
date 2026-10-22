@@ -33,10 +33,11 @@ Since 22 October 2026 (one folder per tool):
 | `~/Dev/MTPLX/wt/<branch>` | One worktree per branch, slashes as dashes (`fix/foo` becomes `wt/fix-foo`). |
 | `~/Dev/MTPLX/.venv` | Development venv (editable from `repo`) for tests and experiments, with `PYTHONPATH=<worktree>`. |
 | `~/Dev/MLX/repo`, `~/Dev/MLX/wt/<branch>` | MLX main checkout and worktrees, same naming. |
-| `~/Dev/MLX/pkg/<name>` | Built MLX packages (`PYTHONPATH`), from the `build_*.sh` recipes in `~/Dev/MLX`. |
+| `~/Dev/MLX/prod` | Worktree of the MLX branch production runs (now `prod-0.32.4-gdnf32`). |
+| `~/Dev/MLX/pkg/<name>` | Built MLX packages (`PYTHONPATH`), from the `build_*.sh` recipes in `~/Dev/MLX`; `pkg/prod` is built from `~/Dev/MLX/prod` and is what production loads. |
 
-New worktrees go under `wt/`, nowhere else. Measurement data and `gate.sh` still live in `~/Dev/laya-nl` for now.
+New worktrees go under `wt/`, nowhere else. Both folders have a README.md with the local rules (and a CLAUDE.md that loads it). Measurement data and `gate.sh` still live in `~/Dev/laya-nl` for now.
 
 ## MLX
 
-Same structure on `jvmenen/mlx`: `main` mirrors `ml-explore/mlx`, feature branches per upstream PR (branched from MLX `main`, MLX style, `python/tests`), and production runs the release tag in use plus our patches (since 19 Oct branch `prod-0.32.4-gdnf32`, v0.32.4), built into `~/Dev/MLX/pkg/prod-0.32.4-gdnf32`. Upstream rules: open an issue first; Jeroen writes PR descriptions himself (MLX CONTRIBUTING).
+Same structure on `jvmenen/mlx`: `main` mirrors `ml-explore/mlx`, feature branches per upstream PR (branched from MLX `main`, MLX style, `python/tests`), and production runs the release tag in use plus our patches (since 19 Oct branch `prod-0.32.4-gdnf32`, v0.32.4), built into `~/Dev/MLX/pkg/prod`. Upstream rules: open an issue first; Jeroen writes PR descriptions himself (MLX CONTRIBUTING).
