@@ -26,15 +26,15 @@ This directory belongs to the fork [jvmenen/MTPLX](https://github.com/jvmenen/MT
 - **Separate measured from estimated.** Note where a number comes from (real model, synthetic tensors, test model, code read only), with hardware, model, profile and date.
 - **Public:** the fork is public. No client names, private messages or chat content in reports; only counts and outcomes.
 - **Writing style:** short, businesslike, no em-dashes. Run the spelling check (LanguageTool; jargon such as "forward pass" may stay) before committing.
-- **Committing and pushing:** in the local worktree `~/Dev/MTPLX-onderzoek`, then `git push fork onderzoek`. Commit messages end with the Co-Authored-By line.
+- **Committing and pushing:** in the local worktree `~/Dev/MTPLX/wt/onderzoek`, then `git push fork onderzoek`. Commit messages end with the Co-Authored-By line.
 
 ### Code and branches
 
-- **One topic per branch**, based on `origin/main`, each in its own worktree (`~/Dev/MTPLX-<topic>`), so agents don't get in each other's way. Never work in another agent's worktree.
+- **One topic per branch**, based on `origin/main`, each in its own worktree (`~/Dev/MTPLX/wt/<branch>`, slashes as dashes), so agents don't get in each other's way. Never work in another agent's worktree.
 - **Do not change default behavior** unless it is proven to be better; new behavior goes behind a switch first (env or config, in the style of the existing toggles).
 - **Clean Code:** small functions with clear names, minimal diffs in the large files (`openai.py` ~39k lines, `generation.py` ~16k), no unrequested reformatting.
 - **Tests:** new tests with every change; run the relevant existing tests and compare against the baseline. On a clean `main`, 19 tests fail in this environment (9 `test_public_cli`, 8 `test_forge_cli`, 1 `test_hf_loader`, 1 `test_laguna_model`) due to our `~/.mtplx/config.toml` and 64 GB of memory (see [falende-tests](2026-09-26-falende-tests.md)): only report deviations from that. Run tests with `MTPLX_CONFIG=/nonexistent` in the env; without that variable the forge tests write directories into the real `~/.mtplx/models`. On a branch with `fix/test-isolation` in it that is no longer necessary. Ruff must not produce new findings (compare the count with `main`).
-- **Python:** venv `~/Dev/MTPLX/.venv` (editable, dev and server extras). In another worktree: set `PYTHONPATH=<worktree>` and check with `python -c "import mtplx; print(mtplx.__file__)"`.
+- **Python:** development venv `~/Dev/MTPLX/.venv` (editable from `~/Dev/MTPLX/repo`, dev and server extras). Production has its own venv in `~/Dev/MTPLX/prod/.venv`; never use that one for tests or experiments. In another worktree: set `PYTHONPATH=<worktree>` and check with `python -c "import mtplx; print(mtplx.__file__)"`.
 
 ### The real model and the server (important)
 
@@ -103,7 +103,7 @@ This directory belongs to the fork [jvmenen/MTPLX](https://github.com/jvmenen/MT
 
 ## Branches
 
-All branches except `feat/faster-prompt-scoring` live in the fork on GitHub; locally they work in `~/Dev/MTPLX` and the worktrees `~/Dev/MTPLX-<topic>`.
+All branches except `feat/faster-prompt-scoring` live in the fork on GitHub; locally they work in `~/Dev/MTPLX/repo` and the worktrees `~/Dev/MTPLX/wt/<branch>`.
 
 | Branch | Content | Status |
 |---|---|---|

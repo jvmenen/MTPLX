@@ -50,7 +50,7 @@ From [profiles.py](../../mtplx/profiles.py) on `prod` and `docs/profiles.md`:
 ## 3. The production launch command (current Qwen3.8 recipe)
 
 ```
-env PYTHONPATH=~/Dev/mlx-sdpa/pkg-combo:~/Dev/MTPLX-prod \
+env PYTHONPATH=~/Dev/MLX/pkg-combo:~/Dev/MTPLX/prod \
   MLX_SDPA_D256_MINQ=64 \
   MTPLX_MULTIROW_QMM=1 MTPLX_NAX_FLASH_WIDE=1 MTPLX_NAX_FLASH_DSPLIT4=1 \
   MTPLX_BATCH_INVARIANT_PREFILL=1 MTPLX_A3B_MOE_PREFILL_COMBINE=1 \
