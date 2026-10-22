@@ -36,7 +36,7 @@ Since 22 October 2026 (one folder per tool):
 | `~/Dev/MLX/prod` | Worktree of the MLX branch production runs (now `prod-0.32.4-gdnf32`). |
 | `~/Dev/MLX/pkg/<name>` | Built MLX packages (`PYTHONPATH`), from the `build_*.sh` recipes in `~/Dev/MLX`; `pkg/prod` is built from `~/Dev/MLX/prod` and is what production loads. |
 
-New worktrees go under `wt/`, nowhere else. Both folders have a README.md with the local rules (and a CLAUDE.md that loads it). Measurement data and `gate.sh` still live in `~/Dev/laya-nl` for now.
+New worktrees go under `wt/`, nowhere else. Both folders have a README.md with the local rules (and a CLAUDE.md that loads it). Measurement folders live in `~/Dev/MTPLX/lab/` (MLX: `~/Dev/MLX/lab/`); the GPU gate (`gate.sh`, `GPU.lock`, `gpu.zsh`) in `~/Dev/gpu/`, shared by MTPLX, MLX and Bink.
 
 ## MLX
 
