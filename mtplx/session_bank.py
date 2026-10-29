@@ -4745,7 +4745,9 @@ class SessionBank:
         least recently used first, their entries dropped. An entry not
         published yet loses its queued SSD encode when that job is its own
         (``_cancel_queued_persistence``). With ``write_out_before_release``
-        (the admission's release of idle conversations) that entry is first
+        (the memory guard's releases on the model-owner thread: the
+        admission's and the prefill shed's, of idle conversations and of the
+        request's own siblings) that entry is first
         written to the SSD cache on this thread, streamed one tensor at a
         time and bounded by ``RELEASE_WRITE_OUT_MAX_S``, so the conversation
         restores from disk when it comes back instead of being re-read
