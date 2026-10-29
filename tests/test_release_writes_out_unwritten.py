@@ -22,12 +22,14 @@ import inspect
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
 import mtplx.server.openai as srv
 import mtplx.session_bank as session_bank_module
+import mtplx.system_memory as sm
 from mtplx.cache_bank import SessionBankColdTier
 from mtplx.engine_session import EngineSessionManager
 from mtplx.session_bank import SessionBank
@@ -228,8 +230,9 @@ class TestTheRelease:
         assert record["outcome"] == "deadline"
 
     def test_without_it_the_release_cancels_the_write(self, cold):
-        """The other callers (the shed before an abort, the request's own
-        siblings) keep the cancel: they run when memory is shortest."""
+        """A caller that does not opt in (the pressure trim, the shed after
+        an allocation failure: off the model-owner thread, or past the line
+        already) keeps the cancel."""
 
         lane = _Lane()
         bank = _bank(cold, lane)
@@ -345,3 +348,167 @@ class TestTheAdmission:
         assert lane.pending == {}
         assert machine.queued() == 0
         assert receipt["projected_bytes_after"] <= 96 * GIB
+
+
+def _starved(at_s: float, compressor_gib: float):
+    """A Mac losing to compression: free pages under the abort floor while
+    the compressor grows fast (the guard's death signature)."""
+
+    return sm.SystemMemory(
+        available_bytes=20 * GIB,
+        total_bytes=128 * GIB,
+        level_percent=20,
+        free_bytes=16 * GIB // 1024,
+        file_backed_bytes=20 * GIB - 16 * GIB // 1024,
+        wired_bytes=88 * GIB,
+        compressor_bytes=int(compressor_gib * GIB),
+        swap_used_bytes=0,
+        monotonic_s=at_s,
+    )
+
+
+class TestTheSideRequest:
+    """One session id, two prompts: a client's side call (a title or summary
+    request) arrives under its conversation's session id while the
+    conversation's newest state waits in RAM, its SSD write queued behind
+    turns a few seconds apart. The field log, 2026-10-29 on a 64 GB Mac: an
+    8K side request tripped the prefill's death signature; the shed gave back
+    the conversation's three entries (9 GB, nothing on disk), and its next
+    turn re-read 23K tokens, 69 s to the first token."""
+
+    SIDE = list(range(500_000, 500_040))
+
+    def test_its_own_conversation_is_written_before_the_shed_lets_it_go(
+        self, cold
+    ):
+        lane = _Lane()
+        bank = _bank(cold, lane)
+        _put(bank, range(1, 9), session_id="conv")
+        newest = _put(bank, list(range(1, 9)) + [9, 10], session_id="conv")
+        assert "ssd_cold:conv" in lane.pending
+        receipt = srv._release_own_unusable_entries(
+            session_bank=bank,
+            session_id="conv",
+            prompt_ids=self.SIDE,
+            vision_splice=None,
+            restore_identity=None,
+            reason="prefill_shed_before_abort_own_session",
+        )
+        assert not bank.has_session_entries("conv")
+        # The next turn of the conversation restores from disk.
+        assert cold.is_published(newest)
+        assert receipt["written_out_entries"] >= 1
+        assert receipt["sessions"][0]["dropped_entries"] == 0
+        assert lane.pending == {}
+
+    def test_the_prefill_shed_writes_out_idle_and_own_conversations(
+        self, cold, monkeypatch
+    ):
+        lane = _Lane()
+        bank = _bank(cold, lane)
+        manager = EngineSessionManager(bank=bank, idle_ttl_s=3600)
+        other = _put(bank, range(100, 108), session_id="other")
+        own = _put(bank, range(1, 9), session_id="conv")
+        incoming = manager.get_or_create("conv")
+        assert incoming.try_begin_generation()
+        readings = iter([_starved(0.0, 10), _starved(1.0, 12)])
+        last = [None]
+
+        def reader():
+            last[0] = next(readings, last[0])
+            return last[0]
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(
+            srv,
+            "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": 80 * GIB, "cache_memory_bytes": 0},
+        )
+        monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+        state = SimpleNamespace(
+            dashboard=SimpleNamespace(), allow_swap=False, sessions=manager
+        )
+
+        def own_session_shed(reason):
+            return srv._release_own_unusable_entries(
+                session_bank=bank,
+                session_id="conv",
+                prompt_ids=self.SIDE,
+                vision_splice=None,
+                restore_identity=None,
+                reason=reason,
+            )
+
+        guard = srv._PrefillSystemGuard(state, own_session_shed=own_session_shed)
+        try:
+            assert guard() is False
+            # The death signature: the shed runs, the Mac still reads starved.
+            assert guard() is True
+        finally:
+            incoming.end_generation()
+        assert guard.tripped["reason"] == "death_signature"
+        shed = guard.shed
+        assert shed["released_sessions"] == ["other"]
+        assert shed["written_out_entries"] == 1
+        assert shed["own_session_written_out_entries"] == 1
+        assert cold.is_published(other)
+        assert cold.is_published(own)
+        assert not bank.has_session_entries("other")
+        assert not bank.has_session_entries("conv")
+        assert lane.pending == {}
+
+
+class TestTheAdmissionsOwnSiblings:
+    def test_a_side_request_does_not_cost_its_conversation_the_ssd_copy(
+        self, cold, monkeypatch
+    ):
+        """The admission's step 7, with the conversation and the request
+        under one session id: the release that makes room writes the
+        conversation's newest state out first."""
+
+        lane = _Lane()
+        bank = _bank(
+            cold,
+            lane,
+            max_entries=64,
+            max_bytes=60 * GIB,
+            per_session_max_bytes=30 * GIB,
+        )
+        manager = EngineSessionManager(bank=bank, idle_ttl_s=3600)
+        _put(
+            bank,
+            CONV,
+            session_id="anon-conv",
+            nbytes=len(CONV) * FN_ROW,
+            live_cache=True,
+        )
+        newest = _put(
+            bank,
+            CONV[:-1] + (999_999,),
+            session_id="anon-conv",
+            nbytes=len(CONV) * FN_ROW,
+            live_cache=True,
+        )
+        assert "ssd_cold:anon-conv" in lane.pending
+        incoming = manager.get_or_create("anon-conv")
+        assert incoming.try_begin_generation()
+        machine = _Machine(bank, base_gib=88.6, cache_gib=0.5, host_gib=6.0, lane=lane)
+        _install(monkeypatch, machine)
+        try:
+            receipt = srv._prefill_admission_shed(
+                _flash_next_state(manager),
+                prompt_ids=COMPACTION,
+                session_bank=bank,
+                session_id="anon-conv",
+            )
+        finally:
+            incoming.end_generation()
+        assert receipt is not None and receipt.get("refused") is not True
+        own = receipt["own_session_release"]
+        # The newest state, the one its queued write was for, is on disk.
+        assert own["written_out_entries"] == 1
+        assert own["sessions"][0]["on_ssd_entries"] == 1
+        assert not bank.has_session_entries("anon-conv")
+        assert cold.is_published(newest)
+        assert lane.pending == {}
