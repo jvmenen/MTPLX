@@ -1520,6 +1520,7 @@ class SessionBank:
                 file=sys.stderr,
                 flush=True,
             )
+        supplied_positions: tuple[int, ...] = ()
         if not normalized_boundaries:
             # Same-key replacement must not lose interior boundaries: the idle
             # postcommit re-put of a prompt-boundary entry (which restores
@@ -1580,6 +1581,7 @@ class SessionBank:
                 )
             ):
                 supplied = {position for position, _state, _hidden in normalized_boundaries}
+                supplied_positions = tuple(sorted(supplied))
                 normalized_boundaries = sorted(
                     normalized_boundaries
                     + [
@@ -1600,6 +1602,11 @@ class SessionBank:
                     budget_bytes=self.checkpoint_budget_bytes,
                     prompt_end=len(tokens) - 1,
                     tail_backoff=default_tail_backoff(),
+                    # The caller's own records were retained under its plan
+                    # (session-head anchor included), so they come first and
+                    # the stored prefix's records fill what is left of the
+                    # budget instead of pushing the head anchor out.
+                    head_anchors=supplied_positions,
                 ),
             )
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
